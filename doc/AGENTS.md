@@ -70,9 +70,12 @@ When a new event-decision pair is added:
 ## Testing
 
 - **Host tests** (`tests/host/`): markdown playbooks driven by the
-  shell scripts in the same directory. Driven via `start.sh` /
-  `ctrl.sh` / `screenshot.sh`. These run qdwin natively on the
-  developer's machine.
+  shell scripts in the same directory (`start.sh` / `ctrl.sh` /
+  `screenshot.sh`). qdwin runs **only with `--backend=headless`**
+  on the host — no real seat, no real display, no input-injection.
+  These tests exercise protocol behaviours that don't need a seat;
+  anything that needs a real seat goes in `tests/gui/` to run in a
+  VM. Never run qdwin against the developer's actual display server.
 - **GUI tests** (`tests/gui/`, `tests/apps/`): VM tests. They run
   inside a virt-manager VM driven over `virsh send-key` + the
   qemu-guest-agent ctrl-socket + screenshot extraction. GUI tests

@@ -10,6 +10,11 @@ but is published as a separate project: nothing in qdwin assumes the
 qdistro broker, the qdshell QML stack, or the qdistro userland is
 present. A different shell can adopt it.
 
+If you ARE building qdistro: the umbrella repo expects qdwin checked
+out as a sibling directory (`../qdwin/`) so its daemons can compile
+against qdwin's protocol XML. See the qdistro umbrella README for
+the canonical 3-repo checkout layout.
+
 ## What's in here
 
 - `qdwin/` — the shell plugin: `qdwin.c` + nested-compositor client
