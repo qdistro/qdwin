@@ -1,0 +1,128 @@
+# libweston-vendored — patched libweston-14 for qdwin
+
+A privately-built copy of `libweston-14.so.0` carrying the
+**NULL-parent xdg_popup** patch
+(`0001-allow-null-parent-xdg-popup.patch`). The patch lifts an
+assertion that prevents popup surfaces from being attached without
+a parent; qdwin's shell client needs root-level popups for
+Quickshell-style floating menus.
+
+## Why a private libweston instead of LD_PRELOADing libweston-desktop?
+
+There is no separate `libweston-desktop.so`. The desktop subdir is
+`subdir()`'d into the single `lib_weston = shared_library('weston-14',
+...)`, and the protocol handler we need to patch
+(`weston_desktop_xdg_surface_protocol_get_popup`) is `static` — its
+address never crosses a public symbol boundary, so it cannot be
+LD_PRELOAD-interposed. Replacing the whole libweston is the only
+shape that works. See the design note for full reasoning.
+
+## Layout
+
+```
+VERSION                              # "14.0.2" (must match Tumbleweed package)
+0001-allow-null-parent-xdg-popup.patch
+src/                                 # weston @ tag 14.0.2 with desktop/xdg-shell.c patched in-place
+build-libweston.sh                   # one-shot build wrapper
+README.md                            # this file
+```
+
+The patch is **already applied to `src/libweston/desktop/xdg-shell.c`**.
+The `.patch` file is the reproducible record so we can regenerate the
+tree against a future weston bump (apply with `patch -p1` from
+`src/`).
+
+## Build
+
+```sh
+cd ${QDWIN_REPO}/libweston-vendored
+./build-libweston.sh
+```
+
+Output: `src/build/libweston/libweston-14.so.0.0.2` (~1.7 MB).
+SONAME `libweston-14.so.0` — the LD_LIBRARY_PATH trick relies on this
+matching the system library exactly.
+
+Required system devel packages:
+- `wayland-devel`, `libxkbcommon-devel`, `libpixman-1-0-devel`,
+  `libinput-devel`, `libdrm-devel`, `lcms2-devel`
+- `libevdev-devel` is NOT required for this minimal config (we strip
+  all backends except headless and don't link libinput-backend.a).
+
+## Use from qdwin
+
+```sh
+LD_LIBRARY_PATH=${QDWIN_REPO}/libweston-vendored/src/build/libweston${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
+  /usr/local/bin/qdwin --backend=headless ...
+```
+
+For an installed-tree layout (Phase 7+), copy
+`src/build/libweston/libweston-14.so.0.0.2` plus its symlinks to
+`/usr/libexec/qdistro/qdwin-libweston/` and have the qdwin systemd
+unit set `Environment=LD_LIBRARY_PATH=/usr/libexec/qdistro/qdwin-libweston`.
+
+Verify the right copy is loaded after start with:
+
+```sh
+pmap $(pgrep qdwin) | grep libweston-14.so
+# expect path under qdistro/, NOT /usr/lib64/
+```
+
+## Verifying the patch is live
+
+After qdwin starts with the vendored library in `LD_LIBRARY_PATH`,
+have a client send `xdg_surface.get_popup(parent=NULL)` — e.g. via
+the smoke harness in `compositor/qdwin/test_zwlr_layer_shell.py` (a
+new `test_null_parent_popup` case is required and is the next TODO).
+
+Stock libweston response: client disconnects with
+`xdg_surface#NN: error 3: popup parent must be non-null`.
+Patched response: no error on get_popup; if the client commits without
+setting a parent via another protocol, error is posted at commit-time
+with message `popup parent must be set before commit`.
+
+## Bumping to a new weston version
+
+1. `cd $HOME/doc/weston && git fetch && git tag --list "14.*"`
+2. Update `VERSION` in this directory.
+3. Re-extract: `cd src && rm -rf * && git -C $HOME/doc/weston archive 14.0.X | tar -x`
+4. Strip again: `rm -rf clients data desktop-shell doc fullscreen-shell ivi-shell kiosk-shell man notes.txt pipewire remoting tests pam wcap weston.ini.in` (keep tools/, frontend/include/ if needed)
+5. Apply patch: `patch -p1 < ../0001-allow-null-parent-xdg-popup.patch`
+6. Rebuild: `./build-libweston.sh`
+
+If patch fails: re-edit `xdg-shell.c` by hand, then regenerate the
+patch with `diff -u`.
+
+## Host-side gate
+
+`run-null-parent-test.sh` (in this directory) spawns headless weston
+twice — once with the system libweston, once with the vendored .so
+via the meson build prefix `/tmp/qdwin-libweston-prefix` — and runs
+`compositor/qdwin/test_zwlr_layer_shell.py` against each. Stock
+should report `null_parent_popup` as a deliberate rejection; vendored
+should report it as accepted. Use this as the regression gate
+whenever `0001-allow-null-parent-xdg-popup.patch` or its rebase
+target moves.
+
+## Smoke and protocol-test wiring
+
+Both `compositor/run-noctalia-smoke.sh` and
+`compositor/qdwin/run-protocol-tests.sh` honour
+`QDWIN_USE_VENDORED_LIBWESTON=1`. They prepend
+`$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64` (default
+`/usr/libexec/qdistro/qdwin-libweston`) to LD_LIBRARY_PATH and
+propagate the same env to the python test client so
+`test_null_parent_popup` flips its expected outcome to "accepted".
+
+To exercise this in-VM the `.so` plus its symlinks plus the
+matching `headless-backend.so` need to be deployed under that
+prefix path. The host build script's `ninja install` step lays
+them out correctly under `/tmp/qdwin-libweston-prefix/`; rsyncing
+that tree into `/usr/libexec/qdistro/qdwin-libweston/` in a VM is
+sufficient.
+
+## Open follow-ups
+
+- Decide install vehicle: `/usr/libexec/qdistro/qdwin-libweston/` vs
+  bake into `compositor/build/` and reference from qdwin systemd unit.
+- Upstream the patch to weston master; spec wording supports it.
