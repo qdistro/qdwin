@@ -188,7 +188,7 @@ primary_selection_protocol_code = custom_target(
 
 # Layer-shell (zwlr_layer_shell_v1 v5): vendored from
 # Quickshell's repo because wayland-protocols never accepted it
-# upstream. Source XML is at compositor/qdwin/wlr-layer-shell-unstable-v1.xml
+# upstream. Source XML is at qdwin/wlr-layer-shell-unstable-v1.xml
 # (407 lines). Lets external Wayland clients (waybar, Quickshell,
 # eww, fuzzel, mako, etc.) place panels/notifications/lockscreens on
 # fixed compositor layers with anchor + exclusive-zone reservation.
