@@ -107,7 +107,7 @@ All asserts 1.1 → 5.1 pass. Confirms:
 
 - Step 3 indexed count doesn't increase → mtime auto-rescan is
   broken. Verify launcher_toggle in
-  `compositor/qdshell/modules/launcher.py` calls `_app_dirs_mtime()`
+  `qdshell/Modules/Launcher (QML)` calls `_app_dirs_mtime()`
   and compares to `ln.indexed_mtime`.
 - Step 4 matches=0 → install path didn't actually drop the .desktop
   file. Run `ls /usr/share/applications/` in the VM to confirm.

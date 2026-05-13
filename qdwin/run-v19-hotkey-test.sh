@@ -8,7 +8,7 @@
 # test_v19_register_hotkey_live can scrape it.
 #
 # Real key-press → hotkey_pressed event delivery is not exercised
-# (headless weston has no input backend; see compositor/host-tests/
+# (headless weston has no input backend; see tests/host/
 # AGENTS.md). This driver locks the request surface, the binding
 # allocation, and the teardown path. Anything stronger needs a
 # weston-test or ext-virtual-pointer-v1 plumbing.
@@ -23,7 +23,7 @@ TEST_PY="$HERE/test_zwlr_layer_shell.py"
 
 if [[ ! -f "$QDWIN_SO" ]]; then
     echo "[v2] qdwin-shell.so missing at $QDWIN_SO" >&2
-    echo "[v2] run compositor/host-tests/lib.sh ht_require_build first" >&2
+    echo "[v2] run tests/host/lib.sh ht_require_build first" >&2
     exit 2
 fi
 

@@ -15,7 +15,7 @@ tell at a glance which window came from which identity.
 ## Setup
 
 ```bash
-HT=compositor/host-tests
+HT=tests/host
 ID_A=03-multi-uid-colours-A
 ID_B=03-multi-uid-colours-B
 

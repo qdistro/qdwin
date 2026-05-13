@@ -30,7 +30,7 @@ and observation primitives are different.
 | Real-keyboard chords (Alt+Tab, Ctrl+Alt+L, etc.) | `qdwin_chord <holds> -- <taps>` (QMP `input-send-event`) | **mandatory** for any chord that depends on a modifier-release transition (e.g. weston modifier_binding fires only when modifier was alone — see B3-switcher post-mortem in ) |
 | Single key down/up explicitly | `qdwin_qmp_key <qcode> <down\|up>` | building block of qdwin_chord; reach for it when a scenario needs Alt held while doing other work |
 | Input to focused **toplevels** | qdwin_send_key or qdwin_chord | foot/firefox/etc. once on screen and focused |
-| Launcher overlay text input | **NOT keyboard** — only `qdwin_ctrl "launcher-type ..."` | known §6.8 gap; see `compositor/qdshell/modules/launcher.py:17-23` |
+| Launcher overlay text input | **NOT keyboard** — only `qdwin_ctrl "launcher-type ..."` | known §6.8 gap; see `qdshell/Modules/Launcher (QML):17-23` |
 | Launcher click-to-select | **NOT mouse** — only `qdwin_ctrl "launcher-activate"` | same gap |
 | Locker password input | **NOT keyboard** (variant of launcher gap) — only `qdwin_ctrl "unlock-password <pw>"` | tracked B4 |
 | Mouse pointer move | `qdwin_mouse_move <px_x> <px_y>` (QMP `input-send-event` abs axes; helper converts pixels to 0..32767) | toplevels under cursor receive enter events + can request cursor shape |

@@ -271,7 +271,7 @@ All asserts 1.1 → 5.1 pass. Confirms:
 ## Coordinate notes
 
 The 28 px titlebar / 8 px border defaults are wired in
-`compositor/qdshell/qdshell.py:_paint_titlebar` (constants near top
+`qdshell shell.qml:_paint_titlebar` (constants near top
 of file). If a future qdshell change moves them, update the
 arithmetic in Step 1 / Step 5 — the test asserts on outer-rect
 coords, not on the constants directly, so it stays robust to a

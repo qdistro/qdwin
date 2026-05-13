@@ -145,9 +145,9 @@ All asserts 1.1 → 5.3 pass. Confirms:
   `(sw.selection + direction) % len(...)` advance.
 - Step 3 focus moves but step 3.5 text appears in foot2 not foot1 →
   switcher_commit didn't call set_keyboard_focus_v2. Check
-  `compositor/qdshell/modules/launcher.py` switcher_commit().
+  `qdshell/Modules/Launcher (QML)` switcher_commit().
 - Step 3 focus moves but visual front stays on foot2 → request_raise
-  is a no-op again. Check `compositor/qdwin/qdwin.c`
+  is a no-op again. Check `qdwin/qdwin.c`
   qdwin_handle_request_raise — must call qdwin_toplevel_move_to_layer
   even for non-minimised toplevels.
 - Step 5 keyboard goes nowhere after exit → on_toplevel_removed

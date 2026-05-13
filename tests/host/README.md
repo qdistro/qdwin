@@ -1,4 +1,4 @@
-# compositor/host-tests/
+# tests/host/
 
 Vision-driven GUI scenarios for qdwin + qdshell, runnable headless on
 the host. No VM, no popups.

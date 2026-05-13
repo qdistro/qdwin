@@ -117,7 +117,7 @@ focus, (d) emits seat_focus_changed for the shell.
 
 - Step 3 focus stays on the original handle → click-to-focus
   regression. Check `qdwin_proxy_default_grab_button` in
-  `compositor/qdwin/qdwin.c` for the `state == PRESSED && button ==
+  `qdwin/qdwin.c` for the `state == PRESSED && button ==
   BTN_LEFT` branch with `qdwin_toplevel_for_view`.
 - Step 3 focus moves but visual doesn't (foot1 stays behind) →
   request_raise re-stack regression. Same handler must call

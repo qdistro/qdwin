@@ -341,7 +341,7 @@ def test_v19_register_hotkey_live(display_name):
 
     Real key-press → hotkey_pressed event delivery is intentionally
     NOT exercised here: headless weston has no input backend, see
-    compositor/host-tests/AGENTS.md. This test proves the request
+    tests/host/AGENTS.md. This test proves the request
     surface is reachable, the binding allocates without error, and
     the teardown path runs — anything stronger waits on weston-test
     or ext-virtual-pointer-v1.

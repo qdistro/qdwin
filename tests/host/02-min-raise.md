@@ -14,7 +14,7 @@ hidden, and that the window restores cleanly.
 
 ```bash
 ID=02-min-raise
-HT=compositor/host-tests
+HT=tests/host
 $HT/start.sh $ID
 ```
 

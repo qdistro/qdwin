@@ -18,7 +18,7 @@ manifest here as "qdshell stalls when terminal stalls."
 
 ```bash
 ID=04-content-hung-chrome-responsive
-HT=compositor/host-tests
+HT=tests/host
 $HT/start.sh $ID
 ```
 

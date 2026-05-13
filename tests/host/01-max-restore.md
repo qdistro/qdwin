@@ -15,7 +15,7 @@ on the maximised geometry.
 
 ```bash
 ID=01-max-restore
-HT=compositor/host-tests
+HT=tests/host
 $HT/start.sh $ID
 ```
 

@@ -6,7 +6,7 @@
 # Differs from phase1/gui-tests/qdwin/qdwin-helpers.sh in that:
 # - No qdshell (no /run/user/1000/qdshell.sock);
 # - The shell role is held by `qdwin-bystander` (a 200-line C client
-#   built from compositor/test-client/qdwin-bystander.c) which exposes
+#   built from test-client/qdwin-bystander.c) which exposes
 #   max/restore/min/close/focus on a FIFO at
 #   /run/user/1000/qdwin-cmd.fifo;
 # - The active wayland socket name is auto-detected because weston

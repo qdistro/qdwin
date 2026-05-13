@@ -72,7 +72,7 @@ pmap $(pgrep qdwin) | grep libweston-14.so
 
 After qdwin starts with the vendored library in `LD_LIBRARY_PATH`,
 have a client send `xdg_surface.get_popup(parent=NULL)` — e.g. via
-the smoke harness in `compositor/qdwin/test_zwlr_layer_shell.py` (a
+the smoke harness in `qdwin/test_zwlr_layer_shell.py` (a
 new `test_null_parent_popup` case is required and is the next TODO).
 
 Stock libweston response: client disconnects with
@@ -98,7 +98,7 @@ patch with `diff -u`.
 `run-null-parent-test.sh` (in this directory) spawns headless weston
 twice — once with the system libweston, once with the vendored .so
 via the meson build prefix `/tmp/qdwin-libweston-prefix` — and runs
-`compositor/qdwin/test_zwlr_layer_shell.py` against each. Stock
+`qdwin/test_zwlr_layer_shell.py` against each. Stock
 should report `null_parent_popup` as a deliberate rejection; vendored
 should report it as accepted. Use this as the regression gate
 whenever `0001-allow-null-parent-xdg-popup.patch` or its rebase
@@ -107,7 +107,7 @@ target moves.
 ## Smoke and protocol-test wiring
 
 Both `compositor/run-noctalia-smoke.sh` and
-`compositor/qdwin/run-protocol-tests.sh` honour
+`qdwin/run-protocol-tests.sh` honour
 `QDWIN_USE_VENDORED_LIBWESTON=1`. They prepend
 `$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64` (default
 `/usr/libexec/qdistro/qdwin-libweston`) to LD_LIBRARY_PATH and

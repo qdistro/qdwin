@@ -12,7 +12,7 @@ Invocation (install-time, from bootstrap-qdwin-in-vm.sh):
 
 or standalone:
 
-    python3 /path/to/compositor/qdwin/backend/cffi/build.py
+    python3 /path/to/qdwin/backend/cffi/build.py
 
 Output: _qdwin_ffi*.so next to this file. Tests import as
 `from qdwin.backend.cffi import _qdwin_ffi`.

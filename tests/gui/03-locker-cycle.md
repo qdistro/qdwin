@@ -128,7 +128,7 @@ guard against "ctrl/alt held from chord poisoning subsequent KEY_ENTER"
 
 - Step 4 PASS at ctrl-socket (`locked=False`) but FAIL at screenshot
   (lock screen still visible) → B1 regression. The `unlock()` flow in
-  `compositor/qdshell/modules/locker.py` must call `lk.proxy.destroy()`.
+  `qdshell/Modules/LockScreen (QML)` must call `lk.proxy.destroy()`.
 - Step 5 produces `^[[13;7~` or similar escape sequences in the
   terminal output → modifier state poisoning. Helpers must use QMP
   `input-send-event` for ALL input (not virsh send-key for some and

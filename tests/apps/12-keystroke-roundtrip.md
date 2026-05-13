@@ -4,7 +4,7 @@
 --codeset linux KEY_*` reach both a native-Wayland focused toplevel
 and an XWayland focused toplevel and produce visible characters.
 Tests qdwin's `set_keyboard_focus` path (the bystander uses the v14
-form, see `compositor/test-client/qdwin-bystander.c`) plus libweston's
+form, see `test-client/qdwin-bystander.c`) plus libweston's
 keymap and Xwayland keyboard hand-off.
 
 ## Setup

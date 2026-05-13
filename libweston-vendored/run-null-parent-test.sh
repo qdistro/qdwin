@@ -3,7 +3,7 @@
 # patch.
 #
 # Spawns a fresh headless weston with qdwin-shell.so loaded, runs
-# compositor/qdwin/test_zwlr_layer_shell.py against it, and asserts
+# qdwin/test_zwlr_layer_shell.py against it, and asserts
 # the test_null_parent_popup case passes. Loops twice — first against
 # stock libweston (expect xdg_wm_base#3 fired), second against the
 # vendored .so via LD_LIBRARY_PATH (expect no error). The full
@@ -23,11 +23,11 @@ VEND_PREFIX="/tmp/qdwin-libweston-prefix"
 VEND_LIB="$VEND_PREFIX/lib64"
 QDWIN_INSTALL="${QDWIN_INSTALL:-/tmp/qdwin-host-install}"
 QDWIN_SO="$QDWIN_INSTALL/lib/weston/qdwin-shell.so"
-TEST_PY="$REPO/compositor/qdwin/test_zwlr_layer_shell.py"
+TEST_PY="$REPO/qdwin/test_zwlr_layer_shell.py"
 
 if [[ ! -f "$QDWIN_SO" ]]; then
     echo "[v1] qdwin-shell.so missing at $QDWIN_SO" >&2
-    echo "[v1] run compositor/host-tests/lib.sh ht_require_build first" >&2
+    echo "[v1] run tests/host/lib.sh ht_require_build first" >&2
     exit 2
 fi
 if [[ ! -f "$VEND_LIB/libweston-14.so.0.0.2" || ! -f "$VEND_LIB/libweston-14/headless-backend.so" ]]; then

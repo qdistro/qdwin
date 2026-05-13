@@ -131,5 +131,5 @@ event path.
   it says `v16`, the protocol header wasn't regenerated (re-run
   `gen_protocol.sh` against the v17 XML).
 - `selection` doesn't change after KEY_DOWN → launcher_nav handler
-  isn't wired. Check `compositor/qdshell/qdshell.py` `on_overlay_key`
+  isn't wired. Check `qdshell shell.qml` `on_overlay_key`
   for the XKB_Down branch.

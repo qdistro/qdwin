@@ -4,13 +4,13 @@ These scenarios verify **third-party application compatibility** with
 the qdwin compositor. Distinct from `phase1/gui-tests/qdwin/`, which
 exercises qdshell (panel/launcher/locker). Here qdshell is **not**
 running — instead a minimal `qdwin-bystander` C client (built from
-`compositor/test-client/qdwin-bystander.c`) plays the role of a v14
+`test-client/qdwin-bystander.c`) plays the role of a v14
 shell: it releases the held-layer for each new toplevel and accepts
 `max` / `restore` / `min` / `close` / `focus` commands on a FIFO at
 `/run/user/1000/qdwin-cmd.fifo`.
 
 These scenarios were authored 2026-05-05 alongside the four-bug-fix
-landing in `compositor/qdwin/qdwin.c`. Each scenario double-checks one
+landing in `qdwin/qdwin.c`. Each scenario double-checks one
 qdwin protocol path against a real client.
 
 ## Bug coverage map
@@ -86,7 +86,7 @@ the screenshots. Same pattern as `phase1/gui-tests/qdwin/AGENTS.md`.
 Spawn one Sonnet subagent per scenario, **serially** on a given VM.
 The bystander and stale-toplevel pollution mean concurrent scenarios
 on one VM produce spurious FAILs. Spin up a second clone via
-`compositor/spike-6.5/clone-baseweed.sh apps-qdwin --from-baked` if
+`qdistro/scripts/vm/clone-baseweed.sh apps-qdwin --from-baked` if
 you need wall-clock parallelism.
 
 Pre-conditions every runner assumes:

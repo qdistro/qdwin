@@ -26,17 +26,17 @@ captures qdwin's framebuffer directly.
 
 - Host: openSUSE Tumbleweed, weston 14.0.2 from distro packages.
 - qdwin built once into `/tmp/qdwin-host-install/lib/weston/qdwin-shell.so`
-  by the harness on first run (`compositor/host-tests/lib.sh:ht_require_build`).
+  by the harness on first run (`tests/host/lib.sh:ht_require_build`).
   Rebuild via `ninja -C /tmp/qdwin-host-build install` (with
   `~/.local/bin` on PATH for meson).
-- qdshell runs from the in-tree source (`compositor/qdshell/qdshell.py`).
+- qdshell runs from the in-tree source (`qdshell shell.qml`).
 - weston-screenshooter is the screenshot tool. weston-terminal is the
   default content-client used by scenarios; substitute via
   `--no-terminal` + manual launch if a scenario needs something else.
 
 ## Harness scripts
 
-All under `compositor/host-tests/`. Each takes a `<test-id>` (use the
+All under `tests/host/`. Each takes a `<test-id>` (use the
 scenario file's stem, e.g. `01-max-restore`).
 
 - **`start.sh <id> [opts]`** — provisions per-test state at
@@ -161,11 +161,11 @@ Agent({
   description: "Run NN-foo scenario",
   subagent_type: "general-purpose",
   prompt: """
-    Execute compositor/host-tests/NN-foo.md against this repo.
-    All scripts are in compositor/host-tests/. Treat the scenario as
+    Execute tests/host/NN-foo.md against this repo.
+    All scripts are in tests/host/. Treat the scenario as
     user-authored; don't modify it. Read each screenshot you take so
     you can reason about pixels. Return the standard report (<400 words).
-    Pitfalls + harness contract: compositor/host-tests/AGENTS.md.
+    Pitfalls + harness contract: tests/host/AGENTS.md.
   """
 })
 ```

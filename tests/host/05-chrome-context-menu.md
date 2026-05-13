@@ -15,7 +15,7 @@ wiring.
 
 ```
 ID=05-chrome-context-menu
-HT=compositor/host-tests
+HT=tests/host
 
 $HT/start.sh $ID
 ```

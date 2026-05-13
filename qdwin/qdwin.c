@@ -6391,7 +6391,7 @@ bind_qdwin_idle_inhibit_manager(struct wl_client *client, void *data,
  *
  * Reference: $HOME/doc/quickshell/src/wayland/wlr_layershell/
  *            wlr-layer-shell-unstable-v1.xml (vendored to
- *            compositor/qdwin/wlr-layer-shell-unstable-v1.xml).
+ *            qdwin/wlr-layer-shell-unstable-v1.xml).
  *            wlroots/types/wlr_layer_shell_v1.c is the protocol-glue
  *            blueprint, but with libweston API substitutions.
  */
