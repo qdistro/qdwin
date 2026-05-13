@@ -1,0 +1,21 @@
+# Build outputs
+build/
+build-*/
+*.o
+*.so
+
+# Wayland-scanner generated headers (regenerated each build)
+*-server-protocol.h
+*-client-protocol.h
+*-protocol.c
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor noise
+.idea/
+.vscode/
+*.swp
+extra/
