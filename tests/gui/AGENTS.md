@@ -1,0 +1,192 @@
+# qdwin GUI test runner — for graphic-aware subagents
+
+This is the qdwin-on-tty3 sibling of `phase1/gui-tests/AGENTS.md`. The
+older guide assumes labwc + XWayland (Phase 1-5 demo); qdwin runs on
+bare DRM via libweston with no XWayland in this profile, so the input
+and observation primitives are different.
+
+## Roles
+
+- **Orchestrator** — picks scenarios from `qdwin/NN-*.md`, spawns one
+  runner per scenario, aggregates PASS/FAIL.
+- **Runner** — graphic-aware subagent given a single scenario file +
+  a target VM. Executes setup → steps → asserts and returns a report.
+
+## Environment
+
+- Host: openSUSE Tumbleweed with `libvirt` + `virsh`.
+- Target: a running libvirt domain on `qemu:///session` running the
+  qdwin compositor (greetd-qdwin.service active on tty3 with autologin
+  as `admin`). Standard test password `$QDISTRO_VM_PASSWORD`.
+- VM name: `$VMNAME` if set, else `virsh list --name --state-running | head -1`.
+- The qdshell ctrl-socket lives at `/run/user/1000/qdshell.sock` and is
+  the **only** way to drive the launcher / switcher / locker.
+
+## What works (and what doesn't)
+
+| Surface | Driveable how | Notes |
+|---|---|---|
+| Single keys / non-modifier chords | `qdwin_send_key KEY_*` (virsh send-key) | evdev-layer; --holdtime applied; OK for plain typing |
+| Real-keyboard chords (Alt+Tab, Ctrl+Alt+L, etc.) | `qdwin_chord <holds> -- <taps>` (QMP `input-send-event`) | **mandatory** for any chord that depends on a modifier-release transition (e.g. weston modifier_binding fires only when modifier was alone — see B3-switcher post-mortem in ) |
+| Single key down/up explicitly | `qdwin_qmp_key <qcode> <down\|up>` | building block of qdwin_chord; reach for it when a scenario needs Alt held while doing other work |
+| Input to focused **toplevels** | qdwin_send_key or qdwin_chord | foot/firefox/etc. once on screen and focused |
+| Launcher overlay text input | **NOT keyboard** — only `qdwin_ctrl "launcher-type ..."` | known §6.8 gap; see `compositor/qdshell/modules/launcher.py:17-23` |
+| Launcher click-to-select | **NOT mouse** — only `qdwin_ctrl "launcher-activate"` | same gap |
+| Locker password input | **NOT keyboard** (variant of launcher gap) — only `qdwin_ctrl "unlock-password <pw>"` | tracked B4 |
+| Mouse pointer move | `qdwin_mouse_move <px_x> <px_y>` (QMP `input-send-event` abs axes; helper converts pixels to 0..32767) | toplevels under cursor receive enter events + can request cursor shape |
+| Mouse clicks (left/right/middle) | `qdwin_click <x> <y> [button]` or split `qdwin_mouse_button left down\|up` | left-click on a chrome side or content surface raises + focuses the toplevel (click-to-focus, since task(129)) |
+| Mouse drag (button held + motion) | `qdwin_drag <x1> <y1> <x2> <y2> [button]` | move + down + N intermediate moves + up. Drag of a titlebar (within the N chrome strip, outside the close/min/max buttons) translates the whole toplevel. `QDWIN_DRAG_STEPS`/`QDWIN_DRAG_STEP_MS` tune granularity. |
+| Visual assertion | `qdwin_screenshot <file.png>` (wraps virsh screenshot + PPM→PNG) | cursor is on a KMS plane and never appears in the screenshot |
+
+## qcode reference
+
+`qdwin_qmp_key` and `qdwin_chord` take qemu key codes (qcodes), NOT linux KEY_* names. See `qapi/ui.json` `QKeyCode` enum upstream. Common ones:
+
+| qcode | Linux KEY_ |
+|---|---|
+| `alt`, `alt_r` | LEFTALT, RIGHTALT |
+| `ctrl`, `ctrl_r` | LEFTCTRL, RIGHTCTRL |
+| `shift`, `shift_r` | LEFTSHIFT, RIGHTSHIFT |
+| `meta_l`, `meta_r` (super) | LEFTMETA, RIGHTMETA |
+| `tab`, `esc`, `ret`, `spc`, `backspace` | TAB, ESC, ENTER, SPACE, BACKSPACE |
+| `a..z`, `0..9`, `f1..f12` | A..Z, 1..0, F1..F12 |
+| `left`, `right`, `up`, `down` | LEFT, RIGHT, UP, DOWN |
+
+## Helper script
+
+Source `qdwin-helpers.sh` from any scenario runner:
+
+```bash
+source phase1/gui-tests/qdwin/qdwin-helpers.sh
+qdwin_set_vm demo-260430-0912
+qdwin_session_healthy || { echo "session not up"; exit 2; }
+
+# Plain typing — virsh send-key is fine
+qdwin_send_key KEY_LEFTCTRL KEY_SPACE   # or use ctrl-socket directly:
+qdwin_ctrl "launcher-type foot"
+qdwin_ctrl "launcher-activate"
+sleep 1.5
+qdwin_screenshot /tmp/foot-running.png
+
+# Alt+Tab / Ctrl+Alt+L — MUST use qdwin_chord (real-keyboard sequence)
+qdwin_chord alt -- tab          # one Alt+Tab cycle
+qdwin_chord ctrl alt -- l       # lock screen
+qdwin_chord alt -- tab tab      # cycle twice while Alt is held
+```
+
+### Why two key paths
+
+`virsh send-key`, `qdwin_send_key`, and `qemu-monitor-command 'sendkey'` all press the listed keys simultaneously, hold for `--holdtime`, then release simultaneously. There is no "Alt held alone, Tab released" intermediate state in the resulting evdev stream. weston's `weston_compositor_add_modifier_binding` (used for the original switcher_commit / lock-on-modifier-release patterns) fires *only* when the modifier was pressed *alone* for the entire hold. Press Tab during the Alt-hold and the binding never fires. Verified 2026-04-30 by capturing /dev/input/event0 with evtest while pressing Alt+Tab on a real keyboard: all four events arrived in correct order, but the binding still did not fire.
+
+`qdwin_chord` instead emits each event independently via QMP `input-send-event` (down for each hold key, then down/up for each tap key, then up for each hold key in reverse). Order matches what a real keyboard produces, and weston's grab `modifiers` callback (the new path used by the switcher in qdwin.c) sees the Alt-released transition cleanly.
+
+For non-chord key tests (typing into a focused toplevel, sending Enter, etc.) `qdwin_send_key` is faster and fine.
+
+The helper pushes ctrl-socket payloads through the same host:8765
+HTTP server `fresh-vm-bootstrap.sh` uses (so `vm-exec`'s JSON quoting
+never sees embedded quotes). Make sure the HTTP server is running
+under `compositor/`:
+
+```
+cd ${QDWIN_REPO} && \
+  python3 -m http.server 8765 --bind 127.0.0.1 &
+```
+
+## Reading screenshots
+
+A vision-capable LLM agent (e.g. Claude with `Read` on a `.png`)
+extracts text and shape directly from the framebuffer. For non-vision
+agents:
+
+```bash
+zypper -n install tesseract-ocr tesseract-ocr-traineddata-english
+tesseract /tmp/foo.png - -c tessedit_create_tsv=1
+```
+
+yields tab-separated `(text, left, top, width, height)` rows. Match
+on text labels, not pixel offsets — qdshell font/theme drift breaks
+hard-coded coordinates across clones.
+
+## Hard-learned pitfalls (qdwin-specific)
+
+1. **Launcher cache is built lazily on first toggle and never
+   rescanned.** A package installed after the session started won't
+   appear in the launcher until qdshell is restarted (or until a
+   `launcher-rescan` ctrl command is added — currently a TODO). Add
+   any test-only packages to `fresh-vm-bootstrap.sh` so they're
+   present before greetd-qdwin starts.
+
+2. **CSD-only toplevels (foot, GTK4 apps without
+   server-decoration-v1) double-decorate.** qdshell attaches its own
+   chrome + the client also draws a titlebar inside its content area.
+   foot specifically logs `"no decoration manager available - using
+   CSDs unconditionally"` — the toplevel renders at its CSD-default
+   tiny size with both decorations stacked. xdg-decoration-v1 was
+   declined per spec/27 (chrome is private-protocol shell-attached);
+   tracked as a real gap, not a test-author problem.
+
+3. **Foot launched via the launcher's `setsid Exec=foot --server`
+   sometimes exits before chrome attaches; foot launched directly via
+   `runuser -u admin -- bash -c 'WAYLAND_DISPLAY=wayland-1 foot'` stays
+   alive.** When a scenario needs a known-good toplevel for input
+   tests, prefer the direct path; reserve the launcher path for
+   testing the launcher itself.
+
+4. **Don't `systemctl restart greetd-qdwin.service` mid-scenario
+   without re-waiting for the ctrl-socket.** The socket disappears
+   for 3–5s during restart; a too-quick `qdwin_ctrl` returns
+   "Connection refused".
+
+5. **virsh send-key doesn't echo errors** for unknown keysyms — it
+   just returns 0 and nothing happens. Stick to `KEY_*` constants
+   from `/usr/include/linux/input-event-codes.h`.
+
+6. **Cursor visibility in `virsh screenshot` depends on the renderer.**
+   With `--renderer=pixman` (the VM default) weston falls back to
+   compositing the cursor into the primary framebuffer, so it DOES
+   show in `virsh screenshot` since task(135). With
+   `--renderer=gl` + virgl, weston puts the cursor on the hardware
+   cursor plane, which `virsh screenshot` doesn't capture. Don't rely
+   on its presence/absence as a robust assertion across renderer
+   profiles — assert by-effect for behavioural tests ("after click at
+   (X, Y), expected toplevel at the front").
+
+7. **The pre-fixed VMs autologin as the `greeter` pseudo-user (uid
+   471), not admin.** If `qdwin_session_healthy` returns false but the
+   service is active, check `loginctl list-sessions` — if you see uid
+   471 on tty3 you're on a pre-task(125) image. Re-run
+   `bootstrap-qdwin-in-vm.sh` against an updated source tree.
+
+## Available scenarios
+
+| File | What it covers |
+|---|---|
+| `01-open-terminal.md` | end-to-end: launcher → filter → activate → type into focused terminal (B2 + auto-focus + ctrl-socket launcher path) |
+| `02-launcher-keyboard.md` | real-keyboard input into launcher overlay — type, arrows, Esc, Enter (B3) |
+| `03-locker-cycle.md` | Ctrl+Alt+L → type password → Enter unlock → keyboard reaches focused toplevel again (B1 + B4 + post-unlock regression) |
+| `04-alt-tab-switch.md` | Alt+Tab single-press swaps focus + raises + survives close-and-refocus (switcher_grab + anchor + request_raise re-stack + on_toplevel_removed refocus) |
+| `05-launcher-rescan.md` | new app installed mid-session appears in launcher on next toggle (B5) |
+| `06-mouse-click-focus.md` | clicking a background window's chrome focuses + raises it (mouse path) |
+| `07-titlebar-buttons.md` | clicking maximize / restore / minimize glyphs on the titlebar actually changes window state (mouse path) + ctrl-socket control comparison; also verifies maximised window leaves room for chrome + panel (not fullscreen) |
+| `08-titlebar-close-button.md` | clicking the red × on the titlebar destroys the toplevel; chrome_button right-click+left-click cycle for the close action |
+| `09-titlebar-context-menu.md` | right-click on titlebar opens qdshell context-menu popup; clicking "Restore"/"Maximise" / "Minimise" / "Close" items dispatches the right action via qdwin_shell_v1@v21 popup_button |
+| `10-context-menu-relabel.md` | the maximise/restore row label flips with `tl.state & 1` on every menu open ("Maximise" ↔ "Restore"), proving the label is recomputed not cached |
+
+Run each scenario sequentially against the same VM; each cleans up after itself. For a full smoke pass, an orchestrator can spawn one runner per scenario in series.
+
+## Running a scenario
+
+1. Read `qdwin/NN-*.md` top to bottom before acting.
+2. Source `qdwin-helpers.sh`.
+3. Follow the **Setup** block. Stop and FAIL if any step exits
+   nonzero or `qdwin_session_healthy` returns false.
+4. Execute **Steps** in order. After each step that mutates state,
+   capture a screenshot to `/tmp/<scenario-stem>-<step>.png` AND read
+   it (vision) or OCR it before moving to the next step. Don't trust
+   the prior step's "ok" — qdshell logs success on dispatch, not on
+   completion.
+5. For each **Assert**, decide PASS/FAIL by looking at the most
+   recent screenshot AND/OR the qdshell `list` snapshot. Report
+   concretely: quote the OCR'd text or the snapshot fields.
+6. Cleanup: kill spawned processes, ensure the launcher is hidden,
+   reset the locker if engaged.
