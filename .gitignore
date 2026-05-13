@@ -19,3 +19,12 @@ __pycache__/
 .vscode/
 *.swp
 extra/
+
+# Local test artifacts (host + in-VM scenario screenshots)
+test-output/
+screenshots/
+test-screenshots/
+**/screenshots/
+*.screenshot.png
+shot-*.png
+shot-*.jpg
