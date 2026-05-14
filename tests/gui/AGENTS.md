@@ -171,6 +171,9 @@ hard-coded coordinates across clones.
 | `08-titlebar-close-button.md` | clicking the red × on the titlebar destroys the toplevel; chrome_button right-click+left-click cycle for the close action |
 | `09-titlebar-context-menu.md` | right-click on titlebar opens qdshell context-menu popup; clicking "Restore"/"Maximise" / "Minimise" / "Close" items dispatches the right action via qdwin_shell_v1@v21 popup_button |
 | `10-context-menu-relabel.md` | the maximise/restore row label flips with `tl.state & 1` on every menu open ("Maximise" ↔ "Restore"), proving the label is recomputed not cached |
+| `12-bar-no-overdraw.md` | bar `content` and `exclusion-top` agree on height; maximized windows do not have their top row clipped by the bar's bottom row (pixel-mismatch fix + `exclusionZoneBleed` toggle round-trip) |
+| `13-focus-events-emitted.md` | every keyboard-focus transition between toplevels emits a `qdwin: focus handle=N (was M) seat=…` line, including the spawn / spawn / close-handoff / last-close-to-no-window sequence |
+| `14-bar-content-quiet-when-idle.md` | journal grows by ≤2 bar-content remap lines over 10 s idle (no remap storm) and re-settles to quiet after a window cycle |
 
 Run each scenario sequentially against the same VM; each cleans up after itself. For a full smoke pass, an orchestrator can spawn one runner per scenario in series.
 

@@ -156,6 +156,7 @@ static void qdwin_handle_nested_proxy_decision(struct wl_client *client,
 					       uint32_t handle,
 					       uint32_t decision,
 					       const char *reason);
+static void qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl);
 static void qdwin_toplevel_release_holding(struct qdwin_toplevel *tl,
 					   const char *cause);
 static struct qdwin_toplevel *
@@ -636,6 +637,7 @@ static void qdwin_default_cursor_on_focus_changed(struct wl_listener *l,
  * because they walk seat_trackers via wl_list_for_each on the `link`
  * field which needs the struct to be complete. */
 static void qdwin_seat_emit_focus_now(struct qdwin_seat_tracker *tr);
+static void qdwin_seat_focus_recover_idle_cb(void *data);
 static void qdwin_emit_seat_focus_changed(struct qdwin *qdwin,
 					  struct weston_seat *seat,
 					  uint32_t handle);
@@ -982,6 +984,15 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 	for (int s = 0; s < QDWIN_SIDES; s++)
 		qdwin_chrome_detach(&tl->chrome[s]);
 
+	/* Focus transfer to a surviving sibling on toplevel destroy is
+	 * NOT done here. By the time qdwin_surface_removed runs,
+	 * libweston has already cleared kbd->focus to NULL (the
+	 * weston_surface destroy_signal fires before libweston-desktop's
+	 * surface_removed callback). Instead, the recovery is done from
+	 * the focus_signal listener in qdwin_seat_emit_focus_now —
+	 * whenever focus drops to UINT32_MAX with surviving siblings
+	 * present, it re-targets the next mapped toplevel. */
+
 	weston_desktop_surface_unlink_view(tl->view);
 	weston_view_destroy(tl->view);
 	wl_list_remove(&tl->link);
@@ -1101,6 +1112,11 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 		weston_log("qdwin: mapped handle=%u size=%dx%d (%s)\n",
 			   tl->handle, surface->width, surface->height,
 			   tl->decorated ? "normal" : "held");
+		/* If approval (release_holding) already fired before this
+		 * first commit, qdwin_toplevel_release_holding's autofocus
+		 * call shortcircuited because the surface wasn't yet
+		 * mapped. Re-arm now that both conditions hold. */
+		qdwin_toplevel_autofocus_if_ready(tl);
 	}
 
 	if (tl->last_width != surface->width ||
@@ -1313,6 +1329,61 @@ qdwin_toplevel_release_holding(struct qdwin_toplevel *tl, const char *cause)
 	}
 	weston_log("qdwin: holding_released handle=%u via %s (held → normal)\n",
 		   tl->handle, cause);
+
+	/* Auto-focus is wired in qdwin_toplevel_autofocus_if_ready, called
+	 * from BOTH the release-holding path (here, in case the surface
+	 * already committed a buffer) and the first-commit map path (in
+	 * case release fires before first commit). See the helper's
+	 * docblock for why both call sites are needed. */
+	qdwin_toplevel_autofocus_if_ready(tl);
+}
+
+/* Assign keyboard focus to this toplevel on every seat with a keyboard,
+ * but only when the surface is BOTH mapped (has a buffer; safe to
+ * render) AND decorated (on the normal layer, not still held in the
+ * bystander layer awaiting approval). Idempotent — re-arming with the
+ * same focus is cheap and the kbd->focus equality check shortcircuits.
+ *
+ * Without this, the qdshell side has no path to drive focus
+ * (Services/Qdwin/Qdwin.qml::focusWindow is a TODO stub), leaving
+ * keyboard focus pinned at UINT32_MAX indefinitely — every newly-
+ * spawned window is unfocused until the user clicks it. This matches
+ * the default behaviour of sway/hyprland/labwc/etc.
+ *
+ * Called from both:
+ *   - qdwin_toplevel_release_holding (held→normal transition): handles
+ *     the common case where first_commit/map fires before approval.
+ *   - qdwin_surface_committed first-map branch: handles the case
+ *     where approval (release_holding) fires before the surface has
+ *     committed any buffer (e.g. QDWIN_AUTO_APPROVE_TOPLEVELS env).
+ * Only one call ends up actually emitting focus_signal; the other
+ * shortcircuits on kbd->focus equality.
+ *
+ * Skipped when the session is locked — the locker's EXCLUSIVE layer
+ * surface (ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE in
+ * qdwin_layer_surface_apply) owns focus. Without the guard a
+ * background app spawning during a lock could briefly steal focus
+ * before the next exclusive-grab re-assertion.
+ *
+ * See todo/qdshell-no-focus-driving.md.
+ */
+static void
+qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl)
+{
+	if (!tl || !tl->qdwin || tl->qdwin->locked)
+		return;
+	if (!tl->decorated)  /* still in held bystander layer */
+		return;
+	if (!tl->view || !tl->view->surface)
+		return;
+	if (!weston_surface_is_mapped(tl->view->surface))
+		return;
+	struct weston_seat *seat;
+	wl_list_for_each(seat, &tl->qdwin->compositor->seat_list, link) {
+		struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
+		if (kbd && kbd->focus != tl->view->surface)
+			weston_keyboard_set_focus(kbd, tl->view->surface);
+	}
 }
 
 static void
@@ -5474,6 +5545,16 @@ struct qdwin_seat_tracker {
 	 * data_offer. UINT32_MAX-handle (clear-focus) calls reset to NULL
 	 * so the next non-clear v2 call always counts as cross-silo. */
 	char *last_target_silo;
+	/* Deferred focus-transfer source: scheduled when focus drops to
+	 * UINT32_MAX so the recovery runs on the next event-loop pass,
+	 * after any concurrent toplevel destroys have finished tearing
+	 * down. Doing the transfer synchronously inside the focus_signal
+	 * listener loops infinitely when the focused window is itself
+	 * being destroyed (its wl_list_remove hasn't fired yet, so the
+	 * recovery picks it back up, only for libweston to clear focus
+	 * again as the destroy continues). The idle defers past the
+	 * destroy chain. NULL when nothing scheduled. */
+	struct wl_event_source *focus_recover_idle;
 	struct wl_list link;               /* qdwin::seat_trackers */
 };
 
@@ -6071,8 +6152,68 @@ qdwin_seat_emit_focus_now(struct qdwin_seat_tracker *tr)
 	uint32_t handle = tl ? tl->handle : UINT32_MAX;
 	if (handle == tr->last_focused_handle)
 		return;
+	uint32_t prev = tr->last_focused_handle;
 	tr->last_focused_handle = handle;
+	/* Unconditional ground-truth log — independent of shell binding state
+	 * so focus transitions are observable in the journal even before
+	 * qdshell has bound qdwin_shell_v1 at v14+ (see
+	 * todo/qdwin-focus-events.md). The shell-facing protocol emit below
+	 * is still gated on v14 inside qdwin_emit_seat_focus_changed. */
+	weston_log("qdwin: focus handle=%u (was %u) seat=%s\n",
+		   handle, prev,
+		   (tr->seat && tr->seat->seat_name) ? tr->seat->seat_name : "");
 	qdwin_emit_seat_focus_changed(tr->qdwin, tr->seat, handle);
+
+	/* Focus-transfer recovery: when focus drops to "no toplevel"
+	 * (handle == UINT32_MAX) while live siblings exist, auto-recover
+	 * to the next mapped+decorated toplevel. Deferred to the next
+	 * event-loop pass via wl_event_loop_add_idle — see the docblock
+	 * on focus_recover_idle for why synchronous recovery here
+	 * infinite-loops when the dropping window is itself mid-destroy.
+	 *
+	 * Skipped when locked (locker grab owns focus). One idle queued
+	 * per tracker at a time; if focus oscillates we'd over-schedule
+	 * but the de-dupe at the top of this function makes the second
+	 * idle a no-op. */
+	if (handle == UINT32_MAX && kbd && !tr->qdwin->locked &&
+	    !tr->focus_recover_idle) {
+		struct wl_event_loop *loop = wl_display_get_event_loop(
+			tr->qdwin->compositor->wl_display);
+		if (loop)
+			tr->focus_recover_idle = wl_event_loop_add_idle(
+				loop, qdwin_seat_focus_recover_idle_cb, tr);
+	}
+}
+
+/* Idle callback firing one event-loop iteration after focus dropped
+ * to UINT32_MAX. Re-checks state (focus might have legitimately moved
+ * elsewhere in the meantime) and assigns focus to the head-most
+ * mapped+decorated toplevel if any remain. See the focus_recover_idle
+ * docblock for the rationale on deferring rather than recovering
+ * synchronously. */
+static void
+qdwin_seat_focus_recover_idle_cb(void *data)
+{
+	struct qdwin_seat_tracker *tr = data;
+	tr->focus_recover_idle = NULL;
+	if (!tr->seat || !tr->qdwin || tr->qdwin->locked)
+		return;
+	struct weston_keyboard *kbd = weston_seat_get_keyboard(tr->seat);
+	if (!kbd || kbd->focus != NULL)
+		return;  /* focus already moved elsewhere, nothing to do */
+	struct qdwin_toplevel *succ = NULL;
+	struct qdwin_toplevel *cand;
+	wl_list_for_each(cand, &tr->qdwin->toplevels, link) {
+		if (!cand->decorated)
+			continue;
+		if (cand->view && cand->view->surface &&
+		    weston_surface_is_mapped(cand->view->surface)) {
+			succ = cand;
+			break;
+		}
+	}
+	if (succ)
+		weston_keyboard_set_focus(kbd, succ->view->surface);
 }
 
 static void
@@ -6231,6 +6372,10 @@ qdwin_on_seat_destroyed(struct wl_listener *listener, void *data)
 	}
 	free(tr->last_target_silo);
 	tr->last_target_silo = NULL;
+	if (tr->focus_recover_idle) {
+		wl_event_source_remove(tr->focus_recover_idle);
+		tr->focus_recover_idle = NULL;
+	}
 	wl_list_remove(&tr->link);
 	free(tr);
 }
@@ -6873,6 +7018,18 @@ qdwin_layer_surface_apply(struct qdwin_layer_surface *ls)
 		if (!weston_surface_is_mapped(ls->surface))
 			weston_surface_map(ls->surface);
 		ls->mapped = 1;
+		/* Log "mapped" only on the !mapped→mapped transition (i.e.
+		 * an actual map event), not on every subsequent same-shape
+		 * commit. Otherwise a client that repaints at 60 Hz (clock
+		 * widget, animation) floods the journal with one "mapped"
+		 * line per frame, drowning real qdwin signal — see
+		 * todo/qdshell-bar-remap-storm.md. Reconfigures still log
+		 * separately in qdwin_layer_surface_on_commit. */
+		weston_log("qdwin: layer-shell mapped ns=%s layer=%u "
+			   "at %d,%d %ux%u\n",
+			   ls->namespace ? ls->namespace : "(null)",
+			   ls->layer, ls->box_x, ls->box_y,
+			   ls->box_w, ls->box_h);
 		/* Phase 1.3: a newly mapped panel with exclusive_zone > 0
 		 * shrinks the work area; reflow any maximised toplevels.
 		 * Cheap to call unconditionally — qdwin_panels_on_output_change
@@ -6951,11 +7108,9 @@ qdwin_layer_surface_on_commit(struct wl_listener *l, void *data)
 	}
 
 	qdwin_layer_surface_apply(ls);
-	weston_log("qdwin: layer-shell mapped ns=%s layer=%u "
-		   "at %d,%d %ux%u\n",
-		   ls->namespace ? ls->namespace : "(null)",
-		   ls->layer, ls->box_x, ls->box_y,
-		   ls->box_w, ls->box_h);
+	/* "mapped" is logged inside qdwin_layer_surface_apply on the
+	 * unmapped→mapped transition only — not on every subsequent
+	 * same-shape commit. See todo/qdshell-bar-remap-storm.md. */
 }
 
 static void
