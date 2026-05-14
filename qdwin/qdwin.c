@@ -1101,8 +1101,13 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 					siblings++;
 			}
 			int offset = (siblings * 40) % 200;  /* wrap at 5 */
-			int cx = out->pos.c.x + (out->width  - surface->width)  / 2 + offset;
-			int cy = out->pos.c.y + (out->height - surface->height) / 2 + offset;
+			/* Pixel-coord math is int throughout; cast pos.c.{x,y}
+			 * (double) to int so clang-tidy doesn't flag the
+			 * intermediate int divisions as occurring in a float
+			 * context. Position values are whole pixels in
+			 * practice. */
+			int cx = (int)out->pos.c.x + (out->width  - surface->width)  / 2 + offset;
+			int cy = (int)out->pos.c.y + (out->height - surface->height) / 2 + offset;
 			if (cx < 0) cx = 0;
 			if (cy < 0) cy = 0;
 			struct weston_coord_global p = { .c = weston_coord(cx, cy) };
@@ -4327,6 +4332,7 @@ qdwin_on_launcher_key(struct weston_keyboard *kb,
 		weston_log("qdwin: launcher key pressed; no shell bound\n");
 		return;
 	}
+	weston_log("qdwin: launcher_requested\n");
 	qdwin_shell_v1_send_launcher_requested(qdwin->shell_resource);
 }
 
@@ -4372,11 +4378,13 @@ qdwin_switcher_grab_key(struct weston_keyboard_grab *grab,
 			? (1u << kb->xkb_info->shift_mod) : 0;
 		int dir = (shift_mask && (kb->modifiers.mods_depressed & shift_mask))
 			? -1 : 1;
+		weston_log("qdwin: switcher_next dir=%d\n", dir);
 		qdwin_shell_v1_send_switcher_next(qdwin->shell_resource, dir);
 		return;
 	}
 	/* Any non-Tab key cancels with commit (matches gnome behaviour). */
 	qdwin_switcher_grab_end(qdwin);
+	weston_log("qdwin: switcher_commit cause=non-tab-key\n");
 	qdwin_shell_v1_send_switcher_commit(qdwin->shell_resource);
 }
 
@@ -4403,6 +4411,7 @@ qdwin_switcher_grab_modifiers(struct weston_keyboard_grab *grab,
 	if (mods_depressed & alt_mask)
 		return;     /* Alt still held */
 	/* Alt released → commit + end grab. */
+	weston_log("qdwin: switcher_commit cause=alt-released\n");
 	if (qdwin->shell_resource)
 		qdwin_shell_v1_send_switcher_commit(qdwin->shell_resource);
 	qdwin_switcher_grab_end(qdwin);
@@ -4468,6 +4477,8 @@ qdwin_overlay_grab_key(struct weston_keyboard_grab *grab,
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(kb->xkb_state.state, kc);
 	char utf8[16] = {0};
 	xkb_state_key_get_utf8(kb->xkb_state.state, kc, utf8, sizeof utf8);
+	weston_log("qdwin: overlay_key role=%u sym=%u utf8=\"%s\" state=PRESSED\n",
+		   qdwin->overlay_grab_role, (uint32_t)sym, utf8);
 	qdwin_shell_v1_send_overlay_key(qdwin->shell_resource,
 					qdwin->overlay_grab_role,
 					(uint32_t)sym, utf8,
@@ -4546,8 +4557,10 @@ qdwin_on_switcher_key(struct weston_keyboard *kb,
 {
 	struct qdwin *qdwin = data;
 	(void)t; (void)key;
-	if (!qdwin->shell_resource)
+	if (!qdwin->shell_resource) {
+		weston_log("qdwin: switcher key pressed; no shell bound\n");
 		return;
+	}
 	/* Just install the grab. The grab's key callback fires
 	 * switcher_next for this Tab press AND subsequent ones — sending
 	 * switcher_next from here too would double-fire (one from
@@ -4562,8 +4575,10 @@ qdwin_on_switcher_back_key(struct weston_keyboard *kb,
 {
 	struct qdwin *qdwin = data;
 	(void)t; (void)key;
-	if (!qdwin->shell_resource)
+	if (!qdwin->shell_resource) {
+		weston_log("qdwin: switcher back-key pressed; no shell bound\n");
 		return;
+	}
 	/* See qdwin_on_switcher_key — grab's key callback also handles
 	 * Shift+Tab via the modifier check, so don't send here. */
 	qdwin_switcher_grab_start(qdwin, kb);
@@ -4581,6 +4596,7 @@ qdwin_on_alt_released(struct weston_keyboard *kb,
 	(void)kb;
 	if (mod != MODIFIER_ALT || !qdwin->shell_resource)
 		return;
+	weston_log("qdwin: switcher_commit cause=mod-fallback\n");
 	qdwin_shell_v1_send_switcher_commit(qdwin->shell_resource);
 }
 
@@ -4603,6 +4619,7 @@ qdwin_on_lock_key(struct weston_keyboard *kb,
 		weston_log("qdwin: lock key pressed but shell bound <v7\n");
 		return;
 	}
+	weston_log("qdwin: lock_requested\n");
 	qdwin_shell_v1_send_lock_requested(qdwin->shell_resource);
 }
 
@@ -4714,6 +4731,7 @@ qdwin_lock_surface_destroyed_cb(struct wl_listener *l, void *data)
 		qdwin_lock_surface_v1_send_dismissed(qdwin->lock_resource);
 	if (qdwin->locked) {
 		qdwin->locked = 0;
+		weston_log("qdwin: locked_changed=0 cause=lock-surface-destroy\n");
 		if (qdwin->shell_resource)
 			qdwin_shell_v1_send_locked_changed(
 				qdwin->shell_resource, 0);
@@ -4752,6 +4770,7 @@ qdwin_lock_surface_resource_destroyed(struct wl_resource *resource)
 	}
 	if (qdwin->locked) {
 		qdwin->locked = 0;
+		weston_log("qdwin: locked_changed=0 cause=lock-resource-destroy\n");
 		if (qdwin->shell_resource)
 			qdwin_shell_v1_send_locked_changed(
 				qdwin->shell_resource, 0);
@@ -4992,6 +5011,7 @@ qdwin_handle_set_locked(struct wl_client *client,
 	qdwin->locked = want;
 	weston_log("qdwin: set_locked=%d (lock_surface=%p)\n",
 		   want, (void*)qdwin->lock_surface);
+	weston_log("qdwin: locked_changed=%d cause=set_locked\n", want);
 	if (qdwin->shell_resource)
 		qdwin_shell_v1_send_locked_changed(qdwin->shell_resource,
 						   want);
@@ -5311,6 +5331,7 @@ qdwin_hotkey_handler(struct weston_keyboard *keyboard,
 {
 	struct qdwin_hotkey *h = data;
 	(void)keyboard; (void)time; (void)key;
+	weston_log("qdwin: hotkey_pressed id=%u\n", h->id);
 	if (h->qdwin->shell_resource) {
 		qdwin_shell_v1_send_hotkey_pressed(h->qdwin->shell_resource,
 						   h->id);
@@ -10553,8 +10574,10 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 	struct weston_output *out = qdwin_primary_output(qdwin);
 	int cx = 0, cy = 0;
 	if (out) {
-		cx = out->pos.c.x + (out->width  - w) / 2;
-		cy = out->pos.c.y + (out->height - h) / 2;
+		/* Pixel-coord math; cast pos.c.{x,y} (double) to int so the
+		 * integer division isn't flagged as float-context loss. */
+		cx = (int)out->pos.c.x + (out->width  - w) / 2;
+		cy = (int)out->pos.c.y + (out->height - h) / 2;
 		if (cx < 0) cx = 0;
 		if (cy < 0) cy = 0;
 	}
@@ -10744,8 +10767,10 @@ qdwin_proxy_pixel_surface_destroyed(struct wl_listener *listener, void *data)
 	struct weston_output *out = qdwin_primary_output(qdwin);
 	int cx = 0, cy = 0;
 	if (out) {
-		cx = out->pos.c.x + (out->width  - w) / 2;
-		cy = out->pos.c.y + (out->height - h) / 2;
+		/* Pixel-coord math; cast pos.c.{x,y} (double) to int so the
+		 * integer division isn't flagged as float-context loss. */
+		cx = (int)out->pos.c.x + (out->width  - w) / 2;
+		cy = (int)out->pos.c.y + (out->height - h) / 2;
 		if (cx < 0) cx = 0;
 		if (cy < 0) cy = 0;
 	}

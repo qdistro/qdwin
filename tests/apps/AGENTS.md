@@ -29,6 +29,7 @@ qdwin protocol path against a real client.
 | `10-tk-fltk-swing.md` | Three "small toolkits" (Tk, FLTK, Java Swing) round-trip |
 | `11-imlib2-feh.md` | Raw Xlib + Imlib2 (no toolkit at all) |
 | `12-keystroke-roundtrip.md` | wl_keyboard delivery to focused native + XWayland clients |
+| `13-rdp-subscribe-frame.md` | single-window RDP sharing: subscribe → qdistro-forward spawns → xfreerdp completes handshake + decodes frames |
 
 ## Running
 
