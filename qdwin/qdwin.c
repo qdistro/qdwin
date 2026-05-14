@@ -302,6 +302,16 @@ struct qdwin_toplevel {
 	/* At most one popup anchored to this toplevel; a second
 	 * show_popup dismisses the prior. NULL when no popup active. */
 	struct qdwin_popup *popup;
+	/* Last title we sent via toplevel_added or toplevel_title; we
+	 * compare on every commit to detect xdg_toplevel.set_title and
+	 * forward the change to qdshell. NULL until the first publish. */
+	char *cached_title;
+	/* Last app_id observed on this toplevel. xdg_toplevel.set_app_id
+	 * post-map currently logs only — no protocol event yet, so
+	 * qdshell can't react. Once a toplevel_app_id event lands in
+	 * qdwin-shell-v1, send it here on diff. NULL until first
+	 * commit. */
+	char *cached_app_id;
 	struct wl_list link;           /* qdwin::toplevels */
 };
 
@@ -649,6 +659,24 @@ static void qdwin_fractional_scale_broadcast(struct qdwin *qdwin);
 static void qdwin_output_work_area(struct qdwin *qdwin,
 				   struct weston_output *out,
 				   int *x, int *y, int *w, int *h);
+/* Shared window-state cores, called from both the qdshell custom
+ * protocol handlers and the standard xdg_toplevel.{set_maximized,
+ * set_fullscreen,set_minimized} desktop_api callbacks. Without the
+ * desktop_api wiring these requests are silently dropped by libweston
+ * (libweston-desktop.c NULL-checks each callback before dispatch), so
+ * client-drawn maximize/fullscreen/minimize buttons appear clickable
+ * but do nothing. Forward-declared so the desktop_api struct above
+ * the protocol handlers can reference them. */
+struct qdwin_toplevel;
+static void qdwin_toplevel_set_maximized(struct qdwin *qdwin,
+					 struct qdwin_toplevel *tl,
+					 bool maximized);
+static void qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
+					  struct qdwin_toplevel *tl,
+					  bool fullscreen,
+					  struct weston_output *output);
+static void qdwin_toplevel_set_minimized(struct qdwin *qdwin,
+					 struct qdwin_toplevel *tl);
 static void qdwin_panels_on_output_change(struct qdwin *qdwin);
 /* zwlr_layer_shell_v1 zone subtraction — defined after struct
  * qdwin_layer_surface; called from qdwin_output_work_area. */
@@ -804,6 +832,12 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 					   app_id ? app_id : "",
 					   title  ? title  : "",
 					   (uint32_t)qdwin_toplevel_is_xwayland(qdwin, tl));
+	/* Seed the caches so qdwin_surface_committed only fires diffs
+	 * for *changes* after this initial publish. */
+	free(tl->cached_title);
+	tl->cached_title = strdup(title ? title : "");
+	free(tl->cached_app_id);
+	tl->cached_app_id = strdup(app_id ? app_id : "");
 	qdwin_send_toplevel_security_context(qdwin, tl);
 }
 
@@ -910,6 +944,15 @@ qdwin_surface_added(struct weston_desktop_surface *dsurf, void *data)
 		   weston_desktop_surface_get_app_id(dsurf) ?: "(null)");
 
 	qdwin_send_toplevel_added(qdwin, tl);
+
+	/* QDWIN_AUTO_APPROVE_TOPLEVELS: dev/test escape hatch for envs
+	 * where qdshell hasn't bound qdwin_shell_v1 (the binding is a
+	 * Phase 5+ task per Qdwin.qml). With no binder, set_border_color
+	 * + attach_decoration never fire, so qdwin_toplevel_release_
+	 * holding() never gets called and every toplevel is invisible.
+	 * This flag bypasses the wait by releasing immediately. */
+	if (getenv("QDWIN_AUTO_APPROVE_TOPLEVELS"))
+		qdwin_toplevel_release_holding(tl, "auto-approve-env");
 }
 
 static void
@@ -942,6 +985,8 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 	weston_view_destroy(tl->view);
 	wl_list_remove(&tl->link);
 	weston_desktop_surface_set_user_data(dsurf, NULL);
+	free(tl->cached_title);
+	free(tl->cached_app_id);
 	free(tl);
 }
 
@@ -972,6 +1017,46 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 		/* Publish on first commit so app_id/title are usually set. */
 		qdwin_nested_publish_toplevel(tl);
 		return;
+	}
+
+	/* xdg_toplevel.set_title diff. libweston has no title_changed
+	 * callback — clients update the title via set_title and we only
+	 * notice on the next commit. cached_title is seeded in
+	 * qdwin_send_toplevel_added to the value already shipped, so
+	 * this only triggers on *changes*. The wire event needs shell
+	 * binding; the log line fires regardless so tests can assert
+	 * the diff path even when no shell is connected. Note: surfaces
+	 * stuck in the held bystander layer only commit once, so title
+	 * updates only propagate after the surface is approved and
+	 * migrates to the normal layer where frame-driven commits
+	 * resume (set QDWIN_AUTO_APPROVE_TOPLEVELS=1 in dev/test). */
+	{
+		const char *cur = weston_desktop_surface_get_title(tl->desktop_surface);
+		const char *cur_safe = cur ? cur : "";
+		if (!tl->cached_title || strcmp(tl->cached_title, cur_safe) != 0) {
+			free(tl->cached_title);
+			tl->cached_title = strdup(cur_safe);
+			weston_log("qdwin: toplevel_title handle=%u title=\"%s\"\n",
+				   tl->handle, cur_safe);
+			if (qdwin->shell_bound && qdwin->shell_resource)
+				qdwin_shell_v1_send_toplevel_title(qdwin->shell_resource,
+								   tl->handle, cur_safe);
+		}
+	}
+	/* xdg_toplevel.set_app_id diff. Same shape as the title diff:
+	 * detect changes on commit, log them. No protocol event yet
+	 * (qdwin_shell_v1 ships app_id only at toplevel_added) so this
+	 * is log-only — but the diff path is in place for when a
+	 * toplevel_app_id event lands. */
+	{
+		const char *cur = weston_desktop_surface_get_app_id(tl->desktop_surface);
+		const char *cur_safe = cur ? cur : "";
+		if (!tl->cached_app_id || strcmp(tl->cached_app_id, cur_safe) != 0) {
+			free(tl->cached_app_id);
+			tl->cached_app_id = strdup(cur_safe);
+			weston_log("qdwin: toplevel_app_id handle=%u app_id=\"%s\" (log-only — no protocol event yet)\n",
+				   tl->handle, cur_safe);
+		}
 	}
 
 	/* First-commit map path. S3 decides whether to migrate to
@@ -1012,8 +1097,9 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 			weston_view_set_position(tl->view, p);
 			weston_view_update_transform(tl->view);
 		}
-		weston_log("qdwin: mapped handle=%u size=%dx%d (held)\n",
-			   tl->handle, surface->width, surface->height);
+		weston_log("qdwin: mapped handle=%u size=%dx%d (%s)\n",
+			   tl->handle, surface->width, surface->height,
+			   tl->decorated ? "normal" : "held");
 	}
 
 	if (tl->last_width != surface->width ||
@@ -1071,6 +1157,51 @@ qdwin_surface_resize(struct weston_desktop_surface *dsurf,
 	(void)qdwin;
 }
 
+/* xdg_toplevel.set_maximized / .set_fullscreen / .set_minimized
+ * handlers. Without these libweston drops the requests silently
+ * (libweston-desktop.c NULL-checks each callback before dispatch), so
+ * client-side titlebar buttons (weston-terminal, foot+libdecor, GTK
+ * CSD apps) appear clickable but do nothing. Each routes through the
+ * same shared core the qdshell custom protocol uses so both paths
+ * produce identical state. */
+static void
+qdwin_surface_maximized_requested(struct weston_desktop_surface *dsurf,
+				  bool maximized, void *data)
+{
+	struct qdwin *qdwin = data;
+	struct qdwin_toplevel *tl =
+		weston_desktop_surface_get_user_data(dsurf);
+	if (!tl || qdwin->locked)
+		return;
+	qdwin_toplevel_set_maximized(qdwin, tl, maximized);
+}
+
+static void
+qdwin_surface_fullscreen_requested(struct weston_desktop_surface *dsurf,
+				   bool fullscreen,
+				   struct weston_output *output,
+				   void *data)
+{
+	struct qdwin *qdwin = data;
+	struct qdwin_toplevel *tl =
+		weston_desktop_surface_get_user_data(dsurf);
+	if (!tl || qdwin->locked)
+		return;
+	qdwin_toplevel_set_fullscreen(qdwin, tl, fullscreen, output);
+}
+
+static void
+qdwin_surface_minimized_requested(struct weston_desktop_surface *dsurf,
+				  void *data)
+{
+	struct qdwin *qdwin = data;
+	struct qdwin_toplevel *tl =
+		weston_desktop_surface_get_user_data(dsurf);
+	if (!tl || qdwin->locked)
+		return;
+	qdwin_toplevel_set_minimized(qdwin, tl);
+}
+
 static const struct weston_desktop_api qdwin_desktop_api = {
 	.struct_size = sizeof(struct weston_desktop_api),
 	.surface_added = qdwin_surface_added,
@@ -1078,6 +1209,9 @@ static const struct weston_desktop_api qdwin_desktop_api = {
 	.committed = qdwin_surface_committed,
 	.move = qdwin_surface_move,
 	.resize = qdwin_surface_resize,
+	.maximized_requested = qdwin_surface_maximized_requested,
+	.fullscreen_requested = qdwin_surface_fullscreen_requested,
+	.minimized_requested = qdwin_surface_minimized_requested,
 };
 
 /* ------------------------------------------------------------------
@@ -1524,13 +1658,112 @@ qdwin_handle_request_minimize(struct wl_client *client,
 		weston_log("qdwin: request_minimize unknown handle=%u\n", handle);
 		return;
 	}
+	qdwin_toplevel_set_minimized(qdwin, tl);
+}
+
+static void
+qdwin_toplevel_set_minimized(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
 	if (tl->state & QDWIN_TS_MINIMIZED)
 		return;
-
 	qdwin_toplevel_move_to_layer(tl, &qdwin->minimized_layer);
 	tl->state |= QDWIN_TS_MINIMIZED;
-	weston_log("qdwin: request_minimize handle=%u (state=%#x)\n",
-		   handle, tl->state);
+	weston_log("qdwin: set_minimized handle=%u (state=%#x)\n",
+		   tl->handle, tl->state);
+	qdwin_send_toplevel_state(qdwin, tl);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
+/* Fullscreen: like maximize but fills the entire output (covers panels
+ * and layer-shell exclusive zones). On unset, restore to the saved
+ * pre-fullscreen geometry. The output param may be NULL — pick the
+ * primary in that case. */
+static void
+qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
+			      struct qdwin_toplevel *tl,
+			      bool fullscreen,
+			      struct weston_output *output)
+{
+	int want_fs = fullscreen ? 1 : 0;
+	int is_fs   = (tl->state & QDWIN_TS_FULLSCREEN) ? 1 : 0;
+	if (want_fs == is_fs) {
+		weston_log("qdwin: set_fullscreen handle=%u fs=%d noop\n",
+			   tl->handle, want_fs);
+		return;
+	}
+
+	if (want_fs) {
+		struct weston_output *out = output ? output
+						   : qdwin_primary_output(qdwin);
+		if (!out) {
+			weston_log("qdwin: set_fullscreen handle=%u: no output\n",
+				   tl->handle);
+			return;
+		}
+		struct weston_coord_global pos =
+			weston_view_get_pos_offset_global(tl->view);
+		tl->saved_x = pos.c.x;
+		tl->saved_y = pos.c.y;
+		if (tl->outer_width == 0 || tl->outer_height == 0) {
+			struct weston_surface *surface = tl->is_nested_proxy
+				? NULL
+				: weston_desktop_surface_get_surface(tl->desktop_surface);
+			int sw = surface ? surface->width  : tl->last_width;
+			int sh = surface ? surface->height : tl->last_height;
+			if (sw <= 0) sw = 800;
+			if (sh <= 0) sh = 600;
+			tl->outer_width  = sw;
+			tl->outer_height = sh;
+		}
+		tl->saved_outer_w = tl->outer_width;
+		tl->saved_outer_h = tl->outer_height;
+
+		int ox = out->pos.c.x, oy = out->pos.c.y;
+		int ow = out->width,   oh = out->height;
+		tl->outer_width  = ow;
+		tl->outer_height = oh;
+		if (tl->is_nested_proxy) {
+			qdwin_nested_proxy_set_geometry(tl, ow, oh);
+		} else {
+			weston_desktop_surface_set_fullscreen(tl->desktop_surface,
+							      true);
+		}
+		struct weston_coord_global origin = {
+			.c = weston_coord(ox + tl->inset_w,
+					  oy + tl->inset_n),
+		};
+		weston_view_set_position(tl->view, origin);
+		qdwin_toplevel_apply_inset(tl);
+		qdwin_toplevel_position_chrome(tl);
+
+		tl->state |= QDWIN_TS_FULLSCREEN;
+		weston_log("qdwin: set_fullscreen handle=%u fs=1 outer=%dx%d at (%d,%d) "
+			   "saved=%dx%d@(%.0f,%.0f)\n",
+			   tl->handle, tl->outer_width, tl->outer_height, ox, oy,
+			   tl->saved_outer_w, tl->saved_outer_h,
+			   tl->saved_x, tl->saved_y);
+	} else {
+		if (tl->is_nested_proxy) {
+			qdwin_nested_proxy_set_geometry(tl, tl->saved_outer_w,
+							tl->saved_outer_h);
+		} else {
+			weston_desktop_surface_set_fullscreen(tl->desktop_surface,
+							      false);
+		}
+		tl->outer_width  = tl->saved_outer_w;
+		tl->outer_height = tl->saved_outer_h;
+		struct weston_coord_global pos = {
+			.c = weston_coord(tl->saved_x, tl->saved_y),
+		};
+		weston_view_set_position(tl->view, pos);
+		qdwin_toplevel_apply_inset(tl);
+		qdwin_toplevel_position_chrome(tl);
+
+		tl->state &= ~QDWIN_TS_FULLSCREEN;
+		weston_log("qdwin: set_fullscreen handle=%u fs=0 restored=%dx%d@(%.0f,%.0f)\n",
+			   tl->handle, tl->outer_width, tl->outer_height,
+			   tl->saved_x, tl->saved_y);
+	}
 	qdwin_send_toplevel_state(qdwin, tl);
 	weston_compositor_schedule_repaint(qdwin->compositor);
 }
@@ -1555,20 +1788,27 @@ qdwin_handle_request_maximize(struct wl_client *client,
 		weston_log("qdwin: request_maximize unknown handle=%u\n", handle);
 		return;
 	}
+	qdwin_toplevel_set_maximized(qdwin, tl, maximized != 0);
+}
 
+static void
+qdwin_toplevel_set_maximized(struct qdwin *qdwin,
+			     struct qdwin_toplevel *tl,
+			     bool maximized)
+{
 	int want_max = maximized ? 1 : 0;
 	int is_max   = (tl->state & QDWIN_TS_MAXIMIZED) ? 1 : 0;
 	if (want_max == is_max) {
-		weston_log("qdwin: request_maximize handle=%u max=%u noop\n",
-			   handle, maximized);
+		weston_log("qdwin: set_maximized handle=%u max=%d noop\n",
+			   tl->handle, want_max);
 		return;
 	}
 
 	if (want_max) {
 		struct weston_output *out = qdwin_primary_output(qdwin);
 		if (!out) {
-			weston_log("qdwin: request_maximize handle=%u: no output\n",
-				   handle);
+			weston_log("qdwin: set_maximized handle=%u: no output\n",
+				   tl->handle);
 			return;
 		}
 		struct weston_coord_global pos =
@@ -1630,9 +1870,9 @@ qdwin_handle_request_maximize(struct wl_client *client,
 		qdwin_toplevel_position_chrome(tl);
 
 		tl->state |= QDWIN_TS_MAXIMIZED;
-		weston_log("qdwin: request_maximize handle=%u max=1 outer=%dx%d at (%d,%d) "
+		weston_log("qdwin: set_maximized handle=%u max=1 outer=%dx%d at (%d,%d) "
 			   "content_at=(%d,%d) saved=%dx%d@(%.0f,%.0f)\n",
-			   handle, tl->outer_width, tl->outer_height, wx, wy,
+			   tl->handle, tl->outer_width, tl->outer_height, wx, wy,
 			   (int)origin.c.x, (int)origin.c.y,
 			   tl->saved_outer_w, tl->saved_outer_h,
 			   tl->saved_x, tl->saved_y);
@@ -1654,8 +1894,8 @@ qdwin_handle_request_maximize(struct wl_client *client,
 		qdwin_toplevel_position_chrome(tl);
 
 		tl->state &= ~QDWIN_TS_MAXIMIZED;
-		weston_log("qdwin: request_maximize handle=%u max=0 restored=%dx%d@(%.0f,%.0f)\n",
-			   handle, tl->outer_width, tl->outer_height,
+		weston_log("qdwin: set_maximized handle=%u max=0 restored=%dx%d@(%.0f,%.0f)\n",
+			   tl->handle, tl->outer_width, tl->outer_height,
 			   tl->saved_x, tl->saved_y);
 	}
 	qdwin_send_toplevel_state(qdwin, tl);
