@@ -810,8 +810,6 @@ qdwin_toplevel_is_xwayland(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 static void
 qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
-	if (!qdwin->shell_bound || !qdwin->shell_resource)
-		return;
 	const char *app_id;
 	const char *title;
 	uid_t uid;
@@ -826,18 +824,21 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 		title  = weston_desktop_surface_get_title(tl->desktop_surface);
 		uid    = qdwin_client_uid(tl->desktop_surface);
 	}
+	/* Seed the caches unconditionally — even when no shell is bound,
+	 * the surface_committed diff path uses these to suppress spurious
+	 * "title/app_id changed" log spam on every initial commit. */
+	free(tl->cached_title);
+	tl->cached_title = strdup(title ? title : "");
+	free(tl->cached_app_id);
+	tl->cached_app_id = strdup(app_id ? app_id : "");
+	if (!qdwin->shell_bound || !qdwin->shell_resource)
+		return;
 	qdwin_shell_v1_send_toplevel_added(qdwin->shell_resource,
 					   tl->handle,
 					   (uint32_t)uid,
 					   app_id ? app_id : "",
 					   title  ? title  : "",
 					   (uint32_t)qdwin_toplevel_is_xwayland(qdwin, tl));
-	/* Seed the caches so qdwin_surface_committed only fires diffs
-	 * for *changes* after this initial publish. */
-	free(tl->cached_title);
-	tl->cached_title = strdup(title ? title : "");
-	free(tl->cached_app_id);
-	tl->cached_app_id = strdup(app_id ? app_id : "");
 	qdwin_send_toplevel_security_context(qdwin, tl);
 }
 
