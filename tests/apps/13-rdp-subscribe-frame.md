@@ -18,10 +18,13 @@ This scenario REQUIRES:
   `xfreerdp3` on $PATH).
 - `qdistro-forward` installed on the VM (built via
   `qdistro/daemons/forward/` — present in the baseweed bake).
-- A test shell client capable of calling
-  `qdwin_shell_v1.subscribe_view_stream` — currently neither
-  qdwin-bystander nor qdshell does this. Until one of them gains
-  the request, the manual workaround is at the bottom.
+- `qdwin-bystander` v ≥ 2026-05-14 installed on the VM (its
+  `--subscribe HANDLE` flag is what drives the request — see
+  `qdwin/test-client/qdwin-bystander.c`).
+- `[pipewire] num-outputs >= 1` in the VM's weston.ini, OR the
+  §6.5 spike bake's pipewire-bake provisioning. Without a free
+  pipewire output, qdwin emits `denied "no free pipewire output"`
+  and the rest of the scenario short-circuits.
 
 Fail loudly if any prereq is missing; do not skip.
 
@@ -62,30 +65,41 @@ echo "subject toplevel handle=$HANDLE"
 The shell-side request:
 
 ```c
-qdwin_shell_v1_subscribe_view_stream(shell, HANDLE);
+qdwin_shell_v1_subscribe_view_stream(shell, HANDLE, "...", 0, 0, 0);
 ```
 
 emits the `approved` event with `(pipewire_node_name, rdp_port,
-rdp_cert_path, rdp_password)`. Drive this via the §6.5 helper
-script on the VM:
+rdp_cert_path, rdp_password)`. Drive this from the VM via
+`qdwin-bystander --subscribe`, which prints sh-sourceable KEY=value
+lines on stdout when `approved` fires and keeps the wayland
+connection open so the stream stays live:
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "bash /root/s3c-subscribe-extract.sh $HANDLE > /tmp/15-creds.env"
+    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
+     WAYLAND_DISPLAY=wayland-1 nohup /usr/bin/qdwin-bystander \
+       --subscribe $HANDLE \
+       > /tmp/15-creds.env 2>/tmp/15-bystander.err & echo \$!'" \
+    > /tmp/15-bystander.pid
+sleep 1
 . <(printf '\n'; "$QDWIN_VM_EXEC" "$VMNAME" 'cat /tmp/15-creds.env')
 
-# Variables now in scope: RDP_PORT, RDP_PASSWORD, RDP_CERT_PATH,
-# PIPEWIRE_NODE_NAME, FORWARD_PID
-echo "rdp_port=$RDP_PORT pid=$FORWARD_PID node=$PIPEWIRE_NODE_NAME"
+# Variables now in scope: HANDLE, PIPEWIRE_NODE_NAME, RDP_PORT,
+# RDP_CERT_PATH, RDP_PASSWORD. FORWARD_PID is not exposed via the
+# protocol — derive from journal if needed.
+echo "rdp_port=$RDP_PORT node=$PIPEWIRE_NODE_NAME"
 ```
 
-If `/root/s3c-subscribe-extract.sh` is absent, the §6.5 helper
-suite isn't installed on this VM — fail with that message; do not
-skip.
+If qdwin-bystander is absent on the VM (older bake), fail with
+"deploy qdwin-bystander v >= 2026-05-14"; do not skip.
 
 **Assert (1.1):** the journal shows
-`qdwin: view_stream_approved handle=$HANDLE pid=<P> rdp_port=<P>
-pw=<token> output_pos=...` within 2s of the subscribe request.
+`qdwin: view_stream approved handle=$HANDLE peer_label=... pw=...
+output_pos=... rdp_port=<P> forward_pid=<P> ...` within 2s of the
+subscribe request. (If instead the journal shows
+`qdwin: subscribe_view_stream denied handle=$HANDLE ... (no pw
+output)`, weston.ini lacks `[pipewire] num-outputs>=1` — that's a
+prereq failure, fail loud.)
 
 **Assert (1.2):** $RDP_PORT is a valid TCP port (1024..65535).
 
@@ -198,13 +212,18 @@ half (xfreerdp completing the TLS handshake and decoding frames).
   (typically RGB/16). Inspect the FreeRDP debug output with
   `wlog.level=debug`.
 
-## Note on a missing test client
+## History
 
-As of 2026-05-14, neither `qdwin-bystander` nor `qdshell` calls
-`qdwin_shell_v1.subscribe_view_stream`. The
-`/root/s3c-subscribe-extract.sh` helper this scenario depends on
-is part of the §6.5 spike bake (see
-`qdistro/scripts/install/bare-metal-install.sh` and friends).
-Extending qdwin-bystander with `--subscribe <handle>` mode is
-tracked separately; once landed, this scenario can run against
-any qdwin VM, not just baked-spike VMs.
+Originally (pre-2026-05-14) this scenario could only run against
+§6.5-baked VMs because it depended on
+`/root/s3c-subscribe-extract.sh` to drive the request. As of
+2026-05-14, `qdwin-bystander --subscribe <handle>` carries the
+subscribe wire request and prints sh-sourceable credentials on
+stdout when `approved` fires, so the scenario runs against any VM
+that has `qdwin-bystander` + `qdistro-forward` installed and a
+free pipewire output. The deterministic regression
+`t_bystander_subscribe_sends_request` in
+`qdistro/scripts/install/gui-regression-tests.sh` exercises the
+wire path on the deny branch (the more common state on non-spike
+VMs); the visual half of this scenario covers the approved branch
+plus the real xfreerdp handshake.

@@ -8,12 +8,33 @@
  *   - calls set_keyboard_focus on the default seat so the app
  *     receives keyboard input.
  *
+ * CLI flags (optional):
+ *   --subscribe <handle>   send subscribe_view_stream for HANDLE once
+ *                          the bind roundtrip completes (or once a
+ *                          toplevel with that handle is replayed/added).
+ *   --subscribe last       subscribe to the first toplevel_added we
+ *                          see after start (handy when the test spawns
+ *                          the target after the bystander).
+ *   --peer-label <s>       peer_label arg for the subscribe; default
+ *                          "qdwin-bystander".
+ *
+ * On `approved`, the credentials are printed to stdout as KEY=value
+ * lines suitable for shell sourcing:
+ *   HANDLE=<n>
+ *   PIPEWIRE_NODE_NAME=<s>
+ *   RDP_PORT=<n>
+ *   RDP_CERT_PATH=<s>
+ *   RDP_PASSWORD=<s>
+ * The wayland connection is kept open so the stream stays live.
+ *
  * Reads commands on a FIFO (default /tmp/qdwin-cmd.fifo), one per line:
  *   max <handle>      → request_maximize(handle, 1)
  *   restore <handle>  → request_maximize(handle, 0)
  *   min <handle>      → request_minimize(handle)
  *   close <handle>    → request_close(handle)
  *   focus <handle>    → set_keyboard_focus("default", handle)
+ *   subscribe <handle> → subscribe_view_stream(handle)
+ *   subscribelast     → subscribe to the most recently added toplevel
  *   list              → print last seen toplevels to stderr
  *   maxlast / restorelast → operate on most recently added toplevel
  *
@@ -36,6 +57,7 @@
 
 #define BIND_VERSION 14
 #define MAX_TOPS 16
+#define MAX_STREAMS 4
 #define FIFO_PATH_DEFAULT "/tmp/qdwin-cmd.fifo"
 
 struct top_info {
@@ -43,14 +65,31 @@ struct top_info {
 	int active;
 };
 
+struct stream_info {
+	uint32_t handle;
+	struct qdwin_view_stream_v1 *stream;
+	struct app *app;
+};
+
+struct pending_subscribe {
+	int armed;
+	int wait_first;        /* 1 = subscribe to the next toplevel_added */
+	uint32_t handle;
+};
+
 struct app {
 	struct qdwin_shell_v1 *shell;
 	struct top_info tops[MAX_TOPS];
 	uint32_t last_handle;
 	int got_last;
+	struct stream_info streams[MAX_STREAMS];
+	struct pending_subscribe pending;
+	char peer_label[64];
 };
 
 static struct app g_app;
+
+static void do_subscribe(struct app *a, uint32_t handle);
 
 static void
 on_hello(void *d, struct qdwin_shell_v1 *s, uint32_t uid)
@@ -97,6 +136,15 @@ on_toplevel_added(void *d, struct qdwin_shell_v1 *s,
 	qdwin_shell_v1_set_border_color(s, handle, 0x0088aaffu);
 	qdwin_shell_v1_set_keyboard_focus(s, "default", handle);
 	record_toplevel(a, handle);
+
+	if (a->pending.armed) {
+		int match = a->pending.wait_first
+			|| (a->pending.handle == handle);
+		if (match) {
+			a->pending.armed = 0;
+			do_subscribe(a, handle);
+		}
+	}
 }
 
 /* ---- noop event listeners (signatures must match exactly) ---- */
@@ -185,6 +233,91 @@ static const struct qdwin_shell_v1_listener listener = {
 	.seat_focus_changed     = l_seat_focus_changed,
 };
 
+/* ---- qdwin_view_stream_v1 listener ---- */
+static void
+on_stream_approved(void *d, struct qdwin_view_stream_v1 *stream,
+		   const char *pipewire_node_name, uint32_t rdp_port,
+		   const char *rdp_cert_path, const char *rdp_password)
+{
+	struct stream_info *si = d;
+	(void)stream;
+	fprintf(stderr,
+		"qdwin-bystander: view_stream approved handle=%u "
+		"pw=%s port=%u cert=%s\n",
+		si->handle, pipewire_node_name ? pipewire_node_name : "",
+		rdp_port, rdp_cert_path ? rdp_cert_path : "");
+	printf("HANDLE=%u\n", si->handle);
+	printf("PIPEWIRE_NODE_NAME=%s\n",
+	       pipewire_node_name ? pipewire_node_name : "");
+	printf("RDP_PORT=%u\n", rdp_port);
+	printf("RDP_CERT_PATH=%s\n", rdp_cert_path ? rdp_cert_path : "");
+	printf("RDP_PASSWORD=%s\n", rdp_password ? rdp_password : "");
+	fflush(stdout);
+}
+
+static void
+on_stream_denied(void *d, struct qdwin_view_stream_v1 *stream,
+		 const char *reason)
+{
+	struct stream_info *si = d;
+	fprintf(stderr,
+		"qdwin-bystander: view_stream denied handle=%u reason=\"%s\"\n",
+		si->handle, reason ? reason : "");
+	qdwin_view_stream_v1_destroy(stream);
+	si->stream = NULL;
+}
+
+static void
+on_stream_torn_down(void *d, struct qdwin_view_stream_v1 *stream,
+		    const char *reason)
+{
+	struct stream_info *si = d;
+	fprintf(stderr,
+		"qdwin-bystander: view_stream torn_down handle=%u reason=\"%s\"\n",
+		si->handle, reason ? reason : "");
+	qdwin_view_stream_v1_destroy(stream);
+	si->stream = NULL;
+}
+
+static const struct qdwin_view_stream_v1_listener stream_listener = {
+	.approved  = on_stream_approved,
+	.denied    = on_stream_denied,
+	.torn_down = on_stream_torn_down,
+};
+
+static void
+do_subscribe(struct app *a, uint32_t handle)
+{
+	if (!a->shell) {
+		fprintf(stderr, "qdwin-bystander: subscribe handle=%u: shell not bound\n",
+			handle);
+		return;
+	}
+	int slot = -1;
+	for (int i = 0; i < MAX_STREAMS; i++) {
+		if (!a->streams[i].stream) { slot = i; break; }
+	}
+	if (slot < 0) {
+		fprintf(stderr, "qdwin-bystander: subscribe handle=%u: stream table full\n",
+			handle);
+		return;
+	}
+	const char *label = a->peer_label[0] ? a->peer_label : "qdwin-bystander";
+	struct qdwin_view_stream_v1 *s = qdwin_shell_v1_subscribe_view_stream(
+		a->shell, handle, label, 0, 0, 0);
+	if (!s) {
+		fprintf(stderr, "qdwin-bystander: subscribe handle=%u: proxy create failed\n",
+			handle);
+		return;
+	}
+	a->streams[slot].handle = handle;
+	a->streams[slot].stream = s;
+	a->streams[slot].app = a;
+	qdwin_view_stream_v1_add_listener(s, &stream_listener, &a->streams[slot]);
+	fprintf(stderr, "qdwin-bystander: subscribe sent handle=%u peer_label=\"%s\"\n",
+		handle, label);
+}
+
 static void
 on_global(void *data, struct wl_registry *reg, uint32_t name,
 	  const char *interface, uint32_t version)
@@ -243,6 +376,13 @@ process_command(struct app *a, char *line)
 	} else if (strcmp(cmd, "focus") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd focus handle=%u\n", handle);
 		qdwin_shell_v1_set_keyboard_focus(a->shell, "default", handle);
+	} else if (strcmp(cmd, "subscribe") == 0 && has_handle) {
+		fprintf(stderr, "qdwin-bystander: cmd subscribe handle=%u\n", handle);
+		do_subscribe(a, handle);
+	} else if (strcmp(cmd, "subscribelast") == 0 && a->got_last) {
+		fprintf(stderr, "qdwin-bystander: cmd subscribelast handle=%u\n",
+			a->last_handle);
+		do_subscribe(a, a->last_handle);
 	} else if (strcmp(cmd, "list") == 0) {
 		fprintf(stderr, "qdwin-bystander: tracked toplevels:");
 		for (int i = 0; i < MAX_TOPS; i++)
@@ -254,8 +394,42 @@ process_command(struct app *a, char *line)
 	}
 }
 
-int main(void)
+static void
+usage(const char *argv0)
 {
+	fprintf(stderr,
+		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n",
+		argv0);
+}
+
+int main(int argc, char **argv)
+{
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--subscribe") == 0 && i + 1 < argc) {
+			const char *v = argv[++i];
+			g_app.pending.armed = 1;
+			if (strcmp(v, "last") == 0 || strcmp(v, "first") == 0) {
+				g_app.pending.wait_first = 1;
+				g_app.pending.handle = 0;
+			} else {
+				g_app.pending.wait_first = 0;
+				g_app.pending.handle = (uint32_t)strtoul(v, NULL, 10);
+			}
+		} else if (strcmp(argv[i], "--peer-label") == 0 && i + 1 < argc) {
+			snprintf(g_app.peer_label, sizeof g_app.peer_label,
+				 "%s", argv[++i]);
+		} else if (strcmp(argv[i], "--help") == 0
+			   || strcmp(argv[i], "-h") == 0) {
+			usage(argv[0]);
+			return 0;
+		} else {
+			fprintf(stderr, "qdwin-bystander: unknown arg '%s'\n",
+				argv[i]);
+			usage(argv[0]);
+			return 2;
+		}
+	}
+
 	const char *fifo_path = getenv("QDWIN_BYSTANDER_FIFO");
 	if (!fifo_path) fifo_path = FIFO_PATH_DEFAULT;
 	unlink(fifo_path);
