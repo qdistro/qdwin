@@ -388,3 +388,8 @@ executable('qdistro-test-clipboard-sink',
   install: true,
   install_dir: get_option('bindir'),
 )
+
+# The Qdistro.Qdwin QML plugin that binds qdwin_shell_v1 from
+# qdshell lives in the qdshell sibling repo (qdshell/qml-plugin/) —
+# it reads this directory's qdwin-shell-v1.xml via a relative path
+# during its own meson build. See qdshell/qml-plugin/meson.build.

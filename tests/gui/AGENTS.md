@@ -175,6 +175,8 @@ hard-coded coordinates across clones.
 | `13-focus-events-emitted.md` | every keyboard-focus transition between toplevels emits a `qdwin: focus handle=N (was M) seat=…` line, including the spawn / spawn / close-handoff / last-close-to-no-window sequence |
 | `14-bar-content-quiet-when-idle.md` | journal grows by ≤2 bar-content remap lines over 10 s idle (no remap storm) and re-settles to quiet after a window cycle |
 | `15-keybinding-events.md` | Ctrl+Space / Alt+Tab / Ctrl+Alt+L / registered hotkeys all emit `qdwin: <event>` log lines independent of shell binding state (silent-drop guard) |
+| `16-qdshell-binding-protocol-events.md` | qdshell binds qdwin_shell_v1 at v14 via the Qdistro.Qdwin QML plugin; `hello`, `toplevel_added/removed`, `seat_focus_changed`, and switcher_next/commit all round-trip; alt+tab cycles focus via the protocol |
+| `17-qdshell-drives-close.md` | qdshell's `Qdwin.closeWindow` Q_INVOKABLE invokes `qdwin_shell_v1.request_close(handle)`; target toplevel exits cleanly and the removal propagates back through the protocol to the QML side |
 
 Run each scenario sequentially against the same VM; each cleans up after itself. For a full smoke pass, an orchestrator can spawn one runner per scenario in series.
 
