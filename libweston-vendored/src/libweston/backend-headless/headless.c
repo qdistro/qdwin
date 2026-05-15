@@ -411,8 +411,15 @@ headless_output_set_size(struct weston_output *base,
 		weston_head_set_monitor_strings(head, "weston", "headless",
 						NULL);
 
-		/* XXX: Calculate proper size. */
-		weston_head_set_physical_size(head, width, height);
+		/* qdistro patch: upstream weston passes pixel count as
+		 * physical millimetres (XXX comment in the original line
+		 * acknowledges this is wrong). 1mm/pixel yields ~25 DPI
+		 * which makes GDK and Qt-Wayland compute absurd Cairo
+		 * surface dimensions on any reasonable window size.
+		 * Approximate a 96 DPI display: mm = px * 25.4 / 96. */
+		weston_head_set_physical_size(head,
+					      width * 254 / 960,
+					      height * 254 / 960);
 	}
 
 	output_width = width * output->base.current_scale;
