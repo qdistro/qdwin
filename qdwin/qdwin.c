@@ -59,6 +59,7 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "security-context-v1-server-protocol.h"
 #include "qdwin-nested-v1-server-protocol.h"
 #include "wlr-layer-shell-unstable-v1-server-protocol.h"
+#include "xdg-decoration-unstable-v1-server-protocol.h"
 
 /* §6.8 S1: nested-mode publisher needs the wl_client side; symbols
  * isolated to qdwin-nested-client.c, opaque-pointer interface here. */
@@ -627,6 +628,11 @@ struct qdwin {
 	struct wl_global *layer_shell_global;
 	struct wl_list layer_surfaces;  /* qdwin_layer_surface::link */
 	uint32_t layer_configure_serial_next;
+
+	/* zxdg_decoration_manager_v1: always-server_side stub. qdshell
+	 * draws chrome via qdwin_shell_v1, so toolkits should not try
+	 * client-side decorations. See bind_qdwin_xdg_decoration_manager. */
+	struct wl_global *xdg_decoration_manager_global;
 };
 
 struct qdwin_seat_tracker;
@@ -6862,6 +6868,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->nested_manager_global);
 	if (qdwin->layer_shell_global)
 		wl_global_destroy(qdwin->layer_shell_global);
+	if (qdwin->xdg_decoration_manager_global)
+		wl_global_destroy(qdwin->xdg_decoration_manager_global);
 	if (qdwin->nested_outer_event_source) {
 		wl_event_source_remove(qdwin->nested_outer_event_source);
 		qdwin->nested_outer_event_source = NULL;
@@ -10273,6 +10281,120 @@ bind_xdg_activation(struct wl_client *client, void *data,
 }
 
 /* ------------------------------------------------------------------
+ * zxdg_decoration_manager_v1 — always-server_side stub.
+ *
+ * Background. qdwin's design has qdshell draw chrome via the private
+ * qdwin_shell_v1 protocol, so the compositor never wants toolkit-drawn
+ * CSDs (they would stack on top of qdshell's chrome — see
+ * tests/gui/AGENTS.md pitfall #2 for the foot case). The natural way
+ * to tell toolkits "skip CSD" is to advertise xdg-decoration-v1 and
+ * always reply with mode=server_side; Qt-Wayland and GTK4 both honour
+ * this. We don't actually draw any decoration in response — qdshell
+ * does that via qdwin_shell_v1.attach_decoration.
+ *
+ * Without this global, PyQt6 (Qt-Wayland built-in bradient/adwaita
+ * CSD plugin) aborts in QApplication during first-widget construction:
+ *
+ *     Fatal Python error: Aborted
+ *       File "<string>", line N in <module>
+ *     Extension modules: PyQt6.QtCore, PyQt6.QtGui, PyQt6.QtWidgets
+ *
+ * Set QT_WAYLAND_DISABLE_WINDOWDECORATION=1 and the abort disappears,
+ * which is what isolated the crash to the CSD attach path. With this
+ * stub global the abort also disappears because Qt opts out of CSD
+ * on its own. See todo/qdwin-crash.md.
+ * ------------------------------------------------------------------ */
+
+static void
+qdwin_toplevel_decoration_destroy(struct wl_client *client,
+				  struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void
+qdwin_toplevel_decoration_set_mode(struct wl_client *client,
+				   struct wl_resource *resource,
+				   uint32_t mode)
+{
+	(void)client; (void)mode;
+	/* Whatever the client asks for, we mandate server_side. */
+	zxdg_toplevel_decoration_v1_send_configure(
+		resource, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
+static void
+qdwin_toplevel_decoration_unset_mode(struct wl_client *client,
+				     struct wl_resource *resource)
+{
+	(void)client;
+	zxdg_toplevel_decoration_v1_send_configure(
+		resource, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
+static const struct zxdg_toplevel_decoration_v1_interface
+qdwin_toplevel_decoration_impl = {
+	.destroy    = qdwin_toplevel_decoration_destroy,
+	.set_mode   = qdwin_toplevel_decoration_set_mode,
+	.unset_mode = qdwin_toplevel_decoration_unset_mode,
+};
+
+static void
+qdwin_xdg_decoration_manager_destroy(struct wl_client *client,
+				     struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void
+qdwin_xdg_decoration_manager_get_toplevel_decoration(
+	struct wl_client *client,
+	struct wl_resource *manager_resource,
+	uint32_t id,
+	struct wl_resource *xdg_toplevel_resource)
+{
+	(void)manager_resource; (void)xdg_toplevel_resource;
+	uint32_t version = wl_resource_get_version(manager_resource);
+	struct wl_resource *dec = wl_resource_create(
+		client, &zxdg_toplevel_decoration_v1_interface, version, id);
+	if (!dec) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(dec, &qdwin_toplevel_decoration_impl,
+				       NULL, NULL);
+	/* Send the initial configure immediately. The client must ack
+	 * via xdg_surface.ack_configure before attaching a buffer; Qt
+	 * and GTK both handle a same-frame initial mode correctly. */
+	zxdg_toplevel_decoration_v1_send_configure(
+		dec, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
+static const struct zxdg_decoration_manager_v1_interface
+qdwin_xdg_decoration_manager_impl = {
+	.destroy                 = qdwin_xdg_decoration_manager_destroy,
+	.get_toplevel_decoration =
+		qdwin_xdg_decoration_manager_get_toplevel_decoration,
+};
+
+static void
+bind_qdwin_xdg_decoration_manager(struct wl_client *client, void *data,
+				  uint32_t version, uint32_t id)
+{
+	struct wl_resource *resource = wl_resource_create(
+		client, &zxdg_decoration_manager_v1_interface, version, id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource,
+				       &qdwin_xdg_decoration_manager_impl,
+				       data, NULL);
+}
+
+/* ------------------------------------------------------------------
  * §6.8 S1 — nested-mode publisher.
  *
  * When QDWIN_NESTED_MODE=1 is set in the environment, qdwin-shell.so
@@ -11993,6 +12115,17 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		5, qdwin, bind_qdwin_layer_shell);
 	if (!qdwin->layer_shell_global) {
 		weston_log("qdwin: layer-shell wl_global_create failed\n");
+		goto fail;
+	}
+
+	/* zxdg_decoration_manager_v1 v1: always-server_side stub. Keeps
+	 * toolkit CSDs (Qt-Wayland bradient, GTK4 fallback) off so the
+	 * private qdwin_shell_v1 chrome is the only decoration. */
+	qdwin->xdg_decoration_manager_global = wl_global_create(
+		ec->wl_display, &zxdg_decoration_manager_v1_interface,
+		1, qdwin, bind_qdwin_xdg_decoration_manager);
+	if (!qdwin->xdg_decoration_manager_global) {
+		weston_log("qdwin: xdg-decoration wl_global_create failed\n");
 		goto fail;
 	}
 

@@ -256,6 +256,30 @@ xdg_shell_protocol_code_plugin = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# xdg-decoration-unstable-v1: lets clients ask whether the compositor
+# will decorate. qdshell draws chrome via the private qdwin_shell_v1
+# protocol, so the compositor's correct answer is always server_side
+# — but clients (notably PyQt6 / Qt-Wayland with Qt's built-in
+# bradient CSD plugin) abort during the first QMainWindow when the
+# compositor advertises no decoration manager at all. Implementing
+# this protocol with an always-server_side response makes those
+# clients skip CSD instead. See todo/qdwin-crash.md.
+xdg_decoration_xml = files(
+  wayland_protocols_dir / 'unstable/xdg-decoration/xdg-decoration-unstable-v1.xml',
+)
+xdg_decoration_server_header = custom_target(
+  'xdg-decoration-unstable-v1-server-header',
+  input: xdg_decoration_xml,
+  output: 'xdg-decoration-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_decoration_protocol_code = custom_target(
+  'xdg-decoration-unstable-v1-private-code',
+  input: xdg_decoration_xml,
+  output: 'xdg-decoration-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 # §6.8 S0: qdwin_nested_v1 — private protocol for nested-compositor
 # native-toplevel passthrough. S0 (2026-04-25) ships the XML + stub
 # server-side handler that registers the global and logs advertises;
@@ -324,6 +348,8 @@ qdwin_plugin = shared_library(
     wlr_layer_shell_protocol_code,
     xdg_shell_server_header_plugin,
     xdg_shell_protocol_code_plugin,
+    xdg_decoration_server_header,
+    xdg_decoration_protocol_code,
   ],
   dependencies: [dep_libweston, dep_wayland_server, dep_wayland_client,
                  dep_xcursor],
