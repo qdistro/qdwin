@@ -49,6 +49,7 @@
 int screenshooter_create(struct weston_compositor *ec);
 
 #include "qdwin-shell-v1-server-protocol.h"
+#include "qdwin-locker-v1-server-protocol.h"
 #include "xdg-activation-v1-server-protocol.h"
 #include "ext-idle-notify-v1-server-protocol.h"
 #include "idle-inhibit-unstable-v1-server-protocol.h"
@@ -380,6 +381,25 @@ struct qdwin {
 	uid_t allowed_uid;
 	int locked;
 	int shell_bound;
+
+	/* qdwin_locker_v1 — peer locker (qdlocker). Same trust shape as
+	 * the shell binding but on its own global so the locker is a
+	 * separate process from the shell. See doc/locker.md. */
+	struct wl_global *locker_global;
+	struct wl_resource *locker_resource;
+	uid_t allowed_locker_uid;
+	/* Which protocol owns the currently-attached lock_resource.
+	 * 0 = shell (qdwin_lock_surface_v1), 1 = locker
+	 * (qdwin_locker_surface_v1). Used so the destroy/dismiss path
+	 * sends the right opcode on the right interface. */
+	int lock_resource_is_locker;
+	/* Set while we're mid-replace of an attached lock surface (the
+	 * locker reattaches). Suppresses the spurious
+	 * `locked_changed=0` that the destroy callback would otherwise
+	 * fire when the old resource is torn down — the new surface is
+	 * about to be attached and the locked state should stay at 1
+	 * across the swap. Without this, observers see a 1→0→1 flap. */
+	int lock_resource_reattach_in_progress;
 
 	/* Layering (see spec/03). */
 	struct weston_layer background_layer;
@@ -4465,8 +4485,6 @@ qdwin_overlay_grab_key(struct weston_keyboard_grab *grab,
 {
 	struct qdwin *qdwin = wl_container_of(grab, qdwin, overlay_grab);
 	(void)t;
-	if (!qdwin->shell_resource)
-		return;
 	if (state_w != WL_KEYBOARD_KEY_STATE_PRESSED)
 		return;     /* releases absorbed; v17 forwards press only */
 	struct weston_keyboard *kb = grab->keyboard;
@@ -4479,10 +4497,21 @@ qdwin_overlay_grab_key(struct weston_keyboard_grab *grab,
 	xkb_state_key_get_utf8(kb->xkb_state.state, kc, utf8, sizeof utf8);
 	weston_log("qdwin: overlay_key role=%u sym=%u utf8=\"%s\" state=PRESSED\n",
 		   qdwin->overlay_grab_role, (uint32_t)sym, utf8);
-	qdwin_shell_v1_send_overlay_key(qdwin->shell_resource,
-					qdwin->overlay_grab_role,
-					(uint32_t)sym, utf8,
-					WL_KEYBOARD_KEY_STATE_PRESSED);
+	/* Security boundary: locker keystrokes go to the locker process,
+	 * NOT the shell. The shell never observes the password buffer.
+	 * See qdlocker/tests/gui/05-keystroke-isolation.md. The fallback
+	 * to the shell remains for launcher/switcher overlays (roles 0/1)
+	 * which qdshell still owns. */
+	if (qdwin->overlay_grab_role == 2 /* locker */ && qdwin->locker_resource) {
+		qdwin_locker_v1_send_overlay_key(qdwin->locker_resource,
+						 (uint32_t)sym, utf8);
+		return;
+	}
+	if (qdwin->shell_resource)
+		qdwin_shell_v1_send_overlay_key(qdwin->shell_resource,
+						qdwin->overlay_grab_role,
+						(uint32_t)sym, utf8,
+						WL_KEYBOARD_KEY_STATE_PRESSED);
 }
 
 static void
@@ -4611,16 +4640,27 @@ qdwin_on_lock_key(struct weston_keyboard *kb,
 {
 	struct qdwin *qdwin = data;
 	(void)kb; (void)t; (void)key;
-	if (!qdwin->shell_resource) {
-		weston_log("qdwin: lock key pressed; no shell bound\n");
-		return;
+	/* `reason=3` is the manual hotkey (XML lock_requested enum).
+	 * Include in the log so tests that grep for the reason can
+	 * distinguish this from the idle / lid / suspend paths once
+	 * those are wired. */
+	weston_log("qdwin: lock_requested reason=3=manual\n");
+	/* Fan out to whichever lock client is bound. Locker is the new
+	 * path (qdlocker); shell is the deprecated path. When a locker
+	 * is bound it takes the event exclusively — sending to both
+	 * causes both to call set_locked(1) and double-fires the state
+	 * machine. Until qdshell's Modules/LockScreen is deleted, the
+	 * shell-only branch remains as a fallback for sessions without
+	 * a peer locker. */
+	if (qdwin->locker_resource) {
+		qdwin_locker_v1_send_lock_requested(qdwin->locker_resource,
+			3 /* reason=manual, per XML */);
+	} else if (qdwin->shell_resource &&
+		   wl_resource_get_version(qdwin->shell_resource) >= 7) {
+		qdwin_shell_v1_send_lock_requested(qdwin->shell_resource);
+	} else {
+		weston_log("qdwin: lock key pressed; no locker or shell bound\n");
 	}
-	if (wl_resource_get_version(qdwin->shell_resource) < 7) {
-		weston_log("qdwin: lock key pressed but shell bound <v7\n");
-		return;
-	}
-	weston_log("qdwin: lock_requested\n");
-	qdwin_shell_v1_send_lock_requested(qdwin->shell_resource);
 }
 
 static void
@@ -4727,14 +4767,28 @@ qdwin_lock_surface_destroyed_cb(struct wl_listener *l, void *data)
 	wl_list_remove(&qdwin->lock_surface_destroy.link);
 	wl_list_init(&qdwin->lock_surface_destroy.link);
 	qdwin->lock_surface = NULL;
-	if (qdwin->lock_resource)
-		qdwin_lock_surface_v1_send_dismissed(qdwin->lock_resource);
-	if (qdwin->locked) {
+	/* Send the dismiss opcode on whichever interface owns this
+	 * lock_resource. Sending the shell's dismissed event on a
+	 * qdwin_locker_surface_v1 resource posts a protocol error and
+	 * tears down the locker connection. */
+	if (qdwin->lock_resource) {
+		if (qdwin->lock_resource_is_locker) {
+			/* qdwin_locker_surface_v1 has no dismissed event;
+			 * the client observes the destroy via wl_resource
+			 * tracking + the next locked_changed=0. */
+		} else {
+			qdwin_lock_surface_v1_send_dismissed(qdwin->lock_resource);
+		}
+	}
+	if (qdwin->locked && !qdwin->lock_resource_reattach_in_progress) {
 		qdwin->locked = 0;
 		weston_log("qdwin: locked_changed=0 cause=lock-surface-destroy\n");
 		if (qdwin->shell_resource)
 			qdwin_shell_v1_send_locked_changed(
 				qdwin->shell_resource, 0);
+		if (qdwin->locker_resource)
+			qdwin_locker_v1_send_locked_changed(
+				qdwin->locker_resource, 0);
 	}
 	/* B4: drop overlay keyboard grab when locker goes away. */
 	if (qdwin->overlay_grab_active && qdwin->overlay_grab_role == 2)
@@ -4753,6 +4807,26 @@ static const struct qdwin_lock_surface_v1_interface qdwin_lock_surface_impl = {
 	.destroy = qdwin_lock_surface_destroy_req,
 };
 
+/* Locker-side surface vtable. The locker XML declares a distinct
+ * qdwin_locker_surface_v1 type (separate from the shell's
+ * qdwin_lock_surface_v1) so wayland-scanner doesn't emit duplicate
+ * struct definitions when both protocols are compiled in. The
+ * underlying state is the same — both vtables share the
+ * qdwin->lock_* fields and the qdwin_lock_surface_resource_destroyed
+ * teardown. */
+static void
+qdwin_locker_surface_ack_configure(struct wl_client *client,
+				   struct wl_resource *resource,
+				   uint32_t serial)
+{
+	(void)client; (void)resource; (void)serial;
+}
+
+static const struct qdwin_locker_surface_v1_interface qdwin_locker_surface_impl = {
+	.destroy = qdwin_lock_surface_destroy_req,
+	.ack_configure = qdwin_locker_surface_ack_configure,
+};
+
 static void
 qdwin_lock_surface_resource_destroyed(struct wl_resource *resource)
 {
@@ -4768,13 +4842,20 @@ qdwin_lock_surface_resource_destroyed(struct wl_resource *resource)
 		wl_list_remove(&qdwin->lock_surface_destroy.link);
 		qdwin->lock_surface = NULL;
 	}
-	if (qdwin->locked) {
+	if (qdwin->locked && !qdwin->lock_resource_reattach_in_progress) {
 		qdwin->locked = 0;
 		weston_log("qdwin: locked_changed=0 cause=lock-resource-destroy\n");
 		if (qdwin->shell_resource)
 			qdwin_shell_v1_send_locked_changed(
 				qdwin->shell_resource, 0);
+		if (qdwin->locker_resource)
+			qdwin_locker_v1_send_locked_changed(
+				qdwin->locker_resource, 0);
 	}
+	/* Suppress the analogous flap on the surface-destroy callback
+	 * by leaving `locked` untouched when a reattach is in flight;
+	 * see lock_resource_reattach_in_progress on struct qdwin. */
+	qdwin->lock_resource_is_locker = 0;
 	/* B4 fix: when the shell calls proxy.destroy() on the lock_surface,
 	 * the resource-destroyed handler fires (this one). Without ending
 	 * the overlay grab here, the keyboard stays grabbed by an
@@ -4963,6 +5044,7 @@ qdwin_handle_attach_lock_surface(struct wl_client *client,
 		wl_resource_destroy(qdwin->lock_resource);
 
 	qdwin->lock_resource = ls_res;
+	qdwin->lock_resource_is_locker = 0;
 	qdwin->lock_surface = surface;
 	qdwin->lock_view = weston_view_create(surface);
 	if (!qdwin->lock_view) {
@@ -5490,6 +5572,224 @@ bind_qdwin_shell(struct wl_client *client, void *data,
 	qdwin_shell_v1_send_hello(resource, (uint32_t)uid);
 	weston_log("qdwin: bind accepted for uid=%u, hello sent\n",
 		   (unsigned)uid);
+}
+
+/* ------------------------------------------------------------------
+ * qdwin_locker_v1 — peer locker binding. See doc/locker.md.
+ *
+ * Mirrors the shell-side attach_lock_surface / set_locked handlers
+ * above, sharing the lock_surface / lock_view / lock_resource state.
+ * The shell-side variants stay as a deprecation shim until qdshell
+ * drops its Modules/LockScreen QML; once that lands they can be
+ * removed and the version of qdwin_shell_v1 bumped.
+ * ------------------------------------------------------------------ */
+
+static void
+qdwin_locker_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	if (qdwin->locker_resource == resource) {
+		qdwin->locker_resource = NULL;
+		weston_log("qdwin: locker unbound\n");
+		/* End the role=2 overlay keyboard grab so the next press
+		 * isn't forwarded with the locker role still set; without
+		 * this, keystrokes briefly fall through into the shell
+		 * overlay_key path with role=2 — a small but real leak
+		 * window during locker restart. The lock_surface itself
+		 * tears down separately via qdwin_lock_surface_resource_destroyed
+		 * (when the client connection closes wl_resources). */
+		if (qdwin->overlay_grab_active && qdwin->overlay_grab_role == 2)
+			qdwin_overlay_grab_end(qdwin);
+		/* Fail-safe: if the locker disappears while the compositor
+		 * is locked, keep the LOCK layer composited (the surface
+		 * is owned by the (now-defunct) client and will tear down
+		 * naturally). The screen stays black until a fresh locker
+		 * binds and attaches a new surface. We do NOT auto-unlock
+		 * on locker death — see doc/locker.md §Lifecycle. */
+	}
+}
+
+static void
+qdwin_handle_bind_as_locker(struct wl_client *client,
+			    struct wl_resource *resource)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (qdwin->locker_resource == resource) {
+		/* Same resource binding twice. Use the dedicated
+		 * already_bound error code (was using `role` which is for
+		 * "surface already has a role" — wrong category). */
+		wl_resource_post_error(resource,
+			QDWIN_LOCKER_V1_ERROR_ALREADY_BOUND,
+			"qdwin_locker_v1: bind_as_locker already called on this resource");
+		return;
+	}
+	if (qdwin->locker_resource) {
+		/* A fresh bind from a different client (or a different
+		 * resource of the same client) means either the prior
+		 * locker is dead or a duplicate is starting. Per the XML
+		 * "only one locker may exist at a time" — destroy the old
+		 * binding so the new one is authoritative. */
+		wl_resource_destroy(qdwin->locker_resource);
+	}
+	qdwin->locker_resource = resource;
+	weston_log("qdwin: locker bound (initially_locked=%d)\n", qdwin->locked);
+	qdwin_locker_v1_send_ready(resource, qdwin->locked ? 1u : 0u);
+}
+
+static void
+qdwin_handle_locker_attach_lock_surface(struct wl_client *client,
+					struct wl_resource *resource,
+					uint32_t id,
+					struct wl_resource *surface_resource)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	if (qdwin->locker_resource != resource) {
+		wl_resource_post_error(resource,
+			QDWIN_LOCKER_V1_ERROR_NOT_BOUND,
+			"qdwin_locker_v1: not bound (call bind_as_locker first)");
+		return;
+	}
+	struct wl_resource *ls_res = wl_resource_create(
+		client, &qdwin_locker_surface_v1_interface,
+		wl_resource_get_version(resource), id);
+	if (!ls_res) { wl_client_post_no_memory(client); return; }
+	struct weston_surface *surface = surface_resource
+		? wl_resource_get_user_data(surface_resource) : NULL;
+	if (!surface) { wl_resource_destroy(ls_res); return; }
+	/* Drop any previously-attached lock surface (whether from the
+	 * shell-deprecated path or a prior locker attach). Set
+	 * `reattach_in_progress` around the destroy so the resource-
+	 * destroyed callback doesn't fire a spurious locked_changed=0
+	 * between the old surface tearing down and the new one being
+	 * committed — without this, clients observe a 1→0→1 flap on
+	 * every locker reattach mid-lock. */
+	if (qdwin->lock_resource) {
+		qdwin->lock_resource_reattach_in_progress = 1;
+		wl_resource_destroy(qdwin->lock_resource);
+		qdwin->lock_resource_reattach_in_progress = 0;
+	}
+
+	qdwin->lock_resource = ls_res;
+	qdwin->lock_resource_is_locker = 1;
+	qdwin->lock_surface = surface;
+	qdwin->lock_view = weston_view_create(surface);
+	if (!qdwin->lock_view) {
+		qdwin->lock_surface = NULL;
+		qdwin->lock_resource = NULL;
+		qdwin->lock_resource_is_locker = 0;
+		wl_resource_destroy(ls_res);
+		return;
+	}
+	weston_view_move_to_layer(qdwin->lock_view,
+				  &qdwin->lock_layer.view_list);
+	wl_list_init(&qdwin->lock_surface_destroy.link);
+	wl_list_init(&qdwin->lock_surface_commit.link);
+	qdwin->lock_surface_destroy.notify = qdwin_lock_surface_destroyed_cb;
+	wl_signal_add(&surface->destroy_signal, &qdwin->lock_surface_destroy);
+	qdwin->lock_surface_commit.notify = qdwin_lock_surface_commit_cb;
+	wl_signal_add(&surface->commit_signal, &qdwin->lock_surface_commit);
+	wl_resource_set_implementation(ls_res, &qdwin_locker_surface_impl,
+				       qdwin,
+				       qdwin_lock_surface_resource_destroyed);
+	qdwin_lock_surface_place(qdwin);
+	weston_log("qdwin: locker attach_lock_surface\n");
+	/* Install overlay keyboard grab, locker role=2. Same dispatch
+	 * site as the shell path; the overlay_key router now checks for
+	 * locker_resource first. */
+	qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
+}
+
+static void
+qdwin_handle_locker_set_locked(struct wl_client *client,
+			       struct wl_resource *resource,
+			       uint32_t locked)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (qdwin->locker_resource != resource) {
+		wl_resource_post_error(resource,
+			QDWIN_LOCKER_V1_ERROR_NOT_BOUND,
+			"qdwin_locker_v1: not bound (call bind_as_locker first)");
+		return;
+	}
+	int want = locked ? 1 : 0;
+	if (qdwin->locked == want) return;
+	if (want && !qdwin->lock_surface) {
+		wl_resource_post_error(resource,
+			QDWIN_LOCKER_V1_ERROR_NO_SURFACE,
+			"qdwin_locker_v1: set_locked(1) without attach_lock_surface");
+		return;
+	}
+	qdwin->locked = want;
+	weston_log("qdwin: locker set_locked=%d (lock_surface=%p)\n",
+		   want, (void*)qdwin->lock_surface);
+	weston_log("qdwin: locked_changed=%d cause=locker_set_locked\n", want);
+	/* Fan out to both protocols so the shell sees the transition
+	 * even though the locker drove it. */
+	if (qdwin->shell_resource)
+		qdwin_shell_v1_send_locked_changed(qdwin->shell_resource, want);
+	if (qdwin->locker_resource)
+		qdwin_locker_v1_send_locked_changed(qdwin->locker_resource, want);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
+static void
+qdwin_handle_lock_acknowledged(struct wl_client *client,
+			       struct wl_resource *resource,
+			       uint32_t reason)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (qdwin->locker_resource != resource) {
+		wl_resource_post_error(resource,
+			QDWIN_LOCKER_V1_ERROR_NOT_BOUND,
+			"qdwin_locker_v1: lock_acknowledged before bind_as_locker");
+		return;
+	}
+	if (reason > 3) {
+		wl_resource_post_error(resource,
+			QDWIN_LOCKER_V1_ERROR_INVALID_REASON,
+			"qdwin_locker_v1: lock_acknowledged reason=%u out of range", reason);
+		return;
+	}
+	weston_log("qdwin: lock_acknowledged reason=%u\n", reason);
+}
+
+static const struct qdwin_locker_v1_interface qdwin_locker_impl = {
+	.bind_as_locker = qdwin_handle_bind_as_locker,
+	.attach_lock_surface = qdwin_handle_locker_attach_lock_surface,
+	.set_locked = qdwin_handle_locker_set_locked,
+	.lock_acknowledged = qdwin_handle_lock_acknowledged,
+};
+
+static void
+bind_qdwin_locker(struct wl_client *client, void *data,
+		  uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct wl_resource *resource;
+	pid_t pid; uid_t uid; gid_t gid;
+
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	weston_log("qdwin: locker bind attempt pid=%d uid=%u "
+		   "(allowed_locker_uid=%u)\n",
+		   (int)pid, (unsigned)uid,
+		   (unsigned)qdwin->allowed_locker_uid);
+
+	if (uid != qdwin->allowed_locker_uid) {
+		wl_client_post_implementation_error(client,
+			"qdwin_locker_v1: uid %u not permitted "
+			"(allowed locker uid=%u)",
+			(unsigned)uid, (unsigned)qdwin->allowed_locker_uid);
+		return;
+	}
+
+	resource = wl_resource_create(client, &qdwin_locker_v1_interface,
+				      version, id);
+	if (!resource) { wl_client_post_no_memory(client); return; }
+	wl_resource_set_implementation(resource, &qdwin_locker_impl, qdwin,
+				       qdwin_locker_resource_destroy);
 }
 
 /* ------------------------------------------------------------------
@@ -6539,6 +6839,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		weston_desktop_destroy(qdwin->desktop);
 	if (qdwin->shell_global)
 		wl_global_destroy(qdwin->shell_global);
+	if (qdwin->locker_global)
+		wl_global_destroy(qdwin->locker_global);
 	if (qdwin->stream_input_global)
 		wl_global_destroy(qdwin->stream_input_global);
 	if (qdwin->xdg_activation_global)
@@ -11450,6 +11752,11 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	weston_compositor_set_default_pointer_grab(
 		ec, &qdwin_proxy_default_pointer_grab_iface);
 	qdwin->allowed_uid = qdwin_parse_allowed_uid(*argc, argv);
+	/* Default the locker uid to the shell uid (single-admin) until
+	 * an explicit `--qdwin-allowed-locker-uid=N` is wired. Using
+	 * (uid_t)-1 as the sentinel rather than 0 so a root-owned
+	 * locker is a valid configuration. */
+	qdwin->allowed_locker_uid = (uid_t)-1;
 	wl_list_init(&qdwin->hotkeys);
 	wl_list_init(&qdwin->toplevels);
 	wl_list_init(&qdwin->view_streams);
@@ -11540,6 +11847,21 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 					       21, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
+		goto fail;
+	}
+
+	/* qdwin_locker_v1 — peer locker global. Defaults to the same uid
+	 * as the shell unless overridden (single-admin assumption per
+	 * sessions.md:4-14). The sentinel is (uid_t)-1 not 0 so a
+	 * root-owned locker is a legitimate explicit configuration. See
+	 * doc/locker.md. */
+	if (qdwin->allowed_locker_uid == (uid_t)-1)
+		qdwin->allowed_locker_uid = qdwin->allowed_uid;
+	qdwin->locker_global = wl_global_create(ec->wl_display,
+						&qdwin_locker_v1_interface,
+						1, qdwin, bind_qdwin_locker);
+	if (!qdwin->locker_global) {
+		weston_log("qdwin: locker wl_global_create failed\n");
 		goto fail;
 	}
 

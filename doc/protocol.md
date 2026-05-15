@@ -1,9 +1,10 @@
 # Protocols
 
-qdwin exposes a single private protocol (`qdwin_shell_v1`, currently
-at version 21), one helper protocol for nested compositors
-(`qdwin_nested_v1`, see [nested.md](nested.md)), and a curated set of
-public Wayland protocols.
+qdwin exposes two private protocols (`qdwin_shell_v1`, currently
+at version 21, and `qdwin_locker_v1` v1 — see [locker.md](locker.md)),
+one helper protocol for nested compositors (`qdwin_nested_v1`, see
+[nested.md](nested.md)), and a curated set of public Wayland
+protocols.
 
 ## qdwin_shell_v1 (private, single-client)
 

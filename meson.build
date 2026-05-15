@@ -45,6 +45,35 @@ qdwin_shell_protocol_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# qdwin_locker_v1 — private, uid-filtered locker attach protocol.
+# Bound by qdlocker (separate process from qdshell). Carries
+# attach_lock_surface, set_locked, lock_requested, locked_changed,
+# and overlay_key forwarding (locker role, role=2 keystrokes go
+# straight to qdlocker rather than via qdshell).
+# See doc/locker.md for the bind/dispatch wiring.
+locker_proto_xml = files('qdwin/qdwin-locker-v1.xml')
+
+qdwin_locker_server_header = custom_target(
+  'qdwin-locker-v1-server-header',
+  input: locker_proto_xml,
+  output: 'qdwin-locker-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+
+qdwin_locker_client_header = custom_target(
+  'qdwin-locker-v1-client-header',
+  input: locker_proto_xml,
+  output: 'qdwin-locker-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+qdwin_locker_protocol_code = custom_target(
+  'qdwin-locker-v1-private-code',
+  input: locker_proto_xml,
+  output: 'qdwin-locker-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 # §6.7: public xdg-activation-v1 protocol for focus-stealing prevention
 # and launcher tokens. Sourced from the installed wayland-protocols
 # pkgdatadir to avoid vendoring.
@@ -270,6 +299,8 @@ qdwin_plugin = shared_library(
     'qdwin/qdwin-nested-client.c',
     qdwin_shell_server_header,
     qdwin_shell_protocol_code,
+    qdwin_locker_server_header,
+    qdwin_locker_protocol_code,
     xdg_activation_server_header,
     xdg_activation_protocol_code,
     ext_idle_notify_server_header,
