@@ -528,6 +528,9 @@ headless_destroy(struct weston_backend *backend)
 	if (b->theme)
 		theme_destroy(b->theme);
 
+	/* qdistro patch: release the inert seat created in headless_backend_create. */
+	weston_seat_release(&b->fake_seat);
+
 	free(b->formats);
 	free(b);
 
@@ -573,6 +576,12 @@ headless_backend_create(struct weston_compositor *compositor,
 
 	b->formats_count = ARRAY_LENGTH(headless_formats);
 	b->formats = pixel_format_get_array(headless_formats, b->formats_count);
+
+	/* qdistro patch: synthesize an inert wl_seat so toolkit clients
+	 * (GTK 3+, Qt) don't crash on a missing seat global in headless
+	 * test runs. No input devices are wired up, so capabilities stay
+	 * zero — the seat exists for protocol-conformance only. */
+	weston_seat_init(&b->fake_seat, compositor, "default");
 
 	/* Wayland event source's timeout has a granularity of the order of
 	 * milliseconds so the highest supported rate is 1 kHz. 0 is a special
