@@ -203,7 +203,15 @@ static void l_activation_pending(void *d, struct qdwin_shell_v1 *s,
 static void l_secctx(void *d, struct qdwin_shell_v1 *s,
 		     uint32_t h, const char *engine, const char *app_id,
 		     const char *instance_id)
-{ (void)d; (void)s; (void)h; (void)engine; (void)app_id; (void)instance_id; }
+{
+	(void)d; (void)s;
+	fprintf(stdout, "qdwin-bystander: toplevel_security_context handle=%u "
+		"engine=\"%s\" app_id=\"%s\" instance_id=\"%s\"\n",
+		h, engine ? engine : "(null)",
+		app_id ? app_id : "(null)",
+		instance_id ? instance_id : "(null)");
+	fflush(stdout);
+}
 static void l_seat_focus_changed(void *d, struct qdwin_shell_v1 *s,
 				 const char *seat, uint32_t handle)
 { (void)d; (void)s; (void)seat; (void)handle; }
