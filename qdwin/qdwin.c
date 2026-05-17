@@ -1469,8 +1469,9 @@ qdwin_handle_set_border_color(struct wl_client *client,
  * compositor-side default.
  *
  * The split between `border_rgba` and `border_rgba_set` exists so a
- * legitimate set_border_color(0xff000000) (opaque black) is not
- * indistinguishable from "never set". The SSD paint helper uses this
+ * legitimate set_border_color(0x000000ff) (opaque black, R=G=B=0,
+ * A=0xff in RGBA8888) is not indistinguishable from "never set".
+ * The SSD paint helper uses this
  * accessor instead of reading the field directly so the "unset →
  * fallback" semantics live in one place.
  */
@@ -1740,8 +1741,19 @@ qdwin_handle_attach_decoration(struct wl_client *client,
 	tl->inset_w = tl->chrome[QDWIN_SIDE_W].surface
 		? tl->chrome[QDWIN_SIDE_W].surface->width  : 0;
 
-	weston_log("qdwin: attach_decoration handle=%u inset=N%d E%d S%d W%d\n",
-		   handle, tl->inset_n, tl->inset_e, tl->inset_s, tl->inset_w);
+	/* P05a: read the per-toplevel border rgba via the accessor so a
+	 * re-issued attach_decoration emits a journal trail confirming the
+	 * silo colour survived the re-bind. This is the load-bearing
+	 * consumer of qdwin_toplevel_border_rgba(); without it the field
+	 * was inert. The shell paints chrome surfaces itself (qdwin SSD is
+	 * stub today) but the stored rgba is the single source of truth a
+	 * future SSD paint helper / focus ring will read, and logging it
+	 * here means a regression that drops the field flips this line. */
+	uint32_t border_rgba_seen = qdwin_toplevel_border_rgba(tl, 0u);
+	weston_log("qdwin: attach_decoration handle=%u inset=N%d E%d S%d W%d "
+		   "border_rgba=%#010x\n",
+		   handle, tl->inset_n, tl->inset_e, tl->inset_s, tl->inset_w,
+		   border_rgba_seen);
 
 	qdwin_toplevel_release_holding(tl, "attach_decoration");
 
