@@ -296,6 +296,17 @@ struct qdwin_toplevel {
 	int outer_height;
 	/* toplevel_state bitmask (QDWIN_TS_*). */
 	uint32_t state;
+	/* P05a: per-toplevel chrome border colour (ARGB, big-endian RGBA8888
+	 * as set_border_color receives it). Defaults to 0 (= unset → fall
+	 * back to qdshell's neutral chrome). qdshell paints the actual
+	 * chrome surfaces via qdwin_shell_v1.attach_decoration; this field
+	 * captures the per-toplevel value as received so (a) the SSD paint
+	 * helper has a single source of truth for the silo-colour, (b) unit
+	 * tests can introspect the per-toplevel state instead of a global,
+	 * and (c) re-issued attach_decoration calls don't lose the colour
+	 * the shell set earlier. */
+	uint32_t border_rgba;
+	int border_rgba_set;
 	/* Restore geometry — captured on entry to maximise, consumed on
 	 * un-maximise. Outer dims (chrome-inclusive). */
 	int saved_outer_w, saved_outer_h;
@@ -1435,9 +1446,40 @@ qdwin_handle_set_border_color(struct wl_client *client,
 				       handle);
 		return;
 	}
+	/* P05a: store per-toplevel so the SSD paint helper has a single
+	 * source of truth for the silo chrome colour. Pre-P05a the rgba
+	 * arg was logged + discarded; that meant a re-issued
+	 * attach_decoration call (qdshell legitimately does this on
+	 * state changes) silently dropped the colour. Now the per-tl
+	 * state survives, and qdwin_toplevel_border_rgba(tl) is the
+	 * accessor the paint helper + unit tests read. */
+	tl->border_rgba = rgba;
+	tl->border_rgba_set = 1;
 	weston_log("qdwin: set_border_color handle=%u rgba=%#010x\n",
 		   handle, rgba);
 	qdwin_toplevel_release_holding(tl, "set_border_color");
+}
+
+/* P05a: accessor for the per-toplevel chrome border rgba.
+ *
+ * Returns the value last set by qdwin_shell_v1.set_border_color for
+ * `tl`. When no colour has been set (border_rgba_set == 0), returns
+ * `fallback` so callers don't need a separate "is-set" probe — pass
+ * 0 for "transparent / use qdshell default", or a packed RGBA for a
+ * compositor-side default.
+ *
+ * The split between `border_rgba` and `border_rgba_set` exists so a
+ * legitimate set_border_color(0xff000000) (opaque black) is not
+ * indistinguishable from "never set". The SSD paint helper uses this
+ * accessor instead of reading the field directly so the "unset →
+ * fallback" semantics live in one place.
+ */
+uint32_t
+qdwin_toplevel_border_rgba(struct qdwin_toplevel *tl, uint32_t fallback)
+{
+	if (!tl || !tl->border_rgba_set)
+		return fallback;
+	return tl->border_rgba;
 }
 
 /* ------------------------------------------------------------------
