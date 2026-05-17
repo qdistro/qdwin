@@ -5823,6 +5823,10 @@ static const struct qdwin_locker_v1_interface qdwin_locker_impl = {
 	.lock_acknowledged = qdwin_handle_lock_acknowledged,
 };
 
+/* §P10: callback referenced only when role=host; mark unused to avoid
+ * -Wunused-function under role=guest builds without rewrapping every
+ * forward declaration. */
+__attribute__((unused))
 static void
 bind_qdwin_locker(struct wl_client *client, void *data,
 		  uint32_t version, uint32_t id)
@@ -9820,6 +9824,9 @@ qdwin_nested_manager_impl = {
 	.advertise_toplevel = qdwin_nested_manager_advertise_toplevel,
 };
 
+/* §P10: callback referenced only when role=host; see bind_qdwin_locker
+ * note above. */
+__attribute__((unused))
 static void
 bind_qdwin_nested_manager(struct wl_client *client, void *data,
 			  uint32_t version, uint32_t id)
@@ -12030,7 +12037,14 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * as the shell unless overridden (single-admin assumption per
 	 * sessions.md:4-14). The sentinel is (uid_t)-1 not 0 so a
 	 * root-owned locker is a legitimate explicit configuration. See
-	 * doc/locker.md. */
+	 * doc/locker.md.
+	 *
+	 * §P10: compiled out in role=guest builds. The in-VM compositor
+	 * is locked at the host level (the outer host qdwin owns the
+	 * locker; the guest is the locked thing, not a locker target).
+	 * Spec: plan2/research/spice-retirement/00-overview.md §"What it
+	 * drops vs the host qdwin". */
+#ifndef QDWIN_ROLE_GUEST
 	if (qdwin->allowed_locker_uid == (uid_t)-1)
 		qdwin->allowed_locker_uid = qdwin->allowed_uid;
 	qdwin->locker_global = wl_global_create(ec->wl_display,
@@ -12040,6 +12054,11 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		weston_log("qdwin: locker wl_global_create failed\n");
 		goto fail;
 	}
+#else
+	/* role=guest: explicitly leave qdwin->locker_global NULL so any
+	 * code that later wants to broadcast through it short-circuits. */
+	qdwin->locker_global = NULL;
+#endif
 
 	/* §6.5 S5: input-injection global. Visible to any client; the
 	 * access_token in claim() is the gate. qdistro-forward gets the
@@ -12150,7 +12169,16 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 				     qdwin_secctx_global_filter, qdwin);
 
 	/* §6.8 S1: qdwin_nested_v1 manager global at v2 (string node IDs).
-	 * Peer-uid-filtered. */
+	 * Peer-uid-filtered.
+	 *
+	 * §P10: compiled out in role=guest builds. The in-VM compositor
+	 * is the *inner* end of the nested-compositor topology — it never
+	 * advertises a further nesting target to its own clients. Outer
+	 * (host) qdwin keeps the global so it can publish proxy toplevels
+	 * for guest-side apps via qdwin-bystander --forward-all-toplevels.
+	 * Spec: plan2/research/spice-retirement/00-overview.md §"What it
+	 * drops vs the host qdwin". */
+#ifndef QDWIN_ROLE_GUEST
 	qdwin->nested_manager_global = wl_global_create(
 		ec->wl_display, &qdwin_nested_manager_v1_interface,
 		2, qdwin, bind_qdwin_nested_manager);
@@ -12158,6 +12186,9 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		weston_log("qdwin: nested-manager wl_global_create failed\n");
 		goto fail;
 	}
+#else
+	qdwin->nested_manager_global = NULL;
+#endif
 
 	/* zwlr_layer_shell_v1 v5: external panels/notifications/lockscreens
 	 * (waybar, Quickshell/noctalia, eww, fuzzel, mako, swaylock).

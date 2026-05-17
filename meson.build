@@ -12,6 +12,34 @@ project('qdwin', 'c',
 # tracks whatever libweston version the distro ships.
 cc = meson.get_compiler('c')
 
+# §P10: dual-target build option for the SPICE-retirement migration.
+#
+#   role=host   — default. Full qdwin: locker (qdwin_locker_v1), the
+#                 nested-manager (qdwin_nested_manager_v1), and the
+#                 nested-pixelfeed consumer-bind path. KMS/DRM backend
+#                 selection is unchanged (weston picks per --backend).
+#                 The host build is byte-identical to the pre-P10 build:
+#                 we only add a single `-DQDWIN_ROLE_HOST` define which
+#                 doesn't gate any code paths in this mode.
+#
+#   role=guest  — stripped variant intended to run as the in-VM nested
+#                 compositor for tier-4-guest. Compiles out the locker
+#                 global and the nested-manager global (the guest is not
+#                 the locker target; the guest is not itself nesting).
+#                 qdwin_shell_v1 stays advertised because qdwin-bystander
+#                 --connect --forward-all-toplevels relies on it for
+#                 inner-toplevel enumeration (see plan-too-thin tripwire
+#                 #2 in plan2/tasks/P10-tier4-guest-image-nested-qdwin.md).
+#
+# Spec: plan2/research/spice-retirement/00-overview.md §"nested qdwin in
+# the guest"; plan2/tasks/P10-tier4-guest-image-nested-qdwin.md §Phase A.
+qdwin_role = get_option('role')
+if qdwin_role == 'guest'
+  add_project_arguments('-DQDWIN_ROLE_GUEST=1', language: 'c')
+else
+  add_project_arguments('-DQDWIN_ROLE_HOST=1', language: 'c')
+endif
+
 dep_libweston = dependency('libweston-14')
 dep_wayland_server = dependency('wayland-server')
 dep_wayland_scanner = dependency('wayland-scanner', native: true)
@@ -375,25 +403,11 @@ executable('qdwin-probe',
   install: true,
 )
 
-# Long-lived stand-in shell for app-compat scenarios. Binds
-# qdwin_shell_v1, releases held-layer per toplevel, and exposes a
-# max/restore/min/close/focus command FIFO. Used by the qdwin-apps/
-# gui-tests as a minimal alternative to qdshell.
-executable('qdwin-bystander',
-  sources: [
-    'test-client/qdwin-bystander.c',
-    qdwin_shell_client_header,
-    qdwin_shell_protocol_code,
-  ],
-  dependencies: [dep_wayland_client],
-  install: true,
-)
-
-# Phase-7 tier-3 test helper: minimal xdg_toplevel with a
-# configurable --title. Used by s38 because weston-terminal doesn't
-# call xdg_toplevel.set_title at startup, leaving waypipe's
-# --title-prefix nothing to prepend. Reusable for any future test
-# that needs a controllable-title window.
+# xdg-shell client header/code shared by test clients that need to
+# create their own xdg_toplevel(s) on an outer compositor. Declared
+# here (before qdwin-bystander) so the bystander's --forward-session
+# mode can create the single outer toplevel that represents the whole
+# tier-4 VM session on the host compositor (§P10 Shape A).
 xdg_shell_client_header = custom_target(
   'xdg-shell-client-header',
   input: files(wayland_protocols_dir / 'stable/xdg-shell/xdg-shell.xml'),
@@ -406,6 +420,36 @@ xdg_shell_protocol_code_test = custom_target(
   output: 'xdg-shell-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
+
+# Long-lived stand-in shell for app-compat scenarios. Binds
+# qdwin_shell_v1, releases held-layer per toplevel, and exposes a
+# max/restore/min/close/focus command FIFO. Used by the qdwin-apps/
+# gui-tests as a minimal alternative to qdshell.
+#
+# §P10 Shape A: when invoked with --inner-display + --forward-session,
+# the bystander maintains two wl_display connections — one to the
+# inner (in-guest) qdwin via the named socket, and one to the outer
+# compositor via $WAYLAND_DISPLAY (set by waypipe-server to its own
+# intercept socket). It creates exactly one outer xdg_toplevel that
+# represents the entire guest session, regardless of how many inner
+# toplevels exist. xdg-shell client headers are therefore wired in.
+executable('qdwin-bystander',
+  sources: [
+    'test-client/qdwin-bystander.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+    xdg_shell_client_header,
+    xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Phase-7 tier-3 test helper: minimal xdg_toplevel with a
+# configurable --title. Used by s38 because weston-terminal doesn't
+# call xdg_toplevel.set_title at startup, leaving waypipe's
+# --title-prefix nothing to prepend. Reusable for any future test
+# that needs a controllable-title window.
 executable('qdistro-test-window',
   sources: [
     'test-client/qdistro-test-window.c',
