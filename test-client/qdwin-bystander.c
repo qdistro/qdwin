@@ -17,31 +17,54 @@
  *                          the target after the bystander).
  *   --peer-label <s>       peer_label arg for the subscribe; default
  *                          "qdwin-bystander".
- *   --connect <socket>     §P10 — connect to the named Wayland socket
- *                          (basename only — searched under
- *                          $XDG_RUNTIME_DIR, same as wl_display_connect's
- *                          rules). Equivalent to setting WAYLAND_DISPLAY
- *                          but explicit on the CLI so callers don't
- *                          have to plumb env through systemd unit files.
- *                          Used by qdistro-tier4-publisher to point the
- *                          bystander at the in-VM nested qdwin's
- *                          wayland-0 socket while waypipe-server wraps
- *                          the bystander's *outbound* connection.
+ *
+ *   §P10 Shape A flags (tier-4-guest nested-qdwin session forwarding):
+ *
+ *   --inner-display <socket>
+ *                          Connect to the named Wayland socket as the
+ *                          *inner* compositor (guest qdwin's wayland-0).
+ *                          This is a SEPARATE wl_display from the outer
+ *                          one. The outer wl_display comes from the
+ *                          ambient $WAYLAND_DISPLAY (which, when wrapped
+ *                          by waypipe-server, is the intercept socket
+ *                          that ferries protocol over vsock to the host
+ *                          compositor). We deliberately do NOT setenv
+ *                          WAYLAND_DISPLAY for the inner socket — that
+ *                          would clobber waypipe-server's intercept and
+ *                          defeat the entire transport.
+ *                          (Backwards-compat: `--connect` is accepted as
+ *                          an alias but, in --forward-session mode, is
+ *                          treated the same as --inner-display.)
+ *
+ *   --forward-session      §P10 Shape A — one window per VM. On bind to
+ *                          the inner compositor, create exactly ONE
+ *                          outer xdg_toplevel on the outer wl_display
+ *                          to represent the entire guest session. Inner
+ *                          xdg_toplevel additions/removals are logged
+ *                          as structured "FORWARD …" lines on stdout
+ *                          (with newline / quote escaping so guest-side
+ *                          attacker-controlled app_id / title strings
+ *                          cannot spoof additional FORWARD lines), but
+ *                          DO NOT each spawn a new outer toplevel.
+ *                          Pixel-perfect mirroring of inner surfaces
+ *                          onto the outer toplevel is P11's job; for
+ *                          P10 the outer toplevel attaches a minimal
+ *                          SHM placeholder buffer purely to satisfy the
+ *                          Wayland protocol's "no buffer = no map"
+ *                          requirement and prove the outer-toplevel
+ *                          end-to-end path works.
+ *
  *   --forward-all-toplevels
- *                          §P10 — enable per-toplevel forward-mode
- *                          dispatch. On every toplevel_added the
- *                          bystander emits a structured
- *                          "FORWARD toplevel ..." line on stdout
- *                          tagged with the handle / app_id / title /
- *                          xwayland-flag so the host-side waypipe-
- *                          client (or downstream consumer) can react.
- *                          On toplevel_removed it emits
- *                          "FORWARD remove handle=<n>". The actual
- *                          outer xdg_toplevel creation is the
- *                          waypipe-server wrap's job (it ferries
- *                          surface allocations to the outer compositor);
- *                          this mode is the in-process enumeration
- *                          that drives that wrap.
+ *                          Deprecated spelling of --forward-session.
+ *                          Kept so the in-tree publisher.sh and unit
+ *                          tests don't all need to flip in lockstep.
+ *
+ *   --connect <socket>     §P10 legacy spelling of --inner-display.
+ *                          Pre-fix-pass it stomped WAYLAND_DISPLAY,
+ *                          which broke the waypipe transport (see the
+ *                          P10 correctness/integration reviews H2/H3).
+ *                          Now it's a pure alias for --inner-display
+ *                          with no env mutation.
  *
  * Spec: plan2/tasks/P10-tier4-guest-image-nested-qdwin.md §Phase B.
  *
@@ -76,11 +99,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <errno.h>
 
 #include <wayland-client.h>
 #include "qdwin-shell-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 
 #define BIND_VERSION 14
 #define MAX_TOPS 16
@@ -104,6 +129,27 @@ struct pending_subscribe {
 	uint32_t handle;
 };
 
+/* §P10 Shape A: outer wl_display state. Separate from the inner one
+ * so the bystander can connect to *both* the in-guest compositor (via
+ * the named --inner-display socket) AND the outer compositor (via the
+ * ambient $WAYLAND_DISPLAY which, when waypipe-server wraps us, is
+ * its own intercept socket that tunnels over vsock to the host).
+ *
+ * Exactly ONE outer xdg_toplevel is created when --forward-session
+ * is active — the toplevel represents the whole VM session, not any
+ * individual inner toplevel. */
+struct outer_state {
+	struct wl_display *display;
+	struct wl_registry *registry;
+	struct wl_compositor *compositor;
+	struct wl_shm *shm;
+	struct xdg_wm_base *wm_base;
+	struct wl_surface *surface;
+	struct xdg_surface *xdg_surface;
+	struct xdg_toplevel *toplevel;
+	int configured;
+};
+
 struct app {
 	struct qdwin_shell_v1 *shell;
 	struct top_info tops[MAX_TOPS];
@@ -112,19 +158,70 @@ struct app {
 	struct stream_info streams[MAX_STREAMS];
 	struct pending_subscribe pending;
 	char peer_label[64];
-	/* §P10 forward-all-toplevels: when set, every toplevel_added emits
-	 * a "FORWARD toplevel ..." stdout line so a wrapping waypipe-
-	 * server (and any downstream consumer) sees the enumeration. */
-	int forward_all;
+	/* §P10 --forward-session: when set, every toplevel_added emits a
+	 * "FORWARD toplevel ..." stdout line so a wrapping waypipe-server
+	 * (and any downstream consumer) sees the enumeration. Per-inner-
+	 * toplevel events do NOT each create an outer toplevel — Shape A
+	 * is one outer toplevel per VM session. */
+	int forward_session;
 	/* §P10 toplevel count seen since start. Used by the unit tests
 	 * to assert dispatch fired without requiring a real compositor. */
 	unsigned forward_toplevels_seen;
 	unsigned forward_removes_seen;
+	/* §P10 Shape A outer-display state (only populated when
+	 * --forward-session is on and the outer wl_display_connect
+	 * succeeded). NULL on plain --connect / non-forwarding modes. */
+	struct outer_state *outer;
 };
 
 static struct app g_app;
 
 static void do_subscribe(struct app *a, uint32_t handle);
+
+/* §P10 SF1 / security-F1 / correctness-S1 — escape attacker-controlled
+ * strings before printing them inside the structured "FORWARD …" line.
+ * Inner wl_clients can call xdg_toplevel.set_title / set_app_id with
+ * arbitrary bytes (newlines, double-quotes, backslashes); without
+ * escaping a guest app could spoof additional FORWARD lines that a
+ * host-side parser would treat as real events. We strip CR/LF entirely
+ * (replaced with literal "\\n" / "\\r" sequences) and backslash-escape
+ * `"` and `\` so downstream regex parsers keying on "..." substrings
+ * survive untouched. Output is bounded; over-long titles get
+ * truncated to keep the resulting line manageable.
+ *
+ * Returns dst for convenience. dst_sz must be >=1. */
+static char *
+escape_forward_field(char *dst, size_t dst_sz, const char *src)
+{
+	if (dst_sz == 0) return dst;
+	if (!src) src = "";
+	size_t i = 0;
+	for (; *src && i + 2 < dst_sz; src++) {
+		unsigned char c = (unsigned char)*src;
+		if (c == '\n') {
+			if (i + 2 >= dst_sz) break;
+			dst[i++] = '\\'; dst[i++] = 'n';
+		} else if (c == '\r') {
+			if (i + 2 >= dst_sz) break;
+			dst[i++] = '\\'; dst[i++] = 'r';
+		} else if (c == '\\') {
+			if (i + 2 >= dst_sz) break;
+			dst[i++] = '\\'; dst[i++] = '\\';
+		} else if (c == '"') {
+			if (i + 2 >= dst_sz) break;
+			dst[i++] = '\\'; dst[i++] = '"';
+		} else if (c < 0x20 || c == 0x7f) {
+			/* drop / replace other control bytes — they'd
+			 * confuse parsers similarly to \n. */
+			if (i + 1 >= dst_sz) break;
+			dst[i++] = '?';
+		} else {
+			dst[i++] = (char)c;
+		}
+	}
+	dst[i] = '\0';
+	return dst;
+}
 
 static void
 on_hello(void *d, struct qdwin_shell_v1 *s, uint32_t uid)
@@ -172,13 +269,16 @@ on_toplevel_added(void *d, struct qdwin_shell_v1 *s,
 	qdwin_shell_v1_set_keyboard_focus(s, "default", handle);
 	record_toplevel(a, handle);
 
-	/* §P10 forward-all-toplevels: structured stdout for waypipe-server
+	/* §P10 --forward-session: structured stdout for waypipe-server
 	 * (or unit tests) to pick up. Kept on a single line for trivial
-	 * grep / regex matching. */
-	if (a->forward_all) {
+	 * grep / regex matching. Attacker-controlled fields are escaped
+	 * to prevent newline / quote injection (SF1). */
+	if (a->forward_session) {
+		char esc_app_id[256], esc_title[256];
+		escape_forward_field(esc_app_id, sizeof esc_app_id, app_id);
+		escape_forward_field(esc_title, sizeof esc_title, title);
 		printf("FORWARD toplevel handle=%u app_id=\"%s\" title=\"%s\" xwayland=%u\n",
-		       handle, app_id ? app_id : "",
-		       title ? title : "", is_xwayland);
+		       handle, esc_app_id, esc_title, is_xwayland);
 		fflush(stdout);
 		a->forward_toplevels_seen++;
 	}
@@ -211,9 +311,12 @@ static void l_removed(void *d, struct qdwin_shell_v1 *s, uint32_t h)
 	struct app *a = d;
 	fprintf(stderr, "qdwin-bystander: toplevel_removed handle=%u\n", h);
 	forget_toplevel(a, h);
-	/* §P10 forward-all-toplevels: paired removal so the wrap can drop
-	 * its outer xdg_toplevel for this handle. */
-	if (a->forward_all) {
+	/* §P10 --forward-session: paired removal so any downstream wrap
+	 * can drop its inner-toplevel bookkeeping for this handle. The
+	 * outer xdg_toplevel is NOT destroyed here — it represents the
+	 * whole VM session and lives as long as the inner compositor
+	 * connection does. */
+	if (a->forward_session) {
 		printf("FORWARD remove handle=%u\n", h);
 		fflush(stdout);
 		a->forward_removes_seen++;
@@ -258,12 +361,14 @@ static void l_secctx(void *d, struct qdwin_shell_v1 *s,
 		     const char *instance_id)
 {
 	(void)d; (void)s;
-	fprintf(stdout, "qdwin-bystander: toplevel_security_context handle=%u "
+	/* §P10 L5 / log-shape — emit on stderr so stdout stays a clean
+	 * key=value / FORWARD … channel that downstream parsers can
+	 * consume without filtering by prefix. */
+	fprintf(stderr, "qdwin-bystander: toplevel_security_context handle=%u "
 		"engine=\"%s\" app_id=\"%s\" instance_id=\"%s\"\n",
 		h, engine ? engine : "(null)",
 		app_id ? app_id : "(null)",
 		instance_id ? instance_id : "(null)");
-	fflush(stdout);
 }
 static void l_seat_focus_changed(void *d, struct qdwin_shell_v1 *s,
 				 const char *seat, uint32_t handle)
@@ -401,6 +506,195 @@ static const struct wl_registry_listener registry_listener = {
 	.global_remove = on_global_remove,
 };
 
+/* ====================================================================
+ * §P10 Shape A — outer wl_display setup.
+ *
+ * One outer xdg_toplevel for the entire tier-4 VM session. The outer
+ * compositor is whatever lives at $WAYLAND_DISPLAY in our environment.
+ * Under the publisher, that's waypipe-server's intercept socket which
+ * tunnels protocol over vsock to the host-side waypipe-client (and on
+ * to the host qdwin). Under unit tests, $WAYLAND_DISPLAY points at a
+ * non-existent socket and the outer connect fails fast — we just log
+ * the failure and continue running the inner half (the unit tests
+ * assert on stderr lines, not on a real outer toplevel).
+ * ==================================================================== */
+
+static void
+outer_wm_base_ping(void *data, struct xdg_wm_base *base, uint32_t serial)
+{
+	(void)data;
+	xdg_wm_base_pong(base, serial);
+}
+static const struct xdg_wm_base_listener outer_wm_base_listener = {
+	.ping = outer_wm_base_ping,
+};
+
+static void
+outer_registry_global(void *data, struct wl_registry *reg, uint32_t name,
+		      const char *interface, uint32_t version)
+{
+	struct outer_state *o = data;
+	if (!strcmp(interface, wl_compositor_interface.name)) {
+		uint32_t v = version > 4 ? 4 : version;
+		o->compositor = wl_registry_bind(reg, name,
+						 &wl_compositor_interface, v);
+	} else if (!strcmp(interface, wl_shm_interface.name)) {
+		o->shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+	} else if (!strcmp(interface, xdg_wm_base_interface.name)) {
+		o->wm_base = wl_registry_bind(reg, name,
+					      &xdg_wm_base_interface, 1);
+		xdg_wm_base_add_listener(o->wm_base,
+					 &outer_wm_base_listener, NULL);
+	}
+}
+static void outer_registry_global_remove(void *d, struct wl_registry *r, uint32_t n)
+{ (void)d; (void)r; (void)n; }
+static const struct wl_registry_listener outer_registry_listener = {
+	.global = outer_registry_global,
+	.global_remove = outer_registry_global_remove,
+};
+
+static void
+outer_xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial)
+{
+	struct outer_state *o = data;
+	xdg_surface_ack_configure(xs, serial);
+	o->configured = 1;
+}
+static const struct xdg_surface_listener outer_xdg_surface_listener = {
+	.configure = outer_xdg_surface_configure,
+};
+
+static void
+outer_xdg_toplevel_configure(void *d, struct xdg_toplevel *t,
+			     int32_t w, int32_t h, struct wl_array *states)
+{ (void)d; (void)t; (void)w; (void)h; (void)states; }
+static void
+outer_xdg_toplevel_close(void *d, struct xdg_toplevel *t)
+{ (void)d; (void)t; /* host asked us to close; ignore for now — the
+                       publisher's lifecycle is driven by inner
+                       compositor death, not outer close. */ }
+static void
+outer_xdg_toplevel_configure_bounds(void *d, struct xdg_toplevel *t,
+				    int32_t mw, int32_t mh)
+{ (void)d; (void)t; (void)mw; (void)mh; }
+static void
+outer_xdg_toplevel_wm_capabilities(void *d, struct xdg_toplevel *t,
+				   struct wl_array *caps)
+{ (void)d; (void)t; (void)caps; }
+static const struct xdg_toplevel_listener outer_xdg_toplevel_listener = {
+	.configure = outer_xdg_toplevel_configure,
+	.close = outer_xdg_toplevel_close,
+	.configure_bounds = outer_xdg_toplevel_configure_bounds,
+	.wm_capabilities = outer_xdg_toplevel_wm_capabilities,
+};
+
+/* §P10 Shape A — placeholder SHM buffer.
+ * Pixel-perfect mirroring of inner surfaces onto this outer toplevel
+ * is P11's job. For P10 we attach a tiny solid-colour buffer purely
+ * to (a) satisfy the Wayland protocol's "the surface must have a
+ * buffer attached before it can be mapped" rule, and (b) prove the
+ * outer-toplevel end-to-end allocation path works through the
+ * waypipe-server intercept. The buffer is intentionally minimal. */
+static struct wl_buffer *
+outer_make_placeholder_buffer(struct wl_shm *shm, int w, int h, uint32_t argb)
+{
+	int stride = w * 4;
+	int size = stride * h;
+	int fd = memfd_create("qdwin-bystander-outer", MFD_CLOEXEC);
+	if (fd < 0) return NULL;
+	if (ftruncate(fd, size) < 0) { close(fd); return NULL; }
+	uint32_t *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) { close(fd); return NULL; }
+	for (int i = 0; i < w * h; i++) p[i] = argb;
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+	struct wl_buffer *buf = wl_shm_pool_create_buffer(
+		pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+	wl_shm_pool_destroy(pool);
+	munmap(p, size);
+	close(fd);
+	return buf;
+}
+
+/* Attempt to connect to the outer wl_display (whatever $WAYLAND_DISPLAY
+ * points at in our env — typically waypipe-server's intercept socket
+ * when this binary is the waypipe-server's child).
+ *
+ * Returns 0 on success (and stashes display + bindings + the one
+ * outer xdg_toplevel into *out*), or -1 on any failure (with stderr
+ * log). Failure is non-fatal: we still want to drive the inner
+ * compositor connection and emit FORWARD lines, which the unit tests
+ * exercise without a real outer socket. */
+static int
+outer_setup_one_toplevel(struct outer_state *out)
+{
+	memset(out, 0, sizeof *out);
+	out->display = wl_display_connect(NULL);
+	if (!out->display) {
+		fprintf(stderr,
+			"qdwin-bystander: outer wl_display_connect failed "
+			"(WAYLAND_DISPLAY=%s); --forward-session will emit "
+			"FORWARD lines only, no outer toplevel\n",
+			getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY")
+						 : "(unset)");
+		return -1;
+	}
+	out->registry = wl_display_get_registry(out->display);
+	wl_registry_add_listener(out->registry, &outer_registry_listener, out);
+	wl_display_roundtrip(out->display);
+	if (!out->compositor || !out->shm || !out->wm_base) {
+		fprintf(stderr,
+			"qdwin-bystander: outer missing globals "
+			"(compositor=%p shm=%p xdg_wm_base=%p)\n",
+			(void*)out->compositor, (void*)out->shm,
+			(void*)out->wm_base);
+		return -1;
+	}
+	out->surface = wl_compositor_create_surface(out->compositor);
+	out->xdg_surface = xdg_wm_base_get_xdg_surface(out->wm_base, out->surface);
+	xdg_surface_add_listener(out->xdg_surface, &outer_xdg_surface_listener, out);
+	out->toplevel = xdg_surface_get_toplevel(out->xdg_surface);
+	xdg_toplevel_add_listener(out->toplevel, &outer_xdg_toplevel_listener, out);
+	xdg_toplevel_set_title(out->toplevel, "qdistro tier-4 guest");
+	xdg_toplevel_set_app_id(out->toplevel, "qdistro.tier4.guest");
+	wl_surface_commit(out->surface);
+	wl_display_roundtrip(out->display);
+
+	/* Attach a minimal placeholder buffer so the outer compositor
+	 * actually maps the surface. (P11 will replace this with real
+	 * pixel transport from the inner compositor.) */
+	struct wl_buffer *buf = outer_make_placeholder_buffer(
+		out->shm, 64, 64, 0xff202830u);  /* dark slate, distinctive */
+	if (!buf) {
+		fprintf(stderr,
+			"qdwin-bystander: outer placeholder buffer alloc failed\n");
+		return -1;
+	}
+	wl_surface_attach(out->surface, buf, 0, 0);
+	wl_surface_damage_buffer(out->surface, 0, 0, 64, 64);
+	wl_surface_commit(out->surface);
+	wl_display_roundtrip(out->display);
+	fprintf(stderr,
+		"qdwin-bystander: outer xdg_toplevel created "
+		"(one-per-session, P10 Shape A; pixel mirror is P11)\n");
+	return 0;
+}
+
+static void
+outer_teardown(struct outer_state *out)
+{
+	if (!out) return;
+	if (out->toplevel) xdg_toplevel_destroy(out->toplevel);
+	if (out->xdg_surface) xdg_surface_destroy(out->xdg_surface);
+	if (out->surface) wl_surface_destroy(out->surface);
+	if (out->wm_base) xdg_wm_base_destroy(out->wm_base);
+	if (out->shm) wl_shm_destroy(out->shm);
+	if (out->compositor) wl_compositor_destroy(out->compositor);
+	if (out->registry) wl_registry_destroy(out->registry);
+	if (out->display) wl_display_disconnect(out->display);
+	memset(out, 0, sizeof *out);
+}
+
 static volatile sig_atomic_t stop = 0;
 static void on_int(int s) { (void)s; stop = 1; }
 
@@ -460,13 +754,14 @@ usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n"
+		"          [--inner-display <wayland-socket>] [--forward-session]\n"
 		"          [--connect <wayland-socket>] [--forward-all-toplevels]\n",
 		argv0);
 }
 
 int main(int argc, char **argv)
 {
-	const char *connect_socket = NULL;
+	const char *inner_socket = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--subscribe") == 0 && i + 1 < argc) {
 			const char *v = argv[++i];
@@ -481,24 +776,20 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--peer-label") == 0 && i + 1 < argc) {
 			snprintf(g_app.peer_label, sizeof g_app.peer_label,
 				 "%s", argv[++i]);
-		} else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
-			/* §P10: select the inner-compositor socket. We
-			 * forward this to wl_display_connect via the
-			 * WAYLAND_DISPLAY env var (which is exactly what
-			 * wl_display_connect(NULL) reads). Setting it here
-			 * lets callers point at e.g. wayland-0 without
-			 * plumbing env through systemd's per-unit
-			 * Environment=. */
-			connect_socket = argv[++i];
-			if (setenv("WAYLAND_DISPLAY", connect_socket, 1) != 0) {
-				fprintf(stderr, "qdwin-bystander: setenv "
-					"WAYLAND_DISPLAY=%s failed: %s\n",
-					connect_socket, strerror(errno));
-				return 2;
-			}
-		} else if (strcmp(argv[i], "--forward-all-toplevels") == 0) {
-			/* §P10: per-toplevel structured stdout dispatch. */
-			g_app.forward_all = 1;
+		} else if ((strcmp(argv[i], "--inner-display") == 0
+			    || strcmp(argv[i], "--connect") == 0)
+			   && i + 1 < argc) {
+			/* §P10 Shape A: select the *inner* (guest qdwin)
+			 * compositor socket. This connection is SEPARATE
+			 * from the ambient $WAYLAND_DISPLAY — the outer
+			 * compositor (host, via waypipe-server's intercept)
+			 * lives at $WAYLAND_DISPLAY and we leave it alone. */
+			inner_socket = argv[++i];
+		} else if (strcmp(argv[i], "--forward-session") == 0
+			   || strcmp(argv[i], "--forward-all-toplevels") == 0) {
+			/* §P10 Shape A: enable the one-outer-toplevel-per-VM
+			 * forwarding mode. */
+			g_app.forward_session = 1;
 		} else if (strcmp(argv[i], "--help") == 0
 			   || strcmp(argv[i], "-h") == 0) {
 			usage(argv[0]);
@@ -511,13 +802,20 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* §P10: log the resolved connect target on startup so the unit
-	 * tests can grep for it without spinning up a real compositor. */
-	if (connect_socket) {
+	/* §P10: log the resolved inner-socket target on startup so the
+	 * unit tests can grep for it without spinning up a real
+	 * compositor. */
+	if (inner_socket) {
+		fprintf(stderr, "qdwin-bystander: --inner-display socket=\"%s\"\n",
+			inner_socket);
+		/* Back-compat: emit the old log line shape so the existing
+		 * unit-test grep for `socket="…"` continues to fire. */
 		fprintf(stderr, "qdwin-bystander: --connect socket=\"%s\"\n",
-			connect_socket);
+			inner_socket);
 	}
-	if (g_app.forward_all) {
+	if (g_app.forward_session) {
+		fprintf(stderr, "qdwin-bystander: --forward-session enabled\n");
+		/* Back-compat: keep the old log spelling too. */
 		fprintf(stderr, "qdwin-bystander: --forward-all-toplevels enabled\n");
 	}
 
@@ -535,9 +833,42 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	struct wl_display *display = wl_display_connect(NULL);
+	/* §P10 Shape A: bring up the outer compositor FIRST (if
+	 * --forward-session is on). We deliberately attempt the outer
+	 * connect with the *ambient* $WAYLAND_DISPLAY untouched — that's
+	 * waypipe-server's intercept when this binary is wrapped, or
+	 * whatever the test harness pointed at otherwise. Failure here
+	 * is non-fatal: the unit tests run with bogus WAYLAND_DISPLAY
+	 * values and we want them to still see the inner log lines. */
+	struct outer_state outer_storage;
+	int outer_ok = 0;
+	if (g_app.forward_session) {
+		if (outer_setup_one_toplevel(&outer_storage) == 0) {
+			g_app.outer = &outer_storage;
+			outer_ok = 1;
+		} else {
+			g_app.outer = NULL;
+		}
+	}
+
+	/* Connect to the *inner* compositor by an explicit path. If the
+	 * caller passed --inner-display, that's the socket name (relative
+	 * to $XDG_RUNTIME_DIR per libwayland's lookup rules); otherwise
+	 * fall back to $WAYLAND_DISPLAY (legacy behaviour for the host-
+	 * side tests that have a single compositor). */
+	struct wl_display *display = NULL;
+	if (inner_socket) {
+		display = wl_display_connect(inner_socket);
+	} else {
+		display = wl_display_connect(NULL);
+	}
 	if (!display) {
-		fprintf(stderr, "qdwin-bystander: wl_display_connect failed\n");
+		fprintf(stderr, "qdwin-bystander: wl_display_connect failed "
+			"(inner socket=%s)\n",
+			inner_socket ? inner_socket : "(NULL → $WAYLAND_DISPLAY)");
+		if (outer_ok) outer_teardown(&outer_storage);
+		close(fifo_fd);
+		unlink(fifo_path);
 		return 1;
 	}
 	struct wl_registry *reg = wl_display_get_registry(display);
@@ -545,6 +876,10 @@ int main(int argc, char **argv)
 	wl_display_roundtrip(display);
 	if (!g_app.shell) {
 		fprintf(stderr, "qdwin-bystander: qdwin_shell_v1 not advertised\n");
+		if (outer_ok) outer_teardown(&outer_storage);
+		wl_display_disconnect(display);
+		close(fifo_fd);
+		unlink(fifo_path);
 		return 1;
 	}
 	qdwin_shell_v1_bind_as_shell(g_app.shell);
@@ -555,6 +890,8 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 
 	int wl_fd = wl_display_get_fd(display);
+	int outer_fd = (outer_ok && g_app.outer) ?
+		wl_display_get_fd(g_app.outer->display) : -1;
 	char buf[1024];
 	size_t buf_len = 0;
 
@@ -567,11 +904,21 @@ int main(int argc, char **argv)
 			wl_display_cancel_read(display);
 			goto out;
 		}
-		struct pollfd fds[2] = {
+		if (outer_ok && g_app.outer) {
+			wl_display_dispatch_pending(g_app.outer->display);
+			if (wl_display_flush(g_app.outer->display) == -1) {
+				/* outer died — keep the inner half running */
+				outer_fd = -1;
+				outer_ok = 0;
+			}
+		}
+		struct pollfd fds[3] = {
 			{ .fd = wl_fd, .events = POLLIN },
 			{ .fd = fifo_fd, .events = POLLIN },
+			{ .fd = outer_fd, .events = POLLIN },
 		};
-		int pr = poll(fds, 2, -1);
+		int nfds = (outer_fd >= 0) ? 3 : 2;
+		int pr = poll(fds, nfds, -1);
 		if (pr < 0) {
 			wl_display_cancel_read(display);
 			if (errno == EINTR) continue;
@@ -583,6 +930,13 @@ int main(int argc, char **argv)
 			wl_display_cancel_read(display);
 		}
 		if (wl_display_dispatch_pending(display) == -1) goto out;
+
+		if (nfds >= 3 && (fds[2].revents & POLLIN)) {
+			if (wl_display_dispatch(g_app.outer->display) == -1) {
+				outer_fd = -1;
+				outer_ok = 0;
+			}
+		}
 
 		if (fds[1].revents & POLLIN) {
 			ssize_t n = read(fifo_fd, buf + buf_len,
@@ -605,6 +959,7 @@ int main(int argc, char **argv)
 		}
 	}
 out:
+	if (outer_ok) outer_teardown(&outer_storage);
 	wl_display_disconnect(display);
 	close(fifo_fd);
 	unlink(fifo_path);

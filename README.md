@@ -62,6 +62,31 @@ weston --shell=qdwin-shell.so
 For the vendored libweston (only needed if the distro libweston isn't
 patched), see `libweston-vendored/README.md`.
 
+### Build variants (the `role` option)
+
+`meson.options` exposes `role={host|guest}`:
+
+```sh
+meson setup build                     # role=host (default)
+meson setup build-guest -Drole=guest  # tier-4-guest VM image
+```
+
+- `role=host` (default) — full host-side compositor. Behaviour-identical
+  to the pre-P10 build. `qdwin_locker_v1`, `qdwin_nested_manager_v1`, and
+  `qdwin_shell_v1` are all registered.
+- `role=guest` — slimmed variant for the tier-4-guest VM image (the
+  inner compositor that runs inside the guest qcow2 built by
+  `qdistro/tier4-vm-guest/build-guest-image.sh`). Compiles out
+  `qdwin_locker_v1` and `qdwin_nested_manager_v1` (the guest is not a
+  locker target and does not itself nest compositors). `qdwin_shell_v1`
+  stays registered so the in-guest `qdwin-bystander --inner-display …
+  --forward-session` mode can enumerate inner toplevels and ferry one
+  outer xdg_toplevel out over waypipe-server's vsock transport to the
+  host compositor.
+
+See `plan2/tasks/P10-tier4-guest-image-nested-qdwin.md` and
+`plan2/research/spice-retirement/00-overview.md` for the full rationale.
+
 ## Protocol
 
 qdwin exposes a private protocol (`qdwin_shell_v1`, currently at

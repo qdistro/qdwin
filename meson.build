@@ -403,25 +403,11 @@ executable('qdwin-probe',
   install: true,
 )
 
-# Long-lived stand-in shell for app-compat scenarios. Binds
-# qdwin_shell_v1, releases held-layer per toplevel, and exposes a
-# max/restore/min/close/focus command FIFO. Used by the qdwin-apps/
-# gui-tests as a minimal alternative to qdshell.
-executable('qdwin-bystander',
-  sources: [
-    'test-client/qdwin-bystander.c',
-    qdwin_shell_client_header,
-    qdwin_shell_protocol_code,
-  ],
-  dependencies: [dep_wayland_client],
-  install: true,
-)
-
-# Phase-7 tier-3 test helper: minimal xdg_toplevel with a
-# configurable --title. Used by s38 because weston-terminal doesn't
-# call xdg_toplevel.set_title at startup, leaving waypipe's
-# --title-prefix nothing to prepend. Reusable for any future test
-# that needs a controllable-title window.
+# xdg-shell client header/code shared by test clients that need to
+# create their own xdg_toplevel(s) on an outer compositor. Declared
+# here (before qdwin-bystander) so the bystander's --forward-session
+# mode can create the single outer toplevel that represents the whole
+# tier-4 VM session on the host compositor (§P10 Shape A).
 xdg_shell_client_header = custom_target(
   'xdg-shell-client-header',
   input: files(wayland_protocols_dir / 'stable/xdg-shell/xdg-shell.xml'),
@@ -434,6 +420,36 @@ xdg_shell_protocol_code_test = custom_target(
   output: 'xdg-shell-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
+
+# Long-lived stand-in shell for app-compat scenarios. Binds
+# qdwin_shell_v1, releases held-layer per toplevel, and exposes a
+# max/restore/min/close/focus command FIFO. Used by the qdwin-apps/
+# gui-tests as a minimal alternative to qdshell.
+#
+# §P10 Shape A: when invoked with --inner-display + --forward-session,
+# the bystander maintains two wl_display connections — one to the
+# inner (in-guest) qdwin via the named socket, and one to the outer
+# compositor via $WAYLAND_DISPLAY (set by waypipe-server to its own
+# intercept socket). It creates exactly one outer xdg_toplevel that
+# represents the entire guest session, regardless of how many inner
+# toplevels exist. xdg-shell client headers are therefore wired in.
+executable('qdwin-bystander',
+  sources: [
+    'test-client/qdwin-bystander.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+    xdg_shell_client_header,
+    xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Phase-7 tier-3 test helper: minimal xdg_toplevel with a
+# configurable --title. Used by s38 because weston-terminal doesn't
+# call xdg_toplevel.set_title at startup, leaving waypipe's
+# --title-prefix nothing to prepend. Reusable for any future test
+# that needs a controllable-title window.
 executable('qdistro-test-window',
   sources: [
     'test-client/qdistro-test-window.c',
