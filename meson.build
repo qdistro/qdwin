@@ -12,6 +12,34 @@ project('qdwin', 'c',
 # tracks whatever libweston version the distro ships.
 cc = meson.get_compiler('c')
 
+# §P10: dual-target build option for the SPICE-retirement migration.
+#
+#   role=host   — default. Full qdwin: locker (qdwin_locker_v1), the
+#                 nested-manager (qdwin_nested_manager_v1), and the
+#                 nested-pixelfeed consumer-bind path. KMS/DRM backend
+#                 selection is unchanged (weston picks per --backend).
+#                 The host build is byte-identical to the pre-P10 build:
+#                 we only add a single `-DQDWIN_ROLE_HOST` define which
+#                 doesn't gate any code paths in this mode.
+#
+#   role=guest  — stripped variant intended to run as the in-VM nested
+#                 compositor for tier-4-guest. Compiles out the locker
+#                 global and the nested-manager global (the guest is not
+#                 the locker target; the guest is not itself nesting).
+#                 qdwin_shell_v1 stays advertised because qdwin-bystander
+#                 --connect --forward-all-toplevels relies on it for
+#                 inner-toplevel enumeration (see plan-too-thin tripwire
+#                 #2 in plan2/tasks/P10-tier4-guest-image-nested-qdwin.md).
+#
+# Spec: plan2/research/spice-retirement/00-overview.md §"nested qdwin in
+# the guest"; plan2/tasks/P10-tier4-guest-image-nested-qdwin.md §Phase A.
+qdwin_role = get_option('role')
+if qdwin_role == 'guest'
+  add_project_arguments('-DQDWIN_ROLE_GUEST=1', language: 'c')
+else
+  add_project_arguments('-DQDWIN_ROLE_HOST=1', language: 'c')
+endif
+
 dep_libweston = dependency('libweston-14')
 dep_wayland_server = dependency('wayland-server')
 dep_wayland_scanner = dependency('wayland-scanner', native: true)

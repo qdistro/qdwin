@@ -17,6 +17,33 @@
  *                          the target after the bystander).
  *   --peer-label <s>       peer_label arg for the subscribe; default
  *                          "qdwin-bystander".
+ *   --connect <socket>     §P10 — connect to the named Wayland socket
+ *                          (basename only — searched under
+ *                          $XDG_RUNTIME_DIR, same as wl_display_connect's
+ *                          rules). Equivalent to setting WAYLAND_DISPLAY
+ *                          but explicit on the CLI so callers don't
+ *                          have to plumb env through systemd unit files.
+ *                          Used by qdistro-tier4-publisher to point the
+ *                          bystander at the in-VM nested qdwin's
+ *                          wayland-0 socket while waypipe-server wraps
+ *                          the bystander's *outbound* connection.
+ *   --forward-all-toplevels
+ *                          §P10 — enable per-toplevel forward-mode
+ *                          dispatch. On every toplevel_added the
+ *                          bystander emits a structured
+ *                          "FORWARD toplevel ..." line on stdout
+ *                          tagged with the handle / app_id / title /
+ *                          xwayland-flag so the host-side waypipe-
+ *                          client (or downstream consumer) can react.
+ *                          On toplevel_removed it emits
+ *                          "FORWARD remove handle=<n>". The actual
+ *                          outer xdg_toplevel creation is the
+ *                          waypipe-server wrap's job (it ferries
+ *                          surface allocations to the outer compositor);
+ *                          this mode is the in-process enumeration
+ *                          that drives that wrap.
+ *
+ * Spec: plan2/tasks/P10-tier4-guest-image-nested-qdwin.md §Phase B.
  *
  * On `approved`, the credentials are printed to stdout as KEY=value
  * lines suitable for shell sourcing:
@@ -85,6 +112,14 @@ struct app {
 	struct stream_info streams[MAX_STREAMS];
 	struct pending_subscribe pending;
 	char peer_label[64];
+	/* §P10 forward-all-toplevels: when set, every toplevel_added emits
+	 * a "FORWARD toplevel ..." stdout line so a wrapping waypipe-
+	 * server (and any downstream consumer) sees the enumeration. */
+	int forward_all;
+	/* §P10 toplevel count seen since start. Used by the unit tests
+	 * to assert dispatch fired without requiring a real compositor. */
+	unsigned forward_toplevels_seen;
+	unsigned forward_removes_seen;
 };
 
 static struct app g_app;
@@ -137,6 +172,17 @@ on_toplevel_added(void *d, struct qdwin_shell_v1 *s,
 	qdwin_shell_v1_set_keyboard_focus(s, "default", handle);
 	record_toplevel(a, handle);
 
+	/* §P10 forward-all-toplevels: structured stdout for waypipe-server
+	 * (or unit tests) to pick up. Kept on a single line for trivial
+	 * grep / regex matching. */
+	if (a->forward_all) {
+		printf("FORWARD toplevel handle=%u app_id=\"%s\" title=\"%s\" xwayland=%u\n",
+		       handle, app_id ? app_id : "",
+		       title ? title : "", is_xwayland);
+		fflush(stdout);
+		a->forward_toplevels_seen++;
+	}
+
 	if (a->pending.armed) {
 		int match = a->pending.wait_first
 			|| (a->pending.handle == handle);
@@ -165,6 +211,13 @@ static void l_removed(void *d, struct qdwin_shell_v1 *s, uint32_t h)
 	struct app *a = d;
 	fprintf(stderr, "qdwin-bystander: toplevel_removed handle=%u\n", h);
 	forget_toplevel(a, h);
+	/* §P10 forward-all-toplevels: paired removal so the wrap can drop
+	 * its outer xdg_toplevel for this handle. */
+	if (a->forward_all) {
+		printf("FORWARD remove handle=%u\n", h);
+		fflush(stdout);
+		a->forward_removes_seen++;
+	}
 }
 static void l_locked(void *d, struct qdwin_shell_v1 *s, uint32_t l)
 { (void)d; (void)s; (void)l; }
@@ -406,12 +459,14 @@ static void
 usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n",
+		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n"
+		"          [--connect <wayland-socket>] [--forward-all-toplevels]\n",
 		argv0);
 }
 
 int main(int argc, char **argv)
 {
+	const char *connect_socket = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--subscribe") == 0 && i + 1 < argc) {
 			const char *v = argv[++i];
@@ -426,6 +481,24 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--peer-label") == 0 && i + 1 < argc) {
 			snprintf(g_app.peer_label, sizeof g_app.peer_label,
 				 "%s", argv[++i]);
+		} else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
+			/* §P10: select the inner-compositor socket. We
+			 * forward this to wl_display_connect via the
+			 * WAYLAND_DISPLAY env var (which is exactly what
+			 * wl_display_connect(NULL) reads). Setting it here
+			 * lets callers point at e.g. wayland-0 without
+			 * plumbing env through systemd's per-unit
+			 * Environment=. */
+			connect_socket = argv[++i];
+			if (setenv("WAYLAND_DISPLAY", connect_socket, 1) != 0) {
+				fprintf(stderr, "qdwin-bystander: setenv "
+					"WAYLAND_DISPLAY=%s failed: %s\n",
+					connect_socket, strerror(errno));
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--forward-all-toplevels") == 0) {
+			/* §P10: per-toplevel structured stdout dispatch. */
+			g_app.forward_all = 1;
 		} else if (strcmp(argv[i], "--help") == 0
 			   || strcmp(argv[i], "-h") == 0) {
 			usage(argv[0]);
@@ -436,6 +509,16 @@ int main(int argc, char **argv)
 			usage(argv[0]);
 			return 2;
 		}
+	}
+
+	/* §P10: log the resolved connect target on startup so the unit
+	 * tests can grep for it without spinning up a real compositor. */
+	if (connect_socket) {
+		fprintf(stderr, "qdwin-bystander: --connect socket=\"%s\"\n",
+			connect_socket);
+	}
+	if (g_app.forward_all) {
+		fprintf(stderr, "qdwin-bystander: --forward-all-toplevels enabled\n");
 	}
 
 	const char *fifo_path = getenv("QDWIN_BYSTANDER_FIFO");
