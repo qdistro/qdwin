@@ -446,6 +446,22 @@ executable('qdistro-test-clipboard-sink',
   install_dir: get_option('bindir'),
 )
 
+# Test helper: inject a clipboard selection tagged with a qdistro-silo
+# security context via wp_security_context_v1.  Used by
+# tests/integration/vm/s106-browser-clipboard-gate.sh to trigger
+# ClipboardGate.qml's CLIPBOARD_GATE journal lines without a real
+# browser running. The binary hand-rolls the wp_security_context_v1
+# client interface rather than using a generated header so it compiles
+# without an extra wayland-scanner custom_target.
+executable('qdwin-test-clipboard-emit',
+  sources: [
+    'test-client/qdwin-test-clipboard-emit.c',
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
 # The Qdistro.Qdwin QML plugin that binds qdwin_shell_v1 from
 # qdshell lives in the qdshell sibling repo (qdshell/qml-plugin/) —
 # it reads this directory's qdwin-shell-v1.xml via a relative path
