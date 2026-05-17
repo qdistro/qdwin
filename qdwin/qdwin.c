@@ -25,13 +25,16 @@
 #define _GNU_SOURCE  /* accept4(), SOCK_CLOEXEC for §6.10 secctx accept loop */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -218,6 +221,12 @@ qdwin_secctx_client_lookup(struct qdwin *qdwin, struct wl_client *client);
 static const char *qdwin_secctx_client_engine(struct qdwin_secctx_client *sc);
 static const char *qdwin_secctx_client_app_id(struct qdwin_secctx_client *sc);
 static const char *qdwin_secctx_client_instance_id(struct qdwin_secctx_client *sc);
+/* Option-B identity accessors — see todo/decisions/secctx-identity-contract.md. */
+static uint32_t qdwin_secctx_client_peer_pid(struct qdwin_secctx_client *sc);
+static uint64_t qdwin_secctx_client_peer_starttime(struct qdwin_secctx_client *sc);
+static uint32_t qdwin_secctx_client_peer_uid(struct qdwin_secctx_client *sc);
+static const char *qdwin_secctx_client_peer_exe(struct qdwin_secctx_client *sc);
+static const char *qdwin_secctx_client_peer_selinux_label(struct qdwin_secctx_client *sc);
 static bool
 qdwin_secctx_global_filter(const struct wl_client *client,
 			   const struct wl_global *global, void *data);
@@ -825,6 +834,26 @@ qdwin_send_toplevel_security_context(struct qdwin *qdwin,
 	weston_log("qdwin: toplevel_security_context handle=%u engine=%s "
 		   "app_id=%s instance=%s\n",
 		   tl->handle, engine, app_id, instance);
+	/* v22 sidecar: stable process identity for broker-side re-verification
+	 * (todo/decisions/secctx-identity-contract.md, Option B). Additive —
+	 * skipped on shells bound below v22. */
+	if (wl_resource_get_version(qdwin->shell_resource) >= 22) {
+		uint32_t peer_pid = qdwin_secctx_client_peer_pid(sc);
+		uint64_t starttime = qdwin_secctx_client_peer_starttime(sc);
+		uint32_t peer_uid = qdwin_secctx_client_peer_uid(sc);
+		const char *exe = qdwin_secctx_client_peer_exe(sc);
+		const char *label = qdwin_secctx_client_peer_selinux_label(sc);
+		uint32_t st_lo = (uint32_t)(starttime & 0xffffffffu);
+		uint32_t st_hi = (uint32_t)((starttime >> 32) & 0xffffffffu);
+		qdwin_shell_v1_send_toplevel_peer_identity(
+			qdwin->shell_resource, tl->handle,
+			peer_pid, st_lo, st_hi, peer_uid, exe, label);
+		weston_log("qdwin: toplevel_peer_identity handle=%u pid=%u "
+			   "starttime=%llu uid=%u exe=%s label=%s\n",
+			   tl->handle, peer_pid,
+			   (unsigned long long)starttime,
+			   peer_uid, exe, label);
+	}
 }
 
 static int
@@ -3200,11 +3229,44 @@ qdwin_hex_token(char *out, size_t out_len, size_t n_bytes)
 	out[2*slots] = '\0';
 }
 
+/* Reject QDWIN_FORWARD_BIN unless it is a regular file owned by root
+ * with no group/world write bits — matches qdlocker config-hardening
+ * predicate. Compositor process may be reached by the session user, so
+ * a writable forwarder would let them inject code into the compositor's
+ * forked child. */
+static int
+qdwin_forward_bin_is_trusted(const char *path)
+{
+	struct stat st;
+	if (lstat(path, &st) != 0) {
+		weston_log("qdwin: WARN QDWIN_FORWARD_BIN=%s lstat failed: %m; "
+			   "falling back to compiled-in path\n", path);
+		return 0;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		weston_log("qdwin: WARN QDWIN_FORWARD_BIN=%s is not a regular "
+			   "file; falling back to compiled-in path\n", path);
+		return 0;
+	}
+	if (st.st_uid != 0) {
+		weston_log("qdwin: WARN QDWIN_FORWARD_BIN=%s not owned by root "
+			   "(uid=%u); falling back to compiled-in path\n",
+			   path, (unsigned)st.st_uid);
+		return 0;
+	}
+	if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+		weston_log("qdwin: WARN QDWIN_FORWARD_BIN=%s is group/world-"
+			   "writable; falling back to compiled-in path\n", path);
+		return 0;
+	}
+	return 1;
+}
+
 static const char *
 qdwin_forward_bin_path(void)
 {
 	const char *env = getenv("QDWIN_FORWARD_BIN");
-	if (env && *env)
+	if (env && *env && qdwin_forward_bin_is_trusted(env))
 		return env;
 	return "/usr/bin/qdistro-forward";
 }
@@ -5841,6 +5903,7 @@ bind_qdwin_locker(struct wl_client *client, void *data,
 		   (int)pid, (unsigned)uid,
 		   (unsigned)qdwin->allowed_locker_uid);
 
+	/* TODO production hardening: see qdlocker/protocol/qdwin-locker-v1.xml — additional exe/SELinux checks intentionally out of scope here. */
 	if (uid != qdwin->allowed_locker_uid) {
 		wl_client_post_implementation_error(client,
 			"qdwin_locker_v1: uid %u not permitted "
@@ -10242,7 +10305,11 @@ qdwin_activation_activate(struct wl_client *client,
 	struct qdwin_activation_pending *ap =
 		calloc(1, sizeof *ap);
 	if (!ap) {
-		qdwin_activation_perform(qdwin, tl, t);  /* fall back */
+		/* fail closed on alloc failure: gated activation must not auto-allow */
+		weston_log("qdwin: activation_pending calloc failed → deny "
+			   "(token consumed) app_id=%s\n",
+			   t->app_id ? t->app_id : "(none)");
+		qdwin_activation_token_free(t);
 		return;
 	}
 	ap->qdwin = qdwin;
@@ -11544,6 +11611,16 @@ struct qdwin_secctx_client {
 	char *sandbox_engine;
 	char *app_id;
 	char *instance_id;
+	/* Option-B identity tuple, snapshotted at accept-time so the broker
+	 * can re-verify the live process against /proc at decision time.
+	 * (peer_pid, peer_starttime) is the anti-PID-reuse key; peer_exe
+	 * and peer_selinux_label are empty if unreadable. See
+	 * todo/decisions/secctx-identity-contract.md. */
+	uint32_t peer_pid;
+	uint64_t peer_starttime;
+	uint32_t peer_uid;
+	char *peer_exe;
+	char *peer_selinux_label;
 	struct wl_listener client_destroy_listener;
 	struct wl_list link;                /* qdwin::secctx_clients */
 };
@@ -11576,6 +11653,16 @@ static const char *qdwin_secctx_client_app_id(struct qdwin_secctx_client *sc)
 { return sc && sc->app_id ? sc->app_id : ""; }
 static const char *qdwin_secctx_client_instance_id(struct qdwin_secctx_client *sc)
 { return sc && sc->instance_id ? sc->instance_id : ""; }
+static uint32_t qdwin_secctx_client_peer_pid(struct qdwin_secctx_client *sc)
+{ return sc ? sc->peer_pid : 0; }
+static uint64_t qdwin_secctx_client_peer_starttime(struct qdwin_secctx_client *sc)
+{ return sc ? sc->peer_starttime : 0; }
+static uint32_t qdwin_secctx_client_peer_uid(struct qdwin_secctx_client *sc)
+{ return sc ? sc->peer_uid : 0; }
+static const char *qdwin_secctx_client_peer_exe(struct qdwin_secctx_client *sc)
+{ return sc && sc->peer_exe ? sc->peer_exe : ""; }
+static const char *qdwin_secctx_client_peer_selinux_label(struct qdwin_secctx_client *sc)
+{ return sc && sc->peer_selinux_label ? sc->peer_selinux_label : ""; }
 
 static void
 qdwin_secctx_client_on_destroy(struct wl_listener *l, void *data)
@@ -11588,7 +11675,102 @@ qdwin_secctx_client_on_destroy(struct wl_listener *l, void *data)
 	free(sc->sandbox_engine);
 	free(sc->app_id);
 	free(sc->instance_id);
+	free(sc->peer_exe);
+	free(sc->peer_selinux_label);
 	free(sc);
+}
+
+/* Option-B identity capture helpers. Read /proc/<pid>/stat field 22
+ * (starttime, the kernel's PID-reuse-safe pinning value), /proc/<pid>/exe
+ * (resolved), and /proc/<pid>/attr/current (SELinux label). All return
+ * a heap-allocated string the caller must free; readlink/read errors
+ * map to an empty string so downstream consumers see "unverifiable" not
+ * "spoofed". starttime is read into a uint64. */
+static uint64_t
+qdwin_proc_starttime(pid_t pid)
+{
+	if (pid <= 0)
+		return 0;
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	char buf[2048];
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	/* The `comm` field is parenthesised and may contain spaces; skip
+	 * past the *last* ')' so subsequent space-tokenisation is safe. */
+	char *p = strrchr(buf, ')');
+	if (!p)
+		return 0;
+	p++;
+	/* After the ')' there's a leading space then field 3 (state).
+	 * Field 22 (starttime) is the 20th whitespace-separated token after
+	 * the ')'. */
+	int field = 2;  /* the ')' itself is field 2 */
+	while (*p && field < 22) {
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			return 0;
+		field++;
+		if (field == 22)
+			break;
+		while (*p && *p != ' ' && *p != '\t')
+			p++;
+	}
+	if (field != 22)
+		return 0;
+	unsigned long long v = 0;
+	while (*p >= '0' && *p <= '9') {
+		v = v * 10 + (unsigned)(*p - '0');
+		p++;
+	}
+	return (uint64_t)v;
+}
+
+static char *
+qdwin_proc_exe(pid_t pid)
+{
+	if (pid <= 0)
+		return strdup("");
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/exe", (int)pid);
+	char buf[PATH_MAX];
+	ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+	if (n <= 0)
+		return strdup("");
+	buf[n] = '\0';
+	return strdup(buf);
+}
+
+static char *
+qdwin_proc_selinux_label(pid_t pid)
+{
+	if (pid <= 0)
+		return strdup("");
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/attr/current", (int)pid);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return strdup("");
+	char buf[512];
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return strdup("");
+	buf[n] = '\0';
+	/* Kernel appends a trailing NUL or newline; strip any trailing
+	 * whitespace/NUL bytes so the broker's string compare is stable. */
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\0' ||
+			 buf[n - 1] == ' ' || buf[n - 1] == '\r')) {
+		buf[--n] = '\0';
+	}
+	return strdup(buf);
 }
 
 static int
@@ -11628,6 +11810,22 @@ qdwin_secctx_listen_cb(int fd, uint32_t mask, void *data)
 	sc->sandbox_engine = sec->sandbox_engine ? strdup(sec->sandbox_engine) : NULL;
 	sc->app_id         = sec->app_id         ? strdup(sec->app_id)         : NULL;
 	sc->instance_id    = sec->instance_id    ? strdup(sec->instance_id)    : NULL;
+	/* Option-B identity capture: SO_PEERCRED on the accepted socket
+	 * gives us the (pid, uid) the kernel pinned at connect-time, which
+	 * the broker re-verifies against /proc at decision time. We snapshot
+	 * starttime + exe + SELinux label here because the underlying
+	 * process may exit before the broker call; the snapshot lets the
+	 * broker still detect "the process is gone" vs "it changed identity". */
+	pid_t peer_pid = 0;
+	uid_t peer_uid = 0;
+	gid_t peer_gid_unused = 0;
+	wl_client_get_credentials(new_client, &peer_pid, &peer_uid,
+				  &peer_gid_unused);
+	sc->peer_pid = (uint32_t)peer_pid;
+	sc->peer_uid = (uint32_t)peer_uid;
+	sc->peer_starttime = qdwin_proc_starttime(peer_pid);
+	sc->peer_exe = qdwin_proc_exe(peer_pid);
+	sc->peer_selinux_label = qdwin_proc_selinux_label(peer_pid);
 	sc->client_destroy_listener.notify = qdwin_secctx_client_on_destroy;
 	wl_client_add_destroy_listener(new_client,
 				       &sc->client_destroy_listener);
@@ -12194,6 +12392,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * (waybar, Quickshell/noctalia, eww, fuzzel, mako, swaylock).
 	 * Stub stage — accepts the protocol and completes configure/ack
 	 * but does not lay out or render yet. See impl block above. */
+	/* Test aperture: unconditional public bind. Production posture documented in qdwin/doc/protocol.md §"Production posture: layer-shell is a test aperture". */
 	wl_list_init(&qdwin->layer_surfaces);
 	qdwin->layer_shell_global = wl_global_create(
 		ec->wl_display, &zwlr_layer_shell_v1_interface,
@@ -12243,8 +12442,21 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	/* Enables the weston-screenshooter CLI for capture during
 	 * development; safe to call even if the symbol is missing
 	 * from some hypothetical alternative weston build (the library
-	 * loader fails fast at module load, not here). */
-	screenshooter_create(ec);
+	 * loader fails fast at module load, not here). Gated to dev-only:
+	 * the screenshooter exposes whole-output capture outside qdwin's
+	 * per-view stream authorization model and must not ship enabled. */
+	{
+		const char *ss_env = getenv("QDWIN_ENABLE_SCREENSHOOTER");
+		int ss_enabled = ss_env && (strcmp(ss_env, "1") == 0 ||
+					    strcasecmp(ss_env, "true") == 0 ||
+					    strcasecmp(ss_env, "yes") == 0);
+		if (ss_enabled) {
+			weston_log("qdwin: WARNING screenshooter enabled via "
+				   "QDWIN_ENABLE_SCREENSHOOTER — dev/test only, "
+				   "do not use in production\n");
+			screenshooter_create(ec);
+		}
+	}
 
 	/* §6.8 S1: nested-mode publisher init. No-op unless
 	 * QDWIN_NESTED_MODE=1 in env. Must run after compositor + outputs

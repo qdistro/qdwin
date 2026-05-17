@@ -97,6 +97,28 @@ Built-in, registered by qdwin-shell.so:
   through `wl_socket_create_listener` mode.
 - **tablet-v2** — referenced by `cursor-shape-v1`; not used standalone.
 
+### Production posture: layer-shell is a test aperture
+
+`zwlr_layer_shell_v1` is currently registered as an unconditional public
+global. Any same-session client can create overlay/top layer surfaces
+and can request `EXCLUSIVE` keyboard interactivity, which qdwin will
+honour by handing it the seat keyboard focus. This is intentional for
+bring-up and smoke-testing with waybar, fuzzel, mako, swaylock, and
+gtk-layer-shell-based bars.
+
+It is **not** a production-safe default. In a hardened production
+session, either:
+
+- the compositor socket must be reachable only via trusted-launcher /
+  systemd-unit / SELinux confinement so untrusted clients cannot bind
+  any global, or
+- layer-shell `bind` must be gated by uid/exe/SELinux label (analogous
+  to the locker global), or kept behind an explicit config switch with
+  `EXCLUSIVE` / high-layer requests denied for untrusted clients.
+
+See `todo/qdistro-qdwin-wider-codex-review.md` finding #4 and
+`todo/qdwin-codex-review.md` finding #1 for the full context.
+
 ## Source of truth
 
 `qdwin/qdwin-shell-v1.xml` is the single authoritative description

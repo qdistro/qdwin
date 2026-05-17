@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="21">
+  <interface name="qdwin_shell_v1" version="22">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -104,6 +104,14 @@
       active overlay grab. Used for Super+Space → launcher, Super+L →
       lock, etc. — any time a key combo should reach the shell without
       an existing overlay surface to take focus.
+
+      Version 22 adds `toplevel_peer_identity`, a sidecar to v13's
+      `toplevel_security_context` carrying the stable process identity
+      of the backing wl_client so qdshell and the broker can re-verify
+      the secctx-asserted silo at decision time (see todo/decisions/
+      secctx-identity-contract.md — Option B "broker-attested"). The
+      event is purely additive; v21- shells keep getting only the
+      string-tuple secctx event and continue to trust it as before.
 
       Version 18 adds `attach_background`: the shell registers a
       fullscreen wl_surface as the desktop background, replacing
@@ -962,6 +970,43 @@
            summary="from wp_security_context_v1.set_app_id"/>
       <arg name="instance_id" type="string"
            summary="from wp_security_context_v1.set_instance_id"/>
+    </event>
+
+    <event name="toplevel_peer_identity" since="22">
+      <description summary="stable process identity for a secctx toplevel">
+        Sidecar to `toplevel_security_context`. Fires immediately after
+        it (for the same toplevel handle) and carries the compositor-
+        observed peer identity of the toplevel's backing wl_client at
+        bind time. Lets qdshell forward the tuple to the qdistro admin
+        broker, which re-resolves the live process against /proc and
+        confirms the silo string the client asserted via
+        `wp_security_context_v1` actually matches a process that
+        still has that exe / SELinux label / starttime — closing the
+        same-uid spoof window that v13's string-only event leaves open.
+
+        All five args are present; empty strings/zeros mean the
+        compositor could not read that field (kernel/SELinux off, or
+        the process exited between bind and event flush). Consumers
+        MUST treat empty `peer_exe` or empty `peer_selinux_label` as
+        "unverifiable on this axis" rather than as a wildcard match.
+
+        The (peer_pid, peer_starttime) pair is the minimum sufficient
+        anti-reuse key — broker checks must compare BOTH.
+      </description>
+      <arg name="handle" type="uint"
+           summary="from toplevel_added / toplevel_security_context"/>
+      <arg name="peer_pid" type="uint"
+           summary="SO_PEERCRED pid of the wl_client at bind time"/>
+      <arg name="peer_starttime" type="uint"
+           summary="/proc/&lt;pid&gt;/stat field 22 (low 32 bits)"/>
+      <arg name="peer_starttime_hi" type="uint"
+           summary="/proc/&lt;pid&gt;/stat field 22 (high 32 bits)"/>
+      <arg name="peer_uid" type="uint"
+           summary="SO_PEERCRED uid of the wl_client at bind time"/>
+      <arg name="peer_exe" type="string"
+           summary="readlink /proc/&lt;pid&gt;/exe; empty if unreadable"/>
+      <arg name="peer_selinux_label" type="string"
+           summary="contents of /proc/&lt;pid&gt;/attr/current; empty when SELinux off"/>
     </event>
 
     <event name="seat_focus_changed" since="14">
