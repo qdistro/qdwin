@@ -1,9 +1,11 @@
 # 04 — content client hangs; chrome stays responsive
 
 **What**: SIGSTOP the content process (weston-terminal) and verify
-that qdshell's chrome is still responsive — `state 1` returns
-promptly, `min 1` succeeds at the protocol level (qdwin moves the
-view to `minimized_layer`), and the screenshot reflects the change.
+that qdshell's chrome is still responsive — `ctrl.sh state 1` returns
+promptly (it scrapes `qdshell.log`, which only stays current if the
+bystander keeps emitting `toplevel_state` lines), `min 1` succeeds at
+the protocol level (qdwin moves the view to `minimized_layer`), and
+the screenshot reflects the change.
 Then SIGCONT and verify nothing broke.
 
 **Why**: this is the canonical demonstration of the chrome/content
@@ -49,8 +51,14 @@ $HT/ctrl.sh $ID state 1
 ```
 
 **Assert (qdshell alive):**
-- `list` returns the toplevel within ~1 second; doesn't hang.
-- `state 1` returns `0x0`. Both replies start with `ok`.
+- `list` returns within ~1 second; doesn't hang. Its `ok` is from
+  ctrl.sh acknowledging the FIFO write (timeout 5s) — the actual
+  toplevel handles land in `qdshell.log` as
+  `qdwin-bystander: tracked toplevels: 1`.
+- `ctrl.sh $ID state 1` prints `ok state=0x0` (scraped from
+  `qdshell.log`).
+- Both ctrl.sh invocations print a line starting with `ok` on
+  stdout.
 
 ### S3 — minimise the hung window
 
@@ -68,7 +76,7 @@ $HT/ctrl.sh $ID state 1
   to the hidden layer regardless of the content client's state.
   The compositor doesn't wait for the client to ACK anything; the
   view simply isn't composited any more.
-- `state 1` returns `0x4` (minimised bit).
+- `ctrl.sh $ID state 1` prints `ok state=0x4` (minimised bit).
 
 ### S4 — un-hang and un-minimise
 
@@ -88,7 +96,7 @@ $HT/ctrl.sh $ID state 1
 - Terminal prompt visible inside (the SIGCONT'd process is
   responsive again — its surface keeps the buffer it last
   committed before the STOP, so the prompt is unchanged).
-- `state 1` returns `0x0`.
+- `ctrl.sh $ID state 1` prints `ok state=0x0`.
 
 ## Teardown
 
@@ -104,9 +112,10 @@ $HT/stop.sh $ID
 - The "ctrl-socket responds quickly" assertion (S2) is structural —
   if qdshell were sharing an event loop with the content client, a
   SIGSTOP'd terminal would back-pressure the wayland connection and
-  qdshell's reads would block. The fact that ctrl.sh returns
-  promptly is the assertion's main evidence; a stopwatch isn't
-  required, but if `ctrl.sh` itself hangs for >5s, FAIL.
+  qdshell's reads would block. ctrl.sh wraps the FIFO write in
+  `timeout 5`; a dead-or-frozen bystander therefore manifests as a
+  fast non-zero exit (exit 124 from timeout) rather than an infinite
+  hang. If ctrl.sh exits non-zero in S2, FAIL.
 - If S3's screenshot still shows the terminal (the minimise was
   ignored), FAIL — that's a real bug in the compositor: it should
   not wait for the client to acknowledge a hide.

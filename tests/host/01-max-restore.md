@@ -60,7 +60,11 @@ $HT/ctrl.sh $ID state 1
   outer rectangle reaches all four screen edges).
 - Cyan border still visible at the screen edges (qdshell chrome
   follows the resize).
-- `state 1` reply contains `0x1` (bit 0 = QDWIN_TS_MAXIMIZED).
+- `ctrl.sh $ID state 1` prints `ok state=0x1` (bit 0 = QDWIN_TS_MAXIMIZED).
+  Note: `state` is a query synthesised by ctrl.sh — it scrapes the
+  most recent `toplevel_state handle=1 state=0x..` line from
+  `qdshell.log` (where the bystander logs every state change emitted
+  by the compositor). It does NOT round-trip through the command FIFO.
 - Black background outside the window is gone — there's no
   unfilled space.
 
@@ -79,7 +83,8 @@ $HT/ctrl.sh $ID state 1
 - Window is back at the small windowed size from baseline (S1).
 - Black background is visible again on the right + bottom.
 - Cyan chrome present on left + bottom edges.
-- `state 1` reply contains `0x0` (no flags).
+- `ctrl.sh $ID state 1` prints `ok state=0x0` (no flags). See the
+  scraping note under S2.
 
 ## Teardown
 

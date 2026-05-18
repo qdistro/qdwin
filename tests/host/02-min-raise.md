@@ -47,7 +47,10 @@ $HT/ctrl.sh $ID state 1
 - The framebuffer is **entirely black** (or the compositor's
   background colour) — no terminal text, no titlebar, no cyan
   border, no chrome of any kind.
-- `state 1` reply contains `0x4` (bit 2 = QDWIN_TS_MINIMIZED).
+- `ctrl.sh $ID state 1` prints `ok state=0x4` (bit 2 = QDWIN_TS_MINIMIZED).
+  Note: `state` is a query synthesised by ctrl.sh — it scrapes the
+  most recent `toplevel_state handle=1 state=0x..` line from
+  `qdshell.log` rather than round-tripping through the command FIFO.
 
 ### S3 — raise (un-minimise)
 
@@ -64,7 +67,8 @@ $HT/ctrl.sh $ID state 1
 - Window is back at the same position + size as the baseline.
 - Cyan chrome visible on the same edges.
 - Terminal prompt visible inside.
-- `state 1` reply contains `0x0`.
+- `ctrl.sh $ID state 1` prints `ok state=0x0`. See the scraping note
+  under S2.
 
 ## Teardown
 
