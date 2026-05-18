@@ -10051,6 +10051,12 @@ struct qdwin_activation_token {
 	int used;
 };
 
+/* Defined below the qdwin_activation_pending struct — clears any
+ * `ap->token == t` back-references so freeing `t` here can't leave
+ * a dangling pointer on the pending list. */
+static void qdwin_activation_pending_drop_token_refs(
+	struct qdwin *qdwin, struct qdwin_activation_token *t);
+
 static void
 qdwin_activation_token_free(struct qdwin_activation_token *t)
 {
@@ -10066,6 +10072,16 @@ qdwin_activation_token_free(struct qdwin_activation_token *t)
 	 * SEGVs in wl_list_remove. */
 	if (t->token_resource)
 		wl_resource_set_user_data(t->token_resource, NULL);
+	/* The token may also be referenced from a pending activation
+	 * (`ap->token`) that's still waiting on a shell decision or
+	 * its 10s safety timeout. If the client destroys the token
+	 * resource OR a perform/cancel path frees `t` while an `ap`
+	 * still owns it, the next `qdwin_activation_pending_free`
+	 * would call `qdwin_activation_token_free(ap->token)` on the
+	 * already-freed `t` and SEGV in `wl_list_remove(&t->link)`.
+	 * The pending-struct layout is defined further down; defer
+	 * the back-reference scrub to a helper below. */
+	qdwin_activation_pending_drop_token_refs(t->qdwin, t);
 	free(t->token);
 	free(t->app_id);
 	free(t);
@@ -10280,6 +10296,17 @@ struct qdwin_activation_pending {
 	struct wl_event_source *timeout_source;
 	struct wl_list link;  /* qdwin::activation_pending */
 };
+
+static void
+qdwin_activation_pending_drop_token_refs(struct qdwin *qdwin,
+					 struct qdwin_activation_token *t)
+{
+	struct qdwin_activation_pending *ap;
+	wl_list_for_each(ap, &qdwin->activation_pending, link) {
+		if (ap->token == t)
+			ap->token = NULL;
+	}
+}
 
 static void
 qdwin_activation_pending_free(struct qdwin_activation_pending *ap)
@@ -10898,59 +10925,76 @@ qdwin_nested_input_sink_peer_cb(int fd, uint32_t mask, void *data)
 		}
 		return 0;
 	}
-	uint8_t version = 0, payload[256];
-	uint16_t plen = 0;
-	int et = qdwin_nested_input_sink_read_one(tl->nested_input_sink,
-		&version, &plen, payload, sizeof payload);
-	if (et < 0)
-		return 0;
-	switch (et) {
-	case QDNI_EVENT_PING:
-		weston_log("qdwin/nested: input-sink PING handle=%u "
-			   "version=%u (S3 wire-format proven)\n",
-			   tl->handle, (unsigned)version);
-		break;
-	case QDNI_EVENT_MOTION:
-		if (plen < sizeof(struct qdni_motion_payload)) break;
-		qdwin_nested_dispatch_motion(tl,
-			(const struct qdni_motion_payload *)payload);
-		if (getenv("QDWIN_NESTED_INPUT_DEBUG"))
-			weston_log("qdwin/nested: motion handle=%u\n", tl->handle);
-		break;
-	case QDNI_EVENT_BUTTON: {
-		if (plen < sizeof(struct qdni_button_payload)) break;
-		const struct qdni_button_payload *p =
-			(const struct qdni_button_payload *)payload;
-		qdwin_nested_dispatch_button(tl, p);
-		weston_log("qdwin/nested: button handle=%u btn=0x%x state=%u\n",
-			   tl->handle, p->button, p->state);
-		break;
-	}
-	case QDNI_EVENT_KEY: {
-		if (plen < sizeof(struct qdni_key_payload)) break;
-		const struct qdni_key_payload *p =
-			(const struct qdni_key_payload *)payload;
-		qdwin_nested_dispatch_key(tl, p);
-		weston_log("qdwin/nested: key handle=%u key=%u state=%u\n",
-			   tl->handle, p->key, p->state);
-		break;
-	}
-	case QDNI_EVENT_AXIS:
-		if (plen < sizeof(struct qdni_axis_payload)) break;
-		qdwin_nested_dispatch_axis(tl,
-			(const struct qdni_axis_payload *)payload);
-		break;
-	case QDNI_EVENT_FOCUS:
-		if (plen < sizeof(struct qdni_focus_payload)) break;
-		weston_log("qdwin/nested: focus handle=%u focused=%u\n",
-			   tl->handle,
-			   ((const struct qdni_focus_payload *)payload)->focused);
-		break;
-	default:
-		weston_log("qdwin/nested: input-sink unknown event_type=%d "
-			   "plen=%u handle=%u\n",
-			   et, (unsigned)plen, tl->handle);
-		break;
+	/* §6.8 Round-8 fix: drain the per-peer buffer until the parser
+	 * reports QDWIN_NESTED_INPUT_SINK_AGAIN (not enough bytes for the
+	 * next full packet). The outer sends the S3b burst as ~9 packets
+	 * back-to-back; on a SOCK_STREAM they typically arrive in a single
+	 * readable notification, so reading just one packet per callback
+	 * used to drop the trailing packets unless the event loop happened
+	 * to re-trigger (the ~50% Round-7 flake). */
+	for (;;) {
+		uint8_t version = 0, payload[256];
+		uint16_t plen = 0;
+		int et = qdwin_nested_input_sink_read_one(
+			tl->nested_input_sink,
+			&version, &plen, payload, sizeof payload);
+		if (et == QDWIN_NESTED_INPUT_SINK_AGAIN)
+			break;
+		if (et < 0)
+			return 0;
+		switch (et) {
+		case QDNI_EVENT_PING:
+			weston_log("qdwin/nested: input-sink PING handle=%u "
+				   "version=%u (S3 wire-format proven)\n",
+				   tl->handle, (unsigned)version);
+			break;
+		case QDNI_EVENT_MOTION:
+			if (plen < sizeof(struct qdni_motion_payload)) break;
+			qdwin_nested_dispatch_motion(tl,
+				(const struct qdni_motion_payload *)payload);
+			if (getenv("QDWIN_NESTED_INPUT_DEBUG"))
+				weston_log("qdwin/nested: motion handle=%u\n",
+					   tl->handle);
+			break;
+		case QDNI_EVENT_BUTTON: {
+			if (plen < sizeof(struct qdni_button_payload)) break;
+			const struct qdni_button_payload *p =
+				(const struct qdni_button_payload *)payload;
+			qdwin_nested_dispatch_button(tl, p);
+			weston_log("qdwin/nested: button handle=%u "
+				   "btn=0x%x state=%u\n",
+				   tl->handle, p->button, p->state);
+			break;
+		}
+		case QDNI_EVENT_KEY: {
+			if (plen < sizeof(struct qdni_key_payload)) break;
+			const struct qdni_key_payload *p =
+				(const struct qdni_key_payload *)payload;
+			qdwin_nested_dispatch_key(tl, p);
+			weston_log("qdwin/nested: key handle=%u "
+				   "key=%u state=%u\n",
+				   tl->handle, p->key, p->state);
+			break;
+		}
+		case QDNI_EVENT_AXIS:
+			if (plen < sizeof(struct qdni_axis_payload)) break;
+			qdwin_nested_dispatch_axis(tl,
+				(const struct qdni_axis_payload *)payload);
+			break;
+		case QDNI_EVENT_FOCUS:
+			if (plen < sizeof(struct qdni_focus_payload)) break;
+			weston_log("qdwin/nested: focus handle=%u "
+				   "focused=%u\n",
+				   tl->handle,
+				   ((const struct qdni_focus_payload *)
+				    payload)->focused);
+			break;
+		default:
+			weston_log("qdwin/nested: input-sink unknown "
+				   "event_type=%d plen=%u handle=%u\n",
+				   et, (unsigned)plen, tl->handle);
+			break;
+		}
 	}
 	return 1;
 }

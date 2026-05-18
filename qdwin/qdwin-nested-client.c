@@ -368,6 +368,7 @@ qdwin_nested_input_sink_accept(struct qdwin_nested_input_sink *sink)
 	if (sink->peer_fd >= 0)
 		close(sink->peer_fd);
 	sink->peer_fd = fd;
+	sink->rbuf_used = 0;
 	return 0;
 }
 
@@ -380,28 +381,52 @@ qdwin_nested_input_sink_read_one(struct qdwin_nested_input_sink *sink,
 {
 	if (!sink || sink->peer_fd < 0)
 		return -1;
-	uint8_t hdr[8];
-	ssize_t got = recv(sink->peer_fd, hdr, sizeof hdr, MSG_WAITALL);
-	if (got != (ssize_t)sizeof hdr)
-		return -1;
+	/* §6.8 Round-8 fix: pull whatever the kernel has buffered into
+	 * our accumulation buffer first. A single recv() may return any
+	 * mixture of partial-header / partial-payload / multiple-packets
+	 * on a SOCK_STREAM; we then parse exactly one full packet out
+	 * and shift the remainder. Returns -2 if we need more bytes. */
+	if (sink->rbuf_used < sizeof sink->rbuf) {
+		ssize_t got = recv(sink->peer_fd,
+				   sink->rbuf + sink->rbuf_used,
+				   sizeof sink->rbuf - sink->rbuf_used,
+				   MSG_DONTWAIT);
+		if (got > 0) {
+			sink->rbuf_used += (size_t)got;
+		} else if (got == 0) {
+			/* Peer closed and no buffered bytes left. */
+			if (sink->rbuf_used == 0)
+				return -1;
+		} else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+			   errno != EINTR) {
+			return -1;
+		}
+	}
+	if (sink->rbuf_used < 8)
+		return QDWIN_NESTED_INPUT_SINK_AGAIN;
 	uint32_t magic;
-	memcpy(&magic, hdr, 4);
+	memcpy(&magic, sink->rbuf, 4);
 	if (magic != QDNI_MAGIC)
 		return -1;
-	if (out_version)
-		*out_version = hdr[4];
-	uint8_t event_type = hdr[5];
+	uint8_t  version = sink->rbuf[4];
+	uint8_t  event_type = sink->rbuf[5];
 	uint16_t plen;
-	memcpy(&plen, hdr + 6, 2);
+	memcpy(&plen, sink->rbuf + 6, 2);
+	if (plen > payload_buf_size || (size_t)plen > sizeof sink->rbuf - 8)
+		return -1;
+	if (sink->rbuf_used < (size_t)8 + plen)
+		return QDWIN_NESTED_INPUT_SINK_AGAIN;
+	if (out_version)
+		*out_version = version;
 	if (out_payload_len)
 		*out_payload_len = plen;
-	if (plen > 0) {
-		if (plen > payload_buf_size)
-			return -1;
-		got = recv(sink->peer_fd, payload_buf, plen, MSG_WAITALL);
-		if (got != (ssize_t)plen)
-			return -1;
-	}
+	if (plen > 0)
+		memcpy(payload_buf, sink->rbuf + 8, plen);
+	size_t consumed = 8 + plen;
+	if (sink->rbuf_used > consumed)
+		memmove(sink->rbuf, sink->rbuf + consumed,
+			sink->rbuf_used - consumed);
+	sink->rbuf_used -= consumed;
 	return event_type;
 }
 

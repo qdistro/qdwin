@@ -26,6 +26,13 @@ struct qdwin_nested_input_sink {
 	int listen_fd;
 	int peer_fd;       /* -1 until accept */
 	char *socket_path;
+	/* §6.8 Round-8 fix: per-peer accumulation buffer. The outer can
+	 * blast multiple packets in rapid succession; SOCK_STREAM splits
+	 * them at the kernel's whim. read_one accumulates into rbuf and
+	 * returns -2 (would-block) when a full packet isn't yet ready so
+	 * the caller knows to stop looping but keep the source armed. */
+	uint8_t rbuf[8 + 256];
+	size_t rbuf_used;
 };
 
 struct qdwin_nested_input_sink *
@@ -35,7 +42,10 @@ void qdwin_nested_input_sink_close(struct qdwin_nested_input_sink *sink);
  * success (peer_fd populated), -1 on transient/permanent error. */
 int qdwin_nested_input_sink_accept(struct qdwin_nested_input_sink *sink);
 /* Read one packet header + payload. Returns the event_type byte on
- * success or -1 on read error / closed peer. */
+ * success, -1 on read error / closed peer, or -2 when not enough
+ * bytes are buffered yet (caller should stop the drain loop and wait
+ * for the next FD-readable notification). */
+#define QDWIN_NESTED_INPUT_SINK_AGAIN (-2)
 int qdwin_nested_input_sink_read_one(struct qdwin_nested_input_sink *sink,
 				     uint8_t *out_version,
 				     uint16_t *out_payload_len,
