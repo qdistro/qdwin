@@ -3206,7 +3206,7 @@ qdwin_view_stream_unpin(struct qdwin_view_stream *s)
 }
 
 /* Hex-encode n random bytes into out (out_len must be 2*n+1). */
-static void
+static int
 qdwin_hex_token(char *out, size_t out_len, size_t n_bytes)
 {
 	unsigned char buf[32];
@@ -3214,9 +3214,8 @@ qdwin_hex_token(char *out, size_t out_len, size_t n_bytes)
 		n_bytes = sizeof buf;
 	ssize_t got = getrandom(buf, n_bytes, 0);
 	if (got != (ssize_t)n_bytes) {
-		/* Degraded fallback — not cryptographic. Logged by caller. */
-		for (size_t i = 0; i < n_bytes; i++)
-			buf[i] = (unsigned char)rand();
+		out[0] = '\0';
+		return -1;
 	}
 	static const char hex[] = "0123456789abcdef";
 	size_t slots = (out_len - 1) / 2;
@@ -3227,6 +3226,7 @@ qdwin_hex_token(char *out, size_t out_len, size_t n_bytes)
 		out[2*i + 1] = hex[buf[i] & 0xf];
 	}
 	out[2*slots] = '\0';
+	return 0;
 }
 
 /* Reject QDWIN_FORWARD_BIN unless it is a regular file owned by root
@@ -3271,17 +3271,55 @@ qdwin_forward_bin_path(void)
 	return "/usr/bin/qdistro-forward";
 }
 
-static void
+static int
+qdwin_forward_write_secret(int fd, const char *secret)
+{
+	const char *p = secret ? secret : "";
+	size_t left = strlen(p);
+
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	return 0;
+}
+
+static int
 qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 				const char *pw_node_name,
 				int view_width, int view_height)
 {
+	int token_pipe[2] = { -1, -1 };
+	int password_pipe[2] = { -1, -1 };
+	if (pipe(token_pipe) != 0) {
+		weston_log("qdwin: pipe failed for qdistro-forward token: %m\n");
+		return -1;
+	}
+	if (pipe(password_pipe) != 0) {
+		weston_log("qdwin: pipe failed for qdistro-forward password: %m\n");
+		close(token_pipe[0]);
+		close(token_pipe[1]);
+		return -1;
+	}
+
 	pid_t pid = fork();
 	if (pid < 0) {
 		weston_log("qdwin: fork failed for qdistro-forward: %m\n");
-		return;
+		close(token_pipe[0]);
+		close(token_pipe[1]);
+		close(password_pipe[0]);
+		close(password_pipe[1]);
+		return -1;
 	}
 	if (pid == 0) {
+		close(token_pipe[1]);
+		close(password_pipe[1]);
 		/* Child. Reset signal handlers weston installed on our behalf. */
 		signal(SIGPIPE, SIG_DFL);
 		signal(SIGTERM, SIG_DFL);
@@ -3298,27 +3336,51 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 		sigprocmask(SIG_SETMASK, &empty, NULL);
 
 		char port_arg[16];
+		char token_fd_arg[16];
+		char password_fd_arg[16];
 		char width_arg[16];
 		char height_arg[16];
 		snprintf(port_arg,   sizeof port_arg,   "%u", s->rdp_port);
+		snprintf(token_fd_arg, sizeof token_fd_arg, "%d", token_pipe[0]);
+		snprintf(password_fd_arg, sizeof password_fd_arg, "%d", password_pipe[0]);
 		snprintf(width_arg,  sizeof width_arg,  "%d", view_width  > 0 ? view_width  : 640);
 		snprintf(height_arg, sizeof height_arg, "%d", view_height > 0 ? view_height : 480);
 
 		const char *bin = qdwin_forward_bin_path();
 		execl(bin, bin,
 		      "--pipewire-node", pw_node_name,
-		      "--access-token", s->access_token,
+		      "--access-token-fd", token_fd_arg,
 		      "--rdp-port", port_arg,
-		      "--rdp-password", s->rdp_password,
+		      "--rdp-password-fd", password_fd_arg,
+		      "--wayland-display", "wayland-0",
 		      "--width", width_arg,
 		      "--height", height_arg,
 		      (char *)NULL);
 		fprintf(stderr, "exec %s failed: %m\n", bin);
 		_exit(127);
 	}
+	int secret_write_failed = 0;
+	if (qdwin_forward_write_secret(token_pipe[1], s->access_token) < 0) {
+		weston_log("qdwin: writing qdistro-forward token failed: %m\n");
+		secret_write_failed = 1;
+	}
+	if (qdwin_forward_write_secret(password_pipe[1], s->rdp_password) < 0) {
+		weston_log("qdwin: writing qdistro-forward password failed: %m\n");
+		secret_write_failed = 1;
+	}
+	close(token_pipe[1]);
+	close(password_pipe[1]);
+	close(token_pipe[0]);
+	close(password_pipe[0]);
+	if (secret_write_failed) {
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, WNOHANG);
+		return -1;
+	}
 	s->forward_pid = pid;
 	weston_log("qdwin: spawned qdistro-forward pid=%d port=%u node=%s\n",
 		   (int)pid, s->rdp_port, pw_node_name);
+	return 0;
 }
 
 static void
@@ -3460,8 +3522,17 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 	 * fit; for now we always use the pipewire output's size. */
 	(void)desired_width; (void)desired_height;
 	s->rdp_port = qdwin->next_stream_port++;
-	qdwin_hex_token(s->access_token, sizeof s->access_token, 16);
-	qdwin_hex_token(s->rdp_password, sizeof s->rdp_password, 8);
+	if (qdwin_hex_token(s->access_token, sizeof s->access_token, 16) < 0 ||
+	    qdwin_hex_token(s->rdp_password, sizeof s->rdp_password, 8) < 0) {
+		qdwin_view_stream_v1_send_denied(
+			stream_resource,
+			"kernel random source unavailable");
+		weston_log("qdwin: subscribe_view_stream denied "
+			   "handle=%u peer_label=\"%s\" (getrandom failed)\n",
+			   handle, peer_label ? peer_label : "");
+		wl_resource_destroy(stream_resource);
+		return;
+	}
 
 	/* Bring the per-stream virtual input device up before we advertise
 	 * the stream to the subscriber — once the wl_client sees the
@@ -3472,7 +3543,13 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 		? pw->current_mode->width  : 640;
 	int spawn_h = (pw->current_mode && pw->current_mode->height > 0)
 		? pw->current_mode->height : 480;
-	qdwin_view_stream_spawn_forward(s, node_name, spawn_w, spawn_h);
+	if (qdwin_view_stream_spawn_forward(s, node_name, spawn_w, spawn_h) < 0) {
+		qdwin_view_stream_v1_send_denied(
+			stream_resource,
+			"failed to start qdistro-forward");
+		wl_resource_destroy(stream_resource);
+		return;
+	}
 
 	/* Cert path: reuse qdwin's main RDP cert for now; per-stream certs
 	 * are a hardening item. */
@@ -3825,14 +3902,30 @@ qdwin_stream_input_handle_claim(
 		return;
 	}
 
+	pid_t pid = 0; uid_t uid = 0; gid_t gid = 0;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	if (s->forward_pid <= 0 || pid != s->forward_pid) {
+		wl_resource_set_implementation(
+			handle_res, &qdwin_stream_input_handle_impl,
+			NULL, NULL);
+		wl_resource_post_error(
+			input_resource,
+			QDWIN_STREAM_INPUT_V1_ERROR_INVALID_TOKEN,
+			"claim: token is reserved for qdistro-forward pid=%d",
+			(int)s->forward_pid);
+		weston_log("qdwin: stream_input claim PID_MISMATCH "
+			   "rdp_port=%u expected=%d peer pid=%d uid=%u\n",
+			   s->rdp_port, (int)s->forward_pid, (int)pid,
+			   (unsigned)uid);
+		return;
+	}
+
 	wl_resource_set_implementation(
 		handle_res, &qdwin_stream_input_handle_impl, s,
 		qdwin_stream_input_handle_resource_destroyed);
 	s->input_claimed = 1;
 	s->input_handle = handle_res;
 
-	pid_t pid = 0; uid_t uid = 0; gid_t gid = 0;
-	wl_client_get_credentials(client, &pid, &uid, &gid);
 	weston_log("qdwin: stream_input claim OK rdp_port=%u peer pid=%d "
 		   "uid=%u\n", s->rdp_port, (int)pid, (unsigned)uid);
 }
