@@ -6319,6 +6319,36 @@ qdwin_emit_selection_set(struct qdwin *qdwin, struct weston_seat *seat,
 	uint32_t handle = tl ? tl->handle : UINT32_MAX;
 	char *joined = qdwin_pack_mime_types(mime_types);
 	const char *name = (seat && seat->seat_name) ? seat->seat_name : "";
+	/* v23 sidecar (selection_set_source_identity): when the wl_client
+	 * that issued set_selection carries a wp_security_context_v1 tag,
+	 * emit its (engine, app_id, instance_id) tuple IMMEDIATELY BEFORE
+	 * selection_set. Lets the shell derive src_silo from the wire
+	 * (ClipboardGate.qml) instead of from the keyboard-focused
+	 * toplevel handle — which collapses to "admin shell" when a
+	 * tagged client emits set_selection without owning a focused
+	 * toplevel (XWayland helper, waypipe-tier3 bridge, browser-extension
+	 * silo proxy). Untagged sources skip the sidecar entirely and the
+	 * shell falls back to the v11 focus-handle path. */
+	if (wl_resource_get_version(qdwin->shell_resource) >= 23 &&
+	    src_client_fallback) {
+		struct qdwin_secctx_client *src_sc =
+			qdwin_secctx_client_lookup(qdwin, src_client_fallback);
+		if (src_sc) {
+			const char *src_engine   = qdwin_secctx_client_engine(src_sc);
+			const char *src_app_id   = qdwin_secctx_client_app_id(src_sc);
+			const char *src_instance = qdwin_secctx_client_instance_id(src_sc);
+			qdwin_shell_v1_send_selection_set_source_identity(
+				qdwin->shell_resource,
+				src_engine   ? src_engine   : "",
+				src_app_id   ? src_app_id   : "",
+				src_instance ? src_instance : "");
+			weston_log("qdwin: selection_set_source_identity "
+				   "engine=%s app_id=%s instance=%s\n",
+				   src_engine   ? src_engine   : "",
+				   src_app_id   ? src_app_id   : "",
+				   src_instance ? src_instance : "");
+		}
+	}
 	qdwin_shell_v1_send_selection_set(qdwin->shell_resource,
 					  name, handle,
 					  joined ? joined : "",
