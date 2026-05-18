@@ -3,9 +3,9 @@
 # Per-test state lives under $TEST_ROOT/$TEST_ID/:
 #   - runtime/        : XDG_RUNTIME_DIR for weston + clients
 #   - weston.log      : weston log (qdwin-shell.so output included)
-#   - qdshell.log     : qdshell stderr
+#   - qdshell.log     : shell helper stderr
 #   - clients.log     : any other clients (weston-terminal, etc.)
-#   - ctrl.sock       : qdshell --ctrl-socket
+#   - ctrl.fifo       : qdwin-bystander command FIFO
 #   - pids/           : one file per spawned process (basename = role)
 #   - shots/          : screenshots (PNGs)
 
@@ -14,14 +14,14 @@ set -eo pipefail
 TEST_ROOT=${TEST_ROOT:-/tmp/qdwin-host-tests}
 QDWIN_BUILD=${QDWIN_BUILD:-/tmp/qdwin-host-build}
 QDWIN_INSTALL=${QDWIN_INSTALL:-/tmp/qdwin-host-install}
-QDSHELL_PY=${QDSHELL_PY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../qdshell" && pwd)/qdshell.py}
+QDWIN_BYSTANDER=${QDWIN_BYSTANDER:-$QDWIN_INSTALL/bin/qdwin-bystander}
 
 ht_dir()         { echo "$TEST_ROOT/$1"; }
 ht_runtime()     { echo "$TEST_ROOT/$1/runtime"; }
 ht_log_weston()  { echo "$TEST_ROOT/$1/weston.log"; }
 ht_log_qdshell() { echo "$TEST_ROOT/$1/qdshell.log"; }
 ht_log_clients() { echo "$TEST_ROOT/$1/clients.log"; }
-ht_ctrl()        { echo "$TEST_ROOT/$1/ctrl.sock"; }
+ht_ctrl()        { echo "$TEST_ROOT/$1/ctrl.fifo"; }
 ht_pids()        { echo "$TEST_ROOT/$1/pids"; }
 ht_shots()       { echo "$TEST_ROOT/$1/shots"; }
 # Short, fixed socket name — per-test runtime dir already namespaces
@@ -30,18 +30,26 @@ ht_shots()       { echo "$TEST_ROOT/$1/shots"; }
 ht_socket()      { echo "wayland-1"; }
 
 ht_require_build() {
-    if [ ! -f "$QDWIN_INSTALL/lib/weston/qdwin-shell.so" ]; then
-        echo "[harness] qdwin-shell.so missing at $QDWIN_INSTALL — building" >&2
+    # Rebuild if EITHER the shell plugin OR the bystander binary is missing.
+    # A stale install where one artefact was hand-deleted should still
+    # self-heal rather than hard-exit on first missing piece.
+    if [ ! -f "$QDWIN_INSTALL/lib/weston/qdwin-shell.so" ] \
+       || [ ! -x "$QDWIN_BYSTANDER" ]; then
+        echo "[harness] qdwin-shell.so or qdwin-bystander missing at $QDWIN_INSTALL — building" >&2
         if ! command -v meson >/dev/null && [ -x "$HOME/.local/bin/meson" ]; then
             export PATH="$HOME/.local/bin:$PATH"
         fi
         local repo
-        repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-        if [ ! -d "$QDWIN_BUILD" ]; then
+        repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+        if [ ! -f "$QDWIN_BUILD/build.ninja" ]; then
             meson setup "$QDWIN_BUILD" "$repo" \
                 --prefix="$QDWIN_INSTALL" --libdir=lib >/dev/null
         fi
         ninja -C "$QDWIN_BUILD" install >/dev/null
+    fi
+    if [ ! -x "$QDWIN_BYSTANDER" ]; then
+        echo "[harness] qdwin-bystander still missing at $QDWIN_BYSTANDER after build" >&2
+        exit 6
     fi
 }
 

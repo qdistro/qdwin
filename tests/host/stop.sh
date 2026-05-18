@@ -31,6 +31,6 @@ done
 if [ "$KEEP_LOGS" = 0 ]; then
     rm -rf "$DIR"
 else
-    # Just clear the runtime + ctrl socket — logs stay.
-    rm -rf "$DIR/runtime" "$DIR/ctrl.sock" "$DIR/pids"
+    # Just clear the runtime + command FIFO — logs stay.
+    rm -rf "$DIR/runtime" "$(ht_ctrl "$TEST_ID")" "$DIR/pids"
 fi

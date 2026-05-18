@@ -7,8 +7,8 @@
 #
 # After return:
 #   - weston is running headless on socket "qdwin-test-<id>"
-#   - qdshell is running with --colors <map> (default: $UID=#22aaff)
-#     and --ctrl-socket=$(ht_ctrl)
+#   - qdwin-bystander is running as the shell helper, with its command FIFO
+#     at $(ht_ctrl)
 #   - one weston-terminal is running as a client (unless --no-terminal)
 #
 # Stdout is the test-id (so callers can `ID=$(start.sh foo)`).
@@ -79,17 +79,15 @@ if [ "$WANT_TERMINAL" = 1 ]; then
 fi
 
 if [ "$WANT_SHELL" = 1 ]; then
-    WAYLAND_DISPLAY="$SOCK" python3 "$QDSHELL_PY" \
-        --colors "$COLORS" \
-        --ctrl-socket="$CTRL" \
+    QDWIN_BYSTANDER_FIFO="$CTRL" WAYLAND_DISPLAY="$SOCK" "$QDWIN_BYSTANDER" \
         >>"$SLOG" 2>&1 &
     ht_pid_save "$TEST_ID" qdshell $!
-    # Wait for the ctrl-socket to be created.
+    # Wait for the command FIFO to be created.
     for _ in $(seq 1 30); do
-        [ -S "$CTRL" ] && break
+        [ -p "$CTRL" ] && break
         sleep 0.1
     done
-    [ -S "$CTRL" ] || { echo "[start.sh] ctrl socket never appeared" >&2; cat "$SLOG" >&2; exit 8; }
+    [ -p "$CTRL" ] || { echo "[start.sh] command FIFO never appeared" >&2; cat "$SLOG" >&2; exit 8; }
 fi
 
 echo "$TEST_ID"
