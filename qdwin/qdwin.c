@@ -10057,6 +10057,15 @@ qdwin_activation_token_free(struct qdwin_activation_token *t)
 	wl_list_remove(&t->link);
 	if (t->requesting_surface)
 		wl_list_remove(&t->requesting_surface_destroy.link);
+	/* Sever the wl_resource → t back-reference. Many call paths
+	 * (perform/use/timeout/cancel) free `t` while the client's
+	 * xdg_activation_token_v1 resource is still alive; when the
+	 * client later destroys it, qdwin_activation_token_resource_destroy
+	 * fires and dereferences the user_data. Without this NULL-out,
+	 * that destructor re-enters this function on a freed `t` and
+	 * SEGVs in wl_list_remove. */
+	if (t->token_resource)
+		wl_resource_set_user_data(t->token_resource, NULL);
 	free(t->token);
 	free(t->app_id);
 	free(t);
