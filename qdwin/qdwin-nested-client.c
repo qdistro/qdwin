@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE  /* accept4 + SOCK_NONBLOCK | SOCK_CLOEXEC flags */
 #include <errno.h>
+#include <glob.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <fcntl.h>
@@ -403,21 +405,74 @@ qdwin_nested_input_sink_read_one(struct qdwin_nested_input_sink *sink,
 	return event_type;
 }
 
-int
-qdwin_nested_input_sink_connect(const char *socket_path)
+/* Try to connect to a unix socket at `path`. Returns fd >= 0 on success,
+ * -1 on failure. Caller-owned errno is left untouched on success. */
+static int
+qdwin_nested_input_sink_connect_one(const char *path)
 {
-	if (!socket_path || !*socket_path)
+	if (!path || !*path)
 		return -1;
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0)
 		return -1;
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	strncpy(addr.sun_path, socket_path, sizeof addr.sun_path - 1);
+	strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
 	if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
 		close(fd);
 		return -1;
 	}
 	return fd;
+}
+
+int
+qdwin_nested_input_sink_connect(const char *socket_path)
+{
+	if (!socket_path || !*socket_path)
+		return -1;
+
+	/* First try the path as advertised. This works for non-isolated
+	 * nested publishers (same XDG_RUNTIME_DIR view as the outer). */
+	int fd = qdwin_nested_input_sink_connect_one(socket_path);
+	if (fd >= 0)
+		return fd;
+
+	/* tier-2 fallback: the inner publisher lives in a podman container
+	 * whose /run/user/<uid> is a bind-mount of
+	 * /run/user/<uid>/qdistro-tier2/<token>/ on the host. The inner
+	 * advertises an XDG_RUNTIME_DIR-relative path (e.g. "/run/user/1000/
+	 * qdwin-nested-input-7-1.sock") which on the host actually resolves
+	 * under the per-container dir. Glob `qdistro-tier2/<*>/<basename>`
+	 * under /run/user/<uid>/ and try each match. The publisher's
+	 * uniqueness pattern (pid+handle, pid is container PID 7..) makes
+	 * collisions across containers essentially impossible. */
+	const char *slash = strrchr(socket_path, '/');
+	if (!slash)
+		return -1;
+	const char *basename = slash + 1;
+	if (strncmp(socket_path, "/run/user/", 10) != 0)
+		return -1;
+	const char *uid_start = socket_path + 10;
+	const char *uid_end = strchr(uid_start, '/');
+	if (!uid_end || uid_end == uid_start)
+		return -1;
+	char pattern[256];
+	int n = snprintf(pattern, sizeof pattern,
+			 "/run/user/%.*s/qdistro-tier2/*/%s",
+			 (int)(uid_end - uid_start), uid_start, basename);
+	if (n < 0 || n >= (int)sizeof pattern)
+		return -1;
+	glob_t gl;
+	if (glob(pattern, 0, NULL, &gl) != 0)
+		return -1;
+	for (size_t i = 0; i < gl.gl_pathc; ++i) {
+		fd = qdwin_nested_input_sink_connect_one(gl.gl_pathv[i]);
+		if (fd >= 0) {
+			globfree(&gl);
+			return fd;
+		}
+	}
+	globfree(&gl);
+	return -1;
 }
 
 int
