@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="22">
+  <interface name="qdwin_shell_v1" version="23">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -865,6 +865,44 @@
       <arg name="mime_types_concat" type="string"
            summary="LF-joined mime types, possibly empty"/>
       <arg name="is_primary" type="uint" summary="0 clipboard, 1 primary"/>
+    </event>
+
+    <event name="selection_set_source_identity" since="23">
+      <description summary="secctx tuple of the wl_client behind selection_set">
+        Sidecar to `selection_set`. Fires IMMEDIATELY BEFORE the
+        matching `selection_set` event whenever the wl_client that
+        called `wl_data_device.set_selection` (or the primary-selection
+        equivalent) carries a `wp_security_context_v1` tag. The shell
+        MUST pair the two events by sequence — there is at most one
+        outstanding sidecar at any time on a given qdwin_shell_v1
+        resource, and the very next `selection_set` it sees consumes
+        the cached identity.
+
+        Closes the source-of-truth gap that v11 left open: in v11..v22
+        the shell had to derive the source silo from the keyboard-
+        focused toplevel handle (which works for normal apps but
+        collapses to "the focused admin shell's silo" when a tagged
+        wl_client emits set_selection without owning a focused
+        toplevel — XWayland helpers, waypipe-tier3 background bridges,
+        compositor-internal scratch sources). With this event the
+        shell can map source → silo directly from the wire instead
+        of from focus state.
+
+        For untagged source clients this event is NOT sent — the
+        shell falls back to the v11 focus-handle mapping for those
+        (matching the existing default-deny posture). Empty strings
+        on individual args are permitted (the secctx engine left
+        them unset at commit time, as with `toplevel_security_context`).
+
+        Pre-v23 shells never see this event. Their fall-back to the
+        v11 focus-handle path is preserved verbatim.
+      </description>
+      <arg name="src_sandbox_engine" type="string"
+           summary="from wp_security_context_v1.set_sandbox_engine"/>
+      <arg name="src_app_id" type="string"
+           summary="from wp_security_context_v1.set_app_id"/>
+      <arg name="src_instance_id" type="string"
+           summary="from wp_security_context_v1.set_instance_id"/>
     </event>
 
     <request name="clear_selection" since="11">
