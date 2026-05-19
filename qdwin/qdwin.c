@@ -12401,7 +12401,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       21, qdwin, bind_qdwin_shell);
+					       23, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
