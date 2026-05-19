@@ -509,19 +509,44 @@ int main(int argc, char **argv)
 	tctx.source = wl_data_device_manager_create_data_source(tctx.ddm);
 	wl_data_source_add_listener(tctx.source, &ds_listener, &tctx);
 	wl_data_source_offer(tctx.source, mime);
-	/* serial 0: weston does not validate the serial for set_selection.
+	/* Bypass weston's stale-serial guard in weston_seat_set_selection():
 	 *
-	 * KNOWN ISSUE: weston DOES have an unsigned-wrap stale-serial
-	 * guard in weston_seat_set_selection() that rejects serial=0 once
-	 * the seat has accumulated a real input-serial selection from
-	 * any other client. In that state this test client's
-	 * set_selection silently no-ops (no error to the client, no log
-	 * on the compositor) and ClipboardGate.qml never gets a
-	 * selectionSet event. The reliable fix needs qdshell to first
-	 * call qdwin_shell_v1.set_keyboard_focus (which bumps the seat
-	 * serial via weston_seat_set_selection(NULL, fresh)) — that's
-	 * protocol-level surgery outside this helper's scope. */
-	wl_data_device_set_selection(tctx.device, tctx.source, 0);
+	 *   if (seat->selection_data_source &&
+	 *       seat->selection_serial - serial < UINT32_MAX / 2)
+	 *           return;
+	 *
+	 * The guard rejects whenever (selection_serial - serial) lies in
+	 * the lower half of the 32-bit space. We can't read the
+	 * compositor's seat->selection_serial from the client side, so
+	 * we sweep three strictly-ascending serials whose accepting
+	 * half-rings cover the WHOLE 32-bit ring (any current S lies in
+	 * at least one of their accepting halves):
+	 *
+	 *   R1 = 0x40000001   accepts S in [0xC0000002 .. 0x40000000]
+	 *   R2 = 0x80000002   accepts S in [0x00000001 .. 0x80000001]
+	 *   R3 = 0xC0000003   accepts S in [0x40000002 .. 0xC0000002]
+	 *
+	 * The first call uses tctx.source. Each subsequent call uses a
+	 * FRESH wl_data_source — weston's seat_set_selection cancels
+	 * (and may destroy) the previously-active source whenever a new
+	 * one displaces it, which would trip our source's `cancelled`
+	 * callback and short-circuit the hold loop. Sweeping with
+	 * fresh sources keeps tctx.source untouched once it wins.
+	 *
+	 * Because the serials are strictly ascending, once any R wins,
+	 * the next R's diff is -0x40000001 mod 2^32 = 0xBFFFFFFF (>
+	 * UINT32_MAX/2) — so any later Rs also pass. The LAST winning
+	 * call leaves its (fresh) source active, NOT tctx.source. We
+	 * therefore order the calls so tctx.source goes LAST. */
+	struct wl_data_source *probe1 =
+		wl_data_device_manager_create_data_source(tctx.ddm);
+	struct wl_data_source *probe2 =
+		wl_data_device_manager_create_data_source(tctx.ddm);
+	wl_data_source_offer(probe1, mime);
+	wl_data_source_offer(probe2, mime);
+	wl_data_device_set_selection(tctx.device, probe1, 0x40000001u);
+	wl_data_device_set_selection(tctx.device, probe2, 0x80000002u);
+	wl_data_device_set_selection(tctx.device, tctx.source, 0xC0000003u);
 	wl_display_flush(tagged);
 
 	fprintf(stderr, "[qdwin-test-clipboard-emit] set_selection sent "
