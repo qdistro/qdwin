@@ -293,6 +293,11 @@ static void ms_sleep(int ms)
 	nanosleep(&ts, NULL);
 }
 
+/* Stashed write-end of the close_fd pipe; main() closes this after the
+ * hold-ms window so the compositor sees POLLHUP and tears down its
+ * listener cleanly. See make_unix_socket_pair() for the rationale. */
+int g_emit_close_signal_fd = -1;
+
 /* Build a path to a unix socket inside $XDG_RUNTIME_DIR. */
 static int
 make_unix_socket_pair(int *listen_out, int *close_out)
@@ -323,19 +328,37 @@ make_unix_socket_pair(int *listen_out, int *close_out)
 		return -1;
 	}
 
-	/* close side: any fd whose hangup tells the compositor to stop */
+	/* close side: any fd whose hangup tells the compositor to stop.
+	 *
+	 * security-context-v1 contract: the compositor polls the fd we
+	 * hand it as close_fd for POLLHUP. POLLHUP on the read end of a
+	 * pipe fires when ALL writers close. So:
+	 *   - give the compositor the READ end (pfd[0]) as close_fd
+	 *   - keep the WRITE end (pfd[1]) in our process; close it
+	 *     when we want the compositor to stop accepting
+	 *
+	 * The previous wiring was reversed (compositor received pfd[1]
+	 * and we closed pfd[0] immediately): POLLHUP on a pipe's
+	 * write end fires the moment the read side is closed, so the
+	 * compositor tore down the listener before our tagged client
+	 * could connect through it ("close_fd hangup ... → tearing
+	 * down listener" 0ms after "client accepted"). The resulting
+	 * selection_set never reached the bound shell, so
+	 * ClipboardGate logged the fallback src_silo=unknown verdict.
+	 *
+	 * Callers must close *close_out + the stashed write-end fd
+	 * at the end of the hold window. */
 	int pfd[2];
 	if (pipe2(pfd, O_CLOEXEC) < 0) {
 		perror("pipe2");
 		close(lfd);
 		return -1;
 	}
-	/* We hold pfd[1] (write end); compositor holds pfd[0] (read end).
-	 * Closing pfd[1] signals done via POLLHUP. */
-	close(pfd[0]);
-
 	*listen_out = lfd;
-	*close_out  = pfd[1];  /* we close this to signal done */
+	*close_out  = pfd[0];   /* compositor reads; ours to close after send */
+	/* Stash the write end in the global so main() can close it
+	 * after the hold-ms window. */
+	g_emit_close_signal_fd = pfd[1];
 	return 0;
 }
 
@@ -443,6 +466,15 @@ int main(int argc, char **argv)
 	security_context_set_instance_id(secctx, "qdwin-test-emit");
 	security_context_commit(secctx);
 	wl_display_flush(outer);
+	/* The compositor has its own dup'd close_fd via SCM_RIGHTS now;
+	 * our local copy is redundant. Keeping it open would just delay
+	 * the eventual POLLHUP for the compositor (POLLHUP only fires
+	 * when EVERY writer/holder of the matching end is gone, but
+	 * what matters here is that the write end (g_emit_close_signal_fd)
+	 * is the only signal — closing the read end has no effect on
+	 * the compositor's POLLHUP). Close it for hygiene. */
+	close(close_fd);
+	close_fd = -1;
 
 	/* ---- 3. Connect tagged client through the listening socket ---------- */
 
@@ -477,7 +509,18 @@ int main(int argc, char **argv)
 	tctx.source = wl_data_device_manager_create_data_source(tctx.ddm);
 	wl_data_source_add_listener(tctx.source, &ds_listener, &tctx);
 	wl_data_source_offer(tctx.source, mime);
-	/* serial 0: weston does not validate the serial for set_selection */
+	/* serial 0: weston does not validate the serial for set_selection.
+	 *
+	 * KNOWN ISSUE: weston DOES have an unsigned-wrap stale-serial
+	 * guard in weston_seat_set_selection() that rejects serial=0 once
+	 * the seat has accumulated a real input-serial selection from
+	 * any other client. In that state this test client's
+	 * set_selection silently no-ops (no error to the client, no log
+	 * on the compositor) and ClipboardGate.qml never gets a
+	 * selectionSet event. The reliable fix needs qdshell to first
+	 * call qdwin_shell_v1.set_keyboard_focus (which bumps the seat
+	 * serial via weston_seat_set_selection(NULL, fresh)) — that's
+	 * protocol-level surgery outside this helper's scope. */
 	wl_data_device_set_selection(tctx.device, tctx.source, 0);
 	wl_display_flush(tagged);
 
@@ -522,8 +565,12 @@ int main(int argc, char **argv)
 	if (tctx.ddm)    wl_data_device_manager_destroy(tctx.ddm);
 	wl_display_disconnect(tagged);
 
-	/* Closing close_fd signals the compositor to stop accepting on listen_fd. */
-	close(close_fd);
+	/* Closing the write end of the close pipe signals the compositor
+	 * to stop accepting on listen_fd (POLLHUP fires on the dup'd read
+	 * end the compositor is polling). close_fd (our read-end copy)
+	 * was already closed right after create_listener flushed. */
+	if (g_emit_close_signal_fd >= 0) close(g_emit_close_signal_fd);
+	if (close_fd >= 0) close(close_fd);
 	close(listen_fd);
 	wl_display_disconnect(outer);
 
