@@ -2,37 +2,36 @@
 set -euo pipefail
 
 # Agent/CI smoke: cursor sprite visible above shell UI does NOT capture
-# clicks. plan3 H3 reproducer, post-review tightened.
+# clicks. plan3 H3 reproducer; tightened twice — once after the first
+# post-implementation review and again after the deep-review caught a
+# focus-away-optional gap that let broken click paths pass.
 #
 # Symptom this test guards: a cursor sprite that retains a non-empty
-# input region becomes a pickable shell surface above qdshell/layer-
-# shell UI, and pointer clicks land on the cursor view instead of the
-# UI underneath. libweston's pointer_cursor_surface_committed clears
-# both pending and current input regions on every commit
+# input region becomes a pickable shell surface above qdshell / layer-
+# shell UI; pointer clicks land on the cursor view instead of the UI
+# underneath. libweston's pointer_cursor_surface_committed clears both
+# pending and current input regions on every commit
 # (libweston/input.c:3521-3522). qdwin's install path clears them once;
 # plan3 M2 adds a per-sprite commit listener that re-asserts the
-# invariant on every commit. This smoke proves the invariant by-effect.
+# invariant on every commit. This smoke proves the invariant by-effect
+# using a mandatory focus transition.
 #
-# Discriminator (post-review): require a focus TRANSITION caused by
-# the click, not the spawn-time auto-focus. The original smoke only
-# checked "qdwin: focus handle=N" anywhere after click, which matched
-# the spawn-time line; clicks that did NOT land would still pass.
+# Sequence (deep-review tightened):
+#   1. Spawn TWO test windows — handle_one, then handle_two.
+#      handle_two is the foreground (auto-focused on spawn).
+#   2. Park the pointer over the exposed top-left of handle_one
+#      (cursor sprite maps on cursor_layer above the window).
+#   3. Click that exposed pixel. Focus MUST transition from
+#      handle_two → handle_one. If the cursor sprite were pickable,
+#      the click would land on the cursor view and no such transition
+#      would appear.
 #
-# Sequence:
-#   1. Spawn test window — focus transitions to handle=N at spawn.
-#   2. Click empty desktop corner — focus should leave to UINT32_MAX
-#      (qdwin: focus handle=4294967295 (was N)).
-#   3. Park cursor sprite over the test window content.
-#   4. Click that content — focus must transition back to handle=N
-#      (qdwin: focus handle=N (was 4294967295)).
+# The two-window setup removes the previous test's reliance on
+# "empty-desktop click moves focus", which on noctalia-bootstrap is
+# best-effort because the shell auto-takes focus.
 #
-# Step 2 is what proves the click engine actually moves focus.
-# Step 4 is what proves the click landed THROUGH the cursor sprite
-# onto the test window.
-#
-# QDWIN_CURSOR_CLICKTHROUGH_FORCE_BREAK=1 flips the step-4 assertion
-# (the focus return MUST NOT happen) for validating the test itself
-# against a regressed qdwin.
+# QDWIN_CURSOR_CLICKTHROUGH_FORCE_BREAK=1 flips the assertion so the
+# regression itself is reproducible (focus must NOT transition).
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 QDWIN_REPO=${QDWIN_REPO:-$ROOT}
@@ -73,38 +72,35 @@ detect_screen_size() {
     [ -n "$dims" ] || fail "could not read screenshot dimensions"
     echo "$dims"
 }
-wait_for_handle() {
-    local cursor=$1
+wait_for_handles() {
+    local cursor=$1 want=$2 handles
     for _ in $(seq 1 30); do
-        local h
-        h=$(journal_after "$cursor" \
+        handles=$(journal_after "$cursor" \
             | sed -n 's/.*qdwin: toplevel_added handle=\([0-9][0-9]*\) uid=1000 app_id=qdistro-test-window.*/\1/p' \
-            | head -n1)
-        if [ -n "$h" ]; then
-            echo "$h"
+            | head -n"$want" | tr '\n' ' ')
+        if [ "$(wc -w <<<"$handles")" -ge "$want" ]; then
+            echo "$handles"
             return 0
         fi
         sleep 0.2
     done
     return 1
 }
-# Wait for a focus transition into target $next from any other handle.
-# `prev` may be a literal number or the string "any". Returns 0 if seen
-# within the polling window, 1 otherwise.
-wait_for_focus_transition() {
+# Wait for a focus transition matching `(was $prev)` into `handle=$next`.
+# Required (deep-review H6): no fallback path that accepts "focus
+# stayed where it was". Returns 0 if the exact transition is seen,
+# else 1 with the matched/unmatched journal printed to stderr.
+wait_for_strict_focus_transition() {
     local prev=$1 next=$2 cursor=$3
-    local pat
-    if [ "$prev" = any ]; then
-        pat="qdwin: focus handle=$next \\(was [0-9]+\\)"
-    else
-        pat="qdwin: focus handle=$next \\(was $prev\\)"
-    fi
-    for _ in $(seq 1 20); do
+    local pat="qdwin: focus handle=$next \\(was $prev\\)"
+    for _ in $(seq 1 25); do
         if journal_after "$cursor" | grep -qE "$pat"; then
             return 0
         fi
         sleep 0.2
     done
+    journal_after "$cursor" | grep -E 'qdwin: focus handle=|toplevel_added' \
+        | tail -10 >&2
     return 1
 }
 
@@ -140,97 +136,70 @@ vm_exec "journalctl _UID=1000 -b --no-pager | grep -q 'cursor-sprite registered 
 pass "cursor sprite helper registered pointer/default shape"
 
 run_id=$$
-title="agent-clickthrough-$run_id"
+title_one="agent-clickthrough-one-$run_id"
+title_two="agent-clickthrough-two-$run_id"
 cleanup() {
     vm_exec "pkill -KILL -u admin -f '[q]distro-test-window --title agent-clickthrough-' 2>/dev/null || true" >/dev/null || true
 }
 trap cleanup EXIT
 cleanup
 
+# Spawn handle_one then handle_two; handle_two becomes foreground.
 cursor_start=$(journal_cursor)
-vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title' --width 400 --height 240 --color 0xff207040 >/tmp/$title.log 2>&1 &"
+# Use the exact same window geometry as agent-click-smoke so qdwin's
+# default placement + 40px cascade behaves the same way. Larger windows
+# moved the exposed top-left out from under the centre point that
+# qdwin's default placement actually uses on noctalia-bootstrap.
+vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 300 --height 180 --color 0xff206040 >/tmp/$title_one.log 2>&1 &"
+sleep 0.8
+vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_two' --width 300 --height 180 --color 0xff604020 >/tmp/$title_two.log 2>&1 &"
 
-handle=$(wait_for_handle "$cursor_start") \
-    || fail "qdistro-test-window did not appear in qdwin journal"
-pass "test window handle=$handle"
+read -r handle_one handle_two < <(wait_for_handles "$cursor_start" 2) \
+    || fail "two test windows did not appear in qdwin journal"
+pass "windows handle_one=$handle_one handle_two=$handle_two"
 
-# Confirm spawn-time auto-focus transitions to handle=$handle from any
-# prior handle. qdistro-daily focuses (was 4294967295); noctalia-bootstrap
-# typically has the shell holding focus first so the transition is
-# (was <shell-handle>). Accept either.
-wait_for_focus_transition any "$handle" "$cursor_start" \
-    || fail "spawn did not focus handle=$handle (preconditions broken)"
-pass "spawn focused handle=$handle"
+content_w=300
+content_h=180
+one_x=$(( (QDWIN_SCREEN_W - content_w) / 2 ))
+one_y=$(( (QDWIN_SCREEN_H - content_h) / 2 ))
 
-# Step 1: click empty desktop corner. Top-left (1,1) is outside any
-# panel or test window. qdshell layer-shell panel covers some screen
-# area at top — use a position that is guaranteed empty: the centre of
-# the bottom screen edge minus a margin (no qdshell dock here on
-# default config; if a dock is added later, swap to a different empty
-# point).
-empty_x=$(( QDWIN_SCREEN_W / 2 ))
-empty_y=$(( QDWIN_SCREEN_H - 30 ))
-cursor_clear=$(journal_cursor)
-qdwin_click "$empty_x" "$empty_y"
-# Accept ANY transition away from $handle (to 4294967295 or to the
-# shell's handle if it auto-focuses). Some configs do not move focus on
-# empty-desktop click at all; treat that as a GAP, not a fail.
-if ! journal_after "$cursor_clear" | grep -qE "qdwin: focus handle=[0-9]+ \(was $handle\)"; then
-    cursor_clear=$(journal_cursor)
-    qdwin_click 1 1
-    if ! journal_after "$cursor_clear" | grep -qE "qdwin: focus handle=[0-9]+ \(was $handle\)"; then
-        echo "GAP: empty-desktop click did not blank focus from handle=$handle; " \
-             "click engine may not move focus here. Treating step 1 as best-effort."
-    fi
-fi
-pass "empty-desktop click attempted at ($empty_x,$empty_y)"
+# Park pointer over the exposed top-left of handle_one (offset 20,20
+# from the chrome-relative origin so we are inside the visible content
+# strip). This is the spot we will click after confirming cursor sprite
+# is mapped.
+target_x=$(( one_x + 20 ))
+target_y=$(( one_y + 20 ))
 
-# Step 2: park cursor over the test-window content (screen centre).
-target_x=$(( QDWIN_SCREEN_W / 2 ))
-target_y=$(( QDWIN_SCREEN_H / 2 ))
 cursor_park=$(journal_cursor)
 qdwin_mouse_move "$target_x" "$target_y"
-sleep 0.5
+sleep 0.6
 if ! vm_exec "journalctl _UID=1000 -b --no-pager | grep -q 'mapped on cursor_layer'"; then
     fail "no cursor sprite mapped on cursor_layer — preconditions not met"
 fi
-pass "cursor sprite mapped on cursor_layer (Weston invariant)"
+pass "cursor sprite mapped on cursor_layer at ($target_x,$target_y)"
 
-# Step 3: click through the visible cursor onto the test window.
-# Expectation: focus transitions to handle=$handle. If step 1 actually
-# blanked focus, the transition is (was 4294967295). If step 1 was a
-# no-op, focus didn't move and this click is a no-op — accept either
-# "focus stays on $handle" (no transition log line emitted) OR a
-# transition into $handle.
+# Click the exposed pixel of handle_one. Required transition is
+# focus handle=$handle_one (was $handle_two).
 cursor_click=$(journal_cursor)
 qdwin_click "$target_x" "$target_y"
-sleep 1
 
 if [ "${QDWIN_CURSOR_CLICKTHROUGH_FORCE_BREAK:-0}" = 1 ]; then
-    # In the broken state we expect either no transition or transition
-    # to a non-$handle surface (a cursor-role surface).
-    if journal_after "$cursor_click" | grep -qE "qdwin: focus handle=$handle "; then
-        fail "FORCE_BREAK: click landed on handle=$handle (cursor not intercepting)"
+    if wait_for_strict_focus_transition "$handle_two" "$handle_one" "$cursor_click"; then
+        fail "FORCE_BREAK: click reached handle_one — cursor not intercepting"
     fi
-    pass "FORCE_BREAK: click did not land on toplevel"
+    pass "FORCE_BREAK: click did NOT transition focus to handle_one"
     qdwin_screenshot "/tmp/qdwin-cursor-clickthrough-FORCE_BREAK-$run_id.png" >/dev/null
     exit 0
 fi
 
-# Discriminator: either focus is currently on $handle (a transition INTO it
-# happened, OR it never left) AND no focus moved to a different handle in
-# the click window.
-focused_now=$(vm_exec "journalctl _UID=1000 -b --no-pager | grep 'qdwin: focus handle=' | tail -1 | sed -n 's/.*focus handle=\\([0-9][0-9]*\\).*/\\1/p'")
-if [ "$focused_now" != "$handle" ]; then
-    journal_after "$cursor_click" | tail -20 >&2
-    fail "click at ($target_x,$target_y) left focus on handle=$focused_now (want $handle) — cursor sprite may be capturing clicks"
-fi
-pass "click at ($target_x,$target_y) landed: focus is on handle=$handle"
+wait_for_strict_focus_transition "$handle_two" "$handle_one" "$cursor_click" \
+    || fail "click at ($target_x,$target_y) did not transition focus from handle=$handle_two to handle=$handle_one — cursor sprite may be capturing clicks"
+pass "click at ($target_x,$target_y) transitioned focus handle_two=$handle_two -> handle_one=$handle_one through visible cursor sprite"
 
 # Bonus M2 sanity: the per-sprite commit listener should never log
 # "re-cleared input" in normal operation (the helper does not commit
-# non-empty input regions). Its presence indicates either a regression
-# in the helper or a defensive save. WARN, do not fail.
+# non-empty input regions). Its presence indicates a regression in the
+# helper. WARN, do not fail.
 if journal_after "$cursor_click" | grep -q 'cursor-sprite commit re-cleared input'; then
     echo "WARN: M2 listener observed a non-empty cursor input region " \
          "at commit — investigate qdistro-cursor-sprites helper"

@@ -68,9 +68,23 @@ $QDWIN_VIRSH domstate "$VMNAME" >/dev/null || fail "VM '$VMNAME' not found"
 
 vm_exec "test -S /run/user/1000/wayland-1" >/dev/null \
     || fail "admin qdwin Wayland socket is not up"
-vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active qdwin-compositor.service qdshell.service" \
-    | grep -qx active || fail "qdwin/qdshell services are not active"
-pass "qdwin and qdshell services are active"
+
+# qdistro-daily ships qdwin-compositor.service + qdshell.service;
+# noctalia-bootstrap ships noctalia-session.service + noctalia-shell.service.
+if vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user list-unit-files qdwin-compositor.service" >/dev/null 2>&1; then
+    QDWIN_UNITS="qdwin-compositor.service qdshell.service"
+else
+    QDWIN_UNITS="noctalia-session.service noctalia-shell.service"
+fi
+vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active $QDWIN_UNITS" \
+    > /tmp/audit-svc-$$.txt 2>&1
+if grep -qE '^(inactive|failed|unknown)' /tmp/audit-svc-$$.txt; then
+    cat /tmp/audit-svc-$$.txt >&2
+    rm -f /tmp/audit-svc-$$.txt
+    fail "qdwin/qdshell services are not active"
+fi
+rm -f /tmp/audit-svc-$$.txt
+pass "qdwin and qdshell services are active ($QDWIN_UNITS)"
 
 read -r QDWIN_SCREEN_W QDWIN_SCREEN_H < <(detect_screen_size)
 export QDWIN_SCREEN_W QDWIN_SCREEN_H
@@ -120,6 +134,19 @@ if journal_after "$cursor" | grep -q 'qdwin: layer-shell get_popup'; then
     pass "layer-shell get_popup path observed"
 else
     echo "WARN: launcher opened without observing qdwin layer-shell get_popup"
+fi
+
+# plan3 M4 (deep-review): positive H1 grab discriminator. When the
+# launcher opens a popup with xdg_popup.grab, qdwin logs
+# "qdwin: layer-popup grab started popup=...". Soft check — Quickshell
+# may not always grab on this path, and on stock libweston the dlsym
+# fallback will refuse the grab (logged at startup as DEGRADED).
+if journal_after "$cursor" | grep -q 'qdwin: layer-popup grab started'; then
+    pass "layer-popup grab path observed"
+elif vm_exec "journalctl _UID=1000 -b --no-pager | grep -q 'layer-popup grab handler NOT registered'"; then
+    echo "GAP: layer-popup grab handler not registered — stock libweston without qdistro patch; grab assertion is N/A on this build"
+else
+    echo "WARN: launcher opened but no qdwin: layer-popup grab started observed; the popup may not have requested grab on this path"
 fi
 
 qdwin_screenshot "/tmp/qdwin-protocol-audit-$VMNAME-$$.png" >/dev/null

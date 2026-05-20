@@ -2735,6 +2735,17 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 	if (layer_view && pointer->focus != layer_view)
 		weston_pointer_set_focus(pointer, layer_view);
 
+	/* plan3 H1 (post-deep-review): a press that landed on a layer-shell
+	 * surface is governed by that surface's keyboard-interactivity (NONE
+	 * leaves focus alone, ON_DEMAND transfers, EXCLUSIVE was already
+	 * granted at map time). The toplevel click-to-focus block below
+	 * would otherwise steal keyboard focus to the toplevel behind the
+	 * layer surface — that broke Quickshell text fields whose layer
+	 * panel overlaps a window. */
+	int press_on_layer =
+		(state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_LEFT &&
+		 layer_view != NULL);
+
 	/* plan3 M4: zwlr_layer_surface_v1 ON_DEMAND keyboard interactivity.
 	 * On left-button press over a layer-shell surface that requested
 	 * ON_DEMAND, transfer keyboard focus to that surface so that text
@@ -2752,9 +2763,13 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 	 *
 	 * Done BEFORE delivering the button so the click also lands on
 	 * the now-focused window in the same dispatch (matches gnome /
-	 * kwin / kiosk-shell behaviour). */
+	 * kwin / kiosk-shell behaviour).
+	 *
+	 * Skip this block when the press landed on a layer-shell view —
+	 * layer-shell focus is owned by the layer-shell interactivity mode,
+	 * not by click-to-raise. See press_on_layer above. */
 	if (state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_LEFT &&
-	    qdwin_singleton) {
+	    !press_on_layer && qdwin_singleton) {
 		/* Look up the toplevel under the pointer by position rather
 		 * than by pointer->focus — see qdwin_chrome_at_pos comment
 		 * for why pointer->focus is unreliable when the cursor is
@@ -7470,6 +7485,15 @@ struct qdwin_layer_popup {
 	struct weston_view *view;
 	struct wl_listener surface_commit_listener;
 	struct wl_listener surface_destroy_listener;
+	/* plan3 H2 (deep-review): the underlying wl_surface destroy listener
+	 * above only fires when the client destroys the wl_surface. A client
+	 * can destroy the xdg_popup *role* resource independently (per the
+	 * xdg-shell protocol) and libweston's resource-destroy path tears
+	 * the desktop_surface down without touching the wl_surface. Without
+	 * this listener, a destroyed xdg_popup would leave qdwin_layer_popup
+	 * linked under ls->popups with a stale popup_resource — later
+	 * commits/dismissals would deref freed libweston state. */
+	struct wl_listener popup_resource_destroy_listener;
 	struct wl_list link;                   /* qdwin_layer_surface::popups */
 
 	/* plan3 H1: layer-popup grab state. Set when the client calls
@@ -7478,6 +7502,11 @@ struct qdwin_layer_popup {
 	 * instance (mirrors upstream xdg_popup grab serialisation). */
 	struct weston_pointer_grab grab;
 	int grab_active;
+	/* plan3 H3 (deep-review): seat destroy listener so we know the
+	 * cached grab.pointer became dangling before we attempt to end the
+	 * grab on it during destroy/dismiss. */
+	struct wl_listener seat_destroy_listener;
+	struct weston_seat *grab_seat;
 };
 
 static void qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp);
@@ -7799,11 +7828,14 @@ qdwin_layer_surface_apply(struct qdwin_layer_surface *ls)
 	 * shell's own focus orchestration via set_keyboard_focus_v2 keeps
 	 * working for normal toplevels — EXCLUSIVE is a compositor-side
 	 * override that mirrors wlroots's behaviour for OVERLAY/TOP locker
-	 * surfaces. ON_DEMAND (focus on click) is intentionally NOT wired
-	 * here: it requires a per-surface pointer-button hook against
-	 * weston_pointer that no client in the current smoke harness
-	 * exercises. Track in  if a real client
-	 * surfaces it. */
+	 * surfaces.
+	 *
+	 * ON_DEMAND (focus-on-click) is wired in plan3 M4 via
+	 * qdwin_layer_surface_handle_on_demand_button (called from
+	 * qdwin_proxy_default_grab_button). EXCLUSIVE is granted here at
+	 * map/apply time; ON_DEMAND is granted at left-button-press time
+	 * and ON_DEMAND will not steal focus from a held EXCLUSIVE
+	 * (see post-deep-review NEW-H2 guard). NONE leaves focus alone. */
 	if (ls->current.kbd_interactivity ==
 	    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE) {
 		struct weston_seat *seat;
@@ -7978,10 +8010,10 @@ qdwin_layer_surface_set_keyboard_interactivity(
 	 * qdwin_layer_surface_apply: every apply while EXCLUSIVE grants
 	 * keyboard focus to this surface across all seats with a keyboard
 	 * (matches wlroots semantics for swaylock-style OVERLAY surfaces).
-	 * ON_DEMAND (focus-on-click) is still deferred — it needs a
-	 * per-surface pointer-button hook that no current smoke client
-	 * exercises. The pending value is stored verbatim so a future hook
-	 * can pick it up without a protocol bump. */
+	 * ON_DEMAND (focus-on-click) is wired in plan3 M4 via
+	 * qdwin_proxy_default_grab_button → qdwin_layer_surface_handle_on_demand_button;
+	 * NEW-H2 guards it against stealing focus from an EXCLUSIVE
+	 * holder. The pending value is the source of truth for both paths. */
 	ls->pending.kbd_interactivity = interactivity;
 }
 
@@ -8093,23 +8125,20 @@ qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp)
 	if (!lp)
 		return;
 
-	/* plan3 NEW-H1: end any active pointer grab so libweston rebinds
-	 * the default grab before we free the qdwin_layer_popup. Two
-	 * subtleties:
+	/* plan3 NEW-H1 + deep-review H3/H5: end any active pointer grab so
+	 * libweston rebinds the default grab before we free the
+	 * qdwin_layer_popup. Subtleties:
 	 *
-	 * 1. weston_pointer_end_grab re-enters the grab's cancel op
-	 *    (qdwin_layer_popup_grab_cancel), which calls
-	 *    dismiss_layer_grab(lp->popup_resource) — that would send
-	 *    xdg_popup.popup_done on the resource we are tearing down. We
-	 *    null lp->popup_resource and clear grab_active BEFORE calling
-	 *    end_grab so the cancel becomes a no-op.
+	 * - weston_pointer_end_grab re-enters our cancel op which calls
+	 *   dismiss_layer_grab(lp->popup_resource). To avoid sending
+	 *   xdg_popup.popup_done on the resource we are tearing down, we
+	 *   null popup_resource and clear grab_active BEFORE end_grab.
 	 *
-	 * 2. lp->grab.pointer was cached at start time. If the seat that
-	 *    owned the pointer was destroyed since (libinput re-init,
-	 *    multi-seat hotplug), the cached pointer is dangling. Guard by
-	 *    checking that the pointer's current grab still belongs to us
-	 *    — weston_pointer_end_grab only makes sense for our own grab. */
-	if (lp->grab_active && lp->grab.pointer &&
+	 * - lp->grab.pointer is the pointer cached at start time. We must
+	 *   not dereference it if its owning seat was destroyed since (the
+	 *   seat_destroy_listener nulls lp->grab_seat for that case; we
+	 *   skip end_grab and just release our state). */
+	if (lp->grab_active && lp->grab_seat && lp->grab.pointer &&
 	    lp->grab.pointer->grab == &lp->grab) {
 		struct weston_pointer *p = lp->grab.pointer;
 		lp->popup_resource = NULL;        /* suppresses cancel→dismiss */
@@ -8118,18 +8147,57 @@ qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp)
 	} else {
 		lp->grab_active = 0;
 	}
+	if (lp->seat_destroy_listener.link.next)
+		wl_list_remove(&lp->seat_destroy_listener.link);
+	lp->grab_seat = NULL;
 
 	wl_list_remove(&lp->link);
 	if (lp->surface_commit_listener.link.next)
 		wl_list_remove(&lp->surface_commit_listener.link);
 	if (lp->surface_destroy_listener.link.next)
 		wl_list_remove(&lp->surface_destroy_listener.link);
+	if (lp->popup_resource_destroy_listener.link.next)
+		wl_list_remove(&lp->popup_resource_destroy_listener.link);
 
 	if (lp->view) {
 		weston_desktop_surface_unlink_view(lp->view);
 		weston_view_destroy(lp->view);
 	}
 	free(lp);
+}
+
+/* plan3 H2 (deep-review): xdg_popup resource was destroyed — qdwin must
+ * release its qdwin_layer_popup before any further commit/dismiss path
+ * dereferences stale libweston data. lp->popup_resource is nulled first
+ * to suppress any outgoing dismiss event aimed at the dying resource. */
+static void
+qdwin_layer_popup_on_popup_resource_destroyed(struct wl_listener *listener,
+					      void *data)
+{
+	struct qdwin_layer_popup *lp =
+		wl_container_of(listener, lp, popup_resource_destroy_listener);
+	(void)data;
+	lp->popup_resource = NULL;
+	qdwin_layer_popup_destroy(lp);
+}
+
+/* plan3 H3 (deep-review): the grab pointer's owning seat was destroyed.
+ * Null the cached lp->grab_seat so qdwin_layer_popup_destroy skips its
+ * weston_pointer_end_grab call. The pointer struct itself may be freed
+ * already — we never deref it from here. */
+static void
+qdwin_layer_popup_on_grab_seat_destroyed(struct wl_listener *listener,
+					 void *data)
+{
+	struct qdwin_layer_popup *lp =
+		wl_container_of(listener, lp, seat_destroy_listener);
+	(void)data;
+	weston_log("qdwin: layer-popup grab seat destroyed; clearing cached "
+		   "pointer\n");
+	lp->grab_seat = NULL;
+	lp->grab_active = 0;
+	/* lp->grab.pointer is now stale; do not deref. weston_pointer was
+	 * freed alongside the seat. */
 }
 
 /* plan3 H1: layer-popup grab interface. xdg_popup.grab on a layer-
@@ -8164,14 +8232,40 @@ qdwin_layer_popup_grab_motion(struct weston_pointer_grab *grab,
 			      const struct timespec *time,
 			      struct weston_pointer_motion_event *event)
 {
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
 	struct weston_pointer *pointer = grab->pointer;
 	weston_pointer_move(pointer, event);
-	/* Re-pick so layer-popup contents get enter/motion while held. */
+	/* plan3 H4 (deep-review): upstream xdg-popup grabs filter pointer
+	 * focus to surfaces owned by the grabbing client and clear focus
+	 * for views belonging to anyone else
+	 * (libweston/desktop/seat.c:weston_desktop_seat_pointer_popup_grab_focus).
+	 * We do the same: pick the topmost view at the pointer; if it is
+	 * the popup surface, the layer-shell parent, or any other view
+	 * whose surface belongs to the same wl_client as the popup,
+	 * deliver motion. Otherwise clear pointer focus so motion does
+	 * not leak to unrelated clients. */
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
-	if (view != pointer->focus)
-		weston_pointer_set_focus(pointer, view);
-	weston_pointer_send_motion(pointer, time, event);
+	struct wl_client *grab_client = lp->popup_resource ?
+		wl_resource_get_client(lp->popup_resource) : NULL;
+	int deliver = 0;
+	if (view && view->surface) {
+		if (view->surface == lp->surface) {
+			deliver = 1;
+		} else if (view->surface->resource && grab_client &&
+			   wl_resource_get_client(view->surface->resource) ==
+			       grab_client) {
+			deliver = 1;
+		}
+	}
+	if (deliver) {
+		if (view != pointer->focus)
+			weston_pointer_set_focus(pointer, view);
+		weston_pointer_send_motion(pointer, time, event);
+	} else if (pointer->focus) {
+		/* libweston accepts NULL view → clears focus + sends leave. */
+		weston_pointer_set_focus(pointer, NULL);
+	}
 }
 
 static void
@@ -8187,15 +8281,23 @@ qdwin_layer_popup_grab_button(struct weston_pointer_grab *grab,
 		weston_log("qdwin: layer-popup dismissed by outside click "
 			   "at (%.0f,%.0f)\n",
 			   pointer->pos.c.x, pointer->pos.c.y);
-		if (lp->grab_active) {
-			weston_pointer_end_grab(pointer);
-			lp->grab_active = 0;
-		}
-		if (lp->popup_resource) {
+		/* plan3 H5 (deep-review): dismiss exactly once. The cancel op
+		 * we install via weston_pointer_end_grab also calls
+		 * dismiss_layer_grab on lp->popup_resource — without ownership
+		 * of the dismiss event, popup_done would fire twice. Send the
+		 * dismiss ourselves first, then null lp->popup_resource so the
+		 * cancel-driven dismiss is a no-op. */
+		struct wl_resource *r = lp->popup_resource;
+		lp->popup_resource = NULL;
+		if (r) {
 			qdwin_xdg_popup_dismiss_layer_grab_fn dismiss =
 				qdwin_xdg_popup_dismiss_layer_grab_sym();
 			if (dismiss)
-				dismiss(lp->popup_resource);
+				dismiss(r);
+		}
+		if (lp->grab_active) {
+			lp->grab_active = 0;
+			weston_pointer_end_grab(pointer);
 		}
 		return;
 	}
@@ -8311,6 +8413,16 @@ qdwin_layer_popup_layer_grab_handler(struct wl_resource *popup_resource,
 	lp->grab.interface = &qdwin_layer_popup_grab_iface;
 	weston_pointer_start_grab(pointer, &lp->grab);
 	lp->grab_active = 1;
+	/* plan3 H3 (deep-review): subscribe to the seat's destroy signal so
+	 * that if the seat goes away mid-grab, the cached lp->grab.pointer
+	 * is recognised as stale and qdwin_layer_popup_destroy skips its
+	 * end_grab. The listener.link was wl_list_init'd at get_popup time;
+	 * re-init defensively in case a prior grab on a different seat left
+	 * it attached, then add to the new seat's signal. */
+	if (lp->seat_destroy_listener.link.next)
+		wl_list_remove(&lp->seat_destroy_listener.link);
+	wl_signal_add(&wseat->destroy_signal, &lp->seat_destroy_listener);
+	lp->grab_seat = wseat;
 	weston_log("qdwin: layer-popup grab started popup=%p seat=%s\n",
 		   (void *)popup_resource,
 		   wseat->seat_name ? wseat->seat_name : "");
@@ -8381,6 +8493,16 @@ qdwin_layer_surface_get_popup(struct wl_client *client,
 	lp->surface_destroy_listener.notify =
 		qdwin_layer_popup_on_surface_destroyed;
 	wl_signal_add(&lp->surface->destroy_signal, &lp->surface_destroy_listener);
+	/* plan3 H2: also subscribe to xdg_popup resource destruction so a
+	 * client that drops the popup role (without destroying the
+	 * wl_surface) does not leave a dangling qdwin_layer_popup. */
+	lp->popup_resource_destroy_listener.notify =
+		qdwin_layer_popup_on_popup_resource_destroyed;
+	wl_resource_add_destroy_listener(popup,
+					 &lp->popup_resource_destroy_listener);
+	wl_list_init(&lp->seat_destroy_listener.link);
+	lp->seat_destroy_listener.notify =
+		qdwin_layer_popup_on_grab_seat_destroyed;
 	wl_list_insert(&ls->popups, &lp->link);
 
 	weston_log("qdwin: layer-shell get_popup ns=%s popup=%p attached\n",

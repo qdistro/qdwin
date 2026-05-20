@@ -587,11 +587,15 @@ def test_layer_popup_grab_handler_registered(display_name):
 
 
 def test_layer_popup_reposition(display_name):
-    """plan3 M1: xdg_popup.reposition on a layer-parented popup must NOT
-    post an error (was previously a stash-only no-op that did not
-    schedule a configure). The patched flow re-computes geometry from
-    the positioner and schedules a configure; the client sees no
-    protocol error.
+    """plan3 M1: xdg_popup.reposition on a layer-parented popup must
+    (1) NOT post a protocol error AND (2) actually take effect.
+
+    Deep-review M3 tightening: the original test only checked (1). A
+    server path that accepted reposition() but never scheduled a
+    configure or sent xdg_popup.repositioned would still pass. Now we
+    install event handlers and require the compositor to send both
+    xdg_popup.repositioned(token=42) AND a follow-up
+    xdg_surface.configure. Without either, fail.
     """
     label = "layer_popup_reposition"
     d, st = with_globals(display_name)
@@ -625,7 +629,31 @@ def test_layer_popup_reposition(display_name):
         return True
     ls.get_popup(popup)
 
-    # Reposition with a fresh positioner — must not post an error.
+    # Initial commit to trigger first configure/ack — required so the
+    # popup is in the "committed" state when reposition runs (only then
+    # does libweston schedule the next configure).
+    saw_repositioned = [False]
+    saw_configure_after_repos = [False]
+    saw_initial_xdg_configure = [False]
+    state = {"reposition_seen": False}
+    def on_xdg_configure(_xs, serial):
+        _xs.ack_configure(serial)
+        if state["reposition_seen"]:
+            saw_configure_after_repos[0] = True
+        else:
+            saw_initial_xdg_configure[0] = True
+    popup_xs.dispatcher["configure"] = on_xdg_configure
+    def on_repositioned(_p, token):
+        if token == 42:
+            saw_repositioned[0] = True
+            state["reposition_seen"] = True
+    if "repositioned" in popup.dispatcher.keys() if hasattr(popup.dispatcher, "keys") else True:
+        popup.dispatcher["repositioned"] = on_repositioned
+    popup_surf.commit()
+    d.roundtrip(); d.roundtrip()
+
+    # Reposition with a fresh positioner — must not post an error and
+    # must produce the repositioned + configure event sequence.
     positioner2 = st["xdg"].create_positioner()
     positioner2.set_size(20, 20)
     positioner2.set_anchor_rect(10, 10, 5, 5)
@@ -638,7 +666,7 @@ def test_layer_popup_reposition(display_name):
     start = _stderr_size()
     popup.reposition(positioner2, 42)
     try:
-        d.roundtrip(); d.roundtrip()
+        d.roundtrip(); d.roundtrip(); d.roundtrip()
     except Exception:
         pass
     captured = _read_captured_stderr_since(start)
@@ -651,7 +679,17 @@ def test_layer_popup_reposition(display_name):
         print(f"  FAIL [{label}] reposition triggered protocol error: "
               f"{captured.strip()[:200]}")
         return False
-    print(f"  PASS [{label}] reposition accepted on layer-parented popup")
+    if not saw_repositioned[0]:
+        print(f"  FAIL [{label}] xdg_popup.repositioned(42) not received "
+              f"after reposition() — layer-parented popup did not "
+              f"schedule a configure on the qdistro patch")
+        return False
+    if not saw_configure_after_repos[0]:
+        print(f"  FAIL [{label}] xdg_surface.configure not received "
+              f"after repositioned(42)")
+        return False
+    print(f"  PASS [{label}] reposition produced repositioned(42) + "
+          f"xdg_surface.configure on layer-parented popup")
     return True
 
 
