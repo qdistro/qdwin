@@ -8129,10 +8129,17 @@ qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp)
 	 * libweston rebinds the default grab before we free the
 	 * qdwin_layer_popup. Subtleties:
 	 *
-	 * - weston_pointer_end_grab re-enters our cancel op which calls
-	 *   dismiss_layer_grab(lp->popup_resource). To avoid sending
-	 *   xdg_popup.popup_done on the resource we are tearing down, we
-	 *   null popup_resource and clear grab_active BEFORE end_grab.
+	 * - In vendored libweston, weston_pointer_end_grab (input.c:2113)
+	 *   only swaps pointer->grab back to default_grab and calls
+	 *   default_grab->focus(). It does NOT call our .cancel op, so
+	 *   end_grab here will not synchronously fire any popup_done.
+	 *   We still null popup_resource first (a) to make the intent
+	 *   obvious — once destroy starts, no further events may be sent
+	 *   on this resource — and (b) because our .cancel op IS invoked
+	 *   from the explicit teardown paths (weston_pointer_cancel_grab
+	 *   on seat keyboard release at input.c:2802); nulling first means
+	 *   any racing cancel sees popup_resource == NULL and becomes a
+	 *   no-op.
 	 *
 	 * - lp->grab.pointer is the pointer cached at start time. We must
 	 *   not dereference it if its owning seat was destroyed since (the
@@ -8316,12 +8323,16 @@ qdwin_layer_popup_grab_button(struct weston_pointer_grab *grab,
 		weston_log("qdwin: layer-popup dismissed by outside click "
 			   "at (%.0f,%.0f)\n",
 			   pointer->pos.c.x, pointer->pos.c.y);
-		/* plan3 H5 (deep-review): dismiss exactly once. The cancel op
-		 * we install via weston_pointer_end_grab also calls
-		 * dismiss_layer_grab on lp->popup_resource — without ownership
-		 * of the dismiss event, popup_done would fire twice. Send the
-		 * dismiss ourselves first, then null lp->popup_resource so the
-		 * cancel-driven dismiss is a no-op. */
+		/* plan3 H5 (deep-review): dismiss exactly once.
+		 * weston_pointer_end_grab itself does not call our .cancel op
+		 * (it only restores default_grab and calls default_grab->focus,
+		 * input.c:2113), so end_grab on its own will not double-fire
+		 * popup_done. The hazard the ordering still defends against is
+		 * a racing explicit weston_pointer_cancel_grab from seat
+		 * teardown (input.c:2802) that would call our cancel handler
+		 * while we are mid-dismiss. Null popup_resource first; the
+		 * cancel handler treats NULL as "already dismissed" and stays
+		 * a no-op. Then send the one dismiss, then end the grab. */
 		struct wl_resource *r = lp->popup_resource;
 		lp->popup_resource = NULL;
 		if (r) {
