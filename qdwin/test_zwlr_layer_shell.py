@@ -551,6 +551,41 @@ def test_layer_popup_grab_stale_serial(display_name):
     return False
 
 
+def test_layer_popup_grab_handler_registered(display_name):
+    """plan3 post-review: positive discriminator for H1.
+
+    Stock libweston has no layer-grab handler; xdg_popup.grab on a
+    layer-parented popup posts XDG_POPUP_ERROR_INVALID_GRAB
+    unconditionally. Patched libweston with qdwin registered calls the
+    handler, which logs `qdwin: layer-popup grab handler registered`
+    at compositor startup if the symbol was found. We use that log
+    line as the discriminator — it is emitted exactly once per
+    compositor run and is observable in the captured stderr.
+
+    This is a lighter assertion than driving a real grab (which would
+    need a wp_pointer + synthetic button press to produce a fresh
+    serial); a follow-up VM GUI scenario exercises the live grab path.
+    """
+    label = "layer_popup_grab_handler_registered"
+    log_path = os.environ.get("QDWIN_COMPOSITOR_LOG")
+    if not log_path or not os.path.exists(log_path):
+        print(f"  SKIP [{label}] QDWIN_COMPOSITOR_LOG not set; run via "
+              f"qdwin/run-protocol-tests.sh which captures the log")
+        return True
+    with open(log_path, "rb") as f:
+        text = f.read().decode("utf-8", "replace")
+    if "qdwin: layer-popup grab handler registered" in text:
+        print(f"  PASS [{label}] handler was registered at compositor init")
+        return True
+    if "qdwin: layer-popup grab handler NOT registered" in text:
+        print(f"  FAIL [{label}] handler not registered — patched "
+              f"libweston symbol missing")
+        return False
+    print(f"  FAIL [{label}] neither registration log line found; "
+          f"expected one of them")
+    return False
+
+
 def test_layer_popup_reposition(display_name):
     """plan3 M1: xdg_popup.reposition on a layer-parented popup must NOT
     post an error (was previously a stash-only no-op that did not
@@ -640,6 +675,7 @@ def main():
         ("role-conflict",               test_role_conflict),
         ("null_parent_popup",           test_null_parent_popup),
         ("layer_popup_grab_stale_serial", test_layer_popup_grab_stale_serial),
+        ("layer_popup_grab_handler_registered", test_layer_popup_grab_handler_registered),
         ("layer_popup_reposition",      test_layer_popup_reposition),
         ("v19_register_hotkey_live",    test_v19_register_hotkey_live),
     ]

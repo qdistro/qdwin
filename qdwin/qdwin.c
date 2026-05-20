@@ -2604,10 +2604,27 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 	weston_pointer_move(pointer, event);
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
-	struct weston_view *layer_view =
-		qdwin_layer_surface_view_at_pos(qdwin_singleton, pointer->pos);
-	if (layer_view)
-		view = layer_view;
+	/* plan3 post-review: override the picked view with the layer-shell
+	 * view ONLY when the picker resolved to a cursor sprite (a view
+	 * whose surface holds the wl_pointer-cursor role). With the M2
+	 * commit listener keeping cursor input regions empty, the picker
+	 * should already skip cursor sprites — but if a sprite leaks a
+	 * non-empty input region mid-commit, this override prevents the
+	 * focus-on-cursor regression. Avoid unconditional override: the
+	 * SIGABRT trace observed on the daily VM was through this exact
+	 * code path, and forcing a focus change to a layer view that the
+	 * picker didn't pick can hit weston_view_set_position_with_offset
+	 * assertions when the layer view is mid-commit. */
+	if (view && view->surface) {
+		const char *role = weston_surface_get_role(view->surface);
+		if (role && strcmp(role, "wl_pointer-cursor") == 0) {
+			struct weston_view *layer_view =
+				qdwin_layer_surface_view_at_pos(qdwin_singleton,
+								 pointer->pos);
+			if (layer_view)
+				view = layer_view;
+		}
+	}
 	if (view != pointer->focus)
 		weston_pointer_set_focus(pointer, view);
 	qdwin_proxy_pointer_track_focus(qdwin_singleton, pointer);
@@ -7522,7 +7539,14 @@ qdwin_layer_surface_view_at_pos(struct qdwin *qdwin,
  * default pointer grab on every left-button press. If the press lands
  * on a layer-shell surface that requested ON_DEMAND, transfer keyboard
  * focus there. EXCLUSIVE focus is handled at map time in
- * qdwin_layer_surface_apply; NONE never changes focus. */
+ * qdwin_layer_surface_apply; NONE never changes focus.
+ *
+ * plan3 NEW-H2: do NOT steal focus from an EXCLUSIVE layer surface.
+ * A lock screen / OSK / on-call panel that requested EXCLUSIVE expects
+ * its keyboard focus to be sticky; a click into a panel/overlay that
+ * happens to request ON_DEMAND would otherwise silently take focus. We
+ * walk every mapped layer surface and abort the transfer if any other
+ * one with EXCLUSIVE currently owns kb->focus. */
 static void
 qdwin_layer_surface_handle_on_demand_button(struct qdwin *qdwin,
 					    struct weston_pointer *pointer)
@@ -7539,6 +7563,29 @@ qdwin_layer_surface_handle_on_demand_button(struct qdwin *qdwin,
 	struct weston_keyboard *kb = weston_seat_get_keyboard(pointer->seat);
 	if (!kb || kb->focus == ls->surface)
 		return;
+
+	/* NEW-H2 guard: refuse if an EXCLUSIVE layer surface currently
+	 * owns keyboard focus. Compare by ls->surface so a mapped
+	 * EXCLUSIVE layer surface that re-mapped into a different
+	 * weston_surface (rare) does not match accidentally. */
+	struct qdwin_layer_surface *other;
+	wl_list_for_each(other, &qdwin->layer_surfaces, link) {
+		if (other == ls || !other->surface)
+			continue;
+		if (other->current.kbd_interactivity !=
+		    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE)
+			continue;
+		if (kb->focus == other->surface) {
+			weston_log("qdwin: layer-shell ON_DEMAND focus "
+				   "skipped (EXCLUSIVE held by ns=%s) "
+				   "target ns=%s\n",
+				   other->namespace ? other->namespace
+						    : "(null)",
+				   ls->namespace ? ls->namespace : "(null)");
+			return;
+		}
+	}
+
 	weston_keyboard_set_focus(kb, ls->surface);
 	weston_log("qdwin: layer-shell ON_DEMAND focus -> ns=%s seat=%s\n",
 		   ls->namespace ? ls->namespace : "(null)",
@@ -8046,11 +8093,29 @@ qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp)
 	if (!lp)
 		return;
 
-	/* plan3 H1: end any active pointer grab so libweston rebinds the
-	 * default grab before we free the qdwin_layer_popup. Releasing the
-	 * grab here mirrors the order used in qdwin_popup_grab_button. */
-	if (lp->grab_active && lp->grab.pointer) {
-		weston_pointer_end_grab(lp->grab.pointer);
+	/* plan3 NEW-H1: end any active pointer grab so libweston rebinds
+	 * the default grab before we free the qdwin_layer_popup. Two
+	 * subtleties:
+	 *
+	 * 1. weston_pointer_end_grab re-enters the grab's cancel op
+	 *    (qdwin_layer_popup_grab_cancel), which calls
+	 *    dismiss_layer_grab(lp->popup_resource) — that would send
+	 *    xdg_popup.popup_done on the resource we are tearing down. We
+	 *    null lp->popup_resource and clear grab_active BEFORE calling
+	 *    end_grab so the cancel becomes a no-op.
+	 *
+	 * 2. lp->grab.pointer was cached at start time. If the seat that
+	 *    owned the pointer was destroyed since (libinput re-init,
+	 *    multi-seat hotplug), the cached pointer is dangling. Guard by
+	 *    checking that the pointer's current grab still belongs to us
+	 *    — weston_pointer_end_grab only makes sense for our own grab. */
+	if (lp->grab_active && lp->grab.pointer &&
+	    lp->grab.pointer->grab == &lp->grab) {
+		struct weston_pointer *p = lp->grab.pointer;
+		lp->popup_resource = NULL;        /* suppresses cancel→dismiss */
+		lp->grab_active = 0;
+		weston_pointer_end_grab(p);
+	} else {
 		lp->grab_active = 0;
 	}
 
@@ -13162,7 +13227,14 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * patched) posts XDG_POPUP_ERROR_INVALID_GRAB; with it, qdwin
 	 * installs its own pointer grab that dismisses on outside click.
 	 * dlsym-soft so an unpatched libweston still links; the layer-
-	 * popup grab path then falls back to libweston's error. */
+	 * popup grab path then falls back to libweston's error.
+	 *
+	 * plan3 L2: also probe the other two layer-popup helpers and log
+	 * once at startup so the operator knows what degraded behaviour to
+	 * expect on an unpatched libweston. Their failure modes are silent
+	 * otherwise: get_geometry missing makes popup positioning a no-op
+	 * (popup floats at 0,0); dismiss missing makes outside-click
+	 * detection log but never tear the popup down. */
 	{
 		qdwin_xdg_popup_set_layer_grab_handler_fn set_handler =
 			qdwin_xdg_popup_set_layer_grab_handler_sym();
@@ -13173,9 +13245,25 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 				   "registered\n");
 		} else {
 			weston_log("qdwin: layer-popup grab handler NOT "
-				   "registered (libweston symbol missing) — "
-				   "xdg_popup.grab on layer-parented popups "
-				   "will return INVALID_GRAB\n");
+				   "registered (libweston symbol "
+				   "weston_desktop_xdg_popup_set_layer_grab_handler "
+				   "missing) — xdg_popup.grab on layer-parented "
+				   "popups will return INVALID_GRAB\n");
+		}
+		if (!qdwin_xdg_popup_get_geometry_sym()) {
+			weston_log("qdwin: layer-popup positioning DEGRADED "
+				   "(libweston symbol "
+				   "weston_desktop_xdg_popup_get_geometry "
+				   "missing) — layer-parented popups will "
+				   "render at parent origin\n");
+		}
+		if (!qdwin_xdg_popup_dismiss_layer_grab_sym()) {
+			weston_log("qdwin: layer-popup outside-click dismissal "
+				   "DEGRADED (libweston symbol "
+				   "weston_desktop_xdg_popup_dismiss_layer_grab "
+				   "missing) — the grab will end on outside "
+				   "click but xdg_popup.popup_done will not be "
+				   "sent\n");
 		}
 	}
 

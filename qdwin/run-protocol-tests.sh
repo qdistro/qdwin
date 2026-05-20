@@ -67,6 +67,7 @@ fi
 runuser -u admin -- bash -c "
   export XDG_RUNTIME_DIR=/run/user/1000
   export QDWIN_USE_VENDORED_LIBWESTON=$QDWIN_USE_VENDORED_LIBWESTON
+  export QDWIN_COMPOSITOR_LOG=/tmp/weston-proto-test.log
   cd /home/admin/qdwin-test
   python3 test_zwlr_layer_shell.py wayland-77
 "
