@@ -1452,8 +1452,11 @@ qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl)
 	struct weston_seat *seat;
 	wl_list_for_each(seat, &tl->qdwin->compositor->seat_list, link) {
 		struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
-		if (kbd && kbd->focus != tl->view->surface)
+		if (kbd && kbd->focus != tl->view->surface) {
 			weston_keyboard_set_focus(kbd, tl->view->surface);
+			qdwin_seat_emit_focus_now(
+				qdwin_seat_tracker_for_seat(tl->qdwin, seat));
+		}
 	}
 }
 
@@ -6071,6 +6074,7 @@ qdwin_refresh_background(struct qdwin *qdwin)
 struct qdwin_seat_tracker {
 	struct qdwin *qdwin;
 	struct weston_seat *seat;
+	char *seat_name;
 	struct wl_listener destroy_listener;
 	struct wl_listener updated_caps_listener;  /* §6.8 S3c */
 	struct wl_listener selection_listener;     /* spec/10 */
@@ -6897,12 +6901,41 @@ qdwin_send_seat_created(struct qdwin *qdwin, struct weston_seat *seat)
 }
 
 static void
-qdwin_send_seat_removed(struct qdwin *qdwin, struct weston_seat *seat)
+qdwin_send_seat_removed(struct qdwin *qdwin, const char *seat_name)
 {
 	if (!qdwin_shell_can_receive_v2(qdwin))
 		return;
 	qdwin_shell_v1_send_seat_removed(qdwin->shell_resource,
-					 seat->seat_name ? seat->seat_name : "");
+					 seat_name ? seat_name : "");
+}
+
+static void
+qdwin_seat_tracker_destroy(struct qdwin_seat_tracker *tr, int emit_removed)
+{
+	if (!tr)
+		return;
+	if (emit_removed)
+		qdwin_send_seat_removed(tr->qdwin, tr->seat_name);
+	wl_list_remove(&tr->destroy_listener.link);
+	wl_list_remove(&tr->updated_caps_listener.link);
+	wl_list_remove(&tr->selection_listener.link);
+	if (tr->kbd_focus_listener_installed) {
+		wl_list_remove(&tr->kbd_focus_listener.link);
+		tr->kbd_focus_listener_installed = 0;
+	}
+	if (tr->pointer_focus_listener_installed) {
+		wl_list_remove(&tr->pointer_focus_listener.link);
+		tr->pointer_focus_listener_installed = 0;
+	}
+	if (tr->focus_recover_idle) {
+		wl_event_source_remove(tr->focus_recover_idle);
+		tr->focus_recover_idle = NULL;
+	}
+	wl_list_remove(&tr->link);
+	tr->seat = NULL;
+	free(tr->last_target_silo);
+	free(tr->seat_name);
+	free(tr);
 }
 
 static void
@@ -6928,27 +6961,8 @@ qdwin_on_seat_destroyed(struct wl_listener *listener, void *data)
 {
 	struct qdwin_seat_tracker *tr =
 		wl_container_of(listener, tr, destroy_listener);
-	struct weston_seat *seat = data;
-	qdwin_send_seat_removed(tr->qdwin, seat);
-	wl_list_remove(&tr->destroy_listener.link);
-	wl_list_remove(&tr->updated_caps_listener.link);
-	wl_list_remove(&tr->selection_listener.link);
-	if (tr->kbd_focus_listener_installed) {
-		wl_list_remove(&tr->kbd_focus_listener.link);
-		tr->kbd_focus_listener_installed = 0;
-	}
-	if (tr->pointer_focus_listener_installed) {
-		wl_list_remove(&tr->pointer_focus_listener.link);
-		tr->pointer_focus_listener_installed = 0;
-	}
-	free(tr->last_target_silo);
-	tr->last_target_silo = NULL;
-	if (tr->focus_recover_idle) {
-		wl_event_source_remove(tr->focus_recover_idle);
-		tr->focus_recover_idle = NULL;
-	}
-	wl_list_remove(&tr->link);
-	free(tr);
+	(void)data;
+	qdwin_seat_tracker_destroy(tr, 1);
 }
 
 /* §6.8 S3c: caps just changed on this seat — a keyboard may have just
@@ -6992,6 +7006,11 @@ qdwin_track_seat(struct qdwin *qdwin, struct weston_seat *seat)
 		return NULL;
 	tr->qdwin = qdwin;
 	tr->seat = seat;
+	tr->seat_name = strdup(seat->seat_name ? seat->seat_name : "");
+	if (!tr->seat_name) {
+		free(tr);
+		return NULL;
+	}
 	tr->destroy_listener.notify = qdwin_on_seat_destroyed;
 	wl_signal_add(&seat->destroy_signal, &tr->destroy_listener);
 	tr->updated_caps_listener.notify = qdwin_on_seat_updated_caps;
@@ -7074,13 +7093,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&qdwin->seat_created_listener.link);
 	{
 		struct qdwin_seat_tracker *tr, *tmp;
-		wl_list_for_each_safe(tr, tmp, &qdwin->seat_trackers, link) {
-			wl_list_remove(&tr->destroy_listener.link);
-			wl_list_remove(&tr->updated_caps_listener.link);
-			wl_list_remove(&tr->selection_listener.link);
-			wl_list_remove(&tr->link);
-			free(tr);
-		}
+		wl_list_for_each_safe(tr, tmp, &qdwin->seat_trackers, link)
+			qdwin_seat_tracker_destroy(tr, 0);
 	}
 	qdwin_activation_pending_free_all(qdwin);
 	qdwin_data_offer_pending_free_all(qdwin);
