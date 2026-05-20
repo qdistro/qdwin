@@ -8184,7 +8184,15 @@ qdwin_layer_popup_on_popup_resource_destroyed(struct wl_listener *listener,
 /* plan3 H3 (deep-review): the grab pointer's owning seat was destroyed.
  * Null the cached lp->grab_seat so qdwin_layer_popup_destroy skips its
  * weston_pointer_end_grab call. The pointer struct itself may be freed
- * already — we never deref it from here. */
+ * already — we never deref it from here.
+ *
+ * deep-review-2 DPF2-H1: also unlink the listener from the (now
+ * destroyed) seat's destroy_signal list and re-init the link node so
+ * later cleanup paths (qdwin_layer_popup_destroy, or a follow-up grab
+ * on a different seat) can safely call wl_list_remove on a quiescent
+ * listener. libwayland's destroy-signal dispatch does not detach
+ * listeners after firing; the listener.link prev/next still reference
+ * the dying signal's storage until we unlink. */
 static void
 qdwin_layer_popup_on_grab_seat_destroyed(struct wl_listener *listener,
 					 void *data)
@@ -8194,10 +8202,13 @@ qdwin_layer_popup_on_grab_seat_destroyed(struct wl_listener *listener,
 	(void)data;
 	weston_log("qdwin: layer-popup grab seat destroyed; clearing cached "
 		   "pointer\n");
+	wl_list_remove(&lp->seat_destroy_listener.link);
+	wl_list_init(&lp->seat_destroy_listener.link);
 	lp->grab_seat = NULL;
 	lp->grab_active = 0;
 	/* lp->grab.pointer is now stale; do not deref. weston_pointer was
 	 * freed alongside the seat. */
+	lp->grab.pointer = NULL;
 }
 
 /* plan3 H1: layer-popup grab interface. xdg_popup.grab on a layer-
@@ -8221,33 +8232,34 @@ qdwin_layer_popup_bbox_contains(struct qdwin_layer_popup *lp,
 	       pos.c.y >= vp.c.y && pos.c.y < vp.c.y + lp->surface->height;
 }
 
-static void
-qdwin_layer_popup_grab_focus(struct weston_pointer_grab *grab)
+/* deep-review-2 H2: shared client-gated focus filter. Returns the
+ * grab's popup wl_client, or NULL when the popup_resource is gone
+ * (cancelled / outside-click-dismissed). */
+static struct wl_client *
+qdwin_layer_popup_grab_client(struct qdwin_layer_popup *lp)
 {
-	(void)grab;
+	if (!lp || !lp->popup_resource)
+		return NULL;
+	return wl_resource_get_client(lp->popup_resource);
 }
 
+/* deep-review-2 H2: repick the topmost view at the pointer and clamp
+ * pointer->focus to "popup or same-client view"; clear focus
+ * otherwise. Called by every grab event hook before sending events so
+ * stale pre-grab focus cannot receive button/axis/frame.
+ *
+ * Side effect: pointer->focus reflects the filter result on return.
+ * Callers can compare against NULL to decide whether to forward the
+ * current event to a downstream client. */
 static void
-qdwin_layer_popup_grab_motion(struct weston_pointer_grab *grab,
-			      const struct timespec *time,
-			      struct weston_pointer_motion_event *event)
+qdwin_layer_popup_grab_refilter_focus(struct qdwin_layer_popup *lp,
+				      struct weston_pointer *pointer)
 {
-	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
-	struct weston_pointer *pointer = grab->pointer;
-	weston_pointer_move(pointer, event);
-	/* plan3 H4 (deep-review): upstream xdg-popup grabs filter pointer
-	 * focus to surfaces owned by the grabbing client and clear focus
-	 * for views belonging to anyone else
-	 * (libweston/desktop/seat.c:weston_desktop_seat_pointer_popup_grab_focus).
-	 * We do the same: pick the topmost view at the pointer; if it is
-	 * the popup surface, the layer-shell parent, or any other view
-	 * whose surface belongs to the same wl_client as the popup,
-	 * deliver motion. Otherwise clear pointer focus so motion does
-	 * not leak to unrelated clients. */
+	if (!pointer)
+		return;
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
-	struct wl_client *grab_client = lp->popup_resource ?
-		wl_resource_get_client(lp->popup_resource) : NULL;
+	struct wl_client *grab_client = qdwin_layer_popup_grab_client(lp);
 	int deliver = 0;
 	if (view && view->surface) {
 		if (view->surface == lp->surface) {
@@ -8261,11 +8273,34 @@ qdwin_layer_popup_grab_motion(struct weston_pointer_grab *grab,
 	if (deliver) {
 		if (view != pointer->focus)
 			weston_pointer_set_focus(pointer, view);
-		weston_pointer_send_motion(pointer, time, event);
 	} else if (pointer->focus) {
 		/* libweston accepts NULL view → clears focus + sends leave. */
 		weston_pointer_set_focus(pointer, NULL);
 	}
+}
+
+/* deep-review-2 H2: weston_pointer_start_grab invokes the grab's .focus
+ * op synchronously. Without filtering here, the pre-grab focus survives
+ * until the first motion event, so a button/axis/frame received in
+ * between would be delivered to the prior focus client. */
+static void
+qdwin_layer_popup_grab_focus(struct weston_pointer_grab *grab)
+{
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	qdwin_layer_popup_grab_refilter_focus(lp, grab->pointer);
+}
+
+static void
+qdwin_layer_popup_grab_motion(struct weston_pointer_grab *grab,
+			      const struct timespec *time,
+			      struct weston_pointer_motion_event *event)
+{
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	struct weston_pointer *pointer = grab->pointer;
+	weston_pointer_move(pointer, event);
+	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
+	if (pointer->focus)
+		weston_pointer_send_motion(pointer, time, event);
 }
 
 static void
@@ -8301,7 +8336,12 @@ qdwin_layer_popup_grab_button(struct weston_pointer_grab *grab,
 		}
 		return;
 	}
-	weston_pointer_send_button(pointer, time, button, state);
+	/* deep-review-2 H2: clamp focus before delivering the button so a
+	 * press that arrived right after start_grab (no motion yet) cannot
+	 * use stale focus. send_button is a no-op when focus is NULL. */
+	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
+	if (pointer->focus)
+		weston_pointer_send_button(pointer, time, button, state);
 }
 
 static void
@@ -8309,20 +8349,32 @@ qdwin_layer_popup_grab_axis(struct weston_pointer_grab *grab,
 			    const struct timespec *time,
 			    struct weston_pointer_axis_event *event)
 {
-	weston_pointer_send_axis(grab->pointer, time, event);
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	struct weston_pointer *pointer = grab->pointer;
+	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
+	if (pointer->focus)
+		weston_pointer_send_axis(pointer, time, event);
 }
 
 static void
 qdwin_layer_popup_grab_axis_source(struct weston_pointer_grab *grab,
 				   uint32_t source)
 {
-	weston_pointer_send_axis_source(grab->pointer, source);
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	struct weston_pointer *pointer = grab->pointer;
+	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
+	if (pointer->focus)
+		weston_pointer_send_axis_source(pointer, source);
 }
 
 static void
 qdwin_layer_popup_grab_frame(struct weston_pointer_grab *grab)
 {
-	weston_pointer_send_frame(grab->pointer);
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	struct weston_pointer *pointer = grab->pointer;
+	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
+	if (pointer->focus)
+		weston_pointer_send_frame(pointer);
 }
 
 static void

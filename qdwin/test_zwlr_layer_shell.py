@@ -647,8 +647,13 @@ def test_layer_popup_reposition(display_name):
         if token == 42:
             saw_repositioned[0] = True
             state["reposition_seen"] = True
-    if "repositioned" in popup.dispatcher.keys() if hasattr(popup.dispatcher, "keys") else True:
-        popup.dispatcher["repositioned"] = on_repositioned
+    # deep-review-2 H3: the previous guard
+    #     if "repositioned" in popup.dispatcher.keys() if ... else True:
+    # never installed the handler — pywayland's dispatcher is a fresh
+    # dict, so "repositioned" is not a key before assignment and the
+    # condition is False. Assign unconditionally, matching every other
+    # dispatcher assignment in this file.
+    popup.dispatcher["repositioned"] = on_repositioned
     popup_surf.commit()
     d.roundtrip(); d.roundtrip()
 
