@@ -462,6 +462,164 @@ def test_role_conflict(display_name):
     return ok
 
 
+def test_layer_popup_grab_stale_serial(display_name):
+    """plan3 H1: xdg_popup.grab on a layer-parented popup with a stale
+    serial must post XDG_POPUP_ERROR_INVALID_GRAB (4).
+
+    Stock libweston posts INVALID_GRAB unconditionally for any
+    NULL-parent popup. Patched libweston with qdwin's layer-grab
+    handler validates the serial; a never-seen serial of 0 cannot
+    match any pointer/keyboard/touch grab_serial, so the handler
+    refuses and libweston posts the standard INVALID_GRAB. Either
+    way the discriminator is: serial=0 grab attempt is rejected.
+    """
+    label = "layer_popup_grab_stale_serial"
+    d, st = with_globals(display_name)
+    if not (st["xdg"] and st["shell"] and st["compositor"]):
+        print(f"  SKIP [{label}] missing globals")
+        try: d.disconnect()
+        except: pass
+        return True
+
+    # Layer-shell surface that will own the popup.
+    parent_surf = st["compositor"].create_surface()
+    ls = st["shell"].get_layer_surface(
+        parent_surf, None,
+        ZwlrLayerShellV1.layer.top.value, "test-grab-parent")
+    ls.set_size(80, 80)
+    ls.set_anchor(ZwlrLayerSurfaceV1.anchor.top.value
+                  | ZwlrLayerSurfaceV1.anchor.left.value)
+    ls.dispatcher["configure"] = lambda _ls, s, w, h: _ls.ack_configure(s)
+    parent_surf.commit()
+    d.roundtrip()
+
+    # xdg_popup with NULL parent; layer-shell get_popup attaches the
+    # layer-surface as parent before commit (the qdistro patched path).
+    positioner = st["xdg"].create_positioner()
+    positioner.set_size(40, 40)
+    positioner.set_anchor_rect(0, 0, 1, 1)
+    popup_surf = st["compositor"].create_surface()
+    popup_xs = st["xdg"].get_xdg_surface(popup_surf)
+    popup = popup_xs.get_popup(None, positioner)
+    if not hasattr(ls, "get_popup"):
+        print(f"  SKIP [{label}] zwlr_layer_surface_v1 < v3 (no get_popup)")
+        try: d.disconnect()
+        except: pass
+        return True
+    ls.get_popup(popup)
+
+    # Grab with serial=0 — guaranteed stale, no input grab matches.
+    # We need a seat resource for popup.grab.
+    seat = None
+    reg = d.get_registry()
+    def on_g(_r, name, iface, ver):
+        nonlocal seat
+        if iface == "wl_seat":
+            from pywayland.protocol.wayland import WlSeat
+            seat = _r.bind(name, WlSeat, min(ver, 4))
+    reg.dispatcher["global"] = on_g
+    reg.dispatcher["global_remove"] = lambda r, n: None
+    d.roundtrip()
+    if not seat:
+        print(f"  SKIP [{label}] no wl_seat global")
+        try: d.disconnect()
+        except: pass
+        return True
+
+    start = _stderr_size()
+    popup.grab(seat, 0)
+    try:
+        d.roundtrip(); d.roundtrip()
+    except Exception:
+        pass
+    captured = _read_captured_stderr_since(start)
+    saw_invalid_grab = False
+    for m in _WL_ERR_RE.finditer(captured):
+        iface, _oid, code, _msg = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        if iface == "xdg_popup" and code == 4:
+            saw_invalid_grab = True
+            break
+
+    try: d.disconnect()
+    except: pass
+
+    if saw_invalid_grab:
+        print(f"  PASS [{label}] stale-serial grab rejected with INVALID_GRAB")
+        return True
+    print(f"  FAIL [{label}] expected xdg_popup#4 (INVALID_GRAB) on serial=0; "
+          f"got: {captured.strip()[:200]}")
+    return False
+
+
+def test_layer_popup_reposition(display_name):
+    """plan3 M1: xdg_popup.reposition on a layer-parented popup must NOT
+    post an error (was previously a stash-only no-op that did not
+    schedule a configure). The patched flow re-computes geometry from
+    the positioner and schedules a configure; the client sees no
+    protocol error.
+    """
+    label = "layer_popup_reposition"
+    d, st = with_globals(display_name)
+    if not (st["xdg"] and st["shell"] and st["compositor"]):
+        print(f"  SKIP [{label}] missing globals")
+        try: d.disconnect()
+        except: pass
+        return True
+
+    parent_surf = st["compositor"].create_surface()
+    ls = st["shell"].get_layer_surface(
+        parent_surf, None,
+        ZwlrLayerShellV1.layer.top.value, "test-reposition-parent")
+    ls.set_size(80, 80)
+    ls.set_anchor(ZwlrLayerSurfaceV1.anchor.top.value
+                  | ZwlrLayerSurfaceV1.anchor.left.value)
+    ls.dispatcher["configure"] = lambda _ls, s, w, h: _ls.ack_configure(s)
+    parent_surf.commit()
+    d.roundtrip()
+
+    positioner = st["xdg"].create_positioner()
+    positioner.set_size(20, 20)
+    positioner.set_anchor_rect(0, 0, 1, 1)
+    popup_surf = st["compositor"].create_surface()
+    popup_xs = st["xdg"].get_xdg_surface(popup_surf)
+    popup = popup_xs.get_popup(None, positioner)
+    if not hasattr(ls, "get_popup"):
+        print(f"  SKIP [{label}] zwlr_layer_surface_v1 < v3 (no get_popup)")
+        try: d.disconnect()
+        except: pass
+        return True
+    ls.get_popup(popup)
+
+    # Reposition with a fresh positioner — must not post an error.
+    positioner2 = st["xdg"].create_positioner()
+    positioner2.set_size(20, 20)
+    positioner2.set_anchor_rect(10, 10, 5, 5)
+    if not hasattr(popup, "reposition"):
+        print(f"  SKIP [{label}] xdg_popup < v3 (no reposition)")
+        try: d.disconnect()
+        except: pass
+        return True
+
+    start = _stderr_size()
+    popup.reposition(positioner2, 42)
+    try:
+        d.roundtrip(); d.roundtrip()
+    except Exception:
+        pass
+    captured = _read_captured_stderr_since(start)
+    saw_err = bool(_WL_ERR_RE.search(captured))
+
+    try: d.disconnect()
+    except: pass
+
+    if saw_err:
+        print(f"  FAIL [{label}] reposition triggered protocol error: "
+              f"{captured.strip()[:200]}")
+        return False
+    print(f"  PASS [{label}] reposition accepted on layer-parented popup")
+    return True
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} <wayland-display>", file=sys.stderr)
@@ -481,6 +639,8 @@ def main():
         ("set_layer-out-of-range",      test_invalid_layer_set_layer),
         ("role-conflict",               test_role_conflict),
         ("null_parent_popup",           test_null_parent_popup),
+        ("layer_popup_grab_stale_serial", test_layer_popup_grab_stale_serial),
+        ("layer_popup_reposition",      test_layer_popup_reposition),
         ("v19_register_hotkey_live",    test_v19_register_hotkey_live),
     ]
     passed = failed = 0

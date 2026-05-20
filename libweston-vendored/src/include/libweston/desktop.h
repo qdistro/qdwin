@@ -224,6 +224,45 @@ weston_desktop_surface_foreach_child(struct weston_desktop_surface *surface,
 				     void (* callback)(struct weston_desktop_surface *child,
 						       void *user_data),
 				     void *user_data);
+bool
+weston_desktop_xdg_popup_attach_layer_parent(struct wl_resource *popup_resource,
+					     struct weston_surface *parent_surface);
+bool
+weston_desktop_xdg_popup_get_geometry(struct wl_resource *popup_resource,
+				      struct weston_geometry *geometry);
+
+/* qdistro plan3 H1: layer-parented xdg_popup grab handler.
+ *
+ * `xdg_popup.grab` is only implementable in libweston when the popup has
+ * a `weston_desktop_surface` parent (used to drive
+ * weston_desktop_seat_popup_grab_start). Popups created via
+ * zwlr_layer_surface_v1.get_popup have a `weston_surface` parent but no
+ * desktop_surface parent, so the upstream grab path would post
+ * XDG_POPUP_ERROR_INVALID_GRAB. The compositor registers a handler here;
+ * libweston calls it for layer-parented popups instead of posting the
+ * error. The handler is responsible for installing whatever pointer /
+ * keyboard grab semantics it needs (e.g. dismiss-on-outside-click) and
+ * returning true. Returning false makes libweston post the usual
+ * INVALID_GRAB error. */
+typedef bool (*weston_desktop_xdg_popup_layer_grab_handler_t)(
+	struct wl_resource *popup_resource,
+	struct weston_surface *popup_surface,
+	struct weston_surface *layer_parent_surface,
+	struct weston_seat *seat,
+	uint32_t serial,
+	void *user_data);
+
+void
+weston_desktop_xdg_popup_set_layer_grab_handler(
+	weston_desktop_xdg_popup_layer_grab_handler_t handler,
+	void *user_data);
+
+/* qdistro plan3 H1: matched dismiss helper. Called by the compositor's
+ * grab implementation when it wants libweston to send xdg_popup.popup_done
+ * and let the client tear down. Safe to call multiple times; it is a
+ * no-op once the popup resource has been destroyed. */
+void
+weston_desktop_xdg_popup_dismiss_layer_grab(struct wl_resource *popup_resource);
 
 
 bool

@@ -19,8 +19,15 @@ and observation primitives are different.
   qdwin compositor (greetd-qdwin.service active on tty3 with autologin
   as `admin`). Standard test password `$QDISTRO_VM_PASSWORD`.
 - VM name: `$VMNAME` if set, else `virsh list --name --state-running | head -1`.
-- The qdshell ctrl-socket lives at `/run/user/1000/qdshell.sock` and is
-  the **only** way to drive the launcher / switcher / locker.
+- The qdshell ctrl-socket at `/run/user/1000/qdshell.sock` is the
+  legacy driver for the launcher / switcher / locker and is still
+  needed by the `NN-*.md` scenarios it was authored against. The
+  shipping qdshell is Quickshell IPC based: new `agent-*` smokes
+  (`agent-click-smoke.sh`, `agent-mvp-session-smoke.sh`,
+  `agent-protocol-audit.sh`, `agent-cursor-clickthrough-smoke.sh`) do
+  NOT depend on the ctrl-socket. Prefer the new path for new tests;
+  port `NN-*.md` scenarios off the ctrl-socket as Quickshell IPC
+  hooks land.
 
 ## What works (and what doesn't)
 
@@ -177,6 +184,10 @@ hard-coded coordinates across clones.
 | `15-keybinding-events.md` | Ctrl+Space / Alt+Tab / Ctrl+Alt+L / registered hotkeys all emit `qdwin: <event>` log lines independent of shell binding state (silent-drop guard) |
 | `16-qdshell-binding-protocol-events.md` | qdshell binds qdwin_shell_v1 at v14 via the Qdistro.Qdwin QML plugin; `hello`, `toplevel_added/removed`, `seat_focus_changed`, and switcher_next/commit all round-trip; alt+tab cycles focus via the protocol |
 | `17-qdshell-drives-close.md` | qdshell's `Qdwin.closeWindow` Q_INVOKABLE invokes `qdwin_shell_v1.request_close(handle)`; target toplevel exits cleanly and the removal propagates back through the protocol to the QML side |
+| `agent-mvp-session-smoke.sh` | executable agent/CI smoke for plan2 MVP session invariants: qdwin/qdshell active, qdshell bound to qdwin_shell_v1, legacy LXQt/labwc absent, cursor sprites active, Ctrl+Space logged, and ordinary toplevels released from qdwin's holding layer |
+| `agent-click-smoke.sh` | executable agent/CI smoke: launches two known test windows, injects QMP mouse clicks, asserts focus moves to the clicked toplevel, and reports the qdshell launcher-icon click as a named gap unless `QDWIN_REQUIRE_LAUNCHER_CLICK=1` is set |
+| `agent-protocol-audit.sh` | executable agent/CI audit: records qdwin Wayland globals, scans qdshell's Quickshell/Wayland usage, and checks that opening the qdshell launcher does not hit the xdg-popup null-parent protocol error |
+| `agent-cursor-clickthrough-smoke.sh` | plan3 H3: spawns a known xdg-toplevel, parks the pointer over it (so a cursor sprite maps on cursor_layer), and verifies the click still lands on the toplevel. Discriminator: `qdwin: focus handle=N` matches the test window. `QDWIN_CURSOR_CLICKTHROUGH_FORCE_BREAK=1` flips the expectation for validating the regression itself. |
 
 Run each scenario sequentially against the same VM; each cleans up after itself. For a full smoke pass, an orchestrator can spawn one runner per scenario in series.
 

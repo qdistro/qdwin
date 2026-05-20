@@ -129,6 +129,7 @@ struct weston_desktop_xdg_popup {
 	struct wl_resource *resource;
 	bool committed;
 	struct weston_desktop_xdg_surface *parent;
+	struct weston_surface *layer_parent_surface;
 	struct weston_desktop_seat *seat;
 	struct weston_geometry geometry;
 
@@ -917,6 +918,14 @@ static const struct xdg_toplevel_interface weston_desktop_xdg_toplevel_implement
 	.set_minimized       = weston_desktop_xdg_toplevel_protocol_set_minimized,
 };
 
+/* qdistro plan3 H1: forward-declared module storage so the protocol_grab
+ * handler (immediately below) can see it. Definition + setter are near
+ * weston_desktop_xdg_popup_attach_layer_parent. */
+static struct {
+	weston_desktop_xdg_popup_layer_grab_handler_t func;
+	void *user_data;
+} weston_desktop_xdg_popup_layer_grab;
+
 static void
 weston_desktop_xdg_popup_protocol_grab(struct wl_client *wl_client,
 				       struct wl_resource *resource,
@@ -932,10 +941,32 @@ weston_desktop_xdg_popup_protocol_grab(struct wl_client *wl_client,
 	struct weston_desktop_surface *topmost;
 	bool parent_is_toplevel;
 
-	/* qdistro patch: a NULL-parent popup cannot be grabbed; the spec
-	 * forbids grab before initial commit anyway, so this is the same
-	 * error class. */
+	/* qdistro patch: a NULL-parent popup cannot be grabbed via the
+	 * desktop seat machinery (it requires a weston_desktop_surface
+	 * parent). For layer-parented popups (plan3 H1), delegate to the
+	 * compositor's layer-popup grab handler if it has been registered.
+	 * The handler is responsible for serial validation and for installing
+	 * whatever pointer/keyboard grab it wants. Falling through to the
+	 * INVALID_GRAB error path is intentional when no handler is set or
+	 * the handler declines. */
 	if (popup->parent == NULL) {
+		if (popup->layer_parent_surface != NULL &&
+		    weston_desktop_xdg_popup_layer_grab.func != NULL) {
+			bool ok = weston_desktop_xdg_popup_layer_grab.func(
+				popup->resource,
+				weston_desktop_surface_get_surface(popup->base.desktop_surface),
+				popup->layer_parent_surface,
+				wseat,
+				serial,
+				weston_desktop_xdg_popup_layer_grab.user_data);
+			if (!ok) {
+				wl_resource_post_error(popup->resource,
+					XDG_POPUP_ERROR_INVALID_GRAB,
+					"xdg_popup layer-parent grab refused (serial=%u)",
+					serial);
+			}
+			return;
+		}
 		wl_resource_post_error(popup->resource,
 				       XDG_POPUP_ERROR_INVALID_GRAB,
 				       "xdg_popup grab requires a parent set before grab");
@@ -1021,10 +1052,30 @@ weston_desktop_xdg_popup_protocol_reposition(struct wl_client *wl_client,
 		return;
 	}
 
-	/* qdistro patch: a NULL-parent popup has no anchor to reposition
-	 * relative to. Reposition before parent attachment is meaningless;
-	 * stash the geometry so a later attach + commit picks it up. */
+	/* qdistro patch: NULL desktop_surface parent.
+	 *
+	 * Two sub-cases:
+	 * 1. layer_parent_surface set (plan3 M1): the popup is parented to a
+	 *    layer-shell surface. weston_desktop_xdg_positioner_get_geometry
+	 *    only uses positioner state (parent/dsurface args are unused), so
+	 *    we can compute the same anchored geometry, schedule a configure,
+	 *    and let the compositor's commit listener reposition the popup
+	 *    view relative to its layer parent. Quickshell tooltips that
+	 *    re-anchor on hover require this.
+	 * 2. No parent at all: reposition before parent attachment is
+	 *    meaningless; stash the rect for a later attach + commit. */
 	if (popup->parent == NULL) {
+		if (popup->layer_parent_surface != NULL) {
+			popup->geometry =
+				weston_desktop_xdg_positioner_get_geometry(
+					positioner, dsurface, NULL);
+			popup->pending_reposition = true;
+			popup->pending_reposition_token = token;
+			if (popup->committed)
+				weston_desktop_xdg_surface_schedule_configure(
+					&popup->base);
+			return;
+		}
 		popup->geometry.x = positioner->offset.x;
 		popup->geometry.y = positioner->offset.y;
 		popup->geometry.width = positioner->size.width;
@@ -1074,7 +1125,7 @@ weston_desktop_xdg_popup_committed(struct weston_desktop_xdg_popup *popup)
 	/* qdistro patch: spec mandates the parent be set "before
 	 * committing". If a NULL-parent popup reaches commit without an
 	 * other-protocol parent attachment, post the error now. */
-	if (popup->parent == NULL) {
+	if (popup->parent == NULL && popup->layer_parent_surface == NULL) {
 		wl_resource_post_error(popup->resource,
 				       XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
 				       "popup parent must be set before commit");
@@ -1120,6 +1171,82 @@ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface
 					       parent_dsurface,
 					       offset,
 					       true);
+}
+
+/* qdistro plan3 H1: setter for the layer-popup grab handler used by
+ * weston_desktop_xdg_popup_protocol_grab above. Storage is the
+ * forward-declared static near the start of the protocol_grab function. */
+WL_EXPORT void
+weston_desktop_xdg_popup_set_layer_grab_handler(
+	weston_desktop_xdg_popup_layer_grab_handler_t handler,
+	void *user_data)
+{
+	weston_desktop_xdg_popup_layer_grab.func = handler;
+	weston_desktop_xdg_popup_layer_grab.user_data = user_data;
+}
+
+WL_EXPORT void
+weston_desktop_xdg_popup_dismiss_layer_grab(struct wl_resource *popup_resource)
+{
+	struct weston_desktop_surface *dsurface;
+	struct weston_desktop_xdg_popup *popup;
+
+	if (!popup_resource)
+		return;
+	dsurface = wl_resource_get_user_data(popup_resource);
+	if (!dsurface)
+		return;
+	popup = weston_desktop_surface_get_implementation_data(dsurface);
+	if (!popup ||
+	    popup->base.role != WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP)
+		return;
+	xdg_popup_send_popup_done(popup->resource);
+}
+
+WL_EXPORT bool
+weston_desktop_xdg_popup_attach_layer_parent(struct wl_resource *popup_resource,
+					     struct weston_surface *parent_surface)
+{
+	struct weston_desktop_surface *dsurface;
+	struct weston_desktop_xdg_popup *popup;
+
+	if (!popup_resource || !parent_surface)
+		return false;
+
+	dsurface = wl_resource_get_user_data(popup_resource);
+	if (!dsurface)
+		return false;
+
+	popup = weston_desktop_surface_get_implementation_data(dsurface);
+	if (!popup ||
+	    popup->base.role != WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP)
+		return false;
+
+	popup->layer_parent_surface = parent_surface;
+	return true;
+}
+
+WL_EXPORT bool
+weston_desktop_xdg_popup_get_geometry(struct wl_resource *popup_resource,
+				      struct weston_geometry *geometry)
+{
+	struct weston_desktop_surface *dsurface;
+	struct weston_desktop_xdg_popup *popup;
+
+	if (!popup_resource || !geometry)
+		return false;
+
+	dsurface = wl_resource_get_user_data(popup_resource);
+	if (!dsurface)
+		return false;
+
+	popup = weston_desktop_surface_get_implementation_data(dsurface);
+	if (!popup ||
+	    popup->base.role != WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP)
+		return false;
+
+	*geometry = popup->geometry;
+	return true;
 }
 
 static void
@@ -1431,15 +1558,17 @@ weston_desktop_xdg_surface_protocol_get_popup(struct wl_client *wl_client,
 						       offset,
 						       true);
 	} else {
-		/* Defer geometry until the parent is set via a side-channel
-		 * protocol (e.g. zwlr_layer_surface_v1.get_popup) before
-		 * commit. We still record the requested rect from the
-		 * positioner so that, once the parent is supplied, no
-		 * additional protocol round-trip is needed. */
-		popup->geometry.x = positioner->offset.x;
-		popup->geometry.y = positioner->offset.y;
-		popup->geometry.width = positioner->size.width;
-		popup->geometry.height = positioner->size.height;
+		/* Defer set_relative_to until the parent is set via a side-
+		 * channel protocol (e.g. zwlr_layer_surface_v1.get_popup)
+		 * before commit. positioner_get_geometry only uses positioner
+		 * state, so we can still compute the anchored rect now —
+		 * qdwin's layer-popup commit listener reads it via
+		 * weston_desktop_xdg_popup_get_geometry to place the view
+		 * relative to its layer-shell parent. */
+		popup->geometry =
+			weston_desktop_xdg_positioner_get_geometry(positioner,
+								   dsurface,
+								   NULL);
 		(void) offset;
 	}
 }

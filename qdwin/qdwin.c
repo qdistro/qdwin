@@ -23,6 +23,7 @@
  */
 
 #define _GNU_SOURCE  /* accept4(), SOCK_CLOEXEC for §6.10 secctx accept loop */
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -100,7 +101,6 @@ void notify_key(struct weston_seat *seat,
 		uint32_t key,
 		enum wl_keyboard_key_state state,
 		enum weston_key_state_update update_state);
-
 struct qdwin;
 
 enum qdwin_side {
@@ -593,6 +593,13 @@ struct qdwin {
 		struct weston_surface *surface;
 		int32_t hotspot_x, hotspot_y;
 		struct wl_listener destroy_listener;
+		/* plan3 M2: re-assert the Weston cursor-surface invariant on
+		 * every commit (libweston/input.c:pointer_cursor_surface_committed
+		 * clears pending+current input on each commit, not only at
+		 * install time). Without this, a sprite helper that recommits
+		 * with a non-empty pending.input would silently make the cursor
+		 * pickable again. */
+		struct wl_listener commit_listener;
 		struct qdwin *qdwin;
 		uint32_t shape;     /* back-ref so the listener can find us */
 	} cursor_sprites[37];
@@ -731,6 +738,17 @@ static void qdwin_panels_on_output_change(struct qdwin *qdwin);
 static void qdwin_layer_shell_subtract_zones(struct qdwin *qdwin,
 					     struct weston_output *out,
 					     int *x, int *y, int *w, int *h);
+struct qdwin_layer_surface;
+static struct qdwin_layer_surface *
+qdwin_layer_surface_at_pos(struct qdwin *qdwin, struct weston_coord_global pos);
+static struct weston_view *
+qdwin_layer_surface_view_at_pos(struct qdwin *qdwin,
+				struct weston_coord_global pos);
+/* plan3 M4: forward-declared so qdwin_proxy_default_grab_button (which
+ * sits above the qdwin_layer_surface struct definition) can call it. */
+static void
+qdwin_layer_surface_handle_on_demand_button(struct qdwin *qdwin,
+					    struct weston_pointer *pointer);
 /* §6.6 S3/S4 keybinding handlers — forward-declared because they are
  * registered in wet_shell_init which precedes their definitions. */
 static void qdwin_on_launcher_key(struct weston_keyboard *kb,
@@ -1014,14 +1032,12 @@ qdwin_surface_added(struct weston_desktop_surface *dsurf, void *data)
 
 	qdwin_send_toplevel_added(qdwin, tl);
 
-	/* QDWIN_AUTO_APPROVE_TOPLEVELS: dev/test escape hatch for envs
-	 * where qdshell hasn't bound qdwin_shell_v1 (the binding is a
-	 * Phase 5+ task per Qdwin.qml). With no binder, set_border_color
-	 * + attach_decoration never fire, so qdwin_toplevel_release_
-	 * holding() never gets called and every toplevel is invisible.
-	 * This flag bypasses the wait by releasing immediately. */
-	if (getenv("QDWIN_AUTO_APPROVE_TOPLEVELS"))
-		qdwin_toplevel_release_holding(tl, "auto-approve-env");
+	/* qdshell consumes qdwin_shell_v1 to track/focus toplevels, but it
+	 * does not attach qdwin SSD chrome for ordinary local applications.
+	 * Do not require a shell-side decoration/colour request before a
+	 * normal desktop surface can become visible. Nested proxy toplevels
+	 * still use their explicit allow/deny path. */
+	qdwin_toplevel_release_holding(tl, "default_toplevel_policy");
 }
 
 static void
@@ -2588,6 +2604,10 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 	weston_pointer_move(pointer, event);
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
+	struct weston_view *layer_view =
+		qdwin_layer_surface_view_at_pos(qdwin_singleton, pointer->pos);
+	if (layer_view)
+		view = layer_view;
 	if (view != pointer->focus)
 		weston_pointer_set_focus(pointer, view);
 	qdwin_proxy_pointer_track_focus(qdwin_singleton, pointer);
@@ -2693,6 +2713,20 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				uint32_t button, uint32_t state)
 {
 	struct weston_pointer *pointer = grab->pointer;
+	struct weston_view *layer_view =
+		qdwin_layer_surface_view_at_pos(qdwin_singleton, pointer->pos);
+	if (layer_view && pointer->focus != layer_view)
+		weston_pointer_set_focus(pointer, layer_view);
+
+	/* plan3 M4: zwlr_layer_surface_v1 ON_DEMAND keyboard interactivity.
+	 * On left-button press over a layer-shell surface that requested
+	 * ON_DEMAND, transfer keyboard focus to that surface so that text
+	 * fields inside Quickshell popups can receive input. The helper
+	 * is defined later (the qdwin_layer_surface struct is incomplete
+	 * here) — see qdwin_layer_surface_handle_on_demand_button. */
+	if (state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_LEFT)
+		qdwin_layer_surface_handle_on_demand_button(qdwin_singleton,
+							    pointer);
 	/* Click-to-focus: on left-button press, raise + focus the toplevel
 	 * under the cursor (whether the pointer is on its content surface
 	 * or on a chrome side). Without this, clicking a background window
@@ -7407,8 +7441,29 @@ struct qdwin_layer_surface {
 
 	struct wl_listener commit_listener;
 	struct wl_listener surface_destroy_listener;
+	struct wl_list popups;                 /* qdwin_layer_popup::link */
 	struct wl_list link;                   /* qdwin::layer_surfaces */
 };
+
+struct qdwin_layer_popup {
+	struct qdwin_layer_surface *parent;
+	struct wl_resource *popup_resource;    /* xdg_popup */
+	struct weston_desktop_surface *desktop_surface;
+	struct weston_surface *surface;
+	struct weston_view *view;
+	struct wl_listener surface_commit_listener;
+	struct wl_listener surface_destroy_listener;
+	struct wl_list link;                   /* qdwin_layer_surface::popups */
+
+	/* plan3 H1: layer-popup grab state. Set when the client calls
+	 * xdg_popup.grab and the vendored libweston layer-grab handler
+	 * delegates to qdwin. One pointer grab at a time per qdwin
+	 * instance (mirrors upstream xdg_popup grab serialisation). */
+	struct weston_pointer_grab grab;
+	int grab_active;
+};
+
+static void qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp);
 
 /* Pick a default output if the client passed NULL: first in the
  * compositor's output_list. Returns NULL if no outputs are connected
@@ -7424,6 +7479,71 @@ qdwin_layer_surface_resolve_output(struct qdwin_layer_surface *ls)
 	struct weston_output *o = NULL;
 	o = wl_container_of(ls->qdwin->compositor->output_list.next, o, link);
 	return o;
+}
+
+static int
+qdwin_layer_surface_contains(struct qdwin_layer_surface *ls,
+			     struct weston_coord_global pos)
+{
+	if (!ls || !ls->mapped || !ls->view || !ls->surface ||
+	    ls->surface->width <= 0 || ls->surface->height <= 0)
+		return 0;
+
+	struct weston_coord_global vp =
+		weston_view_get_pos_offset_global(ls->view);
+	return pos.c.x >= vp.c.x && pos.c.x < vp.c.x + ls->surface->width &&
+	       pos.c.y >= vp.c.y && pos.c.y < vp.c.y + ls->surface->height;
+}
+
+static struct qdwin_layer_surface *
+qdwin_layer_surface_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
+{
+	if (!qdwin)
+		return NULL;
+
+	struct qdwin_layer_surface *ls;
+	wl_list_for_each(ls, &qdwin->layer_surfaces, link) {
+		if (qdwin_layer_surface_contains(ls, pos))
+			return ls;
+	}
+	return NULL;
+}
+
+static struct weston_view *
+qdwin_layer_surface_view_at_pos(struct qdwin *qdwin,
+				struct weston_coord_global pos)
+{
+	struct qdwin_layer_surface *ls =
+		qdwin_layer_surface_at_pos(qdwin, pos);
+	return ls ? ls->view : NULL;
+}
+
+/* plan3 M4: ON_DEMAND keyboard interactivity handler. Called from the
+ * default pointer grab on every left-button press. If the press lands
+ * on a layer-shell surface that requested ON_DEMAND, transfer keyboard
+ * focus there. EXCLUSIVE focus is handled at map time in
+ * qdwin_layer_surface_apply; NONE never changes focus. */
+static void
+qdwin_layer_surface_handle_on_demand_button(struct qdwin *qdwin,
+					    struct weston_pointer *pointer)
+{
+	if (!qdwin || !pointer)
+		return;
+	struct qdwin_layer_surface *ls =
+		qdwin_layer_surface_at_pos(qdwin, pointer->pos);
+	if (!ls || !ls->surface)
+		return;
+	if (ls->current.kbd_interactivity !=
+	    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND)
+		return;
+	struct weston_keyboard *kb = weston_seat_get_keyboard(pointer->seat);
+	if (!kb || kb->focus == ls->surface)
+		return;
+	weston_keyboard_set_focus(kb, ls->surface);
+	weston_log("qdwin: layer-shell ON_DEMAND focus -> ns=%s seat=%s\n",
+		   ls->namespace ? ls->namespace : "(null)",
+		   (pointer->seat && pointer->seat->seat_name)
+			   ? pointer->seat->seat_name : "");
 }
 
 /* Per spec: when exclusive_edge is unset (0), derive from anchor.
@@ -7721,6 +7841,9 @@ qdwin_layer_surface_on_surface_destroyed(struct wl_listener *l, void *data)
 		ls->view = NULL;
 		ls->mapped = 0;
 	}
+	struct qdwin_layer_popup *lp, *tmp;
+	wl_list_for_each_safe(lp, tmp, &ls->popups, link)
+		qdwin_layer_popup_destroy(lp);
 	ls->surface = NULL;
 	if (was_reserving)
 		qdwin_panels_on_output_change(ls->qdwin);
@@ -7815,6 +7938,339 @@ qdwin_layer_surface_set_keyboard_interactivity(
 	ls->pending.kbd_interactivity = interactivity;
 }
 
+typedef bool (*qdwin_xdg_popup_attach_layer_parent_fn)(
+	struct wl_resource *popup_resource,
+	struct weston_surface *parent_surface);
+typedef bool (*qdwin_xdg_popup_get_geometry_fn)(
+	struct wl_resource *popup_resource,
+	struct weston_geometry *geometry);
+
+/* plan3 H1: dlsym typedefs for the new layer-popup grab helpers in
+ * vendored libweston. Kept as soft references so qdwin still links and
+ * runs against an unpatched libweston (the grab call will then
+ * gracefully fall back to libweston's INVALID_GRAB error path). */
+typedef bool (*qdwin_xdg_popup_layer_grab_handler_t)(
+	struct wl_resource *popup_resource,
+	struct weston_surface *popup_surface,
+	struct weston_surface *layer_parent_surface,
+	struct weston_seat *seat,
+	uint32_t serial,
+	void *user_data);
+
+typedef void (*qdwin_xdg_popup_set_layer_grab_handler_fn)(
+	qdwin_xdg_popup_layer_grab_handler_t handler,
+	void *user_data);
+
+typedef void (*qdwin_xdg_popup_dismiss_layer_grab_fn)(
+	struct wl_resource *popup_resource);
+
+static qdwin_xdg_popup_attach_layer_parent_fn
+qdwin_xdg_popup_attach_layer_parent_sym(void)
+{
+	static qdwin_xdg_popup_attach_layer_parent_fn fn;
+	static int looked_up;
+	if (!looked_up) {
+		fn = (qdwin_xdg_popup_attach_layer_parent_fn)dlsym(
+			RTLD_DEFAULT,
+			"weston_desktop_xdg_popup_attach_layer_parent");
+		looked_up = 1;
+	}
+	return fn;
+}
+
+static qdwin_xdg_popup_get_geometry_fn
+qdwin_xdg_popup_get_geometry_sym(void)
+{
+	static qdwin_xdg_popup_get_geometry_fn fn;
+	static int looked_up;
+	if (!looked_up) {
+		fn = (qdwin_xdg_popup_get_geometry_fn)dlsym(
+			RTLD_DEFAULT,
+			"weston_desktop_xdg_popup_get_geometry");
+		looked_up = 1;
+	}
+	return fn;
+}
+
+static qdwin_xdg_popup_set_layer_grab_handler_fn
+qdwin_xdg_popup_set_layer_grab_handler_sym(void)
+{
+	static qdwin_xdg_popup_set_layer_grab_handler_fn fn;
+	static int looked_up;
+	if (!looked_up) {
+		fn = (qdwin_xdg_popup_set_layer_grab_handler_fn)dlsym(
+			RTLD_DEFAULT,
+			"weston_desktop_xdg_popup_set_layer_grab_handler");
+		looked_up = 1;
+	}
+	return fn;
+}
+
+static qdwin_xdg_popup_dismiss_layer_grab_fn
+qdwin_xdg_popup_dismiss_layer_grab_sym(void)
+{
+	static qdwin_xdg_popup_dismiss_layer_grab_fn fn;
+	static int looked_up;
+	if (!looked_up) {
+		fn = (qdwin_xdg_popup_dismiss_layer_grab_fn)dlsym(
+			RTLD_DEFAULT,
+			"weston_desktop_xdg_popup_dismiss_layer_grab");
+		looked_up = 1;
+	}
+	return fn;
+}
+
+static void
+qdwin_layer_popup_update_position(struct qdwin_layer_popup *lp)
+{
+	if (!lp || !lp->parent || !lp->view)
+		return;
+
+	struct weston_geometry g = { 0 };
+	qdwin_xdg_popup_get_geometry_fn get_geometry =
+		qdwin_xdg_popup_get_geometry_sym();
+	if (!get_geometry || !get_geometry(lp->popup_resource, &g))
+		return;
+
+	struct weston_coord_global pos = {
+		.c = weston_coord(lp->parent->box_x + g.x,
+				  lp->parent->box_y + g.y)
+	};
+	weston_view_set_position(lp->view, pos);
+	weston_view_update_transform(lp->view);
+}
+
+static void
+qdwin_layer_popup_destroy(struct qdwin_layer_popup *lp)
+{
+	if (!lp)
+		return;
+
+	/* plan3 H1: end any active pointer grab so libweston rebinds the
+	 * default grab before we free the qdwin_layer_popup. Releasing the
+	 * grab here mirrors the order used in qdwin_popup_grab_button. */
+	if (lp->grab_active && lp->grab.pointer) {
+		weston_pointer_end_grab(lp->grab.pointer);
+		lp->grab_active = 0;
+	}
+
+	wl_list_remove(&lp->link);
+	if (lp->surface_commit_listener.link.next)
+		wl_list_remove(&lp->surface_commit_listener.link);
+	if (lp->surface_destroy_listener.link.next)
+		wl_list_remove(&lp->surface_destroy_listener.link);
+
+	if (lp->view) {
+		weston_desktop_surface_unlink_view(lp->view);
+		weston_view_destroy(lp->view);
+	}
+	free(lp);
+}
+
+/* plan3 H1: layer-popup grab interface. xdg_popup.grab on a layer-
+ * parented popup cannot use libweston's weston_desktop_seat_popup_grab
+ * machinery (it requires desktop_surface parents). We install our own
+ * weston_pointer grab that dismisses the popup on outside-click via
+ * weston_desktop_xdg_popup_dismiss_layer_grab (which sends
+ * xdg_popup.popup_done). Inside-popup events go through normal pointer
+ * delivery. */
+
+static int
+qdwin_layer_popup_bbox_contains(struct qdwin_layer_popup *lp,
+				struct weston_coord_global pos)
+{
+	if (!lp || !lp->view || !lp->surface ||
+	    lp->surface->width <= 0 || lp->surface->height <= 0)
+		return 0;
+	struct weston_coord_global vp =
+		weston_view_get_pos_offset_global(lp->view);
+	return pos.c.x >= vp.c.x && pos.c.x < vp.c.x + lp->surface->width &&
+	       pos.c.y >= vp.c.y && pos.c.y < vp.c.y + lp->surface->height;
+}
+
+static void
+qdwin_layer_popup_grab_focus(struct weston_pointer_grab *grab)
+{
+	(void)grab;
+}
+
+static void
+qdwin_layer_popup_grab_motion(struct weston_pointer_grab *grab,
+			      const struct timespec *time,
+			      struct weston_pointer_motion_event *event)
+{
+	struct weston_pointer *pointer = grab->pointer;
+	weston_pointer_move(pointer, event);
+	/* Re-pick so layer-popup contents get enter/motion while held. */
+	struct weston_view *view = weston_compositor_pick_view(
+		pointer->seat->compositor, pointer->pos);
+	if (view != pointer->focus)
+		weston_pointer_set_focus(pointer, view);
+	weston_pointer_send_motion(pointer, time, event);
+}
+
+static void
+qdwin_layer_popup_grab_button(struct weston_pointer_grab *grab,
+			      const struct timespec *time,
+			      uint32_t button, uint32_t state)
+{
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	struct weston_pointer *pointer = grab->pointer;
+
+	if (state == WL_POINTER_BUTTON_STATE_PRESSED &&
+	    !qdwin_layer_popup_bbox_contains(lp, pointer->pos)) {
+		weston_log("qdwin: layer-popup dismissed by outside click "
+			   "at (%.0f,%.0f)\n",
+			   pointer->pos.c.x, pointer->pos.c.y);
+		if (lp->grab_active) {
+			weston_pointer_end_grab(pointer);
+			lp->grab_active = 0;
+		}
+		if (lp->popup_resource) {
+			qdwin_xdg_popup_dismiss_layer_grab_fn dismiss =
+				qdwin_xdg_popup_dismiss_layer_grab_sym();
+			if (dismiss)
+				dismiss(lp->popup_resource);
+		}
+		return;
+	}
+	weston_pointer_send_button(pointer, time, button, state);
+}
+
+static void
+qdwin_layer_popup_grab_axis(struct weston_pointer_grab *grab,
+			    const struct timespec *time,
+			    struct weston_pointer_axis_event *event)
+{
+	weston_pointer_send_axis(grab->pointer, time, event);
+}
+
+static void
+qdwin_layer_popup_grab_axis_source(struct weston_pointer_grab *grab,
+				   uint32_t source)
+{
+	weston_pointer_send_axis_source(grab->pointer, source);
+}
+
+static void
+qdwin_layer_popup_grab_frame(struct weston_pointer_grab *grab)
+{
+	weston_pointer_send_frame(grab->pointer);
+}
+
+static void
+qdwin_layer_popup_grab_cancel(struct weston_pointer_grab *grab)
+{
+	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
+	lp->grab_active = 0;
+	if (lp->popup_resource) {
+		qdwin_xdg_popup_dismiss_layer_grab_fn dismiss =
+			qdwin_xdg_popup_dismiss_layer_grab_sym();
+		if (dismiss)
+			dismiss(lp->popup_resource);
+	}
+}
+
+static const struct weston_pointer_grab_interface
+qdwin_layer_popup_grab_iface = {
+	.focus       = qdwin_layer_popup_grab_focus,
+	.motion      = qdwin_layer_popup_grab_motion,
+	.button      = qdwin_layer_popup_grab_button,
+	.axis        = qdwin_layer_popup_grab_axis,
+	.axis_source = qdwin_layer_popup_grab_axis_source,
+	.frame       = qdwin_layer_popup_grab_frame,
+	.cancel      = qdwin_layer_popup_grab_cancel,
+};
+
+/* Forward declaration: defined later to find the qdwin_layer_popup that
+ * owns a given xdg_popup resource. */
+static struct qdwin_layer_popup *
+qdwin_layer_popup_for_resource(struct qdwin *qdwin,
+			       struct wl_resource *popup_resource);
+
+/* plan3 H1: layer-popup grab handler called from vendored libweston's
+ * weston_desktop_xdg_popup_protocol_grab when the popup is layer-
+ * parented and qdwin has registered this handler. Returning false makes
+ * libweston post XDG_POPUP_ERROR_INVALID_GRAB to the client. */
+static bool
+qdwin_layer_popup_layer_grab_handler(struct wl_resource *popup_resource,
+				     struct weston_surface *popup_surface,
+				     struct weston_surface *layer_parent_surface,
+				     struct weston_seat *wseat,
+				     uint32_t serial,
+				     void *user_data)
+{
+	struct qdwin *qdwin = user_data;
+	(void)popup_surface;
+	(void)layer_parent_surface;
+	if (!qdwin || !wseat || !popup_resource)
+		return false;
+
+	/* Validate that one of the input devices on this seat has a grab
+	 * serial matching the request. Mirrors libweston's serial check
+	 * in weston_desktop_seat_popup_grab_start. */
+	struct weston_pointer *pointer = weston_seat_get_pointer(wseat);
+	struct weston_keyboard *keyboard = weston_seat_get_keyboard(wseat);
+	struct weston_touch *touch = weston_seat_get_touch(wseat);
+	int serial_ok =
+		(pointer && pointer->grab_serial == serial) ||
+		(keyboard && keyboard->grab_serial == serial) ||
+		(touch && touch->grab_serial == serial);
+	if (!serial_ok) {
+		weston_log("qdwin: layer-popup grab refused: stale serial=%u "
+			   "(p=%u k=%u t=%u)\n", serial,
+			   pointer ? pointer->grab_serial : 0,
+			   keyboard ? keyboard->grab_serial : 0,
+			   touch ? touch->grab_serial : 0);
+		return false;
+	}
+
+	struct qdwin_layer_popup *lp =
+		qdwin_layer_popup_for_resource(qdwin, popup_resource);
+	if (!lp) {
+		weston_log("qdwin: layer-popup grab refused: popup not "
+			   "tracked\n");
+		return false;
+	}
+
+	if (!pointer) {
+		weston_log("qdwin: layer-popup grab refused: no pointer on "
+			   "seat\n");
+		return false;
+	}
+	if (lp->grab_active) {
+		weston_log("qdwin: layer-popup grab already active for "
+			   "popup=%p\n", (void *)popup_resource);
+		return true;
+	}
+	lp->grab.interface = &qdwin_layer_popup_grab_iface;
+	weston_pointer_start_grab(pointer, &lp->grab);
+	lp->grab_active = 1;
+	weston_log("qdwin: layer-popup grab started popup=%p seat=%s\n",
+		   (void *)popup_resource,
+		   wseat->seat_name ? wseat->seat_name : "");
+	return true;
+}
+
+static void
+qdwin_layer_popup_on_commit(struct wl_listener *listener, void *data)
+{
+	struct qdwin_layer_popup *lp =
+		wl_container_of(listener, lp, surface_commit_listener);
+	(void)data;
+	qdwin_layer_popup_update_position(lp);
+}
+
+static void
+qdwin_layer_popup_on_surface_destroyed(struct wl_listener *listener,
+				       void *data)
+{
+	struct qdwin_layer_popup *lp =
+		wl_container_of(listener, lp, surface_destroy_listener);
+	(void)data;
+	qdwin_layer_popup_destroy(lp);
+}
+
 static void
 qdwin_layer_surface_get_popup(struct wl_client *client,
 			      struct wl_resource *resource,
@@ -7823,16 +8279,68 @@ qdwin_layer_surface_get_popup(struct wl_client *client,
 	(void)client;
 	struct qdwin_layer_surface *ls = wl_resource_get_user_data(resource);
 	if (!ls) return;
-	/* Phase 1.4 partial: log the association so the smoke test sees
-	 * popup creation. Full positioning (re-anchoring the popup's
-	 * xdg_positioner reference rect to the layer surface's allocated
-	 * rect) requires libweston-desktop xdg-shell internals; deferred
-	 * until a popup-using waybar config (tray, workspaces) is in the
-	 * smoke harness or Phase 1.7's labwc-parity diff surfaces it. */
-	weston_log("qdwin: layer-shell get_popup ns=%s popup=%p "
-		   "(positioning deferred — Phase 1.4 follow-up)\n",
-		   ls->namespace ? ls->namespace : "(null)",
-		   (void *)popup);
+
+	qdwin_xdg_popup_attach_layer_parent_fn attach_layer_parent =
+		qdwin_xdg_popup_attach_layer_parent_sym();
+	if (!attach_layer_parent || !attach_layer_parent(popup, ls->surface)) {
+		wl_resource_post_error(resource,
+			ZWLR_LAYER_SURFACE_V1_ERROR_INVALID_SURFACE_STATE,
+			"get_popup requires patched libweston xdg_popup support");
+		return;
+	}
+
+	struct weston_desktop_surface *dsurf = wl_resource_get_user_data(popup);
+	struct qdwin_layer_popup *lp = calloc(1, sizeof *lp);
+	if (!lp) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	lp->parent = ls;
+	lp->popup_resource = popup;
+	lp->desktop_surface = dsurf;
+	lp->surface = weston_desktop_surface_get_surface(dsurf);
+	lp->view = weston_desktop_surface_create_view(dsurf);
+	if (!lp->view) {
+		free(lp);
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	weston_view_move_to_layer(lp->view,
+		&ls->qdwin->layer_shell_layer[ls->layer].view_list);
+	qdwin_layer_popup_update_position(lp);
+
+	lp->surface_commit_listener.notify = qdwin_layer_popup_on_commit;
+	wl_signal_add(&lp->surface->commit_signal, &lp->surface_commit_listener);
+	lp->surface_destroy_listener.notify =
+		qdwin_layer_popup_on_surface_destroyed;
+	wl_signal_add(&lp->surface->destroy_signal, &lp->surface_destroy_listener);
+	wl_list_insert(&ls->popups, &lp->link);
+
+	weston_log("qdwin: layer-shell get_popup ns=%s popup=%p attached\n",
+		   ls->namespace ? ls->namespace : "(null)", (void *)popup);
+}
+
+/* plan3 H1: walk every tracked layer-surface and its popups for the one
+ * owning a given xdg_popup resource. Layer popups are rare and short-
+ * lived; a linear scan is cheaper than threading a back-pointer through
+ * the libweston-side struct. */
+static struct qdwin_layer_popup *
+qdwin_layer_popup_for_resource(struct qdwin *qdwin,
+			       struct wl_resource *popup_resource)
+{
+	if (!qdwin || !popup_resource)
+		return NULL;
+	struct qdwin_layer_surface *ls;
+	wl_list_for_each(ls, &qdwin->layer_surfaces, link) {
+		struct qdwin_layer_popup *lp;
+		wl_list_for_each(lp, &ls->popups, link) {
+			if (lp->popup_resource == popup_resource)
+				return lp;
+		}
+	}
+	return NULL;
 }
 
 static void
@@ -7929,6 +8437,9 @@ qdwin_layer_surface_resource_destroy(struct wl_resource *resource)
 		weston_view_destroy(ls->view);
 		ls->view = NULL;
 	}
+	struct qdwin_layer_popup *lp, *tmp;
+	wl_list_for_each_safe(lp, tmp, &ls->popups, link)
+		qdwin_layer_popup_destroy(lp);
 	wl_list_remove(&ls->link);
 	free(ls->namespace);
 	free(ls);
@@ -7976,6 +8487,7 @@ qdwin_layer_shell_get_layer_surface(struct wl_client *client,
 	ls->pending.exclusive_zone = 0;
 	ls->pending.kbd_interactivity =
 		ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
+	wl_list_init(&ls->popups);
 
 	if (output_resource) {
 		struct weston_head *head =
@@ -8408,6 +8920,9 @@ qdwin_cursor_theme_destroy(struct qdwin *qdwin)
 		if (qdwin->cursor_sprites[i].surface) {
 			wl_list_remove(
 				&qdwin->cursor_sprites[i].destroy_listener.link);
+			if (qdwin->cursor_sprites[i].commit_listener.link.next)
+				wl_list_remove(
+					&qdwin->cursor_sprites[i].commit_listener.link);
 			qdwin->cursor_sprites[i].surface = NULL;
 		}
 	}
@@ -8660,6 +9175,37 @@ qdwin_cursor_shape_device_impl = {
  * Falls back to the solid-colour path (QDWIN_CURSOR_SPRITE_SOLID) or
  * a no-op if neither is present. */
 
+/* plan3 M2: per-commit hook that re-asserts the cursor input-region
+ * invariant. Weston's libweston/input.c:pointer_cursor_surface_committed
+ * clears these on every commit; qdwin's install path only clears them
+ * once. The sprite helper is allowed to re-commit (theme change, scale,
+ * new frame) and any non-empty pending.input it ships would otherwise
+ * promote the sprite back to a pickable surface above shell UI. The
+ * post-commit log line is the discriminator for
+ * tests/host/test_cursor_sprite_input_invariant.py. */
+static void
+qdwin_cursor_sprite_on_commit(struct wl_listener *listener, void *data)
+{
+	struct qdwin_cursor_sprite *slot =
+		wl_container_of(listener, slot, commit_listener);
+	struct weston_surface *s = slot->surface;
+	(void)data;
+	if (!s)
+		return;
+	int had_pending = pixman_region32_not_empty(&s->pending.input);
+	int had_current = pixman_region32_not_empty(&s->input);
+	if (had_pending)
+		pixman_region32_clear(&s->pending.input);
+	if (had_current)
+		pixman_region32_clear(&s->input);
+	if (had_pending || had_current) {
+		weston_log("qdwin: cursor-sprite commit re-cleared input "
+			   "shape=%s pending=%d current=%d\n",
+			   qdwin_cursor_shape_name(slot->shape),
+			   had_pending, had_current);
+	}
+}
+
 static void
 qdwin_cursor_sprite_clear_slot(struct qdwin *qdwin, uint32_t shape)
 {
@@ -8669,6 +9215,8 @@ qdwin_cursor_sprite_clear_slot(struct qdwin *qdwin, uint32_t shape)
 	struct qdwin_cursor_sprite *slot = &qdwin->cursor_sprites[shape];
 	if (slot->surface) {
 		wl_list_remove(&slot->destroy_listener.link);
+		if (slot->commit_listener.link.next)
+			wl_list_remove(&slot->commit_listener.link);
 		slot->surface = NULL;
 	}
 	slot->hotspot_x = 0;
@@ -8688,10 +9236,13 @@ qdwin_cursor_sprite_on_surface_destroyed(struct wl_listener *listener,
 	/* Don't call qdwin_cursor_sprite_clear_slot — it does
 	 * wl_list_remove on the destroy_listener.link, but libwayland
 	 * already removed it before invoking us. Just reset state. */
+	if (slot->commit_listener.link.next)
+		wl_list_remove(&slot->commit_listener.link);
 	slot->surface = NULL;
 	slot->hotspot_x = 0;
 	slot->hotspot_y = 0;
 	wl_list_init(&slot->destroy_listener.link);
+	wl_list_init(&slot->commit_listener.link);
 }
 
 /* B6 / task(134): install a cached cursor sprite as pointer->sprite,
@@ -8745,6 +9296,8 @@ qdwin_install_cursor_sprite_view(struct qdwin *qdwin,
 
 	if (!weston_surface_is_mapped(surface))
 		weston_surface_map(surface);
+	pixman_region32_clear(&surface->pending.input);
+	pixman_region32_clear(&surface->input);
 	weston_view_move_to_layer(view,
 				  &qdwin->compositor->cursor_layer.view_list);
 
@@ -8884,6 +9437,18 @@ qdwin_handle_set_cursor_sprite(struct wl_client *client,
 	slot->destroy_listener.notify =
 		qdwin_cursor_sprite_on_surface_destroyed;
 	wl_signal_add(&ws->destroy_signal, &slot->destroy_listener);
+
+	/* plan3 M2: stay aligned with weston cursor-surface invariant on
+	 * every commit, not just at install. The first install also clears
+	 * the regions via qdwin_install_cursor_sprite_view; this listener
+	 * catches subsequent re-commits from the helper. */
+	slot->commit_listener.notify = qdwin_cursor_sprite_on_commit;
+	wl_signal_add(&ws->commit_signal, &slot->commit_listener);
+	/* Also clear once on register so a sprite whose creating client
+	 * already attached a non-empty input region cannot leak before
+	 * its first commit. */
+	pixman_region32_clear(&ws->pending.input);
+	pixman_region32_clear(&ws->input);
 
 	weston_log("qdwin: cursor-sprite registered shape=%s hotspot=%d,%d\n",
 		   qdwin_cursor_shape_name(shape), hotspot_x, hotspot_y);
@@ -12590,6 +13155,28 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	if (!qdwin->layer_shell_global) {
 		weston_log("qdwin: layer-shell wl_global_create failed\n");
 		goto fail;
+	}
+
+	/* plan3 H1: register a handler for xdg_popup.grab on layer-
+	 * parented popups. Without this hook the running libweston (if
+	 * patched) posts XDG_POPUP_ERROR_INVALID_GRAB; with it, qdwin
+	 * installs its own pointer grab that dismisses on outside click.
+	 * dlsym-soft so an unpatched libweston still links; the layer-
+	 * popup grab path then falls back to libweston's error. */
+	{
+		qdwin_xdg_popup_set_layer_grab_handler_fn set_handler =
+			qdwin_xdg_popup_set_layer_grab_handler_sym();
+		if (set_handler) {
+			set_handler(qdwin_layer_popup_layer_grab_handler,
+				    qdwin);
+			weston_log("qdwin: layer-popup grab handler "
+				   "registered\n");
+		} else {
+			weston_log("qdwin: layer-popup grab handler NOT "
+				   "registered (libweston symbol missing) — "
+				   "xdg_popup.grab on layer-parented popups "
+				   "will return INVALID_GRAB\n");
+		}
 	}
 
 	/* zxdg_decoration_manager_v1 v1: always-server_side stub. Keeps
