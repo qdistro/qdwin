@@ -88,13 +88,19 @@ wait_for_handle() {
     done
     return 1
 }
-# Wait for a focus transition matching `was=$prev target=$next`. Returns
-# 0 if seen within the window, 1 otherwise.
+# Wait for a focus transition into target $next from any other handle.
+# `prev` may be a literal number or the string "any". Returns 0 if seen
+# within the polling window, 1 otherwise.
 wait_for_focus_transition() {
     local prev=$1 next=$2 cursor=$3
+    local pat
+    if [ "$prev" = any ]; then
+        pat="qdwin: focus handle=$next \\(was [0-9]+\\)"
+    else
+        pat="qdwin: focus handle=$next \\(was $prev\\)"
+    fi
     for _ in $(seq 1 20); do
-        if journal_after "$cursor" \
-            | grep -qE "qdwin: focus handle=$next \(was $prev\)"; then
+        if journal_after "$cursor" | grep -qE "$pat"; then
             return 0
         fi
         sleep 0.2
@@ -113,9 +119,21 @@ read -r QDWIN_SCREEN_W QDWIN_SCREEN_H < <(detect_screen_size)
 export QDWIN_SCREEN_W QDWIN_SCREEN_H
 pass "screen ${QDWIN_SCREEN_W}x${QDWIN_SCREEN_H}"
 
-vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active qdwin-compositor.service qdistro-cursor-sprites.service" \
-    | grep -qx active || fail "qdwin/cursor-sprite services are not active"
-pass "qdwin and cursor-sprite services active"
+# qdistro-daily ships qdwin-compositor.service; noctalia-bootstrap ships
+# noctalia-session.service. Probe whichever exists.
+if vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user list-unit-files qdwin-compositor.service" >/dev/null 2>&1; then
+    QDWIN_COMP_UNIT=qdwin-compositor.service
+else
+    QDWIN_COMP_UNIT=noctalia-session.service
+fi
+vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active $QDWIN_COMP_UNIT qdistro-cursor-sprites.service" \
+    > /tmp/clickthrough-svc-$$.txt 2>&1
+if grep -qE '^(inactive|failed|unknown)' /tmp/clickthrough-svc-$$.txt; then
+    cat /tmp/clickthrough-svc-$$.txt >&2
+    fail "qdwin/cursor-sprite services are not active"
+fi
+rm -f /tmp/clickthrough-svc-$$.txt
+pass "qdwin ($QDWIN_COMP_UNIT) and cursor-sprite services active"
 
 vm_exec "journalctl _UID=1000 -b --no-pager | grep -q 'cursor-sprite registered shape=pointer\\|cursor-sprite registered shape=default'" \
     || fail "cursor sprite helper did not register pointer/default shape"
@@ -136,8 +154,11 @@ handle=$(wait_for_handle "$cursor_start") \
     || fail "qdistro-test-window did not appear in qdwin journal"
 pass "test window handle=$handle"
 
-# Confirm spawn-time auto-focus transitions handle=$handle (was UINT32_MAX).
-wait_for_focus_transition 4294967295 "$handle" "$cursor_start" \
+# Confirm spawn-time auto-focus transitions to handle=$handle from any
+# prior handle. qdistro-daily focuses (was 4294967295); noctalia-bootstrap
+# typically has the shell holding focus first so the transition is
+# (was <shell-handle>). Accept either.
+wait_for_focus_transition any "$handle" "$cursor_start" \
     || fail "spawn did not focus handle=$handle (preconditions broken)"
 pass "spawn focused handle=$handle"
 
@@ -151,14 +172,15 @@ empty_x=$(( QDWIN_SCREEN_W / 2 ))
 empty_y=$(( QDWIN_SCREEN_H - 30 ))
 cursor_clear=$(journal_cursor)
 qdwin_click "$empty_x" "$empty_y"
-if ! wait_for_focus_transition "$handle" 4294967295 "$cursor_clear"; then
-    # Some configs do not blank focus on empty-desktop click (e.g. focus
-    # follows mouse off). Try clicking at (1,1) as a fallback empty spot.
+# Accept ANY transition away from $handle (to 4294967295 or to the
+# shell's handle if it auto-focuses). Some configs do not move focus on
+# empty-desktop click at all; treat that as a GAP, not a fail.
+if ! journal_after "$cursor_clear" | grep -qE "qdwin: focus handle=[0-9]+ \(was $handle\)"; then
     cursor_clear=$(journal_cursor)
     qdwin_click 1 1
-    if ! wait_for_focus_transition "$handle" 4294967295 "$cursor_clear"; then
-        echo "GAP: empty-desktop click did not blank focus; cannot prove " \
-             "click engine moves focus. Treating step 1 as best-effort."
+    if ! journal_after "$cursor_clear" | grep -qE "qdwin: focus handle=[0-9]+ \(was $handle\)"; then
+        echo "GAP: empty-desktop click did not blank focus from handle=$handle; " \
+             "click engine may not move focus here. Treating step 1 as best-effort."
     fi
 fi
 pass "empty-desktop click attempted at ($empty_x,$empty_y)"
