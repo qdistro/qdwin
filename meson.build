@@ -506,7 +506,30 @@ executable('qdwin-test-clipboard-emit',
   install_dir: get_option('bindir'),
 )
 
-# The Qdistro.Qdwin QML plugin that binds qdwin_shell_v1 from
-# qdshell lives in the qdshell sibling repo (qdshell/qml-plugin/) —
-# it reads this directory's qdwin-shell-v1.xml via a relative path
-# during its own meson build. See qdshell/qml-plugin/meson.build.
+# --- qdistro-protocols: install the private Wayland XMLs and emit a
+# pkg-config file so sibling consumers (qdshell qml-plugin, qdistro
+# daemons, qdlocker bindings) discover them the same way qdwin itself
+# discovers wayland-protocols. Replaces the prior `../../qdwin/qdwin/*.xml`
+# sibling-checkout paths in those consumers' build files. See
+# qdistro/tests/protocol/test_no_duplicate_protocol_xmls.py for the
+# duplicate-XML guard that enforces single-source-of-truth.
+qdistro_protocols_dir = get_option('datadir') / 'qdistro' / 'protocols'
+install_data(
+  [
+    'qdwin/qdwin-shell-v1.xml',
+    'qdwin/qdwin-locker-v1.xml',
+    'qdwin/qdwin-nested-v1.xml',
+    'qdwin/wlr-layer-shell-unstable-v1.xml',
+  ],
+  install_dir: qdistro_protocols_dir,
+)
+
+pkg = import('pkgconfig')
+pkg.generate(
+  name: 'qdistro-protocols',
+  description: 'qdistro private Wayland protocol XMLs (owned by qdwin)',
+  version: meson.project_version(),
+  variables: [
+    'pkgdatadir=' + get_option('prefix') / qdistro_protocols_dir,
+  ],
+)

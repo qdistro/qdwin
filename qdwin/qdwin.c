@@ -6065,7 +6065,7 @@ bind_qdwin_locker(struct wl_client *client, void *data,
 		   (int)pid, (unsigned)uid,
 		   (unsigned)qdwin->allowed_locker_uid);
 
-	/* TODO production hardening: see qdlocker/protocol/qdwin-locker-v1.xml — additional exe/SELinux checks intentionally out of scope here. */
+	/* TODO production hardening: see qdwin/qdwin-locker-v1.xml — additional exe/SELinux checks intentionally out of scope here. */
 	if (uid != qdwin->allowed_locker_uid) {
 		wl_client_post_implementation_error(client,
 			"qdwin_locker_v1: uid %u not permitted "
