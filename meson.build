@@ -532,4 +532,7 @@ pkg.generate(
   variables: [
     'pkgdatadir=' + get_option('prefix') / qdistro_protocols_dir,
   ],
+  uninstalled_variables: [
+    'pkgdatadir=' + meson.current_source_dir() / 'qdwin',
+  ],
 )
