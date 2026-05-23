@@ -86,13 +86,13 @@ wait_for_handles() {
     done
     return 1
 }
-# Wait for a focus transition matching `(was $prev)` into `handle=$next`.
-# Required (deep-review H6): no fallback path that accepts "focus
-# stayed where it was". Returns 0 if the exact transition is seen,
-# else 1 with the matched/unmatched journal printed to stderr.
+# Wait for a focus transition into `handle=$next`. The previous owner may be
+# `$prev` or UINT32_MAX: qdshell layer-shell surfaces can legitimately own
+# keyboard focus between setup and click, and qdwin reports that as no qdwin
+# toplevel focused. We still require the click to focus `$next`.
 wait_for_strict_focus_transition() {
     local prev=$1 next=$2 cursor=$3
-    local pat="qdwin: focus handle=$next \\(was $prev\\)"
+    local pat="qdwin: focus handle=$next \\(was ($prev|4294967295)\\)"
     for _ in $(seq 1 25); do
         if journal_after "$cursor" | grep -qE "$pat"; then
             return 0

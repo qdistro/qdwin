@@ -744,6 +744,8 @@ qdwin_layer_surface_at_pos(struct qdwin *qdwin, struct weston_coord_global pos);
 static struct weston_view *
 qdwin_layer_surface_view_at_pos(struct qdwin *qdwin,
 				struct weston_coord_global pos);
+static int
+qdwin_layer_surface_blocks_toplevel_focus(struct qdwin_layer_surface *ls);
 /* plan3 M4: forward-declared so qdwin_proxy_default_grab_button (which
  * sits above the qdwin_layer_surface struct definition) can call it. */
 static void
@@ -2730,9 +2732,14 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				uint32_t button, uint32_t state)
 {
 	struct weston_pointer *pointer = grab->pointer;
+	struct qdwin_layer_surface *layer_surface =
+		qdwin_layer_surface_at_pos(qdwin_singleton, pointer->pos);
 	struct weston_view *layer_view =
 		qdwin_layer_surface_view_at_pos(qdwin_singleton, pointer->pos);
-	if (layer_view && pointer->focus != layer_view)
+	int layer_blocks_toplevel_focus =
+		qdwin_layer_surface_blocks_toplevel_focus(layer_surface);
+	if (layer_blocks_toplevel_focus && layer_view &&
+	    pointer->focus != layer_view)
 		weston_pointer_set_focus(pointer, layer_view);
 
 	/* plan3 H1 (post-deep-review): a press that landed on a layer-shell
@@ -2744,7 +2751,7 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 	 * panel overlaps a window. */
 	int press_on_layer =
 		(state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_LEFT &&
-		 layer_view != NULL);
+		 layer_view != NULL && layer_blocks_toplevel_focus);
 
 	/* plan3 M4: zwlr_layer_surface_v1 ON_DEMAND keyboard interactivity.
 	 * On left-button press over a layer-shell surface that requested
@@ -2785,6 +2792,9 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				weston_seat_get_keyboard(pointer->seat);
 			struct weston_surface *content = tl_under->view ?
 				tl_under->view->surface : NULL;
+			if (tl_under->view && pointer->focus != tl_under->view)
+				weston_pointer_set_focus(pointer,
+							 tl_under->view);
 			if (kb && content && kb->focus != content) {
 				weston_keyboard_set_focus(kb, content);
 				/* Tell the shell so it can update its
@@ -5352,9 +5362,10 @@ qdwin_handle_attach_lock_surface(struct wl_client *client,
 				       qdwin_lock_surface_resource_destroyed);
 	qdwin_lock_surface_place(qdwin);
 	weston_log("qdwin: attach_lock_surface\n");
-	/* B4: install overlay keyboard grab so the password field can
-	 * accept typing. role=2=locker. v17+ shells handle overlay_key. */
-	if (wl_resource_get_version(resource) >= 17)
+	/* Only grab keyboard input while the compositor is actually locked.
+	 * The locker may attach its surface during normal unlocked startup; an
+	 * eager role=2 grab there would swallow global bindings like Ctrl+Space. */
+	if (qdwin->locked && wl_resource_get_version(resource) >= 17)
 		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 }
 
@@ -5375,6 +5386,13 @@ qdwin_handle_set_locked(struct wl_client *client,
 		return;
 	}
 	qdwin->locked = want;
+	if (want) {
+		if (wl_resource_get_version(resource) >= 17)
+			qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
+	} else if (qdwin->overlay_grab_active &&
+		   qdwin->overlay_grab_role == 2) {
+		qdwin_overlay_grab_end(qdwin);
+	}
 	weston_log("qdwin: set_locked=%d (lock_surface=%p)\n",
 		   want, (void*)qdwin->lock_surface);
 	weston_log("qdwin: locked_changed=%d cause=set_locked\n", want);
@@ -5978,10 +5996,11 @@ qdwin_handle_locker_attach_lock_surface(struct wl_client *client,
 				       qdwin_lock_surface_resource_destroyed);
 	qdwin_lock_surface_place(qdwin);
 	weston_log("qdwin: locker attach_lock_surface\n");
-	/* Install overlay keyboard grab, locker role=2. Same dispatch
-	 * site as the shell path; the overlay_key router now checks for
-	 * locker_resource first. */
-	qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
+	/* The locker can attach while the session is still unlocked. Defer the
+	 * role=2 keyboard grab until set_locked(1), and restore normal global
+	 * keybindings again on set_locked(0). */
+	if (qdwin->locked)
+		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 }
 
 static void
@@ -6006,6 +6025,12 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 		return;
 	}
 	qdwin->locked = want;
+	if (want) {
+		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
+	} else if (qdwin->overlay_grab_active &&
+		   qdwin->overlay_grab_role == 2) {
+		qdwin_overlay_grab_end(qdwin);
+	}
 	weston_log("qdwin: locker set_locked=%d (lock_surface=%p)\n",
 		   want, (void*)qdwin->lock_surface);
 	weston_log("qdwin: locked_changed=%d cause=locker_set_locked\n", want);
@@ -7535,10 +7560,29 @@ qdwin_layer_surface_contains(struct qdwin_layer_surface *ls,
 	    ls->surface->width <= 0 || ls->surface->height <= 0)
 		return 0;
 
+	weston_view_update_transform(ls->view);
 	struct weston_coord_global vp =
 		weston_view_get_pos_offset_global(ls->view);
-	return pos.c.x >= vp.c.x && pos.c.x < vp.c.x + ls->surface->width &&
-	       pos.c.y >= vp.c.y && pos.c.y < vp.c.y + ls->surface->height;
+	if (pos.c.x < vp.c.x || pos.c.x >= vp.c.x + ls->surface->width ||
+	    pos.c.y < vp.c.y || pos.c.y >= vp.c.y + ls->surface->height)
+		return 0;
+
+	/* Quickshell uses PanelWindow masks/input regions to make full-screen
+	 * transparent layer surfaces click-through except for the bar/panel
+	 * widgets. Treating the whole mapped bbox as pickable makes those
+	 * pass-through surfaces block normal toplevel click-to-focus. Mirror
+	 * libweston's picker check here because qdwin has to reason about
+	 * layer surfaces before deciding whether to skip toplevel focus. */
+	struct weston_coord_surface sp =
+		weston_coord_global_to_surface(ls->view, pos);
+	if (!pixman_region32_contains_point(&ls->surface->input,
+					    sp.c.x, sp.c.y, NULL))
+		return 0;
+	if (ls->view->geometry.scissor_enabled &&
+	    !pixman_region32_contains_point(&ls->view->geometry.scissor,
+					    sp.c.x, sp.c.y, NULL))
+		return 0;
+	return 1;
 }
 
 static struct qdwin_layer_surface *
@@ -7562,6 +7606,29 @@ qdwin_layer_surface_view_at_pos(struct qdwin *qdwin,
 	struct qdwin_layer_surface *ls =
 		qdwin_layer_surface_at_pos(qdwin, pos);
 	return ls ? ls->view : NULL;
+}
+
+static int
+qdwin_layer_surface_blocks_toplevel_focus(struct qdwin_layer_surface *ls)
+{
+	if (!ls)
+		return 0;
+	if (ls->current.kbd_interactivity !=
+	    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE)
+		return 1;
+
+	/* Quickshell keeps a transparent full-output background layer alive
+	 * so it can dim/click-close when panels open. With no panel open that
+	 * layer has keyboard-interactivity NONE and should not suppress
+	 * ordinary click-to-focus for application windows underneath it. */
+	struct weston_output *out = qdwin_layer_surface_resolve_output(ls);
+	if (out && ls->surface &&
+	    ls->current.exclusive_zone <= 0 &&
+	    ls->surface->width >= out->width &&
+	    ls->surface->height >= out->height)
+		return 0;
+
+	return 1;
 }
 
 /* plan3 M4: ON_DEMAND keyboard interactivity handler. Called from the

@@ -40,7 +40,10 @@ else
   add_project_arguments('-DQDWIN_ROLE_HOST=1', language: 'c')
 endif
 
-dep_libweston = dependency('libweston-14')
+dep_libweston = dependency('libweston-14', required: false)
+if not dep_libweston.found()
+  dep_libweston = dependency('libweston-13')
+endif
 dep_wayland_server = dependency('wayland-server')
 dep_wayland_scanner = dependency('wayland-scanner', native: true)
 
