@@ -97,27 +97,61 @@ Built-in, registered by qdwin-shell.so:
   through `wl_socket_create_listener` mode.
 - **tablet-v2** — referenced by `cursor-shape-v1`; not used standalone.
 
-### Production posture: layer-shell is a test aperture
+### Security posture: layer-shell
 
-`zwlr_layer_shell_v1` is currently registered as an unconditional public
-global. Any same-session client can create overlay/top layer surfaces
-and can request `EXCLUSIVE` keyboard interactivity, which qdwin will
-honour by handing it the seat keyboard focus. This is intentional for
-bring-up and smoke-testing with waybar, fuzzel, mako, swaylock, and
-gtk-layer-shell-based bars.
+`zwlr_layer_shell_v1` is registered as an unconditional public global
+(advertised to all clients via `wl_registry`), but the bind handler
+(`bind_qdwin_layer_shell`) gates access: only the bound shell client
+(qdshell, matched by client pointer or pid+uid) or a client running as
+`allowed_uid` (before the shell binds) may successfully bind.
+Unauthorized bind attempts are rejected with
+`wl_client_post_implementation_error`.
 
-It is **not** a production-safe default. In a hardened production
-session, either:
+Once bound, `EXCLUSIVE` keyboard interactivity is granted to any layer
+surface that requests it (e.g. swaylock-style overlays, launcher grabs).
+This is safe because only the shell client can bind, but the global
+advertisement is intentionally broad for bring-up compatibility with
+waybar, fuzzel, mako, and gtk-layer-shell-based bars (they need to see
+the global in `wl_registry` even though the bind will fail unless they
+are the shell).
 
-- the compositor socket must be reachable only via trusted-launcher /
-  systemd-unit / SELinux confinement so untrusted clients cannot bind
-  any global, or
-- layer-shell `bind` must be gated by uid/exe/SELinux label (analogous
-  to the locker global), or kept behind an explicit config switch with
-  `EXCLUSIVE` / high-layer requests denied for untrusted clients.
+**Remaining hardening (deferred to production milestone):**
 
-See `todo/qdistro-qdwin-wider-codex-review.md` finding #4 and
-`todo/qdwin-codex-review.md` finding #1 for the full context.
+- Hide the global from non-shell clients via a `wl_global` filter
+  (analogous to the secctx global filter) so untrusted clients cannot
+  even enumerate it.
+- Consider per-request policy for `EXCLUSIVE` + high-z layers, gating
+  through the shell/broker decision channel rather than granting at bind
+  time.
+- Cross-silo policy enforcement happens downstream in qdshell/broker.
+
+See `todo/qdwin-codex-review.md` finding #1 for the original review.
+
+### Security posture: wp_security_context_v1
+
+`wp_security_context_v1` tags (`sandbox_engine`, `app_id`,
+`instance_id`) are **advisory routing metadata, not trusted identity**.
+Any client that can bind the manager can set arbitrary tag values.
+
+Bind-time mitigation: `bind_qdwin_secctx_manager` restricts the manager
+global to the shell client (qdshell) or `allowed_uid`, and a global
+filter (`qdwin_secctx_global_filter`) hides the global from
+already-sandboxed clients so nesting is impossible. The env var
+`QDWIN_SECCTX_OPEN=1` disables the bind gate for developer workflows.
+
+**Downstream verification (design intent):** qdwin forwards secctx tags
+to the shell, but the authoritative identity check happens in
+qdshell/broker, which independently verifies:
+
+- `/proc/<pid>/attr/current` (SELinux label)
+- `/proc/<pid>/exe` (executable path)
+- cgroup membership and namespace identity
+
+The compositor deliberately does not duplicate this verification;
+treating secctx as a routing hint rather than an authentication
+credential is the intended layering.
+
+Reference: `qdistro/doc/isolation-tiers.md`, `qdistro/doc/permissions.md`.
 
 ## Source of truth
 

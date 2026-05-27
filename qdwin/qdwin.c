@@ -13341,6 +13341,9 @@ qdwin_secctx_destroy_req(struct wl_client *client,
 	wl_resource_destroy(resource);
 }
 
+/* secctx tags are advisory routing metadata — qdwin forwards them to the
+ * shell but broker verifies identity via /proc/<pid>/attr/current, exe,
+ * cgroup.  See doc/protocol.md "Security posture: wp_security_context_v1". */
 static void
 qdwin_secctx_set_sandbox_engine(struct wl_client *client,
 				struct wl_resource *resource,
@@ -13881,7 +13884,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * (waybar, Quickshell/noctalia, eww, fuzzel, mako, swaylock).
 	 * Stub stage — accepts the protocol and completes configure/ack
 	 * but does not lay out or render yet. See impl block above. */
-	/* Test aperture: unconditional public bind. Production posture documented in qdwin/doc/protocol.md §"Production posture: layer-shell is a test aperture". */
+	/* Global is advertised publicly but bind_qdwin_layer_shell gates to
+	 * shell-client or allowed_uid.  See doc/protocol.md "Security posture:
+	 * layer-shell".  Production TODO: add a wl_global filter to hide it
+	 * from non-shell clients entirely. */
 	wl_list_init(&qdwin->layer_surfaces);
 	qdwin->layer_shell_global = wl_global_create(
 		ec->wl_display, &zwlr_layer_shell_v1_interface,
