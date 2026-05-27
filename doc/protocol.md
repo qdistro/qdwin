@@ -1,16 +1,18 @@
 # Protocols
 
 qdwin exposes two private protocols (`qdwin_shell_v1`, currently
-at version 21, and `qdwin_locker_v1` v1 — see [locker.md](locker.md)),
+at version 23, and `qdwin_locker_v1` v1 — see [locker.md](locker.md)),
 one helper protocol for nested compositors (`qdwin_nested_v1`, see
 [nested.md](nested.md)), and a curated set of public Wayland
 protocols.
 
 ## qdwin_shell_v1 (private, single-client)
 
-The shell-management protocol. One client binds; every other bind
-attempt is filtered out at `wl_global` registration time using
-libweston's bind-filter callback against the connecting peer's uid.
+The shell-management protocol. The global is registered via
+`wl_global_create`; the bind handler (`bind_qdwin_shell`) rejects
+clients whose uid does not match `allowed_uid`. Only one client
+claims the shell role (via `bind_as_shell`); subsequent binds from
+the same uid succeed but do not gain shell privileges until claimed.
 
 ### Sub-interfaces
 
@@ -107,8 +109,11 @@ Built-in, registered by qdwin-shell.so:
 Unauthorized bind attempts are rejected with
 `wl_client_post_implementation_error`.
 
-Once bound, `EXCLUSIVE` keyboard interactivity is granted to any layer
-surface that requests it (e.g. swaylock-style overlays, launcher grabs).
+Once bound, `EXCLUSIVE` keyboard interactivity is granted directly by
+qdwin to any layer surface that requests it (`qdwin_layer_surface_apply`
+calls `weston_seat_set_keyboard_focus`). There is no broker decision
+path for EXCLUSIVE -- the bind-time gate is the sole access control.
+
 Note: before qdshell binds, any client running as `allowed_uid`
 (defaults to compositor euid) can bind layer-shell, so the window
 between compositor startup and shell bind is a wider-trust period.
@@ -116,9 +121,9 @@ After the shell binds, only qdshell (or same pid+uid) may bind.
 
 The global is advertised broadly so that third-party layer-shell clients
 (waybar, fuzzel, mako, gtk-layer-shell bars) see it in `wl_registry`.
-In practice, these clients will fail to bind unless they run as the
-shell or `allowed_uid`; the advertisement exists for protocol discovery
-rather than access.
+In practice, these clients will fail to bind unless they run as
+`allowed_uid` (pre-shell) or are the shell process; the advertisement
+exists for protocol discovery rather than access.
 
 **Remaining hardening (deferred to production milestone):**
 
@@ -128,7 +133,9 @@ rather than access.
 - Consider per-request policy for `EXCLUSIVE` + high-z layers, gating
   through the shell/broker decision channel rather than granting at bind
   time.
-- Cross-silo policy enforcement happens downstream in qdshell/broker.
+- General cross-silo policy (which clients may interact with which)
+  is enforced downstream in qdshell/broker, but layer-shell EXCLUSIVE
+  itself is compositor-granted with no broker round-trip.
 
 See `todo/qdwin-codex-review.md` finding #1 for the original review.
 
