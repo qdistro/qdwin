@@ -164,6 +164,13 @@ static void qdwin_handle_nested_proxy_decision(struct wl_client *client,
 static void qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl);
 static void qdwin_toplevel_release_holding(struct qdwin_toplevel *tl,
 					   const char *cause);
+static void qdwin_toplevel_move_to_layer(struct qdwin_toplevel *tl,
+					 struct weston_layer *layer);
+static void qdwin_maybe_promote_lock_toplevel(struct qdwin *qdwin,
+					      struct qdwin_toplevel *tl,
+					      const char *cause);
+static void qdwin_demote_lock_toplevel(struct qdwin *qdwin,
+				       const char *cause);
 static struct qdwin_toplevel *
 qdwin_toplevel_from_handle(struct qdwin *qdwin, uint32_t handle);
 /* §6.8 cursor-sprite full theme forward decl (impl table at L3577 needs
@@ -409,6 +416,8 @@ struct qdwin {
 	struct wl_global *locker_global;
 	struct wl_resource *locker_resource;
 	uid_t allowed_locker_uid;
+	pid_t locker_pid;
+	uid_t locker_uid;
 	/* Which protocol owns the currently-attached lock_resource.
 	 * 0 = shell (qdwin_lock_surface_v1), 1 = locker
 	 * (qdwin_locker_surface_v1). Used so the destroy/dismiss path
@@ -446,10 +455,13 @@ struct qdwin {
 	 * position values. */
 	struct weston_layer layer_shell_layer[4];
 
-	/* §6.6 S5: single lock view (one per shell). `lock_view` is valid
-	 * only while a qdwin_lock_surface_v1 resource is alive. */
+	/* §6.6 S5: single lock view. Legacy lock surfaces own a dedicated
+	 * weston_view; qdlocker now uses its real Qt xdg_toplevel, whose
+	 * existing view is borrowed and moved to lock_layer while locked. */
 	struct weston_surface *lock_surface;
 	struct weston_view *lock_view;
+	int lock_view_is_toplevel;
+	struct qdwin_toplevel *lock_toplevel;
 	struct wl_resource *lock_resource;
 	struct wl_listener lock_surface_destroy;
 	struct wl_listener lock_surface_commit;
@@ -821,6 +833,89 @@ qdwin_client_uid(struct weston_desktop_surface *dsurf)
 	return uid;
 }
 
+static int
+qdwin_desktop_surface_peer(struct weston_desktop_surface *dsurf,
+			   pid_t *pid_out, uid_t *uid_out)
+{
+	struct weston_desktop_client *dclient =
+		weston_desktop_surface_get_client(dsurf);
+	if (!dclient)
+		return 0;
+	struct wl_client *client =
+		weston_desktop_client_get_client(dclient);
+	if (!client)
+		return 0;
+	pid_t pid; uid_t uid; gid_t gid;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	(void)gid;
+	if (pid_out)
+		*pid_out = pid;
+	if (uid_out)
+		*uid_out = uid;
+	return 1;
+}
+
+static int
+qdwin_toplevel_is_locker_ui(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
+	if (!qdwin || !tl || !tl->desktop_surface || tl->is_nested_proxy)
+		return 0;
+	if (!qdwin->locker_resource || qdwin->locker_pid <= 0)
+		return 0;
+	pid_t pid = 0;
+	uid_t uid = (uid_t)-1;
+	if (!qdwin_desktop_surface_peer(tl->desktop_surface, &pid, &uid))
+		return 0;
+	return pid == qdwin->locker_pid && uid == qdwin->locker_uid;
+}
+
+static void
+qdwin_maybe_promote_lock_toplevel(struct qdwin *qdwin,
+				  struct qdwin_toplevel *tl,
+				  const char *cause)
+{
+	if (!qdwin_toplevel_is_locker_ui(qdwin, tl))
+		return;
+
+	if (qdwin->lock_toplevel && qdwin->lock_toplevel != tl)
+		qdwin_demote_lock_toplevel(qdwin, "replace-lock-toplevel");
+
+	qdwin->lock_toplevel = tl;
+	qdwin->lock_surface =
+		weston_desktop_surface_get_surface(tl->desktop_surface);
+	qdwin->lock_view = tl->view;
+	qdwin->lock_view_is_toplevel = 1;
+
+	qdwin_toplevel_move_to_layer(tl, &qdwin->lock_layer);
+	qdwin_toplevel_set_fullscreen(qdwin, tl, true, NULL);
+	weston_log("qdwin: promoted locker toplevel handle=%u to lock_layer via %s\n",
+		   tl->handle, cause ? cause : "unknown");
+	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
+static void
+qdwin_demote_lock_toplevel(struct qdwin *qdwin, const char *cause)
+{
+	struct qdwin_toplevel *tl = qdwin ? qdwin->lock_toplevel : NULL;
+	if (!tl)
+		return;
+
+	/* Hide the lock UI immediately on unlock. qdlocker also hides the Qt
+	 * window, but that request travels over a different Wayland connection
+	 * and may arrive after set_locked(0). Keeping the view on held_layer
+	 * avoids a visible post-unlock flash above the restored desktop. */
+	qdwin_toplevel_move_to_layer(tl, &qdwin->held_layer);
+	if (qdwin->lock_view == tl->view) {
+		qdwin->lock_view = NULL;
+		qdwin->lock_surface = NULL;
+		qdwin->lock_view_is_toplevel = 0;
+	}
+	qdwin->lock_toplevel = NULL;
+	weston_log("qdwin: demoted locker toplevel handle=%u via %s\n",
+		   tl->handle, cause ? cause : "unknown");
+	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
 /* §6.10 follow-up: forward a toplevel's secctx tag to the shell as
  * `toplevel_security_context(handle, sandbox_engine, app_id, instance_id)`,
  * but only for shells bound at qdwin_shell_v1@v13 or later. Toplevels
@@ -1047,6 +1142,7 @@ qdwin_surface_added(struct weston_desktop_surface *dsurf, void *data)
 	 * normal desktop surface can become visible. Nested proxy toplevels
 	 * still use their explicit allow/deny path. */
 	qdwin_toplevel_release_holding(tl, "default_toplevel_policy");
+	qdwin_maybe_promote_lock_toplevel(qdwin, tl, "surface_added");
 }
 
 static void
@@ -1057,6 +1153,15 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 		weston_desktop_surface_get_user_data(dsurf);
 	if (!tl)
 		return;
+
+	if (qdwin->lock_toplevel == tl) {
+		qdwin->lock_toplevel = NULL;
+		if (qdwin->lock_view == tl->view) {
+			qdwin->lock_view = NULL;
+			qdwin->lock_surface = NULL;
+			qdwin->lock_view_is_toplevel = 0;
+		}
+	}
 
 	if (qdwin->nested_mode) {
 		qdwin_nested_unpublish_toplevel(tl);
@@ -5061,6 +5166,8 @@ static void
 qdwin_hide_non_lock_layers(struct qdwin *qdwin)
 {
 	weston_log("qdwin: hiding non-lock layers for lock\n");
+	weston_layer_unset_position(&qdwin->background_layer);
+	weston_layer_unset_position(&qdwin->normal_layer);
 	weston_layer_unset_position(&qdwin->panel_layer);
 	weston_layer_unset_position(&qdwin->notification_layer);
 	weston_layer_unset_position(&qdwin->launcher_layer);
@@ -5073,6 +5180,10 @@ static void
 qdwin_show_non_lock_layers(struct qdwin *qdwin)
 {
 	weston_log("qdwin: restoring non-lock layers after unlock\n");
+	weston_layer_set_position(&qdwin->background_layer,
+				  WESTON_LAYER_POSITION_BACKGROUND);
+	weston_layer_set_position(&qdwin->normal_layer,
+				  WESTON_LAYER_POSITION_NORMAL);
 	weston_layer_set_position(&qdwin->panel_layer, QDWIN_LAYER_POS_PANEL);
 	weston_layer_set_position(&qdwin->notification_layer, QDWIN_LAYER_POS_NOTIFICATION);
 	weston_layer_set_position(&qdwin->launcher_layer, QDWIN_LAYER_POS_LAUNCHER);
@@ -5114,10 +5225,13 @@ qdwin_lock_surface_destroyed_cb(struct wl_listener *l, void *data)
 {
 	struct qdwin *qdwin = wl_container_of(l, qdwin, lock_surface_destroy);
 	(void)data;
-	if (qdwin->lock_view) {
+	if (qdwin->lock_view && !qdwin->lock_view_is_toplevel) {
 		weston_view_destroy(qdwin->lock_view);
 		qdwin->lock_view = NULL;
 	}
+	if (qdwin->lock_view_is_toplevel)
+		qdwin->lock_view = NULL;
+	qdwin->lock_view_is_toplevel = 0;
 	wl_list_remove(&qdwin->lock_surface_commit.link);
 	wl_list_init(&qdwin->lock_surface_commit.link);
 	wl_list_remove(&qdwin->lock_surface_destroy.link);
@@ -5190,10 +5304,13 @@ qdwin_lock_surface_resource_destroyed(struct wl_resource *resource)
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	if (!qdwin) return;
 	qdwin->lock_resource = NULL;
-	if (qdwin->lock_view) {
+	if (qdwin->lock_view && !qdwin->lock_view_is_toplevel) {
 		weston_view_destroy(qdwin->lock_view);
 		qdwin->lock_view = NULL;
 	}
+	if (qdwin->lock_view_is_toplevel)
+		qdwin->lock_view = NULL;
+	qdwin->lock_view_is_toplevel = 0;
 	if (qdwin->lock_surface) {
 		wl_list_remove(&qdwin->lock_surface_commit.link);
 		wl_list_remove(&qdwin->lock_surface_destroy.link);
@@ -5404,6 +5521,8 @@ qdwin_handle_attach_lock_surface(struct wl_client *client,
 	qdwin->lock_resource = ls_res;
 	qdwin->lock_resource_is_locker = 0;
 	qdwin->lock_surface = surface;
+	qdwin->lock_view_is_toplevel = 0;
+	qdwin->lock_toplevel = NULL;
 	qdwin->lock_view = weston_view_create(surface);
 	if (!qdwin->lock_view) {
 		qdwin->lock_surface = NULL;
@@ -5959,6 +6078,8 @@ qdwin_locker_resource_destroy(struct wl_resource *resource)
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	if (qdwin->locker_resource == resource) {
 		qdwin->locker_resource = NULL;
+		qdwin->locker_pid = 0;
+		qdwin->locker_uid = (uid_t)-1;
 		weston_log("qdwin: locker unbound\n");
 		/* End the role=2 overlay keyboard grab so the next press
 		 * isn't forwarded with the locker role still set; without
@@ -5983,7 +6104,9 @@ qdwin_handle_bind_as_locker(struct wl_client *client,
 			    struct wl_resource *resource)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
-	(void)client;
+	pid_t pid; uid_t uid; gid_t gid;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	(void)gid;
 	if (qdwin->locker_resource == resource) {
 		/* Same resource binding twice. Use the dedicated
 		 * already_bound error code (was using `role` which is for
@@ -6002,7 +6125,10 @@ qdwin_handle_bind_as_locker(struct wl_client *client,
 		wl_resource_destroy(qdwin->locker_resource);
 	}
 	qdwin->locker_resource = resource;
-	weston_log("qdwin: locker bound (initially_locked=%d)\n", qdwin->locked);
+	qdwin->locker_pid = pid;
+	qdwin->locker_uid = uid;
+	weston_log("qdwin: locker bound pid=%d uid=%u (initially_locked=%d)\n",
+		   (int)pid, (unsigned)uid, qdwin->locked);
 	qdwin_locker_v1_send_ready(resource, qdwin->locked ? 1u : 0u);
 }
 
@@ -6042,6 +6168,8 @@ qdwin_handle_locker_attach_lock_surface(struct wl_client *client,
 	qdwin->lock_resource = ls_res;
 	qdwin->lock_resource_is_locker = 1;
 	qdwin->lock_surface = surface;
+	qdwin->lock_view_is_toplevel = 0;
+	qdwin->lock_toplevel = NULL;
 	qdwin->lock_view = weston_view_create(surface);
 	if (!qdwin->lock_view) {
 		qdwin->lock_surface = NULL;
@@ -6085,17 +6213,16 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 	}
 	int want = locked ? 1 : 0;
 	if (qdwin->locked == want) return;
-	if (want && !qdwin->lock_surface) {
-		wl_resource_post_error(resource,
-			QDWIN_LOCKER_V1_ERROR_NO_SURFACE,
-			"qdwin_locker_v1: set_locked(1) without attach_lock_surface");
-		return;
-	}
 	qdwin->locked = want;
 	if (want) {
+		struct qdwin_toplevel *tl;
+		wl_list_for_each(tl, &qdwin->toplevels, link)
+			qdwin_maybe_promote_lock_toplevel(qdwin, tl,
+							  "locker_set_locked");
 		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 		qdwin_hide_non_lock_layers(qdwin);
 	} else {
+		qdwin_demote_lock_toplevel(qdwin, "locker_set_locked=0");
 		if (qdwin->overlay_grab_active &&
 		    qdwin->overlay_grab_role == 2)
 			qdwin_overlay_grab_end(qdwin);

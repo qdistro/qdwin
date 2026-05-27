@@ -6,19 +6,15 @@ subsystem of it. Rationale and shape live in
 `qdwin/qdwin-locker-v1.xml`; this doc describes the C-side work in
 `qdwin/qdwin.c`.
 
-## Pre-existing state in qdwin.c
+## Model
 
-The lock-surface plumbing already exists on `qdwin_shell_v1`:
-
-- `qdwin_handle_attach_lock_surface` at qdwin.c:4946
-- `qdwin_handle_set_locked` at qdwin.c:4996
-- `qdwin_shell_v1_send_locked_changed` calls at qdwin.c:4736, 4775, 5016
-- Shell-side bind at `bind_qdwin_shell` (qdwin.c:5461)
-- Global registration at qdwin.c:11538 (`wl_global_create(... qdwin_shell_v1_interface, 21, ...)`)
-
-The state machine — `qdwin->lock_surface_view`, `qdwin->locked`,
-the LOCK layer — is already correct. We are adding a second entry
-point that drives the same state, not duplicating state.
+qdlocker is a peer process to qdshell. It owns `qdwin_locker_v1`
+control traffic (`set_locked`, `locked_changed`, `overlay_key`), while
+its visible Qt/QML window is a normal xdg_toplevel until the session
+locks. On lock, qdwin matches that toplevel to the already-bound
+locker process identity and moves the real UI view to `lock_layer`.
+The normal desktop/background/panel/layer-shell layers are hidden, so
+only the LOCK layer can render.
 
 ## Changes
 
@@ -45,15 +41,13 @@ point that drives the same state, not duplicating state.
    qdwin_locker_v1_interface` vtable:
 
    - `bind_as_locker`: stash `qdwin->locker_resource = resource`,
-     send `ready(initially_locked = qdwin->locked)`.
-   - `attach_lock_surface`: reuse `qdwin_handle_attach_lock_surface`
-     body. Surface state moves into a shared helper called by both
-     the shell and locker handlers (during migration both paths
-     accept it; post-migration only the locker does).
-   - `set_locked`: reuse `qdwin_handle_set_locked` body. The
-     `locked_changed` send needs to fan out to both the shell
-     resource (`qdwin_shell_v1_send_locked_changed`) and the locker
-     resource (`qdwin_locker_v1_send_locked_changed`).
+     record the peer pid/uid, send `ready(initially_locked =
+     qdwin->locked)`.
+   - `attach_lock_surface`: legacy compatibility path. Current
+     qdlocker does not create a placeholder surface.
+   - `set_locked`: hide non-lock layers on lock, promote the matching
+     locker Qt toplevel to `lock_layer` when it exists, and fan
+     `locked_changed` out to both qdshell and qdlocker.
    - `lock_acknowledged`: log only; used by tests.
 
 5. **Event sources to redirect to the locker**:
@@ -82,12 +76,9 @@ point that drives the same state, not duplicating state.
 
 ## Lifecycle invariants
 
-- The compositor must boot locked (`qdwin->locked = 1`). It already
-  does — see the boot-locked path in sessions.md:111-132.
-- If the locker disconnects while locked, the LOCK layer stays
-  black (no surface to render). The shell continues to receive
-  `locked_changed` so it knows not to draw chrome. A fresh locker
-  bind re-attaches a surface and the screen comes back.
+- If the locker disconnects while locked, the normal desktop remains
+  hidden and the screen stays black until a fresh locker binds and
+  maps its Qt toplevel.
 - A second `bind_as_locker` from a different client at the locker
   uid is the "old process is dead" path: tear down the old
   resource (it will get a Wayland protocol error on next dispatch
