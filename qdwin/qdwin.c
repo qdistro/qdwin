@@ -1299,7 +1299,7 @@ qdwin_surface_fullscreen_requested(struct weston_desktop_surface *dsurf,
 	struct qdwin *qdwin = data;
 	struct qdwin_toplevel *tl =
 		weston_desktop_surface_get_user_data(dsurf);
-	if (!tl || qdwin->locked)
+	if (!tl)
 		return;
 	qdwin_toplevel_set_fullscreen(qdwin, tl, fullscreen, output);
 }
@@ -8926,7 +8926,44 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 		       uint32_t version, uint32_t id)
 {
 	struct qdwin *qdwin = data;
-	struct wl_resource *resource = wl_resource_create(
+	pid_t pid; uid_t uid; gid_t gid;
+	struct wl_resource *resource;
+
+	/* Gate: only the shell client (or same-uid fallback during early
+	 * startup before bind_as_shell) may bind zwlr_layer_shell_v1.
+	 * Layer-shell surfaces can take exclusive keyboard focus and occupy
+	 * overlay layers — untrusted clients must not have this capability.
+	 * See codex-review Finding 1 (HIGH). */
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	if (qdwin->shell_bound && qdwin->shell_resource) {
+		struct wl_client *shell_client =
+			wl_resource_get_client(qdwin->shell_resource);
+		if (client != shell_client) {
+			weston_log("qdwin: layer-shell bind REJECTED — "
+				   "pid=%d uid=%u is not the shell client\n",
+				   (int)pid, (unsigned)uid);
+			wl_client_post_implementation_error(
+				client,
+				"zwlr_layer_shell_v1: only the shell client "
+				"may bind this interface");
+			return;
+		}
+	} else {
+		/* No shell bound yet; fall back to allowed_uid check. */
+		if (uid != qdwin->allowed_uid) {
+			weston_log("qdwin: layer-shell bind REJECTED — "
+				   "uid=%u not permitted (allowed_uid=%u, "
+				   "no shell bound)\n",
+				   (unsigned)uid, (unsigned)qdwin->allowed_uid);
+			wl_client_post_implementation_error(
+				client,
+				"zwlr_layer_shell_v1: uid %u not permitted",
+				(unsigned)uid);
+			return;
+		}
+	}
+
+	resource = wl_resource_create(
 		client, &zwlr_layer_shell_v1_interface, version, id);
 	if (!resource) {
 		wl_client_post_no_memory(client);
@@ -11128,8 +11165,12 @@ static void
 qdwin_activation_token_free(struct qdwin_activation_token *t)
 {
 	wl_list_remove(&t->link);
-	if (t->requesting_surface)
+	wl_list_init(&t->link);
+	if (t->requesting_surface) {
 		wl_list_remove(&t->requesting_surface_destroy.link);
+		wl_list_init(&t->requesting_surface_destroy.link);
+		t->requesting_surface = NULL;
+	}
 	/* Sever the wl_resource → t back-reference. Many call paths
 	 * (perform/use/timeout/cancel) free `t` while the client's
 	 * xdg_activation_token_v1 resource is still alive; when the
@@ -11194,6 +11235,7 @@ qdwin_activation_requesting_surface_destroyed(struct wl_listener *l, void *data)
 		wl_container_of(l, t, requesting_surface_destroy);
 	(void)data;
 	wl_list_remove(&t->requesting_surface_destroy.link);
+	wl_list_init(&t->requesting_surface_destroy.link);
 	t->requesting_surface = NULL;
 }
 
@@ -11246,6 +11288,7 @@ qdwin_activation_token_set_surface(struct wl_client *client,
 		return;
 	if (t->requesting_surface) {
 		wl_list_remove(&t->requesting_surface_destroy.link);
+		wl_list_init(&t->requesting_surface_destroy.link);
 		t->requesting_surface = NULL;
 	}
 	if (surface) {
@@ -11269,10 +11312,20 @@ qdwin_activation_token_commit(struct wl_client *client,
 	qdwin_generate_token(token_buf);
 	free(t->token);
 	t->token = strdup(token_buf);
+	if (!t->token) {
+		/* Alloc failure: deny rather than issue an empty/unfindable
+		 * token that silently breaks activation.  Send done("") so the
+		 * client doesn't hang, but the empty string will never match
+		 * in qdwin_activation_token_find.  See codex-review Finding 3. */
+		weston_log("qdwin: xdg-activation token strdup failed → "
+			   "deny (empty token issued)\n");
+		t->committed = 1;
+		xdg_activation_token_v1_send_done(resource, "");
+		return;
+	}
 	t->committed = 1;
 	t->qdwin->activation_token_counter++;
-	xdg_activation_token_v1_send_done(resource,
-					  t->token ? t->token : "");
+	xdg_activation_token_v1_send_done(resource, t->token);
 	weston_log("qdwin: xdg-activation token issued #%u app_id=%s\n",
 		   (unsigned)t->qdwin->activation_token_counter,
 		   t->app_id ? t->app_id : "(none)");
@@ -13314,6 +13367,55 @@ bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 			  uint32_t version, uint32_t id)
 {
 	struct qdwin *qdwin = data;
+	pid_t pid; uid_t uid; gid_t gid;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+
+	/* Option A (secctx-identity-contract.md): only the bound shell
+	 * (qdshell) may set security context strings.  The shell is the
+	 * trusted launcher — it knows what it spawned and can vouch for the
+	 * secctx triple.  Any other client binding the manager gets a
+	 * warning log and a refused bind so its subsequent set_sandbox_engine
+	 * / set_app_id / commit calls never reach the protocol handler.
+	 *
+	 * When no shell is bound yet (early startup race or standalone
+	 * probe), fall back to the uid allowlist: only qdwin's allowed_uid
+	 * may bind.  This covers the waypipe->spawn-tier3 path where qdshell
+	 * calls spawn-tier3 which calls waypipe, and waypipe — running as
+	 * the same uid — binds the manager on behalf of the silo client.
+	 *
+	 * The env var QDWIN_SECCTX_OPEN=1 disables this gate for developer
+	 * workflows / CLI smoke tests (decision doc open-questions). */
+	{
+		const char *open_env = getenv("QDWIN_SECCTX_OPEN");
+		int secctx_open = open_env && strcmp(open_env, "1") == 0;
+
+		if (!secctx_open) {
+			int from_shell = 0;
+			if (qdwin->shell_bound && qdwin->shell_resource) {
+				struct wl_client *shell_client =
+					wl_resource_get_client(
+						qdwin->shell_resource);
+				from_shell = (client == shell_client);
+			}
+			if (!from_shell && uid != qdwin->allowed_uid) {
+				weston_log("qdwin/secctx: REJECTED manager "
+					   "bind from uid=%u pid=%d "
+					   "(not shell client, not "
+					   "allowed_uid=%u)\n",
+					   (unsigned)uid, (int)pid,
+					   (unsigned)qdwin->allowed_uid);
+				wl_client_post_implementation_error(
+					client,
+					"wp_security_context_manager_v1: "
+					"only the trusted launcher (qdshell) "
+					"may bind this global "
+					"(uid=%u not permitted)",
+					(unsigned)uid);
+				return;
+			}
+		}
+	}
+
 	struct wl_resource *r = wl_resource_create(client,
 		&wp_security_context_manager_v1_interface, version, id);
 	if (!r) {
@@ -13322,10 +13424,11 @@ bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 	}
 	wl_resource_set_implementation(r, &qdwin_secctx_manager_impl,
 				       qdwin, NULL);
-	pid_t pid; uid_t uid; gid_t gid;
-	wl_client_get_credentials(client, &pid, &uid, &gid);
-	weston_log("qdwin/secctx: manager bound by uid=%u pid=%d\n",
-		   (unsigned)uid, (int)pid);
+	weston_log("qdwin/secctx: manager bound by uid=%u pid=%d%s\n",
+		   (unsigned)uid, (int)pid,
+		   (qdwin->shell_bound && qdwin->shell_resource &&
+		    client == wl_resource_get_client(qdwin->shell_resource))
+		       ? " (shell)" : "");
 }
 
 WL_EXPORT int
@@ -13700,14 +13803,24 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	/* Enables the weston-screenshooter CLI for capture during
 	 * development; safe to call even if the symbol is missing
 	 * from some hypothetical alternative weston build (the library
-	 * loader fails fast at module load, not here). Gated to dev-only:
-	 * the screenshooter exposes whole-output capture outside qdwin's
-	 * per-view stream authorization model and must not ship enabled. */
+	 * loader fails fast at module load, not here). Double-gated:
+	 *   (1) QDWIN_ENABLE_SCREENSHOOTER env var must be set, AND
+	 *   (2) the compositor's own euid must match allowed_uid.
+	 * The screenshooter exposes whole-output capture outside qdwin's
+	 * per-view stream authorization model and must not ship enabled.
+	 * See codex-review Finding 4 (MEDIUM). */
 	{
 		const char *ss_env = getenv("QDWIN_ENABLE_SCREENSHOOTER");
 		int ss_enabled = ss_env && (strcmp(ss_env, "1") == 0 ||
 					    strcasecmp(ss_env, "true") == 0 ||
 					    strcasecmp(ss_env, "yes") == 0);
+		if (ss_enabled && geteuid() != qdwin->allowed_uid) {
+			weston_log("qdwin: screenshooter env var set but "
+				   "euid=%u != allowed_uid=%u — REJECTED\n",
+				   (unsigned)geteuid(),
+				   (unsigned)qdwin->allowed_uid);
+			ss_enabled = 0;
+		}
 		if (ss_enabled) {
 			weston_log("qdwin: WARNING screenshooter enabled via "
 				   "QDWIN_ENABLE_SCREENSHOOTER — dev/test only, "
