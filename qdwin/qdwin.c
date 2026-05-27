@@ -409,6 +409,8 @@ struct qdwin {
 	uid_t allowed_uid;
 	int locked;
 	int shell_bound;
+	pid_t shell_pid;
+	uid_t shell_uid;
 
 	/* qdwin_locker_v1 — peer locker (qdlocker). Same trust shape as
 	 * the shell binding but on its own global so the locker is a
@@ -1466,6 +1468,8 @@ qdwin_handle_bind_as_shell(struct wl_client *client,
 	}
 	qdwin->shell_bound = 1;
 	qdwin->shell_resource = resource;
+	qdwin->shell_pid = pid;
+	qdwin->shell_uid = uid;
 	weston_log("qdwin: shell bound (uid=%u pid=%d); replaying %u toplevels\n",
 		   (unsigned)uid, (int)pid,
 		   (unsigned)wl_list_length(&qdwin->toplevels));
@@ -6023,6 +6027,8 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 		}
 		qdwin->shell_resource = NULL;
 		qdwin->shell_bound = 0;
+		qdwin->shell_pid = 0;
+		qdwin->shell_uid = 0;
 		weston_log("qdwin: shell unbound\n");
 	}
 }
@@ -9065,7 +9071,9 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 	if (qdwin->shell_bound && qdwin->shell_resource) {
 		struct wl_client *shell_client =
 			wl_resource_get_client(qdwin->shell_resource);
-		if (client != shell_client) {
+		if (client != shell_client &&
+		    !(pid > 0 && pid == qdwin->shell_pid &&
+		      uid == qdwin->shell_uid)) {
 			weston_log("qdwin: layer-shell bind REJECTED — "
 				   "pid=%d uid=%u is not the shell client\n",
 				   (int)pid, (unsigned)uid);
