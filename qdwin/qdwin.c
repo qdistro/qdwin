@@ -751,6 +751,9 @@ static void qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
 					  struct qdwin_toplevel *tl,
 					  bool fullscreen,
 					  struct weston_output *output);
+static void qdwin_toplevel_apply_fullscreen_geometry(struct qdwin *qdwin,
+						     struct qdwin_toplevel *tl,
+						     struct weston_output *output);
 static void qdwin_toplevel_set_minimized(struct qdwin *qdwin,
 					 struct qdwin_toplevel *tl);
 static void qdwin_panels_on_output_change(struct qdwin *qdwin);
@@ -1274,43 +1277,52 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 	if (!weston_surface_is_mapped(surface)) {
 		weston_surface_map(surface);
 		tl->mapped = 1;
-		/* Centre content on the primary output so chrome fits
-		 * within visible bounds. Without this the view defaults
-		 * to (0,0) and left/top chrome ends up at negative
-		 * coordinates.
-		 *
-		 * Cascade: every previously-mapped non-nested toplevel
-		 * pushes the new window down-right by 40px. Without this
-		 * spawning two foots stacks them at the same coords —
-		 * user only ever sees the top one and switching focus to
-		 * the bottom one feels broken (text appears on a window
-		 * the user can't see). 40 is small enough to keep most of
-		 * the older window visible behind, large enough to read
-		 * the chrome titlebar through the gap.
-		 */
-		struct weston_output *out = qdwin_primary_output(qdwin);
-		if (out) {
-			int siblings = 0;
-			struct qdwin_toplevel *t;
-			wl_list_for_each(t, &qdwin->toplevels, link) {
-				if (t == tl || t->is_nested_proxy)
-					continue;
-				if (t->mapped)
-					siblings++;
+		if (tl->state & QDWIN_TS_FULLSCREEN) {
+			/* The client may request fullscreen before its first
+			 * buffer. Keep that fullscreen placement authoritative:
+			 * the normal cascade below would otherwise move the
+			 * lock UI or any early-fullscreen client down/right and
+			 * expose whatever is behind it. */
+			qdwin_toplevel_apply_fullscreen_geometry(qdwin, tl, NULL);
+		} else {
+			/* Centre content on the primary output so chrome fits
+			 * within visible bounds. Without this the view defaults
+			 * to (0,0) and left/top chrome ends up at negative
+			 * coordinates.
+			 *
+			 * Cascade: every previously-mapped non-nested toplevel
+			 * pushes the new window down-right by 40px. Without this
+			 * spawning two foots stacks them at the same coords —
+			 * user only ever sees the top one and switching focus to
+			 * the bottom one feels broken (text appears on a window
+			 * the user can't see). 40 is small enough to keep most of
+			 * the older window visible behind, large enough to read
+			 * the chrome titlebar through the gap.
+			 */
+			struct weston_output *out = qdwin_primary_output(qdwin);
+			if (out) {
+				int siblings = 0;
+				struct qdwin_toplevel *t;
+				wl_list_for_each(t, &qdwin->toplevels, link) {
+					if (t == tl || t->is_nested_proxy)
+						continue;
+					if (t->mapped)
+						siblings++;
+				}
+				int offset = (siblings * 40) % 200;  /* wrap at 5 */
+				/* Pixel-coord math is int throughout; cast
+				 * pos.c.{x,y} (double) to int so clang-tidy
+				 * doesn't flag the intermediate int divisions as
+				 * occurring in a float context. Position values
+				 * are whole pixels in practice. */
+				int cx = (int)out->pos.c.x + (out->width  - surface->width)  / 2 + offset;
+				int cy = (int)out->pos.c.y + (out->height - surface->height) / 2 + offset;
+				if (cx < 0) cx = 0;
+				if (cy < 0) cy = 0;
+				struct weston_coord_global p = { .c = weston_coord(cx, cy) };
+				weston_view_set_position(tl->view, p);
+				weston_view_update_transform(tl->view);
 			}
-			int offset = (siblings * 40) % 200;  /* wrap at 5 */
-			/* Pixel-coord math is int throughout; cast pos.c.{x,y}
-			 * (double) to int so clang-tidy doesn't flag the
-			 * intermediate int divisions as occurring in a float
-			 * context. Position values are whole pixels in
-			 * practice. */
-			int cx = (int)out->pos.c.x + (out->width  - surface->width)  / 2 + offset;
-			int cy = (int)out->pos.c.y + (out->height - surface->height) / 2 + offset;
-			if (cx < 0) cx = 0;
-			if (cy < 0) cy = 0;
-			struct weston_coord_global p = { .c = weston_coord(cx, cy) };
-			weston_view_set_position(tl->view, p);
-			weston_view_update_transform(tl->view);
 		}
 		weston_log("qdwin: mapped handle=%u size=%dx%d (%s)\n",
 			   tl->handle, surface->width, surface->height,
@@ -2004,6 +2016,41 @@ qdwin_toplevel_set_minimized(struct qdwin *qdwin, struct qdwin_toplevel *tl)
  * pre-fullscreen geometry. The output param may be NULL — pick the
  * primary in that case. */
 static void
+qdwin_toplevel_apply_fullscreen_geometry(struct qdwin *qdwin,
+					 struct qdwin_toplevel *tl,
+					 struct weston_output *output)
+{
+	struct weston_output *out = output ? output
+					   : qdwin_primary_output(qdwin);
+	if (!out) {
+		weston_log("qdwin: fullscreen geometry handle=%u: no output\n",
+			   tl->handle);
+		return;
+	}
+
+	int ox = out->pos.c.x, oy = out->pos.c.y;
+	int ow = out->width,   oh = out->height;
+	tl->outer_width  = ow;
+	tl->outer_height = oh;
+	if (tl->is_nested_proxy) {
+		qdwin_nested_proxy_set_geometry(tl, ow, oh);
+	} else {
+		weston_desktop_surface_set_fullscreen(tl->desktop_surface,
+						      true);
+	}
+
+	struct weston_coord_global origin = {
+		.c = weston_coord(ox + tl->inset_w,
+				  oy + tl->inset_n),
+	};
+	weston_view_set_output(tl->view, out);
+	weston_view_set_position(tl->view, origin);
+	weston_view_update_transform(tl->view);
+	qdwin_toplevel_apply_inset(tl);
+	qdwin_toplevel_position_chrome(tl);
+}
+
+static void
 qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
 			      struct qdwin_toplevel *tl,
 			      bool fullscreen,
@@ -2012,6 +2059,9 @@ qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
 	int want_fs = fullscreen ? 1 : 0;
 	int is_fs   = (tl->state & QDWIN_TS_FULLSCREEN) ? 1 : 0;
 	if (want_fs == is_fs) {
+		if (want_fs)
+			qdwin_toplevel_apply_fullscreen_geometry(qdwin, tl,
+								output);
 		weston_log("qdwin: set_fullscreen handle=%u fs=%d noop\n",
 			   tl->handle, want_fs);
 		return;
@@ -2044,22 +2094,7 @@ qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
 		tl->saved_outer_h = tl->outer_height;
 
 		int ox = out->pos.c.x, oy = out->pos.c.y;
-		int ow = out->width,   oh = out->height;
-		tl->outer_width  = ow;
-		tl->outer_height = oh;
-		if (tl->is_nested_proxy) {
-			qdwin_nested_proxy_set_geometry(tl, ow, oh);
-		} else {
-			weston_desktop_surface_set_fullscreen(tl->desktop_surface,
-							      true);
-		}
-		struct weston_coord_global origin = {
-			.c = weston_coord(ox + tl->inset_w,
-					  oy + tl->inset_n),
-		};
-		weston_view_set_position(tl->view, origin);
-		qdwin_toplevel_apply_inset(tl);
-		qdwin_toplevel_position_chrome(tl);
+		qdwin_toplevel_apply_fullscreen_geometry(qdwin, tl, out);
 
 		tl->state |= QDWIN_TS_FULLSCREEN;
 		weston_log("qdwin: set_fullscreen handle=%u fs=1 outer=%dx%d at (%d,%d) "
