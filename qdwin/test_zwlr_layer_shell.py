@@ -93,7 +93,7 @@ def with_globals(display_name):
         elif interface == ZwlrLayerShellV1.name:
             state["shell"] = _reg.bind(name, ZwlrLayerShellV1, min(version, 5))
         elif interface == XdgWmBase.name:
-            state["xdg"] = _reg.bind(name, XdgWmBase, min(version, 1))
+            state["xdg"] = _reg.bind(name, XdgWmBase, min(version, 3))
         elif interface == WlShm.name:
             state["shm"] = _reg.bind(name, WlShm, min(version, 1))
 
@@ -464,7 +464,7 @@ def test_role_conflict(display_name):
 
 def test_layer_popup_grab_stale_serial(display_name):
     """plan3 H1: xdg_popup.grab on a layer-parented popup with a stale
-    serial must post XDG_POPUP_ERROR_INVALID_GRAB (4).
+    serial must post XDG_POPUP_ERROR_INVALID_GRAB.
 
     Stock libweston posts INVALID_GRAB unconditionally for any
     NULL-parent popup. Patched libweston with qdwin's layer-grab
@@ -536,7 +536,7 @@ def test_layer_popup_grab_stale_serial(display_name):
     saw_invalid_grab = False
     for m in _WL_ERR_RE.finditer(captured):
         iface, _oid, code, _msg = m.group(1), m.group(2), int(m.group(3)), m.group(4)
-        if iface == "xdg_popup" and code == 4:
+        if iface == "xdg_popup" and code == 0:
             saw_invalid_grab = True
             break
 
@@ -546,7 +546,8 @@ def test_layer_popup_grab_stale_serial(display_name):
     if saw_invalid_grab:
         print(f"  PASS [{label}] stale-serial grab rejected with INVALID_GRAB")
         return True
-    print(f"  FAIL [{label}] expected xdg_popup#4 (INVALID_GRAB) on serial=0; "
+    print(f"  FAIL [{label}] expected xdg_popup error 0 "
+          f"(INVALID_GRAB) on serial=0; "
           f"got: {captured.strip()[:200]}")
     return False
 

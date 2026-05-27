@@ -74,7 +74,8 @@ Last verified against vendored libweston: 2026-05-20 (plan3 landing).
   `weston_desktop_xdg_popup_dismiss_layer_grab`.
 - Test:
   `qdwin/qdwin/test_zwlr_layer_shell.py::test_layer_popup_grab_stale_serial`
-  proves stale serials are rejected with `xdg_popup#4 INVALID_GRAB`.
+  proves stale serials are rejected with `xdg_popup` error 0
+  (`INVALID_GRAB`).
   Live behaviour is covered by Quickshell tooltip/menu paths once they
   are scripted; until then the GUI gate watches the journal for
   `qdwin: layer-popup grab started`.

@@ -422,7 +422,14 @@ struct qdwin {
 	 * across the swap. Without this, observers see a 1→0→1 flap. */
 	int lock_resource_reattach_in_progress;
 
-	/* Layering (see spec/03). */
+	/* Layering (see spec/03).
+	 * Position constants live in QDWIN_LAYER_POS_* so that init and
+	 * lock/unlock hide/show helpers stay in sync. */
+#define QDWIN_LAYER_POS_PANEL          0x70000000u
+#define QDWIN_LAYER_POS_NOTIFICATION   0x78000000u
+#define QDWIN_LAYER_POS_LAUNCHER       0x7C000000u
+#define QDWIN_LAYER_POS_LSHELL_BG      0x00000003u
+#define QDWIN_LAYER_POS_LSHELL_TOP     0x90000000u
 	struct weston_layer background_layer;
 	struct weston_layer held_layer;       /* HIDDEN until shell acks */
 	struct weston_layer normal_layer;
@@ -1206,6 +1213,7 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 		 * call shortcircuited because the surface wasn't yet
 		 * mapped. Re-arm now that both conditions hold. */
 		qdwin_toplevel_autofocus_if_ready(tl);
+		weston_compositor_schedule_repaint(qdwin->compositor);
 	}
 
 	if (tl->last_width != surface->width ||
@@ -1418,6 +1426,7 @@ qdwin_toplevel_release_holding(struct qdwin_toplevel *tl, const char *cause)
 	}
 	weston_log("qdwin: holding_released handle=%u via %s (held → normal)\n",
 		   tl->handle, cause);
+	weston_compositor_schedule_repaint(tl->qdwin->compositor);
 
 	/* Auto-focus is wired in qdwin_toplevel_autofocus_if_ready, called
 	 * from BOTH the release-holding path (here, in case the surface
@@ -2590,6 +2599,12 @@ static void
 qdwin_proxy_default_grab_focus(struct weston_pointer_grab *grab)
 {
 	struct weston_pointer *pointer = grab->pointer;
+	if (qdwin_singleton && qdwin_singleton->locked) {
+		struct weston_view *lv = qdwin_singleton->lock_view;
+		if (pointer->focus != lv)
+			weston_pointer_set_focus(pointer, lv);
+		return;
+	}
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
 	if (view != pointer->focus)
@@ -2604,6 +2619,13 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 {
 	struct weston_pointer *pointer = grab->pointer;
 	weston_pointer_move(pointer, event);
+	if (qdwin_singleton && qdwin_singleton->locked) {
+		struct weston_view *lv = qdwin_singleton->lock_view;
+		if (pointer->focus != lv)
+			weston_pointer_set_focus(pointer, lv);
+		weston_pointer_send_motion(pointer, time, event);
+		return;
+	}
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
 	/* plan3 post-review: override the picked view with the layer-shell
@@ -2732,6 +2754,13 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				uint32_t button, uint32_t state)
 {
 	struct weston_pointer *pointer = grab->pointer;
+	if (qdwin_singleton && qdwin_singleton->locked) {
+		struct weston_view *lv = qdwin_singleton->lock_view;
+		if (pointer->focus != lv)
+			weston_pointer_set_focus(pointer, lv);
+		weston_pointer_send_button(pointer, time, button, state);
+		return;
+	}
 	struct qdwin_layer_surface *layer_surface =
 		qdwin_layer_surface_at_pos(qdwin_singleton, pointer->pos);
 	struct weston_view *layer_view =
@@ -2866,6 +2895,10 @@ qdwin_proxy_default_grab_axis(struct weston_pointer_grab *grab,
 			      const struct timespec *time,
 			      struct weston_pointer_axis_event *event)
 {
+	if (qdwin_singleton && qdwin_singleton->locked) {
+		weston_pointer_send_axis(grab->pointer, time, event);
+		return;
+	}
 	weston_pointer_send_axis(grab->pointer, time, event);
 	struct qdwin_toplevel *tl = qdwin_singleton ?
 		qdwin_singleton->active_input_proxy : NULL;
@@ -5025,6 +5058,35 @@ qdwin_handle_attach_launcher(struct wl_client *client,
 /* §6.6 S5 — lock surface + set_locked. */
 
 static void
+qdwin_hide_non_lock_layers(struct qdwin *qdwin)
+{
+	weston_log("qdwin: hiding non-lock layers for lock\n");
+	weston_layer_unset_position(&qdwin->panel_layer);
+	weston_layer_unset_position(&qdwin->notification_layer);
+	weston_layer_unset_position(&qdwin->launcher_layer);
+	weston_layer_unset_position(&qdwin->popup_layer);
+	for (int i = 0; i < 4; i++)
+		weston_layer_unset_position(&qdwin->layer_shell_layer[i]);
+}
+
+static void
+qdwin_show_non_lock_layers(struct qdwin *qdwin)
+{
+	weston_log("qdwin: restoring non-lock layers after unlock\n");
+	weston_layer_set_position(&qdwin->panel_layer, QDWIN_LAYER_POS_PANEL);
+	weston_layer_set_position(&qdwin->notification_layer, QDWIN_LAYER_POS_NOTIFICATION);
+	weston_layer_set_position(&qdwin->launcher_layer, QDWIN_LAYER_POS_LAUNCHER);
+	weston_layer_set_position(&qdwin->popup_layer,
+				  WESTON_LAYER_POSITION_UI);
+	weston_layer_set_position(&qdwin->layer_shell_layer[0], QDWIN_LAYER_POS_LSHELL_BG);
+	weston_layer_set_position(&qdwin->layer_shell_layer[1],
+				  WESTON_LAYER_POSITION_BOTTOM_UI);
+	weston_layer_set_position(&qdwin->layer_shell_layer[2], QDWIN_LAYER_POS_LSHELL_TOP);
+	weston_layer_set_position(&qdwin->layer_shell_layer[3],
+				  WESTON_LAYER_POSITION_TOP_UI);
+}
+
+static void
 qdwin_lock_surface_place(struct qdwin *qdwin)
 {
 	if (!qdwin->lock_view || !qdwin->lock_surface)
@@ -5076,6 +5138,7 @@ qdwin_lock_surface_destroyed_cb(struct wl_listener *l, void *data)
 	}
 	if (qdwin->locked && !qdwin->lock_resource_reattach_in_progress) {
 		qdwin->locked = 0;
+		qdwin_show_non_lock_layers(qdwin);
 		weston_log("qdwin: locked_changed=0 cause=lock-surface-destroy\n");
 		if (qdwin->shell_resource)
 			qdwin_shell_v1_send_locked_changed(
@@ -5138,6 +5201,7 @@ qdwin_lock_surface_resource_destroyed(struct wl_resource *resource)
 	}
 	if (qdwin->locked && !qdwin->lock_resource_reattach_in_progress) {
 		qdwin->locked = 0;
+		qdwin_show_non_lock_layers(qdwin);
 		weston_log("qdwin: locked_changed=0 cause=lock-resource-destroy\n");
 		if (qdwin->shell_resource)
 			qdwin_shell_v1_send_locked_changed(
@@ -5389,9 +5453,12 @@ qdwin_handle_set_locked(struct wl_client *client,
 	if (want) {
 		if (wl_resource_get_version(resource) >= 17)
 			qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
-	} else if (qdwin->overlay_grab_active &&
-		   qdwin->overlay_grab_role == 2) {
-		qdwin_overlay_grab_end(qdwin);
+		qdwin_hide_non_lock_layers(qdwin);
+	} else {
+		if (qdwin->overlay_grab_active &&
+		    qdwin->overlay_grab_role == 2)
+			qdwin_overlay_grab_end(qdwin);
+		qdwin_show_non_lock_layers(qdwin);
 	}
 	weston_log("qdwin: set_locked=%d (lock_surface=%p)\n",
 		   want, (void*)qdwin->lock_surface);
@@ -6027,9 +6094,12 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 	qdwin->locked = want;
 	if (want) {
 		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
-	} else if (qdwin->overlay_grab_active &&
-		   qdwin->overlay_grab_role == 2) {
-		qdwin_overlay_grab_end(qdwin);
+		qdwin_hide_non_lock_layers(qdwin);
+	} else {
+		if (qdwin->overlay_grab_active &&
+		    qdwin->overlay_grab_role == 2)
+			qdwin_overlay_grab_end(qdwin);
+		qdwin_show_non_lock_layers(qdwin);
 	}
 	weston_log("qdwin: locker set_locked=%d (lock_surface=%p)\n",
 		   want, (void*)qdwin->lock_surface);
@@ -9293,6 +9363,64 @@ qdwin_cursor_solid_enabled(void)
 }
 
 static void
+qdwin_pointer_cursor_surface_committed(struct weston_surface *surface,
+				       struct weston_coord_surface new_origin)
+{
+	struct weston_pointer *pointer = surface->committed_private;
+	struct weston_coord_surface hotspot_inv;
+
+	if (surface->width == 0)
+		return;
+	if (!pointer || !pointer->sprite ||
+	    pointer->sprite->surface != surface) {
+		weston_log("qdwin: cursor-sprite commit ignored for stale "
+			   "surface\n");
+		return;
+	}
+
+	pointer->hotspot = weston_coord_surface_sub(pointer->hotspot,
+						    new_origin);
+	hotspot_inv = weston_coord_surface_invert(pointer->hotspot);
+	weston_view_set_position_with_offset(pointer->sprite,
+					     pointer->pos, hotspot_inv);
+
+	pixman_region32_clear(&surface->pending.input);
+	pixman_region32_clear(&surface->input);
+
+	if (!weston_surface_is_mapped(surface)) {
+		weston_surface_map(surface);
+		weston_view_move_to_layer(pointer->sprite,
+					  &surface->compositor->
+					  cursor_layer.view_list);
+	}
+}
+
+static void
+qdwin_pointer_unmap_sprite(struct weston_pointer *pointer)
+{
+	struct weston_surface *surface;
+
+	if (!pointer || !pointer->sprite)
+		return;
+
+	surface = pointer->sprite->surface;
+	if (surface) {
+		if (weston_surface_is_mapped(surface))
+			weston_surface_unmap(surface);
+		if (surface->committed_private == pointer) {
+			surface->committed = NULL;
+			surface->committed_private = NULL;
+			weston_surface_set_label_func(surface, NULL);
+		}
+	}
+	if (pointer->sprite_destroy_listener.link.next)
+		wl_list_remove(&pointer->sprite_destroy_listener.link);
+	wl_list_init(&pointer->sprite_destroy_listener.link);
+	weston_view_destroy(pointer->sprite);
+	pointer->sprite = NULL;
+}
+
+static void
 qdwin_cursor_shape_colour(uint32_t shape, float *r, float *g, float *b,
 			  float *a)
 {
@@ -9326,9 +9454,12 @@ static void
 qdwin_cursor_sprite_tear_down(struct qdwin_cursor_shape_device *dev)
 {
 	if (dev->sprite_view) {
-		if (dev->pointer && dev->pointer->sprite == dev->sprite_view)
-			dev->pointer->sprite = NULL;
-		weston_view_destroy(dev->sprite_view);
+		if (dev->pointer && dev->pointer->sprite == dev->sprite_view) {
+			qdwin_pointer_unmap_sprite(dev->pointer);
+		}
+		/* If another cursor-shape device replaced pointer->sprite,
+		 * qdwin_pointer_unmap_sprite() already destroyed this view.
+		 * Do not dereference or destroy a non-current cached pointer. */
 		dev->sprite_view = NULL;
 	}
 	if (dev->sprite_buffer_ref) {
@@ -9381,8 +9512,13 @@ qdwin_cursor_device_install_solid_sprite(struct qdwin_cursor_shape_device *dev,
 
 	/* Hotspot at the top-left for a simple coloured cursor; most
 	 * cursor shapes from CSS point into their upper-left quadrant. */
+	qdwin_pointer_unmap_sprite(dev->pointer);
 	dev->pointer->hotspot = weston_coord_surface(0, 0, surface);
 	dev->pointer->sprite = view;
+	wl_signal_add(&surface->destroy_signal,
+		      &dev->pointer->sprite_destroy_listener);
+	surface->committed = qdwin_pointer_cursor_surface_committed;
+	surface->committed_private = dev->pointer;
 
 	weston_compositor_schedule_repaint(dev->qdwin->compositor);
 	weston_log("qdwin: cursor-shape sprite installed "
@@ -9604,8 +9740,13 @@ qdwin_install_cursor_sprite_view(struct qdwin *qdwin,
 		weston_log("qdwin: %s: view create failed\n", log_prefix);
 		return NULL;
 	}
+	qdwin_pointer_unmap_sprite(pointer);
 	pointer->hotspot = weston_coord_surface(hotspot_x, hotspot_y, surface);
 	pointer->sprite = view;
+	wl_signal_add(&surface->destroy_signal,
+		      &pointer->sprite_destroy_listener);
+	surface->committed = qdwin_pointer_cursor_surface_committed;
+	surface->committed_private = pointer;
 
 	struct weston_coord_surface hotspot_inv =
 		weston_coord_surface_invert(pointer->hotspot);
@@ -13254,12 +13395,12 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	/* Panel sits between NORMAL (0x50000000) and UI/popup (0x80000000).
 	 * 0x70000000 keeps popups on top so right-click chrome menus still
 	 * overlay the panel. */
-	weston_layer_set_position(&qdwin->panel_layer, 0x70000000u);
+	weston_layer_set_position(&qdwin->panel_layer, QDWIN_LAYER_POS_PANEL);
 	/* Notifications live above panel but below popups (popup_layer is
 	 * WESTON_LAYER_POSITION_UI = 0x80000000). 0x78000000 fits between.
 	 * Launcher between notifications and popup (0x7C000000). */
-	weston_layer_set_position(&qdwin->notification_layer, 0x78000000u);
-	weston_layer_set_position(&qdwin->launcher_layer,    0x7C000000u);
+	weston_layer_set_position(&qdwin->notification_layer, QDWIN_LAYER_POS_NOTIFICATION);
+	weston_layer_set_position(&qdwin->launcher_layer,    QDWIN_LAYER_POS_LAUNCHER);
 	weston_layer_set_position(&qdwin->popup_layer,
 				  WESTON_LAYER_POSITION_UI);
 	/* Lock layer lives at WESTON_LAYER_POSITION_LOCK (above
@@ -13279,10 +13420,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 *                   above FULLSCREEN per spec ("OVERLAY layer is
 	 *                   above fullscreen surfaces").
 	 */
-	weston_layer_set_position(&qdwin->layer_shell_layer[0], 0x00000003u);
+	weston_layer_set_position(&qdwin->layer_shell_layer[0], QDWIN_LAYER_POS_LSHELL_BG);
 	weston_layer_set_position(&qdwin->layer_shell_layer[1],
 				  WESTON_LAYER_POSITION_BOTTOM_UI);
-	weston_layer_set_position(&qdwin->layer_shell_layer[2], 0x90000000u);
+	weston_layer_set_position(&qdwin->layer_shell_layer[2], QDWIN_LAYER_POS_LSHELL_TOP);
 	weston_layer_set_position(&qdwin->layer_shell_layer[3],
 				  WESTON_LAYER_POSITION_TOP_UI);
 	wl_list_init(&qdwin->panels);
