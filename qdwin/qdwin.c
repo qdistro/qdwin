@@ -860,6 +860,9 @@ qdwin_desktop_surface_peer(struct weston_desktop_surface *dsurf,
 	return 1;
 }
 
+/* Match a toplevel to the locker process by (pid, uid).  We cannot use
+ * wl_client pointer comparison because qdlocker's Qt xdg_toplevel and its
+ * pywayland control connection are separate wl_clients sharing a pid. */
 static int
 qdwin_toplevel_is_locker_ui(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
@@ -6118,25 +6121,22 @@ qdwin_locker_resource_destroy(struct wl_resource *resource)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	if (qdwin->locker_resource == resource) {
+		/* Demote any promoted lock toplevel before zeroing identity
+		 * fields — after this point qdwin_toplevel_is_locker_ui can
+		 * no longer match, so the toplevel would be orphaned on the
+		 * lock layer with no way to demote it later. */
+		qdwin_demote_lock_toplevel(qdwin, "locker_disconnect");
 		qdwin->locker_resource = NULL;
 		qdwin->locker_pid = 0;
 		qdwin->locker_uid = (uid_t)-1;
 		weston_log("qdwin: locker unbound\n");
-		/* End the role=2 overlay keyboard grab so the next press
-		 * isn't forwarded with the locker role still set; without
-		 * this, keystrokes briefly fall through into the shell
-		 * overlay_key path with role=2 — a small but real leak
-		 * window during locker restart. The lock_surface itself
-		 * tears down separately via qdwin_lock_surface_resource_destroyed
-		 * (when the client connection closes wl_resources). */
 		if (qdwin->overlay_grab_active && qdwin->overlay_grab_role == 2)
 			qdwin_overlay_grab_end(qdwin);
 		/* Fail-safe: if the locker disappears while the compositor
-		 * is locked, keep the LOCK layer composited (the surface
-		 * is owned by the (now-defunct) client and will tear down
-		 * naturally). The screen stays black until a fresh locker
-		 * binds and attaches a new surface. We do NOT auto-unlock
-		 * on locker death — see doc/locker.md §Lifecycle. */
+		 * is locked, keep the LOCK layer composited — the screen
+		 * stays black until a fresh locker binds and maps its Qt
+		 * toplevel. We do NOT auto-unlock on locker death — see
+		 * doc/locker.md §Lifecycle. */
 	}
 }
 
@@ -9106,6 +9106,9 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 	if (qdwin->shell_bound && qdwin->shell_resource) {
 		struct wl_client *shell_client =
 			wl_resource_get_client(qdwin->shell_resource);
+		/* qdshell opens a second wl_client for its layer-shell
+		 * surfaces, so pure client-pointer comparison rejects it.
+		 * Fall back to (pid, uid) for same-process identity. */
 		if (client != shell_client &&
 		    !(pid > 0 && pid == qdwin->shell_pid &&
 		      uid == qdwin->shell_uid)) {
