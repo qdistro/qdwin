@@ -109,11 +109,16 @@ Unauthorized bind attempts are rejected with
 
 Once bound, `EXCLUSIVE` keyboard interactivity is granted to any layer
 surface that requests it (e.g. swaylock-style overlays, launcher grabs).
-This is safe because only the shell client can bind, but the global
-advertisement is intentionally broad for bring-up compatibility with
-waybar, fuzzel, mako, and gtk-layer-shell-based bars (they need to see
-the global in `wl_registry` even though the bind will fail unless they
-are the shell).
+Note: before qdshell binds, any client running as `allowed_uid`
+(defaults to compositor euid) can bind layer-shell, so the window
+between compositor startup and shell bind is a wider-trust period.
+After the shell binds, only qdshell (or same pid+uid) may bind.
+
+The global is advertised broadly so that third-party layer-shell clients
+(waybar, fuzzel, mako, gtk-layer-shell bars) see it in `wl_registry`.
+In practice, these clients will fail to bind unless they run as the
+shell or `allowed_uid`; the advertisement exists for protocol discovery
+rather than access.
 
 **Remaining hardening (deferred to production milestone):**
 
@@ -145,9 +150,12 @@ qdshell/broker, which independently verifies:
 
 - `/proc/<pid>/attr/current` (SELinux label)
 - `/proc/<pid>/exe` (executable path)
-- cgroup membership and namespace identity
+- pid start time (to detect pid reuse)
+- uid match
 
-The compositor deliberately does not duplicate this verification;
+Cgroup and namespace identity are collected for audit/display but are
+not currently used as verification inputs in the broker's identity
+check. The compositor deliberately does not duplicate this verification;
 treating secctx as a routing hint rather than an authentication
 credential is the intended layering.
 
