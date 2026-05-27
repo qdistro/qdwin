@@ -115,7 +115,7 @@ calls `weston_seat_set_keyboard_focus`). There is no broker decision
 path for EXCLUSIVE -- the bind-time gate is the sole access control.
 
 Note: before qdshell binds, any client running as `allowed_uid`
-(defaults to compositor euid) can bind layer-shell, so the window
+(defaults to compositor real uid via `getuid()`) can bind layer-shell, so the window
 between compositor startup and shell bind is a wider-trust period.
 After the shell binds, only qdshell (or same pid+uid) may bind.
 
@@ -153,18 +153,20 @@ already-sandboxed clients so nesting is impossible. The env var
 
 **Downstream verification (design intent):** qdwin forwards secctx tags
 to the shell, but the authoritative identity check happens in
-qdshell/broker, which independently verifies:
+qdshell/broker via `VerifyClientIdentity`, which checks:
 
-- `/proc/<pid>/attr/current` (SELinux label)
-- `/proc/<pid>/exe` (executable path)
-- pid start time (to detect pid reuse)
-- uid match
+- pid start time (always checked, to detect pid reuse)
+- uid match (always checked)
+- `/proc/<pid>/exe` (checked when the forwarded exe is non-empty;
+  skipped if qdwin could not read it at bind time)
+- `/proc/<pid>/attr/current` (SELinux label; checked only when both
+  the forwarded label and the live label are non-empty)
 
-Cgroup and namespace identity are collected for audit/display but are
-not currently used as verification inputs in the broker's identity
-check. The compositor deliberately does not duplicate this verification;
-treating secctx as a routing hint rather than an authentication
-credential is the intended layering.
+Cgroup membership is collected for audit/display but is not currently
+used as a verification input. Namespace identity (`/proc/<pid>/ns/*`)
+is not collected. The compositor deliberately does not duplicate this
+verification; treating secctx as a routing hint rather than an
+authentication credential is the intended layering.
 
 Reference: `qdistro/doc/isolation-tiers.md`, `qdistro/doc/permissions.md`.
 

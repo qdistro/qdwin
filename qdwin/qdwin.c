@@ -13342,8 +13342,9 @@ qdwin_secctx_destroy_req(struct wl_client *client,
 }
 
 /* secctx tags are advisory routing metadata — qdwin forwards them to the
- * shell but broker verifies identity via /proc/<pid>/attr/current, exe,
- * starttime, uid.  See doc/protocol.md "Security posture: wp_security_context_v1". */
+ * shell but broker verifies identity via starttime + uid (always) and
+ * exe + SELinux label (when available).  See doc/protocol.md
+ * "Security posture: wp_security_context_v1". */
 static void
 qdwin_secctx_set_sandbox_engine(struct wl_client *client,
 				struct wl_resource *resource,
