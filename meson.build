@@ -127,6 +127,14 @@ xdg_activation_protocol_code = custom_target(
   output: 'xdg-activation-v1-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
+# Client header for the activation negative-path probe (qdwin-activation-probe).
+# The global is server-side in qdwin-shell.so; the probe is a plain client.
+xdg_activation_client_header = custom_target(
+  'xdg-activation-v1-client-header',
+  input: xdg_activation_xml,
+  output: 'xdg-activation-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
 
 # §6.7 more: ext-idle-notify-v1 (+ idle-inhibit-unstable-v1).
 ext_idle_notify_xml = files(
@@ -425,6 +433,33 @@ executable('qdwin-secctx-probe',
     'test-client/qdwin-secctx-probe.c',
     security_context_client_header,
     security_context_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Locker bind-gate probe. Binds qdwin_locker_v1 + bind_as_locker and reports
+# (via exit code) whether qdwin's uid gate accepted or refused it; --double-bind
+# and --rebind exercise the XML's "one locker at a time" semantics. Driven by
+# tests/host/07-locker-bind-gate.md.
+executable('qdwin-locker-probe',
+  sources: [
+    'test-client/qdwin-locker-probe.c',
+    qdwin_locker_client_header,
+    qdwin_locker_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# xdg-activation negative-path probe. Drives qdwin_activation_activate with an
+# unknown/forged token and asserts the compositor drops it without a protocol
+# error or crash. Driven by tests/host/09-xdg-activation-gating.md.
+executable('qdwin-activation-probe',
+  sources: [
+    'test-client/qdwin-activation-probe.c',
+    xdg_activation_client_header,
+    xdg_activation_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,

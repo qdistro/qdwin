@@ -54,18 +54,22 @@ $HT/start.sh $ID --no-shell --no-terminal --allowed-uid "$FOREIGN_UID" >/dev/nul
 RUNTIME=$(ht_runtime $ID); SOCK=$(ht_socket $ID); WLOG=$(ht_log_weston $ID)
 
 # Capture nonzero exits explicitly: lib.sh runs under `set -e`, and S1
-# EXPECTS the probe to fail (exit 1), so a bare `cmd; RC=$?` would abort.
+# EXPECTS the probe to fail, so a bare `cmd; RC=$?` would abort. The probe
+# exits 4 specifically when the bind was refused with the EXPECTED
+# implementation error on wl_display (a wrong/unexpected error exits 1), so
+# this can't false-pass on an unrelated disconnect.
 if XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY="$SOCK" "$PROBE"; then RC=0; else RC=$?; fi
 if grep -qF "secctx: REJECTED manager bind" "$WLOG"; then LOGHIT=0; else LOGHIT=1; fi
 $HT/stop.sh $ID
-if [ "$RC" -eq 1 ] && [ "$LOGHIT" -eq 0 ]; then echo "S1 PASS"; else
-    echo "S1 FAIL (exit=$RC want 1; reject-log hit=$LOGHIT want 0)"; fi
+if [ "$RC" -eq 4 ] && [ "$LOGHIT" -eq 0 ]; then echo "S1 PASS"; else
+    echo "S1 FAIL (exit=$RC want 4; reject-log hit=$LOGHIT want 0)"; fi
 ```
 
 **Assert (S1):** both must hold (the conjunction is the pass — a bind
 error alone could be an unrelated disconnect):
-- `RC == 1` — the probe's bind round-trip saw a protocol/implementation
-  error (the gate refused the bind). PRIMARY client-observed signal.
+- `RC == 4` — the probe's bind round-trip saw the EXPECTED implementation
+  error on wl_display (the gate refused the bind). A wrong error exits 1
+  and fails. PRIMARY client-observed signal.
 - the weston log contains `qdwin/secctx: REJECTED manager bind from
   uid=…` — proves the refusal came from the intended branch. This is a
   HARD assertion, not advisory.
@@ -133,5 +137,5 @@ tear each one down individually (one id per call):
 
 ## Pass criteria
 
-All three asserts hold: S1 `RC==1` + reject log, S2 `RC==0` + bound log,
+All three asserts hold: S1 `RC==4` + reject log, S2 `RC==0` + bound log,
 S3 `RC==0`.
