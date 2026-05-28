@@ -25,9 +25,12 @@
     the kernel pinned at connect time, but /proc is read later when the
     bind request is handled, so the exe/label/starttime checks are
     best-effort defence-in-depth on top of the uid gate, not a proof
-    that /proc still names the exact connecting process — a same-uid
-    process that exits and whose pid is recycled before the bind is
-    serviced is not fully excluded by these checks alone. The primary
+    that /proc still names the exact connecting process. The starttime
+    double-read only proves the pid named one stable process across our
+    own read window; it does not exclude (a) pid reuse that completed
+    before the first sample, nor (b) a same-process execve() (e.g. into
+    a different SELinux domain), because starttime is the fork/clone
+    time and is unchanged by exec. The primary
     gate remains the uid check plus the socket being reachable only to
     the locker uid. When a check is left unconfigured it is skipped,
     and the compositor relies on systemd unit confinement and SELinux

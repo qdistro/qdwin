@@ -41,10 +41,20 @@ only the LOCK layer can render.
    `allowed_locker_exe` / `allowed_locker_label` are set it then
    resolves the peer's `/proc/<pid>/exe` / `/proc/<pid>/attr/current`
    and rejects on mismatch, bracketing the reads with a
-   `/proc/<pid>/stat` starttime double-read so an unstable/recycled
-   pid fails closed. The exe/label checks are best-effort
-   defence-in-depth on top of the uid gate (see the residual-window
-   note in `qdwin-locker-v1.xml`). A *second* `bind_as_locker` from a
+   `/proc/<pid>/stat` starttime double-read. That double-read only
+   proves the pid named **one stable process across our own read
+   window** (mismatched or unreadable starttime ⇒ fail closed); it
+   does **not** prove the pid still names the process that connected.
+   In particular it does not detect (a) pid reuse that completed
+   *before* the first sample, nor (b) a same-process `execve()` — e.g.
+   into a different SELinux domain — since `starttime` is the
+   fork/clone time and is unchanged by `exec`. That residual
+   same-process-exec / pre-read pid-reuse window is closed by relying
+   on service confinement (the locker runs under a confined
+   unit/SELinux domain), not by these in-process `/proc` reads. The
+   exe/label checks are best-effort defence-in-depth on top of the uid
+   gate (see the residual-window note in `qdwin-locker-v1.xml`). A
+   *second* `bind_as_locker` from a
    new client is accepted by destroying the old locker resource (the
    old process is treated as dead); a second bind on the *same*
    resource is the case rejected via the `already_bound` enum.
