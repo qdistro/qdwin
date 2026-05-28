@@ -44,6 +44,13 @@
  *                     already_used (=1) on the second commit. Asserts that.
  *   --set-after-commit commit, then set_app_id. qdwin posts already_used
  *                     (=1) on the post-commit setter. Asserts that.
+ *   --commit-close-destroy  regression for the secctx listener
+ *                     use-after-free: commit, close the close_fd (drives
+ *                     the compositor's HANGUP teardown that frees the
+ *                     listener), then destroy the context resource. On a
+ *                     vulnerable build this crashes the compositor; the
+ *                     probe asserts the connection survives. Exit 0 =
+ *                     survived, 1 = connection died (crash).
  *
  * Exit codes:
  *   0  expected-accept path completed cleanly (bind / commit round-tripped)
@@ -62,7 +69,6 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -166,13 +172,18 @@ denied_or_ok_code(struct probe *p, const char *what, uint32_t *out_code,
 }
 
 enum secctx_mode {
-	M_BIND,            /* default: bind only */
-	M_COMMIT,          /* full set + commit */
-	M_COMMIT_NO_APPID, /* engine + instance_id, no app_id */
-	M_COMMIT_BARE,     /* no setters */
-	M_COMMIT_ENGINE,   /* engine only */
-	M_DOUBLE_COMMIT,   /* commit twice */
-	M_SET_AFTER_COMMIT /* commit then set_app_id */
+	M_BIND,             /* default: bind only */
+	M_COMMIT,           /* full set + commit */
+	M_COMMIT_NO_APPID,  /* engine + instance_id, no app_id */
+	M_COMMIT_BARE,      /* no setters */
+	M_COMMIT_ENGINE,    /* engine only */
+	M_DOUBLE_COMMIT,    /* commit twice */
+	M_SET_AFTER_COMMIT, /* commit then set_app_id */
+	M_UAF_REPRO,        /* commit, HUP close_fd, then destroy the context —
+			     * the secctx listener use-after-free regression */
+	M_UAF_SETTER        /* commit, HUP close_fd, then set_app_id on the dead
+			     * context — guards the NULL-deref the user_data
+			     * clear would otherwise expose in the setters */
 };
 
 int main(int argc, char *argv[])
@@ -191,6 +202,10 @@ int main(int argc, char *argv[])
 			mode = M_DOUBLE_COMMIT;
 		else if (strcmp(argv[i], "--set-after-commit") == 0)
 			mode = M_SET_AFTER_COMMIT;
+		else if (strcmp(argv[i], "--commit-close-destroy") == 0)
+			mode = M_UAF_REPRO;
+		else if (strcmp(argv[i], "--commit-close-setter") == 0)
+			mode = M_UAF_SETTER;
 	}
 
 	struct probe p = {0};
@@ -275,6 +290,8 @@ int main(int argc, char *argv[])
 	 * the "missing"/"bare" variants are still valid commit sequences. */
 	switch (mode) {
 	case M_COMMIT:
+	case M_UAF_REPRO:
+	case M_UAF_SETTER:
 		wp_security_context_v1_set_sandbox_engine(ctx, "qdistro");
 		wp_security_context_v1_set_app_id(ctx,
 			"org.qdistro.test.secctx-probe");
@@ -315,6 +332,59 @@ int main(int argc, char *argv[])
 	 * listener be reaped mid-check. */
 	close(listen_fd);
 	close(close_fds[0]);
+
+	if (mode == M_UAF_REPRO || mode == M_UAF_SETTER) {
+		/* Regression for the secctx listener use-after-free
+		 * (qdwin_secctx_destroy not detaching sec->resource) and the
+		 * NULL-deref the user_data clear would expose in the request
+		 * handlers. First confirm the commit landed. */
+		if (denied_or_ok_code(&p, "listener commit", NULL, NULL) != 0) {
+			close(close_fds[1]);
+			return 1;
+		}
+		/* Close the close-pipe WRITE end so the compositor sees HANGUP
+		 * on the listener's close_fd and runs qdwin_secctx_close_cb →
+		 * qdwin_secctx_destroy(sec), freeing `sec`. The two roundtrips +
+		 * sleeps drive a full server dispatch cycle so the HUP teardown
+		 * lands before the trigger below in practice (empirically
+		 * deterministic — the buggy build aborts every run). It is not a
+		 * hard ordering guarantee; the scenario's `close_fd hangup` log
+		 * check confirms the teardown actually ran in the case. */
+		close(close_fds[1]);
+		usleep(150000);
+		wl_display_roundtrip(p.display);
+		usleep(50000);
+		wl_display_roundtrip(p.display);
+		if (wl_display_get_error(p.display) != 0) {
+			fprintf(stderr, "qdwin-secctx-probe: display error after "
+				"close_fd HUP (before trigger) — unexpected\n");
+			return 1;
+		}
+		/* The trigger. On a vulnerable compositor either path crashes
+		 * weston (M_UAF_REPRO: UAF in the destructor; M_UAF_SETTER:
+		 * UAF reading freed sec, or a NULL-deref if only the user_data
+		 * was cleared without guarding the setters). On a fixed one
+		 * both are safe no-ops. */
+		if (mode == M_UAF_REPRO) {
+			wp_security_context_v1_destroy(ctx);
+		} else {
+			/* set_app_id on the dead context — must hit the NULL
+			 * guard, not deref a freed/NULL sec. */
+			wp_security_context_v1_set_app_id(ctx, "after-hup");
+		}
+		wl_display_flush(p.display);
+		int r = wl_display_roundtrip(p.display);
+		if (r < 0 || wl_display_get_error(p.display) != 0) {
+			fprintf(stderr, "qdwin-secctx-probe: compositor "
+				"connection died after post-HUP %s — crash\n",
+				mode == M_UAF_REPRO ? "destroy" : "set_app_id");
+			return 1;
+		}
+		printf("qdwin-secctx-probe: commit+close+%s survived "
+		       "(no crash)\n",
+		       mode == M_UAF_REPRO ? "destroy" : "set_app_id");
+		return 0;
+	}
 
 	uint32_t code = 0;
 	const struct wl_interface *iface = NULL;

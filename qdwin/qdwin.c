@@ -13626,6 +13626,19 @@ qdwin_secctx_destroy(struct qdwin_secctx *sec)
 		if (sc->secctx == sec)
 			sc->secctx = NULL;
 	}
+	/* Detach the context resource too. After commit the listener can
+	 * outlive the client's wp_security_context_v1 resource (e.g. this
+	 * destroy fires from the close_fd HANGUP), so leaving the resource's
+	 * user_data pointing at the about-to-be-freed `sec` is a
+	 * use-after-free the moment the client later destroys the resource or
+	 * disconnects. Clear it; qdwin_secctx_resource_destroy already no-ops
+	 * on a NULL user_data. (When this is itself called from that
+	 * destructor for the pre-commit case, clearing the in-flight
+	 * resource's user_data is harmless.) */
+	if (sec->resource) {
+		wl_resource_set_user_data(sec->resource, NULL);
+		sec->resource = NULL;
+	}
 	free(sec->sandbox_engine);
 	free(sec->app_id);
 	free(sec->instance_id);
@@ -13651,6 +13664,8 @@ qdwin_secctx_set_sandbox_engine(struct wl_client *client,
 {
 	struct qdwin_secctx *sec = wl_resource_get_user_data(resource);
 	(void)client;
+	if (!sec)   /* listener already torn down (close_fd HUP); dead resource */
+		return;
 	if (sec->committed) {
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_USED,
@@ -13672,6 +13687,8 @@ qdwin_secctx_set_app_id(struct wl_client *client,
 {
 	struct qdwin_secctx *sec = wl_resource_get_user_data(resource);
 	(void)client;
+	if (!sec)   /* listener already torn down (close_fd HUP); dead resource */
+		return;
 	if (sec->committed) {
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_USED,
@@ -13694,6 +13711,8 @@ qdwin_secctx_set_instance_id(struct wl_client *client,
 {
 	struct qdwin_secctx *sec = wl_resource_get_user_data(resource);
 	(void)client;
+	if (!sec)   /* listener already torn down (close_fd HUP); dead resource */
+		return;
 	if (sec->committed) {
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_USED,
@@ -13713,6 +13732,8 @@ static void
 qdwin_secctx_commit(struct wl_client *client, struct wl_resource *resource)
 {
 	struct qdwin_secctx *sec = wl_resource_get_user_data(resource);
+	if (!sec)   /* listener already torn down (close_fd HUP); dead resource */
+		return;
 	struct qdwin *qdwin = sec->qdwin;
 	(void)client;
 	if (sec->committed) {
