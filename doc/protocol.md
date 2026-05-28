@@ -154,17 +154,39 @@ handler additionally verifies the peer's uid and/or resolved
 rejects the bind on mismatch. These checks fail closed: an unreadable,
 OOM, or truncated `/proc` read is treated as "unverifiable" and rejects
 the bind, and the reads are bracketed by `/proc/<pid>/stat` starttime
-samples so a pid whose process identity is unstable (e.g. recycled)
-across the read window is also rejected.
+samples so a pid that is *recycled to a different process* during the
+handler's read window (a different starttime) is rejected.
 
 This mirrors the locker-bind hardening (see `doc/locker.md` /
 `qdwin-locker-v1.xml`). It is best-effort defence-in-depth, **not** a
-proof of identity: the peer pid is what the kernel pinned at connect
-time, but `/proc` is read later when the bind request is serviced, so a
-same-uid process that exits and whose pid is recycled before the bind is
-handled is not fully excluded by these checks alone (the residual
-connect-time pid-reuse window). The exe/label checks do not weaken the
-existing shell-client/`allowed_uid` gate; they only further narrow it.
+proof of identity. The peer pid is what the kernel pinned at connect
+time, but `/proc` is read later when the bind request is serviced. The
+starttime bracketing is narrow and does **not** make the exe/label a
+stable post-bind identity; specifically it does NOT cover:
+
+- **PID reuse before the first read.** If the connecting process exits
+  and its pid is recycled to a different same-uid process *before* the
+  first `/proc/<pid>/stat` sample, every read (starttime included)
+  observes the impostor consistently and the bind is accepted. The
+  bracketing only catches a recycle that races the read window itself.
+- **Same-process `execve()`.** `starttime` is the process creation time
+  and is **unchanged** by `execve()`, so a process that passes the gate
+  and then `exec()`s a different binary keeps the same pid/starttime; the
+  exe verified at bind time is not the binary it later runs. The
+  `/proc/<pid>/exe` value is thus only a snapshot at read time, not a
+  stable identity.
+- **SELinux domain transition.** A `setexeccon()`/policy-driven domain
+  transition (which can accompany an `execve()`) likewise leaves
+  starttime unchanged, so the verified `/proc/<pid>/attr/current` label
+  is also only a read-time snapshot and may differ from the domain the
+  peer runs under afterwards.
+
+In short, the bracketing closes the *racing-recycle* hole during the
+read window only; it does not turn a pid into a tamper-proof identity.
+The check remains useful defence-in-depth on top of the
+shell-client/`allowed_uid` gate (which it does not weaken — it only
+further narrows it), but it must not be relied on as proof of who the
+peer is or will be after binding.
 
 **Remaining hardening (deferred to production milestone):**
 

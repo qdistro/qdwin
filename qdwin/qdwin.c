@@ -2741,6 +2741,12 @@ static void
 qdwin_proxy_pointer_track_focus(struct qdwin *qdwin,
 				struct weston_pointer *pointer)
 {
+	/* Callers pass qdwin_singleton, which is NULL before publication and
+	 * after a wet_shell_init failure tears it down; guard so a stray
+	 * default-grab callback in that window cannot deref freed/absent
+	 * state (the dereferences below are otherwise unconditional). */
+	if (!qdwin)
+		return;
 	struct qdwin_toplevel *new_proxy =
 		qdwin_proxy_for_view(qdwin, pointer->focus);
 	if (new_proxy == qdwin->active_input_proxy)
@@ -9135,13 +9141,22 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 	 * so an unreadable /proc entry can never satisfy a non-empty
 	 * expectation; a NULL return means OOM and is also treated as
 	 * unverifiable. The /proc reads are bracketed by /proc/<pid>/stat
-	 * starttime samples (the kernel's reuse-safe pinning value) and the
-	 * bind is rejected if the starttime is unreadable (0) or changes
-	 * across that window, so a pid recycled *during* the exe/label reads
-	 * fails closed. This does NOT cover a recycle that completes before
-	 * the first starttime sample: the pid is what the kernel pinned at
-	 * connect time but /proc is read now, so these checks are best-effort
-	 * defence-in-depth (see doc/protocol.md). */
+	 * starttime samples and the bind is rejected if the starttime is
+	 * unreadable (0) or *changes* across that window, so a pid recycled
+	 * to a different process *during* the exe/label reads fails closed.
+	 *
+	 * This bracketing is NARROW; the verified exe/label are a read-time
+	 * snapshot, NOT a stable post-bind identity. It does NOT cover:
+	 *   - a recycle that completes *before* the first starttime sample
+	 *     (every read, starttime included, sees the impostor consistently);
+	 *   - a same-process execve() — starttime is the creation time and is
+	 *     unchanged by exec, so a peer can pass the gate then exec another
+	 *     binary under the same pid/starttime;
+	 *   - a SELinux domain transition (e.g. on exec), which likewise leaves
+	 *     starttime unchanged, so the verified label may differ afterwards.
+	 * The pid is what the kernel pinned at connect time but /proc is read
+	 * now, so these checks are best-effort defence-in-depth, not proof of
+	 * peer identity (see doc/protocol.md for the full TOCTOU discussion). */
 	if (qdwin->allowed_layershell_uid_set ||
 	    qdwin->allowed_layershell_exe ||
 	    qdwin->allowed_layershell_label) {
@@ -13802,21 +13817,15 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		return -1;
 
 	qdwin->compositor = ec;
-	/* §6.8 S3b: install our default-pointer-grab so nested-proxy
-	 * input forwarding lives even when no other grab is active.
-	 * Singleton hookup so the grab callbacks (which receive only a
-	 * weston_pointer_grab*) can find this qdwin instance. */
-	qdwin_singleton = qdwin;
-	weston_compositor_set_default_pointer_grab(
-		ec, &qdwin_proxy_default_pointer_grab_iface);
-	qdwin->allowed_uid = qdwin_parse_allowed_uid(*argc, argv);
-	/* Default the locker uid to the shell uid (single-admin) until
-	 * an explicit `--qdwin-allowed-locker-uid=N` is wired. Using
-	 * (uid_t)-1 as the sentinel rather than 0 so a root-owned
-	 * locker is a valid configuration. */
-	qdwin->allowed_locker_uid = (uid_t)-1;
-	/* Optional admin allowlist for who may BIND zwlr_layer_shell_v1
-	 * (security review Finding #4). All three unset => the historical
+
+	/* Parse the optional layer-shell bind allowlist (security review
+	 * Finding #4) FIRST, *before* publishing qdwin_singleton or
+	 * installing the default pointer grab. These parses can fail/abort
+	 * (malformed uid, or a configured exe/label whose strdup() OOM'd),
+	 * and on such failure we free(qdwin) and return. Doing this before
+	 * the singleton/default-grab install guarantees no global hook can
+	 * reference the freed qdwin if shell-init failure is ever treated as
+	 * nonfatal by the caller. All three unset => the historical
 	 * broad/test posture (shell-client or allowed_uid) is unchanged. If a
 	 * string value was supplied but strdup() failed (was_set && NULL) we
 	 * must not silently weaken the policy — abort init. */
@@ -13839,7 +13848,9 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 					    &label_set);
 		/* Fail closed: a present-but-malformed uid, or a configured
 		 * exe/label whose strdup() OOM'd, must abort rather than leave a
-		 * weaker policy than the admin requested. */
+		 * weaker policy than the admin requested. We have NOT yet
+		 * published qdwin_singleton or installed the default pointer
+		 * grab, so these returns leave no dangling global. */
 		if (!uid_ok) {
 			weston_log("qdwin: --qdwin-allowed-layershell-uid / "
 				   "QDWIN_ALLOWED_LAYERSHELL_UID is malformed — "
@@ -13860,6 +13871,22 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 			return -1;
 		}
 	}
+
+	/* §6.8 S3b: install our default-pointer-grab so nested-proxy
+	 * input forwarding lives even when no other grab is active.
+	 * Singleton hookup so the grab callbacks (which receive only a
+	 * weston_pointer_grab*) can find this qdwin instance. Installed only
+	 * after the fallible config parses above so a parse/OOM abort never
+	 * leaves a default grab pointing at a freed qdwin_singleton. */
+	qdwin_singleton = qdwin;
+	weston_compositor_set_default_pointer_grab(
+		ec, &qdwin_proxy_default_pointer_grab_iface);
+	qdwin->allowed_uid = qdwin_parse_allowed_uid(*argc, argv);
+	/* Default the locker uid to the shell uid (single-admin) until
+	 * an explicit `--qdwin-allowed-locker-uid=N` is wired. Using
+	 * (uid_t)-1 as the sentinel rather than 0 so a root-owned
+	 * locker is a valid configuration. */
+	qdwin->allowed_locker_uid = (uid_t)-1;
 	wl_list_init(&qdwin->hotkeys);
 	wl_list_init(&qdwin->toplevels);
 	wl_list_init(&qdwin->view_streams);
@@ -14266,6 +14293,25 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	return 0;
 
 fail:
+	/* We are about to free(qdwin). qdwin_singleton was published and the
+	 * compositor's default pointer grab points at our interface (whose
+	 * callbacks reach qdwin via qdwin_singleton). If the caller ever
+	 * treats a shell-init failure as nonfatal, a later pointer event
+	 * would walk the freed qdwin. Neutralise both, before any free:
+	 *   - reset the compositor default pointer grab to libweston's
+	 *     built-in (passing NULL restores it per
+	 *     weston_pointer_set_default_grab) — this is what actually stops
+	 *     our grab callbacks from being invoked after the free;
+	 *   - NULL the singleton — most consumers (data-source shim, the grab
+	 *     callbacks, qdwin_proxy_pointer_track_focus) null-check it and
+	 *     no-op, so it is a belt-and-braces guard for any other global
+	 *     hook that survives below.
+	 * This only addresses the dangling-singleton/default-grab hazard
+	 * (the scope of the layershell init-reorder fix); a full teardown of
+	 * every wl_global / listener / key binding created earlier in init
+	 * remains a separate, pre-existing cleanup concern. */
+	qdwin_singleton = NULL;
+	weston_compositor_set_default_pointer_grab(ec, NULL);
 	if (qdwin->desktop)
 		weston_desktop_destroy(qdwin->desktop);
 	weston_layer_fini(&qdwin->background_layer);
