@@ -418,6 +418,16 @@ struct qdwin {
 	struct wl_global *locker_global;
 	struct wl_resource *locker_resource;
 	uid_t allowed_locker_uid;
+	/* Expected resolved /proc/<pid>/exe of the locker process. When
+	 * non-NULL the bind handler rejects any peer whose exe does not
+	 * match (in addition to the uid check). NULL = exe check disabled
+	 * (uid-only). Set via --qdwin-allowed-locker-exe= / env. */
+	char *allowed_locker_exe;
+	/* Expected SELinux label of the locker process. When non-NULL the
+	 * bind handler rejects any peer whose /proc/<pid>/attr/current
+	 * label does not match. NULL = SELinux check disabled (deferred to
+	 * service confinement). Set via --qdwin-allowed-locker-label= / env. */
+	char *allowed_locker_label;
 	pid_t locker_pid;
 	uid_t locker_uid;
 	/* Which protocol owns the currently-attached lock_resource.
@@ -6303,6 +6313,12 @@ qdwin_handle_lock_acknowledged(struct wl_client *client,
 	weston_log("qdwin: lock_acknowledged reason=%u\n", reason);
 }
 
+/* Defined later (Option-B identity-capture helpers); the locker bind
+ * handler below uses them for the optional exe/SELinux peer checks. */
+static char *qdwin_proc_exe(pid_t pid);
+static char *qdwin_proc_selinux_label(pid_t pid);
+static uint64_t qdwin_proc_starttime(pid_t pid);
+
 static const struct qdwin_locker_v1_interface qdwin_locker_impl = {
 	.bind_as_locker = qdwin_handle_bind_as_locker,
 	.attach_lock_surface = qdwin_handle_locker_attach_lock_surface,
@@ -6328,13 +6344,81 @@ bind_qdwin_locker(struct wl_client *client, void *data,
 		   (int)pid, (unsigned)uid,
 		   (unsigned)qdwin->allowed_locker_uid);
 
-	/* TODO production hardening: see qdwin/qdwin-locker-v1.xml — additional exe/SELinux checks intentionally out of scope here. */
 	if (uid != qdwin->allowed_locker_uid) {
 		wl_client_post_implementation_error(client,
 			"qdwin_locker_v1: uid %u not permitted "
 			"(allowed locker uid=%u)",
 			(unsigned)uid, (unsigned)qdwin->allowed_locker_uid);
 		return;
+	}
+
+	/* Production hardening (see qdwin/qdwin-locker-v1.xml): when an
+	 * expected locker exe and/or SELinux label is configured, verify
+	 * the peer process matches before handing out the locker resource.
+	 * The helpers map readlink/read failures to "" so an unreadable
+	 * /proc entry can never accidentally pass a non-empty expectation:
+	 * a configured check against "" fails closed.
+	 *
+	 * PID-reuse guard: wl_client_get_credentials() returns the pid the
+	 * kernel pinned at connect time, but we read /proc/<pid>/... now, so
+	 * in principle the pid could have been recycled to a different
+	 * process between connect and bind. We bracket the /proc reads with
+	 * /proc/<pid>/stat starttime samples (the kernel's reuse-safe
+	 * pinning value, same key the secctx path uses) and reject the bind
+	 * if the starttime is unreadable (0) or changes across the window —
+	 * i.e. fail closed on any sign the pid no longer names a single
+	 * stable process. */
+	if (qdwin->allowed_locker_exe || qdwin->allowed_locker_label) {
+		uint64_t st_before = qdwin_proc_starttime(pid);
+
+		if (qdwin->allowed_locker_exe) {
+			char *exe = qdwin_proc_exe(pid);
+			/* exe==NULL means the helper hit OOM; treat as
+			 * "unverifiable" => reject (fail closed). */
+			int ok = (exe && strcmp(exe, qdwin->allowed_locker_exe) == 0);
+			if (!ok) {
+				weston_log("qdwin: locker bind rejected pid=%d exe='%s' "
+					   "(expected '%s')\n",
+					   (int)pid, exe ? exe : "(unreadable)",
+					   qdwin->allowed_locker_exe);
+				wl_client_post_implementation_error(client,
+					"qdwin_locker_v1: peer executable not permitted");
+				free(exe);
+				return;
+			}
+			free(exe);
+		}
+
+		if (qdwin->allowed_locker_label) {
+			char *label = qdwin_proc_selinux_label(pid);
+			/* label==NULL means OOM; treat as unverifiable => reject. */
+			int ok = (label && strcmp(label, qdwin->allowed_locker_label) == 0);
+			if (!ok) {
+				weston_log("qdwin: locker bind rejected pid=%d label='%s' "
+					   "(expected '%s')\n",
+					   (int)pid, label ? label : "(unreadable)",
+					   qdwin->allowed_locker_label);
+				wl_client_post_implementation_error(client,
+					"qdwin_locker_v1: peer SELinux label not permitted");
+				free(label);
+				return;
+			}
+			free(label);
+		}
+
+		uint64_t st_after = qdwin_proc_starttime(pid);
+		if (st_before == 0 || st_after == 0 || st_before != st_after) {
+			weston_log("qdwin: locker bind rejected pid=%d — process "
+				   "identity unstable across /proc read "
+				   "(starttime %llu -> %llu)\n",
+				   (int)pid,
+				   (unsigned long long)st_before,
+				   (unsigned long long)st_after);
+			wl_client_post_implementation_error(client,
+				"qdwin_locker_v1: peer process identity could not be "
+				"verified");
+			return;
+		}
 	}
 
 	resource = wl_resource_create(client, &qdwin_locker_v1_interface,
@@ -7482,6 +7566,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	for (int i = 0; i < 4; i++)
 		weston_layer_fini(&qdwin->layer_shell_layer[i]);
 	wl_list_remove(&qdwin->destroy_listener.link);
+	free(qdwin->allowed_locker_exe);
+	free(qdwin->allowed_locker_label);
 	free(qdwin);
 }
 
@@ -12995,6 +13081,35 @@ qdwin_parse_allowed_uid(int argc, char *argv[])
 	return (uid_t)v;
 }
 
+/* Parse an optional string config value from `--<argprefix>=VALUE` or
+ * the given environment variable (argv wins). Returns a heap-allocated
+ * copy, or NULL when the option is unset/empty. *was_set is set to true
+ * iff a non-empty value was present in argv/env, so the caller can tell
+ * "unset" (NULL, was_set=false) from "configured but strdup() OOM'd"
+ * (NULL, was_set=true) and fail closed on the latter rather than
+ * silently disabling a security check. */
+static char *
+qdwin_parse_str_opt(int argc, char *argv[], const char *argprefix,
+		    const char *envname, bool *was_set)
+{
+	const char *val = envname ? getenv(envname) : NULL;
+	size_t prefixlen = strlen(argprefix);
+
+	for (int i = 1; i < argc; i++) {
+		if (strncmp(argv[i], argprefix, prefixlen) == 0) {
+			val = argv[i] + prefixlen;
+			break;
+		}
+	}
+
+	if (!val || !*val) {
+		*was_set = false;
+		return NULL;
+	}
+	*was_set = true;
+	return strdup(val);
+}
+
 /* ------------------------------------------------------------------
  * §6.10 wp_security_context_v1 — sandboxed-client identity.
  *
@@ -13183,6 +13298,11 @@ qdwin_proc_exe(pid_t pid)
 	ssize_t n = readlink(path, buf, sizeof(buf) - 1);
 	if (n <= 0)
 		return strdup("");
+	/* A full-buffer read may be a silently truncated path; treat it as
+	 * unverifiable ("") rather than risk a prefix matching a configured
+	 * expectation. */
+	if ((size_t)n >= sizeof(buf) - 1)
+		return strdup("");
 	buf[n] = '\0';
 	return strdup(buf);
 }
@@ -13201,6 +13321,11 @@ qdwin_proc_selinux_label(pid_t pid)
 	ssize_t n = read(fd, buf, sizeof(buf) - 1);
 	close(fd);
 	if (n <= 0)
+		return strdup("");
+	/* A full-buffer read may be a silently truncated label; treat it as
+	 * unverifiable ("") rather than risk a prefix matching a configured
+	 * expectation. SELinux labels are far shorter than this buffer. */
+	if ((size_t)n >= sizeof(buf) - 1)
 		return strdup("");
 	buf[n] = '\0';
 	/* Kernel appends a trailing NUL or newline; strip any trailing
@@ -13631,6 +13756,34 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * (uid_t)-1 as the sentinel rather than 0 so a root-owned
 	 * locker is a valid configuration. */
 	qdwin->allowed_locker_uid = (uid_t)-1;
+	/* Optional defence-in-depth peer checks for the locker bind: an
+	 * expected resolved exe path and/or SELinux label. Unset => NULL =>
+	 * that check is skipped (uid-only). Configured via argv or env.
+	 * If a value was supplied but strdup() failed (was_set && NULL), we
+	 * must not silently disable the check — abort init rather than fall
+	 * back to a weaker policy than the admin requested. */
+	{
+		bool exe_set = false, label_set = false;
+		qdwin->allowed_locker_exe =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-locker-exe=",
+					    "QDWIN_ALLOWED_LOCKER_EXE", &exe_set);
+		qdwin->allowed_locker_label =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-locker-label=",
+					    "QDWIN_ALLOWED_LOCKER_LABEL",
+					    &label_set);
+		if ((exe_set && !qdwin->allowed_locker_exe) ||
+		    (label_set && !qdwin->allowed_locker_label)) {
+			weston_log("qdwin: failed to allocate locker bind "
+				   "policy — refusing to start with a weaker "
+				   "policy than configured\n");
+			free(qdwin->allowed_locker_exe);
+			free(qdwin->allowed_locker_label);
+			free(qdwin);
+			return -1;
+		}
+	}
 	wl_list_init(&qdwin->hotkeys);
 	wl_list_init(&qdwin->toplevels);
 	wl_list_init(&qdwin->view_streams);
@@ -13745,6 +13898,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		weston_log("qdwin: locker wl_global_create failed\n");
 		goto fail;
 	}
+	weston_log("qdwin: locker bind policy uid=%u exe=%s label=%s\n",
+		   (unsigned)qdwin->allowed_locker_uid,
+		   qdwin->allowed_locker_exe ? qdwin->allowed_locker_exe : "(any)",
+		   qdwin->allowed_locker_label ? qdwin->allowed_locker_label : "(any)");
 #else
 	/* role=guest: explicitly leave qdwin->locker_global NULL so any
 	 * code that later wants to broadcast through it short-circuits. */
@@ -14035,6 +14192,8 @@ fail:
 	weston_layer_fini(&qdwin->popup_layer);
 	for (int i = 0; i < 4; i++)
 		weston_layer_fini(&qdwin->layer_shell_layer[i]);
+	free(qdwin->allowed_locker_exe);
+	free(qdwin->allowed_locker_label);
 	free(qdwin);
 	return -1;
 }

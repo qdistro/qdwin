@@ -1,10 +1,13 @@
 # Locker protocol wiring (`qdwin_locker_v1`)
 
-Adds a second uid-filtered private global so the screen locker
-(`qdlocker`) is a peer process to the shell (`qdshell`), not a
-subsystem of it. Rationale and shape live in
-`qdwin/qdwin-locker-v1.xml`; this doc describes the C-side work in
-`qdwin/qdwin.c`.
+Adds a second private global so the screen locker (`qdlocker`) is a
+peer process to the shell (`qdshell`), not a subsystem of it. The
+bind handler always enforces the configured locker uid and, when an
+expected executable path and/or SELinux label are configured, also
+verifies the peer's `/proc/<pid>/exe` and `/proc/<pid>/attr/current`
+(see the trust-model paragraph in `qdwin/qdwin-locker-v1.xml`).
+Rationale and shape live in `qdwin/qdwin-locker-v1.xml`; this doc
+describes the C-side work in `qdwin/qdwin.c`.
 
 ## Model
 
@@ -34,8 +37,17 @@ only the LOCK layer can render.
    ```
 
 3. **`bind_qdwin_locker`** — mirror of `bind_qdwin_shell` at
-   qdwin.c:5461 but checking `allowed_locker_uid`. Rejects a second
-   bind via the `already_bound` enum.
+   qdwin.c:5461 but checking `allowed_locker_uid` first. When
+   `allowed_locker_exe` / `allowed_locker_label` are set it then
+   resolves the peer's `/proc/<pid>/exe` / `/proc/<pid>/attr/current`
+   and rejects on mismatch, bracketing the reads with a
+   `/proc/<pid>/stat` starttime double-read so an unstable/recycled
+   pid fails closed. The exe/label checks are best-effort
+   defence-in-depth on top of the uid gate (see the residual-window
+   note in `qdwin-locker-v1.xml`). A *second* `bind_as_locker` from a
+   new client is accepted by destroying the old locker resource (the
+   old process is treated as dead); a second bind on the *same*
+   resource is the case rejected via the `already_bound` enum.
 
 4. **Locker resource implementation** — a `struct
    qdwin_locker_v1_interface` vtable:
