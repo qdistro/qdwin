@@ -137,11 +137,41 @@ In practice, these clients will fail to bind unless they run as
 `allowed_uid` (pre-shell) or are the shell process; the advertisement
 exists for protocol discovery rather than access.
 
+**Optional admin allowlist (security review Finding #4).** On top of the
+shell-client/`allowed_uid` gate above, the bind handler supports an
+optional, fail-closed peer allowlist, configured via (argv wins over
+env):
+
+- `--qdwin-allowed-layershell-uid=` / `QDWIN_ALLOWED_LAYERSHELL_UID`
+- `--qdwin-allowed-layershell-exe=` / `QDWIN_ALLOWED_LAYERSHELL_EXE`
+- `--qdwin-allowed-layershell-label=` / `QDWIN_ALLOWED_LAYERSHELL_LABEL`
+
+Default posture is **unchanged**: when none of these is set, the block is
+skipped entirely and access is exactly the historical broad/test
+behaviour (shell-client or `allowed_uid`). When any is set, the bind
+handler additionally verifies the peer's uid and/or resolved
+`/proc/<pid>/exe` and/or `/proc/<pid>/attr/current` SELinux label and
+rejects the bind on mismatch. These checks fail closed: an unreadable,
+OOM, or truncated `/proc` read is treated as "unverifiable" and rejects
+the bind, and the reads are bracketed by `/proc/<pid>/stat` starttime
+samples so a pid whose process identity is unstable (e.g. recycled)
+across the read window is also rejected.
+
+This mirrors the locker-bind hardening (see `doc/locker.md` /
+`qdwin-locker-v1.xml`). It is best-effort defence-in-depth, **not** a
+proof of identity: the peer pid is what the kernel pinned at connect
+time, but `/proc` is read later when the bind request is serviced, so a
+same-uid process that exits and whose pid is recycled before the bind is
+handled is not fully excluded by these checks alone (the residual
+connect-time pid-reuse window). The exe/label checks do not weaken the
+existing shell-client/`allowed_uid` gate; they only further narrow it.
+
 **Remaining hardening (deferred to production milestone):**
 
 - Hide the global from non-shell clients via a `wl_global` filter
   (analogous to the secctx global filter) so untrusted clients cannot
-  even enumerate it.
+  even enumerate it. (The allowlist above restricts who can *bind*, not
+  who can *see* the global.)
 - Consider per-request policy for `EXCLUSIVE` + high-z layers, gating
   through the shell/broker decision channel rather than granting at bind
   time.
