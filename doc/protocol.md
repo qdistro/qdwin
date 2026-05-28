@@ -137,11 +137,63 @@ In practice, these clients will fail to bind unless they run as
 `allowed_uid` (pre-shell) or are the shell process; the advertisement
 exists for protocol discovery rather than access.
 
+**Optional admin allowlist (security review Finding #4).** On top of the
+shell-client/`allowed_uid` gate above, the bind handler supports an
+optional, fail-closed peer allowlist, configured via (argv wins over
+env):
+
+- `--qdwin-allowed-layershell-uid=` / `QDWIN_ALLOWED_LAYERSHELL_UID`
+- `--qdwin-allowed-layershell-exe=` / `QDWIN_ALLOWED_LAYERSHELL_EXE`
+- `--qdwin-allowed-layershell-label=` / `QDWIN_ALLOWED_LAYERSHELL_LABEL`
+
+Default posture is **unchanged**: when none of these is set, the block is
+skipped entirely and access is exactly the historical broad/test
+behaviour (shell-client or `allowed_uid`). When any is set, the bind
+handler additionally verifies the peer's uid and/or resolved
+`/proc/<pid>/exe` and/or `/proc/<pid>/attr/current` SELinux label and
+rejects the bind on mismatch. These checks fail closed: an unreadable,
+OOM, or truncated `/proc` read is treated as "unverifiable" and rejects
+the bind, and the reads are bracketed by `/proc/<pid>/stat` starttime
+samples so a pid that is *recycled to a different process* during the
+handler's read window (a different starttime) is rejected.
+
+This mirrors the locker-bind hardening (see `doc/locker.md` /
+`qdwin-locker-v1.xml`). It is best-effort defence-in-depth, **not** a
+proof of identity. The peer pid is what the kernel pinned at connect
+time, but `/proc` is read later when the bind request is serviced. The
+starttime bracketing is narrow and does **not** make the exe/label a
+stable post-bind identity; specifically it does NOT cover:
+
+- **PID reuse before the first read.** If the connecting process exits
+  and its pid is recycled to a different same-uid process *before* the
+  first `/proc/<pid>/stat` sample, every read (starttime included)
+  observes the impostor consistently and the bind is accepted. The
+  bracketing only catches a recycle that races the read window itself.
+- **Same-process `execve()`.** `starttime` is the process creation time
+  and is **unchanged** by `execve()`, so a process that passes the gate
+  and then `exec()`s a different binary keeps the same pid/starttime; the
+  exe verified at bind time is not the binary it later runs. The
+  `/proc/<pid>/exe` value is thus only a snapshot at read time, not a
+  stable identity.
+- **SELinux domain transition.** A `setexeccon()`/policy-driven domain
+  transition (which can accompany an `execve()`) likewise leaves
+  starttime unchanged, so the verified `/proc/<pid>/attr/current` label
+  is also only a read-time snapshot and may differ from the domain the
+  peer runs under afterwards.
+
+In short, the bracketing closes the *racing-recycle* hole during the
+read window only; it does not turn a pid into a tamper-proof identity.
+The check remains useful defence-in-depth on top of the
+shell-client/`allowed_uid` gate (which it does not weaken — it only
+further narrows it), but it must not be relied on as proof of who the
+peer is or will be after binding.
+
 **Remaining hardening (deferred to production milestone):**
 
 - Hide the global from non-shell clients via a `wl_global` filter
   (analogous to the secctx global filter) so untrusted clients cannot
-  even enumerate it.
+  even enumerate it. (The allowlist above restricts who can *bind*, not
+  who can *see* the global.)
 - Consider per-request policy for `EXCLUSIVE` + high-z layers, gating
   through the shell/broker decision channel rather than granting at bind
   time.

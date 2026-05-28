@@ -686,6 +686,18 @@ struct qdwin {
 	struct wl_global *layer_shell_global;
 	struct wl_list layer_surfaces;  /* qdwin_layer_surface::link */
 	uint32_t layer_configure_serial_next;
+	/* Optional admin-configured allowlist for who may BIND
+	 * zwlr_layer_shell_v1. Default-unset => the historical broad/test
+	 * posture (shell-client or allowed_uid) is unchanged. When set, the
+	 * bind handler additionally verifies the peer's uid/exe/label and
+	 * fails closed on any mismatch or unverifiable /proc read. Mirrors
+	 * the locker-bind hardening. Set via
+	 * --qdwin-allowed-layershell-uid= / -exe= / -label= and matching
+	 * QDWIN_ALLOWED_LAYERSHELL_* env vars. */
+	bool allowed_layershell_uid_set;       /* false => uid check skipped */
+	uid_t allowed_layershell_uid;
+	char *allowed_layershell_exe;          /* NULL => exe check skipped */
+	char *allowed_layershell_label;        /* NULL => label check skipped */
 
 	/* zxdg_decoration_manager_v1: always-server_side stub. qdshell
 	 * draws chrome via qdwin_shell_v1, so toolkits should not try
@@ -7588,6 +7600,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&qdwin->destroy_listener.link);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
+	free(qdwin->allowed_layershell_exe);
+	free(qdwin->allowed_layershell_label);
 	free(qdwin);
 }
 
@@ -9195,6 +9209,12 @@ static const struct zwlr_layer_shell_v1_interface qdwin_layer_shell_impl = {
 	.destroy           = qdwin_layer_shell_destroy,
 };
 
+/* Defined later (identity-capture helpers); the optional layer-shell
+ * peer allowlist below uses them for the exe/SELinux/starttime checks. */
+static char *qdwin_proc_exe(pid_t pid);
+static char *qdwin_proc_selinux_label(pid_t pid);
+static uint64_t qdwin_proc_starttime(pid_t pid);
+
 static void
 bind_qdwin_layer_shell(struct wl_client *client, void *data,
 		       uint32_t version, uint32_t id)
@@ -9209,6 +9229,101 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 	 * overlay layers — untrusted clients must not have this capability.
 	 * See codex-review Finding 1 (HIGH). */
 	wl_client_get_credentials(client, &pid, &uid, &gid);
+
+	/* Optional admin allowlist (security review Finding #4). When any of
+	 * --qdwin-allowed-layershell-uid/-exe/-label is configured, the peer
+	 * must match the configured constraints before we hand out the
+	 * layer-shell resource — in addition to the shell-client/allowed_uid
+	 * gate below. Default-unset => this whole block is skipped and the
+	 * historical broad/test posture is unchanged (no regression).
+	 *
+	 * Fail-closed: the exe/label helpers map readlink/read failures to ""
+	 * so an unreadable /proc entry can never satisfy a non-empty
+	 * expectation; a NULL return means OOM and is also treated as
+	 * unverifiable. The /proc reads are bracketed by /proc/<pid>/stat
+	 * starttime samples and the bind is rejected if the starttime is
+	 * unreadable (0) or *changes* across that window, so a pid recycled
+	 * to a different process *during* the exe/label reads fails closed.
+	 *
+	 * This bracketing is NARROW; the verified exe/label are a read-time
+	 * snapshot, NOT a stable post-bind identity. It does NOT cover:
+	 *   - a recycle that completes *before* the first starttime sample
+	 *     (every read, starttime included, sees the impostor consistently);
+	 *   - a same-process execve() — starttime is the creation time and is
+	 *     unchanged by exec, so a peer can pass the gate then exec another
+	 *     binary under the same pid/starttime;
+	 *   - a SELinux domain transition (e.g. on exec), which likewise leaves
+	 *     starttime unchanged, so the verified label may differ afterwards.
+	 * The pid is what the kernel pinned at connect time but /proc is read
+	 * now, so these checks are best-effort defence-in-depth, not proof of
+	 * peer identity (see doc/protocol.md for the full TOCTOU discussion). */
+	if (qdwin->allowed_layershell_uid_set ||
+	    qdwin->allowed_layershell_exe ||
+	    qdwin->allowed_layershell_label) {
+		uint64_t st_before = qdwin_proc_starttime(pid);
+
+		if (qdwin->allowed_layershell_uid_set &&
+		    uid != qdwin->allowed_layershell_uid) {
+			weston_log("qdwin: layer-shell bind rejected pid=%d "
+				   "uid=%u (allowlist uid=%u)\n",
+				   (int)pid, (unsigned)uid,
+				   (unsigned)qdwin->allowed_layershell_uid);
+			wl_client_post_implementation_error(client,
+				"zwlr_layer_shell_v1: peer uid not permitted");
+			return;
+		}
+
+		if (qdwin->allowed_layershell_exe) {
+			char *exe = qdwin_proc_exe(pid);
+			int ok = (exe &&
+				  strcmp(exe, qdwin->allowed_layershell_exe) == 0);
+			if (!ok) {
+				weston_log("qdwin: layer-shell bind rejected pid=%d "
+					   "exe='%s' (expected '%s')\n",
+					   (int)pid, exe ? exe : "(unreadable)",
+					   qdwin->allowed_layershell_exe);
+				wl_client_post_implementation_error(client,
+					"zwlr_layer_shell_v1: peer executable not "
+					"permitted");
+				free(exe);
+				return;
+			}
+			free(exe);
+		}
+
+		if (qdwin->allowed_layershell_label) {
+			char *label = qdwin_proc_selinux_label(pid);
+			int ok = (label &&
+				  strcmp(label, qdwin->allowed_layershell_label) == 0);
+			if (!ok) {
+				weston_log("qdwin: layer-shell bind rejected pid=%d "
+					   "label='%s' (expected '%s')\n",
+					   (int)pid, label ? label : "(unreadable)",
+					   qdwin->allowed_layershell_label);
+				wl_client_post_implementation_error(client,
+					"zwlr_layer_shell_v1: peer SELinux label "
+					"not permitted");
+				free(label);
+				return;
+			}
+			free(label);
+		}
+
+		uint64_t st_after = qdwin_proc_starttime(pid);
+		if (st_before == 0 || st_after == 0 || st_before != st_after) {
+			weston_log("qdwin: layer-shell bind rejected pid=%d — "
+				   "process identity unstable across /proc read "
+				   "(starttime %llu -> %llu)\n",
+				   (int)pid,
+				   (unsigned long long)st_before,
+				   (unsigned long long)st_after);
+			wl_client_post_implementation_error(client,
+				"zwlr_layer_shell_v1: peer process identity "
+				"could not be verified");
+			return;
+		}
+	}
+
 	if (qdwin->shell_bound && qdwin->shell_resource) {
 		struct wl_client *shell_client =
 			wl_resource_get_client(qdwin->shell_resource);
@@ -13130,6 +13245,45 @@ qdwin_parse_str_opt(int argc, char *argv[], const char *argprefix,
 	return strdup(val);
 }
 
+/* Parse an optional uid config value from `--<argprefix>=VALUE` or env
+ * (argv wins). Tri-state, fail-closed:
+ *   - unset/empty           -> returns true, *was_set=false (check skipped)
+ *   - present and valid     -> returns true, *was_set=true, *out set
+ *   - present but malformed  -> returns false (caller must abort init
+ *                              rather than silently skip/misapply the
+ *                              configured uid check)
+ * "valid" = the whole string is a non-negative decimal integer that fits
+ * in uid_t and is not the all-ones (uid_t)-1 sentinel (no partial parses
+ * like "123abc", no overflow, no "-1"). */
+static bool
+qdwin_parse_uid_opt(int argc, char *argv[], const char *argprefix,
+		    const char *envname, uid_t *out, bool *was_set)
+{
+	const char *val = envname ? getenv(envname) : NULL;
+	size_t prefixlen = strlen(argprefix);
+
+	for (int i = 1; i < argc; i++) {
+		if (strncmp(argv[i], argprefix, prefixlen) == 0) {
+			val = argv[i] + prefixlen;
+			break;
+		}
+	}
+
+	*was_set = false;
+	if (!val || !*val)
+		return true;  /* unset => check skipped, not an error */
+
+	errno = 0;
+	char *end = NULL;
+	long long v = strtoll(val, &end, 10);
+	if (errno != 0 || end == val || *end != '\0' || v < 0 ||
+	    (unsigned long long)v > (unsigned long long)((uid_t)-1) - 1)
+		return false;  /* present but malformed => fail closed */
+	*out = (uid_t)v;
+	*was_set = true;
+	return true;
+}
+
 /* ------------------------------------------------------------------
  * §6.10 wp_security_context_v1 — sandboxed-client identity.
  *
@@ -13763,12 +13917,61 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		return -1;
 
 	qdwin->compositor = ec;
-	/* Parse the locker bind policy FIRST, before any global hook
-	 * (qdwin_singleton / the default pointer grab) starts pointing at
-	 * this qdwin. A malformed value or strdup() OOM below takes an
-	 * early `return -1` that frees `qdwin`; doing it here keeps that
-	 * failure path from leaving qdwin_singleton or the installed
-	 * default-grab dangling at freed memory. */
+
+	/* Parse the optional layer-shell bind allowlist (security review
+	 * Finding #4) FIRST, *before* publishing qdwin_singleton or
+	 * installing the default pointer grab. These parses can fail/abort
+	 * (malformed uid, or a configured exe/label whose strdup() OOM'd),
+	 * and on such failure we free(qdwin) and return. Doing this before
+	 * the singleton/default-grab install guarantees no global hook can
+	 * reference the freed qdwin if shell-init failure is ever treated as
+	 * nonfatal by the caller. All three unset => the historical
+	 * broad/test posture (shell-client or allowed_uid) is unchanged. If a
+	 * string value was supplied but strdup() failed (was_set && NULL) we
+	 * must not silently weaken the policy — abort init. */
+	{
+		bool exe_set = false, label_set = false;
+		bool uid_ok = qdwin_parse_uid_opt(*argc, argv,
+				    "--qdwin-allowed-layershell-uid=",
+				    "QDWIN_ALLOWED_LAYERSHELL_UID",
+				    &qdwin->allowed_layershell_uid,
+				    &qdwin->allowed_layershell_uid_set);
+		qdwin->allowed_layershell_exe =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-layershell-exe=",
+					    "QDWIN_ALLOWED_LAYERSHELL_EXE",
+					    &exe_set);
+		qdwin->allowed_layershell_label =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-layershell-label=",
+					    "QDWIN_ALLOWED_LAYERSHELL_LABEL",
+					    &label_set);
+		/* Fail closed: a present-but-malformed uid, or a configured
+		 * exe/label whose strdup() OOM'd, must abort rather than leave a
+		 * weaker policy than the admin requested. We have NOT yet
+		 * published qdwin_singleton or installed the default pointer
+		 * grab, so these returns leave no dangling global. */
+		if (!uid_ok) {
+			weston_log("qdwin: --qdwin-allowed-layershell-uid / "
+				   "QDWIN_ALLOWED_LAYERSHELL_UID is malformed — "
+				   "refusing to start\n");
+			free(qdwin->allowed_layershell_exe);
+			free(qdwin->allowed_layershell_label);
+			free(qdwin);
+			return -1;
+		}
+		if ((exe_set && !qdwin->allowed_layershell_exe) ||
+		    (label_set && !qdwin->allowed_layershell_label)) {
+			weston_log("qdwin: failed to allocate layer-shell bind "
+				   "policy — refusing to start with a weaker "
+				   "policy than configured\n");
+			free(qdwin->allowed_layershell_exe);
+			free(qdwin->allowed_layershell_label);
+			free(qdwin);
+			return -1;
+		}
+	}
+
 	qdwin->allowed_uid = qdwin_parse_allowed_uid(*argc, argv);
 	/* Default the locker uid to the shell uid (single-admin) until
 	 * an explicit `--qdwin-allowed-locker-uid=N` is wired. Using
@@ -14082,6 +14285,21 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		weston_log("qdwin: layer-shell wl_global_create failed\n");
 		goto fail;
 	}
+	if (qdwin->allowed_layershell_uid_set ||
+	    qdwin->allowed_layershell_exe ||
+	    qdwin->allowed_layershell_label) {
+		char uidbuf[16];
+		if (qdwin->allowed_layershell_uid_set)
+			snprintf(uidbuf, sizeof uidbuf, "%u",
+				 (unsigned)qdwin->allowed_layershell_uid);
+		weston_log("qdwin: layer-shell bind allowlist uid=%s exe=%s "
+			   "label=%s\n",
+			   qdwin->allowed_layershell_uid_set ? uidbuf : "(any)",
+			   qdwin->allowed_layershell_exe
+				? qdwin->allowed_layershell_exe : "(any)",
+			   qdwin->allowed_layershell_label
+				? qdwin->allowed_layershell_label : "(any)");
+	}
 
 	/* plan3 H1: register a handler for xdg_popup.grab on layer-
 	 * parented popups. Without this hook the running libweston (if
@@ -14207,6 +14425,25 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	return 0;
 
 fail:
+	/* We are about to free(qdwin). qdwin_singleton was published and the
+	 * compositor's default pointer grab points at our interface (whose
+	 * callbacks reach qdwin via qdwin_singleton). If the caller ever
+	 * treats a shell-init failure as nonfatal, a later pointer event
+	 * would walk the freed qdwin. Neutralise both, before any free:
+	 *   - reset the compositor default pointer grab to libweston's
+	 *     built-in (passing NULL restores it per
+	 *     weston_pointer_set_default_grab) — this is what actually stops
+	 *     our grab callbacks from being invoked after the free;
+	 *   - NULL the singleton — most consumers (data-source shim, the grab
+	 *     callbacks, qdwin_proxy_pointer_track_focus) null-check it and
+	 *     no-op, so it is a belt-and-braces guard for any other global
+	 *     hook that survives below.
+	 * This only addresses the dangling-singleton/default-grab hazard
+	 * (the scope of the layershell init-reorder fix); a full teardown of
+	 * every wl_global / listener / key binding created earlier in init
+	 * remains a separate, pre-existing cleanup concern. */
+	qdwin_singleton = NULL;
+	weston_compositor_set_default_pointer_grab(ec, NULL);
 	if (qdwin->desktop)
 		weston_desktop_destroy(qdwin->desktop);
 	weston_layer_fini(&qdwin->background_layer);
@@ -14222,19 +14459,8 @@ fail:
 		weston_layer_fini(&qdwin->layer_shell_layer[i]);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
-	/* Drop the singleton before freeing so the still-installed default
-	 * pointer grab can never observe qdwin_singleton pointing at freed
-	 * memory (UAF). The default-grab callbacks tolerate a NULL singleton:
-	 * the focus/motion/button entry points guard their qdwin_singleton
-	 * dereferences, and the lower-level accessors they reach
-	 * (qdwin_layer_surface_at_pos, qdwin_proxy_pointer_track_focus,
-	 * qdwin_layer_surface_handle_on_demand_button) early-return on NULL.
-	 * In practice a grab callback cannot fire during this synchronous
-	 * teardown — the event loop is not yet pumping input for a shell
-	 * that failed to load — but clearing the singleton keeps the
-	 * invariant honest regardless. */
-	if (qdwin_singleton == qdwin)
-		qdwin_singleton = NULL;
+	free(qdwin->allowed_layershell_exe);
+	free(qdwin->allowed_layershell_label);
 	free(qdwin);
 	return -1;
 }
