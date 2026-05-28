@@ -13987,8 +13987,8 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 *   (1) QDWIN_ENABLE_SCREENSHOOTER env var must be set, AND
 	 *   (2) the compositor's own euid must match allowed_uid.
 	 * The screenshooter exposes whole-output capture outside qdwin's
-	 * per-view stream authorization model and must not ship enabled.
-	 * See codex-review Finding 4 (MEDIUM). */
+	 * per-view stream authorization model and must not ship enabled by
+	 * default. See wider-codex-review Finding 6 (MEDIUM). */
 	{
 		const char *ss_env = getenv("QDWIN_ENABLE_SCREENSHOOTER");
 		int ss_enabled = ss_env && (strcmp(ss_env, "1") == 0 ||

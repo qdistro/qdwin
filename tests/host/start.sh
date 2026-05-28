@@ -53,6 +53,10 @@ chmod 0700 "$RUNTIME"
 
 export XDG_RUNTIME_DIR="$RUNTIME"
 export QDWIN_ALLOWED_UID=$(id -u)
+# Host GUI scenarios use weston-screenshooter for assertions. qdwin keeps the
+# screenshooter interface production-disabled unless this explicit dev/test
+# flag is present.
+export QDWIN_ENABLE_SCREENSHOOTER=1
 
 # weston headless + qdwin-shell.so
 weston \

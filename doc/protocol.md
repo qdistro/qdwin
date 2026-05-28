@@ -99,6 +99,18 @@ Built-in, registered by qdwin-shell.so:
   through `wl_socket_create_listener` mode.
 - **tablet-v2** — referenced by `cursor-shape-v1`; not used standalone.
 
+### Development-only screenshooter
+
+The Weston screenshooter interface is disabled by default. qdwin only calls
+`screenshooter_create()` when `QDWIN_ENABLE_SCREENSHOOTER` is set to `1`,
+`true`, or `yes`, and the compositor euid matches `allowed_uid`. This keeps
+whole-output capture out of the production default while preserving the
+interface for development and automated headless GUI tests.
+
+The host test harness (`tests/host/start.sh`) explicitly exports
+`QDWIN_ENABLE_SCREENSHOOTER=1` and starts Weston with `--debug` because its
+visual assertions use `weston-screenshooter`.
+
 ### Security posture: layer-shell
 
 `zwlr_layer_shell_v1` is registered as an unconditional public global

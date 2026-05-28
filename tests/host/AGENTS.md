@@ -30,8 +30,10 @@ captures qdwin's framebuffer directly.
   Rebuild via `ninja -C /tmp/qdwin-host-build install` (with
   `~/.local/bin` on PATH for meson).
 - qdshell runs from the in-tree source (`qdshell shell.qml`).
-- weston-screenshooter is the screenshot tool. weston-terminal is the
-  default content-client used by scenarios; substitute via
+- weston-screenshooter is the screenshot tool. `start.sh` explicitly
+  enables qdwin's dev/test screenshooter gate with
+  `QDWIN_ENABLE_SCREENSHOOTER=1`. weston-terminal is the default
+  content-client used by scenarios; substitute via
   `--no-terminal` + manual launch if a scenario needs something else.
 
 ## Harness scripts
@@ -103,9 +105,11 @@ small-window size, FAIL with the screenshot path attached.
 4. **One scenario per test-id at a time.** `start.sh` wipes
    `/tmp/qdwin-host-tests/<id>/` clean. Two runs with the same id
    step on each other.
-5. **`--debug` is required** for weston-screenshooter to be allowed
-   to capture the output. `start.sh` already passes it; if you call
-   weston manually for diagnostic purposes, remember the flag.
+5. **Screenshooter is double-gated.** qdwin only registers it when
+   `QDWIN_ENABLE_SCREENSHOOTER=1` and the compositor euid matches
+   `QDWIN_ALLOWED_UID`; weston also requires `--debug`.
+   `start.sh` sets both for host tests. If you call weston manually
+   for diagnostic purposes, remember both gates.
 6. **Don't run as root.** XDG_RUNTIME_DIR ownership and weston's
    default seat handling assume a regular user uid.
 
