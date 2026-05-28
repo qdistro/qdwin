@@ -346,6 +346,7 @@ dep_xcursor = dependency('xcursor')
 # client in qdwin-nested-client.c) is kept conflict-free by isolating
 # the client header to its own translation unit.
 dep_wayland_client = dependency('wayland-client')
+python3 = find_program('python3')
 
 qdwin_plugin = shared_library(
   'qdwin-shell',
@@ -537,5 +538,13 @@ pkg.generate(
   ],
   uninstalled_variables: [
     'pkgdatadir=' + meson.current_source_dir() / 'qdwin',
+  ],
+)
+
+test('xdg-activation-policy',
+  python3,
+  args: [
+    files('qdwin/test_xdg_activation_policy.py'),
+    files('qdwin/qdwin.c'),
   ],
 )
