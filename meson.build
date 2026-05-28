@@ -228,6 +228,15 @@ security_context_protocol_code = custom_target(
   output: 'security-context-v1-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
+# Client header for the secctx bind-gate probe (qdwin-secctx-probe). The
+# manager global is server-side in qdwin-shell.so, but the probe is a
+# plain Wayland client, so it needs the client-side stubs.
+security_context_client_header = custom_target(
+  'security-context-v1-client-header',
+  input: security_context_xml,
+  output: 'security-context-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
 
 # §6.7: primary-selection-unstable-v1 — middle-click clipboard.
 primary_selection_xml = files(
@@ -402,6 +411,20 @@ executable('qdwin-probe',
     'test-client/qdwin-probe.c',
     qdwin_shell_client_header,
     qdwin_shell_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Secctx bind-gate probe. Binds wp_security_context_manager_v1 and reports
+# (via exit code) whether qdwin's launcher gate accepted or refused it;
+# with --commit it also exercises create_listener + commit. Driven by
+# tests/host/06-secctx-bind-gate.md.
+executable('qdwin-secctx-probe',
+  sources: [
+    'test-client/qdwin-secctx-probe.c',
+    security_context_client_header,
+    security_context_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,
