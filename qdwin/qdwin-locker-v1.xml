@@ -7,16 +7,39 @@
 
   <description summary="qdwin compositor locker attach protocol">
     Private protocol between the qdwin compositor and the qdistro
-    PyQt locker (qdlocker). Trust model: qdwin currently filters by
-    uid only — the bind handler rejects clients whose peer uid does
-    not match the admin-configured locker uid. Production deployments
-    rely on systemd unit confinement and SELinux service policy to
-    keep this compositor socket reachable only to the locker process;
-    exe-path and SELinux-label checks are intentionally out of scope
-    for the in-compositor bind path. Regular app clients never see it
-    because they run as a different uid; the shell client
-    (qdwin_shell_v1) does not see it either — the locker is a
-    separate peer process from the shell.
+    PyQt locker (qdlocker). Trust model: the bind handler always
+    rejects clients whose peer uid does not match the
+    admin-configured locker uid. In addition, when an expected
+    locker executable path and/or SELinux label are configured
+    (--qdwin-allowed-locker-exe= / QDWIN_ALLOWED_LOCKER_EXE and
+    --qdwin-allowed-locker-label= / QDWIN_ALLOWED_LOCKER_LABEL), the
+    handler resolves the peer's /proc/&lt;pid&gt;/exe and/or
+    /proc/&lt;pid&gt;/attr/current and rejects the bind unless they
+    match exactly. These checks fail closed: an unreadable or OOM
+    /proc read is treated as "unverifiable" and rejects the bind, and
+    the reads are bracketed by /proc/&lt;pid&gt;/stat starttime samples
+    so a pid whose process identity is unstable across the read window
+    is also rejected.
+
+    Residual window (be honest about scope): the peer pid is the value
+    the kernel pinned at connect time, but /proc is read later when the
+    bind request is handled, so the exe/label/starttime checks are
+    best-effort defence-in-depth on top of the uid gate, not a proof
+    that /proc still names the exact connecting process. The starttime
+    double-read only proves the pid named one stable process across our
+    own read window; it does not exclude (a) pid reuse that completed
+    before the first sample, nor (b) a same-process execve() (e.g. into
+    a different SELinux domain), because starttime is the fork/clone
+    time and is unchanged by exec. The primary
+    gate remains the uid check plus the socket being reachable only to
+    the locker uid. When a check is left unconfigured it is skipped,
+    and the compositor relies on systemd unit confinement and SELinux
+    service policy to keep this socket reachable only to the locker
+    process. The locker global is visible in the registry,
+    but regular app clients cannot bind it because they run as a
+    different uid (and, when configured, a different exe/label); the
+    shell client (qdwin_shell_v1) cannot drive lock state through it
+    either — the locker is a separate peer process from the shell.
 
     Why a separate global from qdwin_shell_v1:
 
