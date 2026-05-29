@@ -252,9 +252,12 @@ ext_workspace_client_header = custom_target(
 # (and any other wlr-output-management client, e.g. wlr-randr / kanshi) can
 # enumerate heads/modes and apply an ATOMIC layout with test/apply + revert.
 # Unlike ext-workspace-v1 this protocol is NOT in wayland-protocols (it is a
-# wlr-protocols extension), so the xml is vendored under qdwin/protocols/.
+# wlr-protocols extension), so the xml is vendored under qdwin/qdwin/ alongside
+# the other private protocol XMLs and installed via the qdistro-protocols
+# pkg-config package (single source of truth — consumers like the qdshell
+# qml-plugin discover it there, never by copying).
 # See todo/decisions/qdwin-output-management.md.
-wlr_output_mgmt_xml = files('qdwin/protocols/wlr-output-management-unstable-v1.xml')
+wlr_output_mgmt_xml = files('qdwin/wlr-output-management-unstable-v1.xml')
 wlr_output_mgmt_server_header = custom_target(
   'wlr-output-management-v1-server-header',
   input: wlr_output_mgmt_xml,
@@ -671,6 +674,7 @@ install_data(
     'qdwin/qdwin-locker-v1.xml',
     'qdwin/qdwin-nested-v1.xml',
     'qdwin/wlr-layer-shell-unstable-v1.xml',
+    'qdwin/wlr-output-management-unstable-v1.xml',
   ],
   install_dir: qdistro_protocols_dir,
 )
