@@ -602,6 +602,22 @@ executable('qdwin-cursor-probe',
   install: true,
 )
 
+# v19 global-hotkey REGISTER-edge probe. Binds qdwin_shell_v1 (v19) +
+# bind_as_shell and drives register/unregister/replace/duplicate-across-ids/
+# modifier-only no-op; the observable postconditions are weston-log
+# register_hotkey/unregister_hotkey lines. The real keypress->hotkey_pressed
+# DELIVERY half needs input injection (a seat) and is VM-only. Driven by
+# tests/host/19-hotkey-edges.md.
+executable('qdwin-hotkey-probe',
+  sources: [
+    'test-client/qdwin-hotkey-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 # Client header + code for the fractional-scale probe (qdwin-fractional-probe).
 fractional_scale_client_header = custom_target(
   'fractional-scale-v1-client-header',
