@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="23">
+  <interface name="qdwin_shell_v1" version="24">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -125,6 +125,30 @@
       empty desktop); (b) clicks on the empty desktop now have a
       target client to receive them. Pre-v18 shells continue with the
       compositor curtain.
+
+      Version 24 adds a per-window workspace sidecar. The workspace
+      LIST, NAMES, ACTIVE state and switching are carried by the
+      standard `ext_workspace_v1` protocol (qdwin implements the server;
+      see qdwin/ext-workspace-v1.xml) — that protocol is window-agnostic
+      and does not tell a taskbar which workspace a given toplevel lives
+      on. This version closes exactly that gap so the bar can compute
+      per-workspace occupancy and window lists:
+
+      - event `toplevel_workspace(handle, index)` reports the workspace
+        a toplevel is on. It fires immediately after the toplevel's
+        `toplevel_added` (carrying the workspace it opened on — the
+        active workspace at map time), again whenever the assignment
+        changes, and once per existing toplevel during the
+        `bind_as_shell` replay (interleaved with each replayed
+        toplevel_added, mirroring `toplevel_security_context`).
+      - request `move_toplevel_to_workspace(handle, index)` relocates a
+        window (the "send window to workspace N" UX) — ext-workspace-v1
+        is workspace-centric and has no window-move request.
+
+      Pre-v24 shells never see the event; they keep classifying every
+      toplevel as workspace 0 (the pre-v24 behaviour). The compositor's
+      internal workspace mechanics (hide/show on switch) are driven by
+      the ext-workspace activate path regardless of the shell version.
     </description>
 
     <enum name="error">
@@ -1403,6 +1427,41 @@
            summary="popup-local y in popup buffer space"/>
       <arg name="button" type="uint" summary="linux BTN_xxx code"/>
       <arg name="state" type="uint" summary="1=pressed, 0=released"/>
+    </event>
+
+    <request name="move_toplevel_to_workspace" since="24">
+      <description summary="reassign a toplevel to a workspace">
+        Move toplevel `handle` to workspace `index`. If `index` is the
+        active workspace the toplevel becomes visible; otherwise it is
+        parked on the hidden workspace layer. The window keeps its
+        position, size, chrome and minimised state across the move.
+
+        `handle` must be a live toplevel (else `invalid_handle`).
+        `index` out of range ([0, ext-workspace count)) is ignored. On
+        success qdwin emits `toplevel_workspace(handle, index)`. If the
+        move hides the currently focused window, focus is re-derived to
+        a still-visible toplevel exactly as on a workspace switch.
+      </description>
+      <arg name="handle" type="uint"
+           summary="toplevel handle from toplevel_added"/>
+      <arg name="index" type="uint" summary="target workspace, 0-based"/>
+    </request>
+
+    <event name="toplevel_workspace" since="24">
+      <description summary="a toplevel's workspace assignment">
+        Reports which workspace a toplevel lives on. Fires immediately
+        after `toplevel_added` for a new window (carrying the workspace
+        it opened on — the active workspace at map time), and again
+        whenever the assignment changes via
+        `move_toplevel_to_workspace`. Replayed at `bind_as_shell` for
+        every existing toplevel after the toplevel_added burst.
+
+        The shell uses this to populate the per-window `workspaceId`
+        so the bar can show window counts per workspace and so
+        per-workspace window lists are correct.
+      </description>
+      <arg name="handle" type="uint" summary="from toplevel_added"/>
+      <arg name="index" type="uint" summary="workspace index, 0-based"/>
     </event>
   </interface>
 

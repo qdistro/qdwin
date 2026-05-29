@@ -59,6 +59,7 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "idle-inhibit-unstable-v1-server-protocol.h"
 #include "cursor-shape-v1-server-protocol.h"
 #include "fractional-scale-v1-server-protocol.h"
+#include "ext-workspace-v1-server-protocol.h"
 #include "primary-selection-unstable-v1-server-protocol.h"
 #include "security-context-v1-server-protocol.h"
 #include "qdwin-nested-v1-server-protocol.h"
@@ -173,6 +174,20 @@ static void qdwin_demote_lock_toplevel(struct qdwin *qdwin,
 				       const char *cause);
 static struct qdwin_toplevel *
 qdwin_toplevel_from_handle(struct qdwin *qdwin, uint32_t handle);
+/* v24 workspaces — mechanics + ext-workspace-v1 server. Forward-declared
+ * because the qdwin_shell_v1 impl table (move_toplevel_to_workspace) and
+ * the ext-workspace request handlers reference them before their
+ * definitions (which sit near qdwin_toplevel_by_surface lower down). */
+static bool qdwin_toplevel_is_visible(struct qdwin_toplevel *tl);
+static void qdwin_toplevel_apply_workspace_visibility(struct qdwin_toplevel *tl);
+static void qdwin_workspace_refocus_seats(struct qdwin *qdwin);
+static void qdwin_set_active_workspace(struct qdwin *qdwin, uint32_t index);
+static void qdwin_workspace_create(struct qdwin *qdwin);
+static void qdwin_workspace_remove(struct qdwin *qdwin, uint32_t index);
+static void qdwin_emit_toplevel_workspace(struct qdwin *qdwin,
+					  struct qdwin_toplevel *tl);
+static void qdwin_ext_ws_broadcast_state(struct qdwin *qdwin);
+static void qdwin_ext_ws_resync_all(struct qdwin *qdwin);
 /* §6.8 cursor-sprite full theme forward decl (impl table at L3577 needs
  * the symbol; definition lives near the rest of the cursor-shape code). */
 static void qdwin_handle_set_cursor_sprite(struct wl_client *client,
@@ -312,6 +327,11 @@ struct qdwin_toplevel {
 	int outer_height;
 	/* toplevel_state bitmask (QDWIN_TS_*). */
 	uint32_t state;
+	/* v24: which workspace this toplevel lives on. Set to the active
+	 * workspace at map time; changed by move_toplevel_to_workspace.
+	 * Only toplevels whose workspace == qdwin->active_workspace are
+	 * composited (the rest are parked on workspace_hidden_layer). */
+	uint32_t workspace;
 	/* P05a: per-toplevel chrome border colour (ARGB, big-endian RGBA8888
 	 * as set_border_color receives it). Defaults to 0 (= unset → fall
 	 * back to qdshell's neutral chrome). qdshell paints the actual
@@ -455,6 +475,8 @@ struct qdwin {
 	struct weston_layer held_layer;       /* HIDDEN until shell acks */
 	struct weston_layer normal_layer;
 	struct weston_layer minimized_layer;  /* unmapped; minimised views */
+	struct weston_layer workspace_hidden_layer; /* v24: off-workspace views
+						     * (unmapped, like minimized) */
 	struct weston_layer panel_layer;      /* §6.6 S1: panels/bars above normal */
 	struct weston_layer notification_layer; /* §6.6 S2: bubbles above panels */
 	struct weston_layer launcher_layer;     /* §6.6 S3/S4: launcher + switcher */
@@ -466,6 +488,14 @@ struct qdwin {
 	 * qdwin's native panels — see wet_shell_init for the chosen
 	 * position values. */
 	struct weston_layer layer_shell_layer[4];
+
+	/* v24 workspaces. The shell owns the count + names (persisted in
+	 * qdshell settings, pushed down via set_workspace_count); qdwin
+	 * owns the active index and the per-toplevel assignment at runtime.
+	 * Defaults to a single implicit workspace so pre-v24 shells and the
+	 * pre-workspace code paths behave exactly as before. */
+	uint32_t workspace_count;   /* >= 1, <= QDWIN_MAX_WORKSPACES */
+	uint32_t active_workspace;  /* < workspace_count */
 
 	/* §6.6 S5: single lock view. Legacy lock surfaces own a dedicated
 	 * weston_view; qdlocker now uses its real Qt xdg_toplevel, whose
@@ -703,7 +733,20 @@ struct qdwin {
 	 * draws chrome via qdwin_shell_v1, so toolkits should not try
 	 * client-side decorations. See bind_qdwin_xdg_decoration_manager. */
 	struct wl_global *xdg_decoration_manager_global;
+
+	/* v24 workspaces: ext-workspace-v1 server. The manager global is
+	 * advertised to all clients (a taskbar/dock protocol — no uid gate,
+	 * unlike qdwin_shell_v1). One logical workspace list (count + active
+	 * live in workspace_count / active_workspace above); each bound
+	 * manager keeps its own group + per-workspace handle resources,
+	 * tracked in ext_ws_managers. See
+	 * todo/decisions/qdwin-workspaces-ext-protocol.md. */
+	struct wl_global *ext_ws_global;
+	struct wl_list ext_ws_managers;  /* qdwin_ext_ws_manager::link */
 };
+
+#define QDWIN_MAX_WORKSPACES 32
+#define QDWIN_DEFAULT_WORKSPACES 4
 
 struct qdwin_seat_tracker;
 
@@ -1060,6 +1103,24 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 					   title  ? title  : "",
 					   (uint32_t)qdwin_toplevel_is_xwayland(qdwin, tl));
 	qdwin_send_toplevel_security_context(qdwin, tl);
+	/* v24 sidecar: tell the shell which workspace this window opened on.
+	 * Mirrors the secctx event ordering — immediately after
+	 * toplevel_added so the shell has the row before it fills fields. */
+	qdwin_emit_toplevel_workspace(qdwin, tl);
+}
+
+/* v24: emit qdwin_shell_v1.toplevel_workspace (per-window occupancy
+ * sidecar). Gated on a bound v24+ shell — pre-v24 shells classify every
+ * window as workspace 0. */
+static void
+qdwin_emit_toplevel_workspace(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
+	if (!qdwin->shell_bound || !qdwin->shell_resource)
+		return;
+	if (wl_resource_get_version(qdwin->shell_resource) < 24)
+		return;
+	qdwin_shell_v1_send_toplevel_workspace(qdwin->shell_resource,
+					       tl->handle, tl->workspace);
 }
 
 static void
@@ -1132,6 +1193,8 @@ qdwin_surface_added(struct weston_desktop_surface *dsurf, void *data)
 	tl->handle = ++qdwin->next_handle;
 	tl->mapped = 0;
 	tl->decorated = 0;
+	/* v24: new windows open on the active workspace. */
+	tl->workspace = qdwin->active_workspace;
 	for (int s = 0; s < QDWIN_SIDES; s++) {
 		tl->chrome[s].side = s;
 		tl->chrome[s].tl = tl;
@@ -1570,6 +1633,12 @@ qdwin_toplevel_release_holding(struct qdwin_toplevel *tl, const char *cause)
 			weston_view_move_to_layer(tl->chrome[s].view,
 				&tl->qdwin->normal_layer.view_list);
 	}
+	/* v24: a workspace switch may have moved off the window's workspace
+	 * while it was still held; park it on the hidden layer if so, so it
+	 * doesn't flash onto the wrong desktop on release. */
+	if (tl->workspace != tl->qdwin->active_workspace)
+		qdwin_toplevel_move_to_layer(tl,
+			&tl->qdwin->workspace_hidden_layer);
 	weston_log("qdwin: holding_released handle=%u via %s (held → normal)\n",
 		   tl->handle, cause);
 	weston_compositor_schedule_repaint(tl->qdwin->compositor);
@@ -1617,6 +1686,9 @@ qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl)
 	if (!tl || !tl->qdwin || tl->qdwin->locked)
 		return;
 	if (!tl->decorated)  /* still in held bystander layer */
+		return;
+	/* v24: don't pull focus to a window parked on another workspace. */
+	if (tl->workspace != tl->qdwin->active_workspace)
 		return;
 	if (!tl->view || !tl->view->surface)
 		return;
@@ -1821,10 +1893,17 @@ qdwin_chrome_attach_side(struct qdwin_toplevel *tl, int side,
 	 * released yet (rare — attach_decoration before set_border_color)
 	 * we stash on held and release_holding will migrate us. Otherwise
 	 * (set_border_color already fired) the content is already on
-	 * normal, and we must follow so the chrome actually composites. */
-	struct weston_layer *target = tl->decorated
-		? &tl->qdwin->normal_layer
-		: &tl->qdwin->held_layer;
+	 * normal, and we must follow so the chrome actually composites.
+	 * v24: a decorated toplevel parked on a non-active workspace lives on
+	 * the hidden layer — its chrome must follow there, not flash onto the
+	 * active workspace. */
+	struct weston_layer *target;
+	if (!tl->decorated)
+		target = &tl->qdwin->held_layer;
+	else if (tl->workspace != tl->qdwin->active_workspace)
+		target = &tl->qdwin->workspace_hidden_layer;
+	else
+		target = &tl->qdwin->normal_layer;
 	weston_view_move_to_layer(c->view, &target->view_list);
 	/* Mark the roleless chrome surface as mapped so it actually
 	 * composites. Shell-owned surfaces have no weston_desktop life-
@@ -2310,8 +2389,12 @@ qdwin_handle_request_raise(struct wl_client *client,
 	/* For now request_raise doubles as un-minimise. Stack-raise for
 	 * non-minimised toplevels is a Phase 6.4/6.5 concern. */
 	if (tl->state & QDWIN_TS_MINIMIZED) {
-		qdwin_toplevel_move_to_layer(tl, &qdwin->normal_layer);
 		tl->state &= ~QDWIN_TS_MINIMIZED;
+		/* v24: restore to the correct layer for its workspace — onto
+		 * normal only if it's on the active workspace, else keep it
+		 * parked hidden (un-minimising a window on another workspace
+		 * must not leak it onto the current desktop). */
+		qdwin_toplevel_apply_workspace_visibility(tl);
 		weston_log("qdwin: request_raise handle=%u unminimised (state=%#x)\n",
 			   handle, tl->state);
 		qdwin_send_toplevel_state(qdwin, tl);
@@ -2325,8 +2408,13 @@ qdwin_handle_request_raise(struct wl_client *client,
 	 * Alt+Tab moves keyboard focus correctly but the raised window
 	 * stays buried under the previously-focused one — user can type
 	 * into a hidden window but only sees the typed text once the
-	 * obscuring window is closed. */
-	qdwin_toplevel_move_to_layer(tl, &qdwin->normal_layer);
+	 * obscuring window is closed.
+	 * v24: only restack on the active workspace; raising an
+	 * off-workspace window leaves it parked (no workspace-follow). */
+	if (tl->workspace == qdwin->active_workspace)
+		qdwin_toplevel_move_to_layer(tl, &qdwin->normal_layer);
+	else
+		qdwin_toplevel_apply_workspace_visibility(tl);
 	weston_log("qdwin: request_raise handle=%u re-stacked\n", handle);
 	weston_compositor_schedule_repaint(qdwin->compositor);
 }
@@ -6049,6 +6137,44 @@ qdwin_hotkeys_purge(struct qdwin *qdwin)
 	}
 }
 
+/* v24 sidecar: move a window to another workspace ("send to workspace
+ * N" UX). The workspace list/active state is ext-workspace-v1's job;
+ * this window-centric move is not expressible there, so it lives on the
+ * private shell binding. */
+static void
+qdwin_handle_move_toplevel_to_workspace(struct wl_client *client,
+					struct wl_resource *resource,
+					uint32_t handle, uint32_t index)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct qdwin_toplevel *tl;
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	tl = qdwin_toplevel_from_handle(qdwin, handle);
+	if (!tl) {
+		wl_resource_post_error(resource,
+			QDWIN_SHELL_V1_ERROR_INVALID_HANDLE,
+			"move_toplevel_to_workspace: unknown handle %u", handle);
+		return;
+	}
+	if (index >= qdwin->workspace_count) {
+		weston_log("qdwin: move_toplevel_to_workspace ignored handle=%u "
+			   "index=%u (count=%u)\n", handle, index,
+			   qdwin->workspace_count);
+		return;
+	}
+	if (tl->workspace != index) {
+		tl->workspace = index;
+		qdwin_toplevel_apply_workspace_visibility(tl);
+		qdwin_workspace_refocus_seats(qdwin);
+		weston_compositor_schedule_repaint(qdwin->compositor);
+		weston_log("qdwin: toplevel handle=%u moved to workspace %u\n",
+			   handle, index);
+	}
+	qdwin_emit_toplevel_workspace(qdwin, tl);
+}
+
 static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.bind_as_shell = qdwin_handle_bind_as_shell,
 	.destroy = qdwin_handle_destroy,
@@ -6078,6 +6204,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.attach_background = qdwin_handle_attach_background,
 	.register_hotkey = qdwin_handle_register_hotkey,
 	.unregister_hotkey = qdwin_handle_unregister_hotkey,
+	.move_toplevel_to_workspace = qdwin_handle_move_toplevel_to_workspace,
 };
 
 static void
@@ -7224,16 +7351,524 @@ qdwin_seat_focus_recover_idle_cb(void *data)
 	struct qdwin_toplevel *succ = NULL;
 	struct qdwin_toplevel *cand;
 	wl_list_for_each(cand, &tr->qdwin->toplevels, link) {
-		if (!cand->decorated)
-			continue;
-		if (cand->view && cand->view->surface &&
-		    weston_surface_is_mapped(cand->view->surface)) {
+		/* v24: only recover focus to a visible window — one that is
+		 * decorated, mapped, not minimised, and on the active
+		 * workspace. Skips windows parked on the hidden workspace
+		 * layer. */
+		if (qdwin_toplevel_is_visible(cand)) {
 			succ = cand;
 			break;
 		}
 	}
 	if (succ)
 		weston_keyboard_set_focus(kbd, succ->view->surface);
+}
+
+/* ==================================================================
+ * v24 workspaces — compositor mechanics + ext-workspace-v1 server.
+ *
+ * Mechanics: each toplevel carries a `workspace` index. Only toplevels
+ * on qdwin->active_workspace are composited; the rest are parked on the
+ * (unmapped) workspace_hidden_layer — the same hide mechanism weston's
+ * reference desktop-shell uses for inactive workspaces. The standard
+ * ext-workspace-v1 protocol is the control/observation surface; the
+ * per-window→workspace mapping the bar needs for occupancy rides the
+ * qdwin_shell_v1.toplevel_workspace sidecar (emitted elsewhere).
+ * See todo/decisions/qdwin-workspaces-ext-protocol.md.
+ * ================================================================== */
+
+/* A toplevel is "visible" when it would actually paint on the current
+ * workspace: decorated (past the held bystander layer), not minimised,
+ * on the active workspace, and backed by a mapped surface. */
+static bool
+qdwin_toplevel_is_visible(struct qdwin_toplevel *tl)
+{
+	if (!tl || !tl->qdwin || !tl->decorated)
+		return false;
+	if (tl->state & QDWIN_TS_MINIMIZED)
+		return false;
+	if (tl->workspace != tl->qdwin->active_workspace)
+		return false;
+	return tl->view && tl->view->surface &&
+	       weston_surface_is_mapped(tl->view->surface);
+}
+
+/* Park or restore a toplevel's views according to its workspace vs the
+ * active one. No-op for state the workspace layer must not touch:
+ * nested-inner toplevels (no workspaces in nested mode), the locker UI
+ * (LOCK layer), still-held windows (release_holding re-evaluates), and
+ * minimised windows (stay on the minimized layer until unminimised). */
+static void
+qdwin_toplevel_apply_workspace_visibility(struct qdwin_toplevel *tl)
+{
+	struct qdwin *qdwin;
+	if (!tl || !tl->qdwin)
+		return;
+	qdwin = tl->qdwin;
+	if (qdwin->nested_mode)
+		return;
+	if (qdwin_toplevel_is_locker_ui(qdwin, tl))
+		return;
+	if (!tl->decorated)
+		return;
+	if (tl->state & QDWIN_TS_MINIMIZED)
+		return;
+	if (tl->workspace == qdwin->active_workspace)
+		qdwin_toplevel_move_to_layer(tl, &qdwin->normal_layer);
+	else
+		qdwin_toplevel_move_to_layer(tl, &qdwin->workspace_hidden_layer);
+}
+
+/* After a workspace change, fix keyboard focus on every seat: keep the
+ * current focus if it is still visible, otherwise move to the front-most
+ * visible toplevel on the active workspace (or clear focus when the
+ * workspace is empty). Mirrors the auto-focus-on-map contract. */
+static void
+qdwin_workspace_refocus_seats(struct qdwin *qdwin)
+{
+	struct qdwin_toplevel *want = NULL, *cand;
+	struct weston_seat *seat;
+	if (qdwin->locked)
+		return;  /* locker grab owns focus while locked */
+	wl_list_for_each(cand, &qdwin->toplevels, link) {
+		if (qdwin_toplevel_is_visible(cand)) {
+			want = cand;
+			break;
+		}
+	}
+	wl_list_for_each(seat, &qdwin->compositor->seat_list, link) {
+		struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
+		struct qdwin_toplevel *cur;
+		if (!kbd)
+			continue;
+		cur = qdwin_toplevel_by_surface(qdwin, kbd->focus);
+		if (cur && qdwin_toplevel_is_visible(cur))
+			continue;  /* still valid on the active workspace */
+		weston_keyboard_set_focus(kbd, want ? want->view->surface : NULL);
+		qdwin_seat_emit_focus_now(qdwin_seat_tracker_for_seat(qdwin, seat));
+	}
+}
+
+/* Switch the active workspace. Out-of-range is ignored. Always
+ * re-broadcasts ext-workspace state (so an activate of the already-active
+ * workspace is a confirmation, matching the protocol's best-effort
+ * semantics). */
+static void
+qdwin_set_active_workspace(struct qdwin *qdwin, uint32_t index)
+{
+	struct qdwin_toplevel *tl;
+	if (index >= qdwin->workspace_count) {
+		weston_log("qdwin: set_active_workspace ignored index=%u (count=%u)\n",
+			   index, qdwin->workspace_count);
+		return;
+	}
+	if (index != qdwin->active_workspace) {
+		qdwin->active_workspace = index;
+		wl_list_for_each(tl, &qdwin->toplevels, link)
+			qdwin_toplevel_apply_workspace_visibility(tl);
+		qdwin_workspace_refocus_seats(qdwin);
+		weston_compositor_schedule_repaint(qdwin->compositor);
+		weston_log("qdwin: active_workspace=%u/%u\n",
+			   qdwin->active_workspace, qdwin->workspace_count);
+	}
+	qdwin_ext_ws_broadcast_state(qdwin);
+}
+
+/* Append a workspace (shell drove the count up). */
+static void
+qdwin_workspace_create(struct qdwin *qdwin)
+{
+	if (qdwin->workspace_count >= QDWIN_MAX_WORKSPACES) {
+		weston_log("qdwin: create_workspace ignored — at max %u\n",
+			   (unsigned)QDWIN_MAX_WORKSPACES);
+		return;
+	}
+	qdwin->workspace_count++;
+	weston_log("qdwin: workspace created, count=%u\n", qdwin->workspace_count);
+	qdwin_ext_ws_resync_all(qdwin);
+}
+
+/* Remove workspace `index`. Workspaces are positional ("1".."N"), so
+ * windows on the removed workspace fall back one slot and windows above
+ * it shift down to keep indices contiguous. The active index and every
+ * window's visibility are recomputed. */
+static void
+qdwin_workspace_remove(struct qdwin *qdwin, uint32_t index)
+{
+	struct qdwin_toplevel *tl;
+	if (qdwin->workspace_count <= 1) {
+		weston_log("qdwin: remove_workspace ignored — at min 1\n");
+		return;
+	}
+	if (index >= qdwin->workspace_count)
+		return;
+	wl_list_for_each(tl, &qdwin->toplevels, link) {
+		if (tl->workspace == index)
+			tl->workspace = (index > 0) ? index - 1 : 0;
+		else if (tl->workspace > index)
+			tl->workspace--;
+	}
+	qdwin->workspace_count--;
+	if (qdwin->active_workspace > index)
+		qdwin->active_workspace--;
+	else if (qdwin->active_workspace == index && index > 0)
+		qdwin->active_workspace--;
+	if (qdwin->active_workspace >= qdwin->workspace_count)
+		qdwin->active_workspace = qdwin->workspace_count - 1;
+	wl_list_for_each(tl, &qdwin->toplevels, link)
+		qdwin_toplevel_apply_workspace_visibility(tl);
+	qdwin_workspace_refocus_seats(qdwin);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+	weston_log("qdwin: workspace %u removed, count=%u active=%u\n",
+		   index, qdwin->workspace_count, qdwin->active_workspace);
+	/* Window→workspace assignments shifted; refresh the sidecar. */
+	wl_list_for_each(tl, &qdwin->toplevels, link)
+		qdwin_emit_toplevel_workspace(qdwin, tl);
+	qdwin_ext_ws_resync_all(qdwin);
+}
+
+/* ---- ext-workspace-v1 server objects ---------------------------- */
+
+struct qdwin_ext_ws_manager {
+	struct wl_list link;             /* qdwin::ext_ws_managers */
+	struct qdwin *qdwin;
+	struct wl_resource *resource;    /* ext_workspace_manager_v1 */
+	struct wl_resource *group;       /* the single ext_workspace_group_handle_v1 */
+	struct wl_resource *handles[QDWIN_MAX_WORKSPACES];  /* per workspace index */
+	uint32_t handle_count;
+	bool stopped;
+};
+
+/* Per-handle back-reference so a handle request resolves to its
+ * (manager, workspace index). */
+struct qdwin_ext_ws_handle_ref {
+	struct qdwin_ext_ws_manager *mgr;
+	uint32_t index;
+};
+
+static void
+qdwin_ext_ws_send_handle_details(struct qdwin *qdwin,
+				 struct wl_resource *h, uint32_t index)
+{
+	char namebuf[16];
+	char idbuf[24];
+	uint32_t state = (index == qdwin->active_workspace)
+		? EXT_WORKSPACE_HANDLE_V1_STATE_ACTIVE : 0;
+	struct wl_array coords;
+	uint32_t *c;
+	snprintf(idbuf, sizeof idbuf, "qdwin-ws-%u", index);
+	snprintf(namebuf, sizeof namebuf, "%u", index + 1u);
+	/* id: stable across the workspace's lifetime (positional). name:
+	 * "1".."N" — the user's custom names are a shell-side display
+	 * overlay (qdshell settings), since ext-workspace-v1 has no rename
+	 * request. coordinates: 1-D = index, so a bar can order cells. */
+	ext_workspace_handle_v1_send_id(h, idbuf);
+	ext_workspace_handle_v1_send_name(h, namebuf);
+	wl_array_init(&coords);
+	c = wl_array_add(&coords, sizeof *c);
+	if (c)
+		*c = index;
+	ext_workspace_handle_v1_send_coordinates(h, &coords);
+	wl_array_release(&coords);
+	ext_workspace_handle_v1_send_capabilities(h,
+		EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE |
+		EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_REMOVE);
+	ext_workspace_handle_v1_send_state(h, state);
+}
+
+static void qdwin_ext_ws_handle_resource_destroy(struct wl_resource *resource);
+static const struct ext_workspace_handle_v1_interface qdwin_ext_ws_handle_impl;
+
+static void
+qdwin_ext_ws_manager_create_handles(struct qdwin_ext_ws_manager *mgr)
+{
+	struct qdwin *qdwin = mgr->qdwin;
+	struct wl_client *client = wl_resource_get_client(mgr->resource);
+	uint32_t ver = wl_resource_get_version(mgr->resource);
+	uint32_t i;
+	for (i = 0; i < qdwin->workspace_count && i < QDWIN_MAX_WORKSPACES; i++) {
+		struct qdwin_ext_ws_handle_ref *ref;
+		struct wl_resource *h = wl_resource_create(client,
+			&ext_workspace_handle_v1_interface, ver, 0);
+		if (!h)
+			continue;
+		ref = calloc(1, sizeof *ref);
+		if (!ref) {
+			wl_resource_destroy(h);
+			continue;
+		}
+		ref->mgr = mgr;
+		ref->index = i;
+		wl_resource_set_implementation(h, &qdwin_ext_ws_handle_impl, ref,
+					       qdwin_ext_ws_handle_resource_destroy);
+		mgr->handles[i] = h;
+		ext_workspace_manager_v1_send_workspace(mgr->resource, h);
+		qdwin_ext_ws_send_handle_details(qdwin, h, i);
+		if (mgr->group)
+			ext_workspace_group_handle_v1_send_workspace_enter(
+				mgr->group, h);
+	}
+	mgr->handle_count = i;
+}
+
+static void
+qdwin_ext_ws_manager_destroy_handles(struct qdwin_ext_ws_manager *mgr)
+{
+	uint32_t i;
+	for (i = 0; i < mgr->handle_count; i++) {
+		struct wl_resource *h = mgr->handles[i];
+		struct qdwin_ext_ws_handle_ref *ref;
+		if (!h)
+			continue;
+		if (mgr->group)
+			ext_workspace_group_handle_v1_send_workspace_leave(
+				mgr->group, h);
+		ext_workspace_handle_v1_send_removed(h);
+		/* Per spec the handle is inert after `removed` — only `destroy`
+		 * is honoured. Sever the ref's manager link so a stale
+		 * activate/remove on the soon-to-be-recreated index becomes a
+		 * no-op (its handler null-checks ref->mgr). The resource stays
+		 * alive until the client destroys it; the destructor then frees
+		 * the ref (and won't touch our slot since mgr is NULL). */
+		ref = wl_resource_get_user_data(h);
+		if (ref)
+			ref->mgr = NULL;
+		mgr->handles[i] = NULL;
+	}
+	mgr->handle_count = 0;
+}
+
+static void
+qdwin_ext_ws_manager_resync(struct qdwin_ext_ws_manager *mgr)
+{
+	if (mgr->stopped)
+		return;
+	qdwin_ext_ws_manager_destroy_handles(mgr);
+	qdwin_ext_ws_manager_create_handles(mgr);
+	ext_workspace_manager_v1_send_done(mgr->resource);
+}
+
+static void
+qdwin_ext_ws_resync_all(struct qdwin *qdwin)
+{
+	struct qdwin_ext_ws_manager *mgr;
+	wl_list_for_each(mgr, &qdwin->ext_ws_managers, link)
+		qdwin_ext_ws_manager_resync(mgr);
+}
+
+static void
+qdwin_ext_ws_broadcast_state(struct qdwin *qdwin)
+{
+	struct qdwin_ext_ws_manager *mgr;
+	wl_list_for_each(mgr, &qdwin->ext_ws_managers, link) {
+		uint32_t i;
+		bool sent = false;
+		if (mgr->stopped)
+			continue;
+		for (i = 0; i < mgr->handle_count && i < qdwin->workspace_count; i++) {
+			uint32_t state;
+			if (!mgr->handles[i])
+				continue;
+			state = (i == qdwin->active_workspace)
+				? EXT_WORKSPACE_HANDLE_V1_STATE_ACTIVE : 0;
+			ext_workspace_handle_v1_send_state(mgr->handles[i], state);
+			sent = true;
+		}
+		if (sent)
+			ext_workspace_manager_v1_send_done(mgr->resource);
+	}
+}
+
+/* ---- ext_workspace_handle_v1 requests ---- */
+
+static void
+qdwin_ext_ws_handle_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void
+qdwin_ext_ws_handle_activate(struct wl_client *client, struct wl_resource *resource)
+{
+	struct qdwin_ext_ws_handle_ref *ref = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!ref || !ref->mgr || !ref->mgr->qdwin)
+		return;
+	qdwin_set_active_workspace(ref->mgr->qdwin, ref->index);
+}
+
+static void
+qdwin_ext_ws_handle_deactivate(struct wl_client *client, struct wl_resource *resource)
+{
+	/* Single-active model: there is always exactly one active
+	 * workspace, so an explicit deactivate is a no-op. */
+	(void)client; (void)resource;
+}
+
+static void
+qdwin_ext_ws_handle_assign(struct wl_client *client, struct wl_resource *resource,
+			   struct wl_resource *group)
+{
+	/* One group spans the whole desktop; reassigning is a no-op. */
+	(void)client; (void)resource; (void)group;
+}
+
+static void
+qdwin_ext_ws_handle_remove(struct wl_client *client, struct wl_resource *resource)
+{
+	struct qdwin_ext_ws_handle_ref *ref = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!ref || !ref->mgr || !ref->mgr->qdwin)
+		return;
+	qdwin_workspace_remove(ref->mgr->qdwin, ref->index);
+}
+
+static const struct ext_workspace_handle_v1_interface qdwin_ext_ws_handle_impl = {
+	.destroy = qdwin_ext_ws_handle_destroy,
+	.activate = qdwin_ext_ws_handle_activate,
+	.deactivate = qdwin_ext_ws_handle_deactivate,
+	.assign = qdwin_ext_ws_handle_assign,
+	.remove = qdwin_ext_ws_handle_remove,
+};
+
+static void
+qdwin_ext_ws_handle_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_ext_ws_handle_ref *ref = wl_resource_get_user_data(resource);
+	if (!ref)
+		return;
+	if (ref->mgr && ref->index < QDWIN_MAX_WORKSPACES &&
+	    ref->mgr->handles[ref->index] == resource)
+		ref->mgr->handles[ref->index] = NULL;
+	free(ref);
+}
+
+/* ---- ext_workspace_group_handle_v1 requests ---- */
+
+static void
+qdwin_ext_ws_group_create_workspace(struct wl_client *client,
+				    struct wl_resource *resource,
+				    const char *workspace)
+{
+	struct qdwin_ext_ws_manager *mgr = wl_resource_get_user_data(resource);
+	(void)client; (void)workspace;  /* name is positional; ignored */
+	if (!mgr || !mgr->qdwin)
+		return;
+	qdwin_workspace_create(mgr->qdwin);
+}
+
+static void
+qdwin_ext_ws_group_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct ext_workspace_group_handle_v1_interface qdwin_ext_ws_group_impl = {
+	.create_workspace = qdwin_ext_ws_group_create_workspace,
+	.destroy = qdwin_ext_ws_group_destroy,
+};
+
+static void
+qdwin_ext_ws_group_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_ext_ws_manager *mgr = wl_resource_get_user_data(resource);
+	if (mgr && mgr->group == resource)
+		mgr->group = NULL;
+}
+
+/* ---- ext_workspace_manager_v1 requests ---- */
+
+static void
+qdwin_ext_ws_manager_commit(struct wl_client *client, struct wl_resource *resource)
+{
+	/* qdwin applies activate/create/remove eagerly, so the atomic
+	 * commit boundary is a no-op here — the client's view is already
+	 * consistent per-request. */
+	(void)client; (void)resource;
+}
+
+static void
+qdwin_ext_ws_manager_stop(struct wl_client *client, struct wl_resource *resource)
+{
+	struct qdwin_ext_ws_manager *mgr = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!mgr)
+		return;
+	mgr->stopped = true;
+	ext_workspace_manager_v1_send_finished(mgr->resource);
+	/* finished is a destructor event — tear the resource down now. The
+	 * manager resource destructor frees the struct and unlinks it. */
+	wl_resource_destroy(resource);
+}
+
+static const struct ext_workspace_manager_v1_interface qdwin_ext_ws_manager_impl = {
+	.commit = qdwin_ext_ws_manager_commit,
+	.stop = qdwin_ext_ws_manager_stop,
+};
+
+static void
+qdwin_ext_ws_manager_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_ext_ws_manager *mgr = wl_resource_get_user_data(resource);
+	uint32_t i;
+	if (!mgr)
+		return;
+	wl_list_remove(&mgr->link);
+	/* Null back-pointers so any late group/handle destructor (the
+	 * client may destroy them after the manager) does not deref freed
+	 * memory. The resources themselves are destroyed by the client. */
+	if (mgr->group)
+		wl_resource_set_user_data(mgr->group, NULL);
+	for (i = 0; i < QDWIN_MAX_WORKSPACES; i++) {
+		if (mgr->handles[i]) {
+			struct qdwin_ext_ws_handle_ref *ref =
+				wl_resource_get_user_data(mgr->handles[i]);
+			if (ref)
+				ref->mgr = NULL;
+		}
+	}
+	free(mgr);
+}
+
+static void
+bind_ext_workspace_manager(struct wl_client *client, void *data,
+			   uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct qdwin_ext_ws_manager *mgr = calloc(1, sizeof *mgr);
+	if (!mgr) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	mgr->qdwin = qdwin;
+	mgr->resource = wl_resource_create(client,
+		&ext_workspace_manager_v1_interface, version, id);
+	if (!mgr->resource) {
+		free(mgr);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(mgr->resource, &qdwin_ext_ws_manager_impl,
+				       mgr, qdwin_ext_ws_manager_resource_destroy);
+	wl_list_insert(&qdwin->ext_ws_managers, &mgr->link);
+
+	mgr->group = wl_resource_create(client,
+		&ext_workspace_group_handle_v1_interface, version, 0);
+	if (mgr->group) {
+		wl_resource_set_implementation(mgr->group,
+			&qdwin_ext_ws_group_impl, mgr,
+			qdwin_ext_ws_group_resource_destroy);
+		ext_workspace_manager_v1_send_workspace_group(mgr->resource,
+							      mgr->group);
+		ext_workspace_group_handle_v1_send_capabilities(mgr->group,
+			EXT_WORKSPACE_GROUP_HANDLE_V1_GROUP_CAPABILITIES_CREATE_WORKSPACE);
+	}
+	qdwin_ext_ws_manager_create_handles(mgr);
+	ext_workspace_manager_v1_send_done(mgr->resource);
+	weston_log("qdwin: ext_workspace_manager bound (count=%u active=%u)\n",
+		   qdwin->workspace_count, qdwin->active_workspace);
 }
 
 static void
@@ -7573,6 +8208,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->layer_shell_global);
 	if (qdwin->xdg_decoration_manager_global)
 		wl_global_destroy(qdwin->xdg_decoration_manager_global);
+	if (qdwin->ext_ws_global)
+		wl_global_destroy(qdwin->ext_ws_global);
 	if (qdwin->nested_outer_event_source) {
 		wl_event_source_remove(qdwin->nested_outer_event_source);
 		qdwin->nested_outer_event_source = NULL;
@@ -7590,6 +8227,7 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	weston_layer_fini(&qdwin->held_layer);
 	weston_layer_fini(&qdwin->normal_layer);
 	weston_layer_fini(&qdwin->minimized_layer);
+	weston_layer_fini(&qdwin->workspace_hidden_layer);
 	weston_layer_fini(&qdwin->panel_layer);
 	weston_layer_fini(&qdwin->notification_layer);
 	weston_layer_fini(&qdwin->launcher_layer);
@@ -14051,6 +14689,21 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_list_init(&qdwin->nested_toplevels);
 	qdwin->next_stream_port = 3401;  /* pool start for per-stream ports */
 
+	/* v24 workspaces. Default count is overridable via env for tests /
+	 * headless probes; the shell reconciles it to qdshell settings at
+	 * session start (create_workspace / workspace.remove). */
+	wl_list_init(&qdwin->ext_ws_managers);
+	qdwin->workspace_count = QDWIN_DEFAULT_WORKSPACES;
+	qdwin->active_workspace = 0;
+	{
+		const char *env = getenv("QDWIN_WORKSPACE_COUNT");
+		if (env && *env) {
+			long n = strtol(env, NULL, 10);
+			if (n >= 1 && n <= QDWIN_MAX_WORKSPACES)
+				qdwin->workspace_count = (uint32_t)n;
+		}
+	}
+
 	/* Layers: background (BACKGROUND) < held (HIDDEN) < normal (NORMAL).
 	 * minimized_layer is intentionally *not* passed through
 	 * weston_layer_set_position — that leaves it detached from the
@@ -14064,6 +14717,11 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	weston_layer_init(&qdwin->held_layer, ec);
 	weston_layer_init(&qdwin->normal_layer, ec);
 	weston_layer_init(&qdwin->minimized_layer, ec);
+	/* v24: off-workspace views park here. Like minimized_layer, it is
+	 * intentionally never weston_layer_set_position'd, so it stays
+	 * detached from the layer_list (invisible) and weston_view_move_to_layer
+	 * unmaps views moving into it. */
+	weston_layer_init(&qdwin->workspace_hidden_layer, ec);
 	weston_layer_init(&qdwin->panel_layer, ec);
 	weston_layer_init(&qdwin->notification_layer, ec);
 	weston_layer_init(&qdwin->launcher_layer, ec);
@@ -14123,11 +14781,21 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       23, qdwin, bind_qdwin_shell);
+					       24, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
 	}
+
+	/* v24: ext-workspace-v1 manager global. Unlike qdwin_shell_v1 this
+	 * is a public taskbar protocol — advertised to all clients, no uid
+	 * gate. See todo/decisions/qdwin-workspaces-ext-protocol.md. */
+	qdwin->ext_ws_global = wl_global_create(ec->wl_display,
+						&ext_workspace_manager_v1_interface,
+						1, qdwin, bind_ext_workspace_manager);
+	if (!qdwin->ext_ws_global)
+		weston_log("qdwin: ext_workspace_manager_v1 global create failed "
+			   "(workspaces unavailable)\n");
 
 	/* qdwin_locker_v1 — peer locker global. Defaults to the same uid
 	 * as the shell unless overridden (single-admin assumption per
@@ -14471,6 +15139,7 @@ fail:
 	weston_layer_fini(&qdwin->held_layer);
 	weston_layer_fini(&qdwin->normal_layer);
 	weston_layer_fini(&qdwin->minimized_layer);
+	weston_layer_fini(&qdwin->workspace_hidden_layer);
 	weston_layer_fini(&qdwin->panel_layer);
 	weston_layer_fini(&qdwin->notification_layer);
 	weston_layer_fini(&qdwin->launcher_layer);

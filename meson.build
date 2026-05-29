@@ -217,6 +217,35 @@ fractional_scale_protocol_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# v24 workspaces: ext-workspace-v1 (server). qdwin implements the standard
+# workspace protocol so any taskbar (qdshell + others) can list/activate
+# workspaces. The window->workspace mapping the bar needs for occupancy is
+# carried by qdwin_shell_v1.toplevel_workspace (a sidecar), since
+# ext-workspace-v1 is window-agnostic. See
+# todo/decisions/qdwin-workspaces-ext-protocol.md.
+ext_workspace_xml = files(
+  wayland_protocols_dir / 'staging/ext-workspace/ext-workspace-v1.xml',
+)
+ext_workspace_server_header = custom_target(
+  'ext-workspace-v1-server-header',
+  input: ext_workspace_xml,
+  output: 'ext-workspace-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_workspace_protocol_code = custom_target(
+  'ext-workspace-v1-private-code',
+  input: ext_workspace_xml,
+  output: 'ext-workspace-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+# Client header for the host workspace probe (qdwin-workspace-probe).
+ext_workspace_client_header = custom_target(
+  'ext-workspace-v1-client-header',
+  input: ext_workspace_xml,
+  output: 'ext-workspace-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
 # §6.10: wp_security_context_v1 — sandboxed-client identity. Lets
 # waypipe (and any other sandbox engine) tag the bridged Wayland
 # connection so the compositor can apply per-app policy without
@@ -386,6 +415,8 @@ qdwin_plugin = shared_library(
     tablet_v2_protocol_code,
     fractional_scale_server_header,
     fractional_scale_protocol_code,
+    ext_workspace_server_header,
+    ext_workspace_protocol_code,
     primary_selection_server_header,
     primary_selection_protocol_code,
     security_context_server_header,
@@ -447,6 +478,19 @@ executable('qdwin-locker-probe',
     'test-client/qdwin-locker-probe.c',
     qdwin_locker_client_header,
     qdwin_locker_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# ext-workspace-v1 server probe. Binds ext_workspace_manager_v1, syncs the
+# workspace set, and (with --activate=K) switches + re-reads the active
+# index. Driven by tests/host/11-workspace-protocol.md.
+executable('qdwin-workspace-probe',
+  sources: [
+    'test-client/qdwin-workspace-probe.c',
+    ext_workspace_client_header,
+    ext_workspace_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,
