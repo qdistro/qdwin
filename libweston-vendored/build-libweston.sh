@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
 # One-shot build wrapper for the qdistro-vendored libweston-14.
-# Output: src/build/libweston/libweston-14.so.0.0.2
 #
-# This is intentionally not wired into compositor/meson.build because
+# Two profiles (set QDWIN_LIBWESTON_PROFILE):
+#
+#   headless (default) — minimal headless-only build for host-side
+#       protocol tests (run-null-parent-test.sh, run-protocol-tests.sh).
+#       Output under /tmp/qdwin-libweston-prefix. Nothing global touched.
+#
+#   production         — full backend set (drm + pipewire + rdp + wayland
+#       + x11 + headless, GL renderer, xwayland, lcms) for shipping in a
+#       qdistro VM/image. The system `weston` binary loads this
+#       libweston-14.so.0 via LD_LIBRARY_PATH and its backends via
+#       WESTON_MODULE_MAP. Installed under $PREFIX (default
+#       /tmp/qdwin-libweston-prod-prefix); qdistro's
+#       install-vendored-libweston.sh stages that tree into
+#       /usr/libexec/qdistro/qdwin-libweston/. See
+#       doc/decisions/0001-vendored-libweston-packaging.md.
+#
+# This is intentionally not wired into qdwin's meson.build because
 # (a) it builds a different pinned-version sub-project with its own
 # meson, (b) we want the build cache invalidated only when the
 # vendored sources change, not on every qdwin rebuild.
@@ -11,7 +26,72 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/src"
-BUILD="$SRC/build"
+
+PROFILE="${QDWIN_LIBWESTON_PROFILE:-headless}"
+
+case "$PROFILE" in
+headless)
+    BUILD="$SRC/build"
+    PREFIX="${QDWIN_LIBWESTON_PREFIX:-/tmp/qdwin-libweston-prefix}"
+    MESON_OPTS=(
+        -Dbackend-drm=false
+        -Dbackend-rdp=false
+        -Dbackend-vnc=false
+        -Dbackend-pipewire=false
+        -Dbackend-wayland=false
+        -Dbackend-x11=false
+        -Dbackend-headless=true
+        -Dbackend-default=headless
+        -Drenderer-gl=false
+        -Dxwayland=false
+        -Dremoting=false
+        -Dpipewire=false
+        -Dcolor-management-lcms=false
+    )
+    NINJA_TARGETS=(
+        libweston/libweston-14.so.0.0.2
+        libweston/backend-headless/headless-backend.so
+    )
+    ;;
+production)
+    # Separate build dir so the production cache does not clobber the
+    # headless test cache (different backend set → full reconfigure).
+    BUILD="$SRC/build-prod"
+    PREFIX="${QDWIN_LIBWESTON_PREFIX:-/tmp/qdwin-libweston-prod-prefix}"
+    # Backend set mirrors the qdwin systemd unit's WESTON_MODULE_MAP
+    # (drm + pipewire + rdp + wayland + x11 + headless + xwayland + lcms).
+    # GL renderer ON for real-GPU hosts (pixman still selectable in
+    # weston.ini for virtio-gpu). VNC stays off (unused by qdwin).
+    #
+    # Each backend defaults ON but can be forced off for host-side build
+    # validation on machines that lack a specific devel package, e.g.
+    #   QDWIN_LW_PIPEWIRE=false QDWIN_LW_RDP=false ... production build
+    # The VM/image deps (scripts/.../install-deps.sh) cover the full set,
+    # so leave these unset for a shippable tree.
+    MESON_OPTS=(
+        -Dbackend-drm="${QDWIN_LW_DRM:-true}"
+        -Dbackend-rdp="${QDWIN_LW_RDP:-true}"
+        -Dbackend-vnc=false
+        -Dbackend-pipewire="${QDWIN_LW_PIPEWIRE:-true}"
+        -Dbackend-wayland="${QDWIN_LW_WAYLAND:-true}"
+        -Dbackend-x11="${QDWIN_LW_X11:-true}"
+        -Dbackend-headless=true
+        -Dbackend-default=drm
+        -Drenderer-gl="${QDWIN_LW_GL:-true}"
+        -Dxwayland="${QDWIN_LW_XWAYLAND:-true}"
+        -Dremoting=false
+        -Dpipewire="${QDWIN_LW_PIPEWIRE:-true}"
+        -Dcolor-management-lcms="${QDWIN_LW_LCMS:-true}"
+    )
+    # Build everything that gets installed for this backend set.
+    NINJA_TARGETS=()
+    ;;
+*)
+    echo "error: unknown QDWIN_LIBWESTON_PROFILE='$PROFILE'" \
+         "(want 'headless' or 'production')" >&2
+    exit 2
+    ;;
+esac
 
 if [[ ! -d "$SRC" ]]; then
     echo "error: $SRC missing — re-extract weston @ tag $(cat "$HERE/VERSION") into src/" >&2
@@ -20,30 +100,18 @@ fi
 
 cd "$SRC"
 
-# Reconfigure if build/ doesn't exist OR if any source file is newer than
-# the existing build.ninja. Cheap heuristic; meson handles incremental.
+# Reconfigure if build/ doesn't exist. meson handles incremental rebuilds
+# thereafter; delete the build dir to force a profile/option change.
 if [[ ! -f "$BUILD/build.ninja" ]]; then
     rm -rf "$BUILD"
     meson setup "$BUILD" \
-        --prefix=/tmp/qdwin-libweston-prefix \
-        -Dbackend-drm=false \
-        -Dbackend-rdp=false \
-        -Dbackend-vnc=false \
-        -Dbackend-pipewire=false \
-        -Dbackend-wayland=false \
-        -Dbackend-x11=false \
-        -Dbackend-headless=true \
-        -Dbackend-default=headless \
-        -Drenderer-gl=false \
+        --prefix="$PREFIX" \
+        "${MESON_OPTS[@]}" \
         -Dscreenshare=false \
-        -Dxwayland=false \
-        -Dremoting=false \
-        -Dpipewire=false \
         -Dshell-desktop=false \
         -Dshell-fullscreen=false \
         -Dshell-ivi=false \
         -Dshell-kiosk=false \
-        -Dcolor-management-lcms=false \
         -Dimage-jpeg=false \
         -Dimage-webp=false \
         -Dsystemd=false \
@@ -55,24 +123,31 @@ if [[ ! -f "$BUILD/build.ninja" ]]; then
         -Dwcap-decode=false
 fi
 
-ninja -C "$BUILD" \
-    libweston/libweston-14.so.0.0.2 \
-    libweston/backend-headless/headless-backend.so
+if [[ ${#NINJA_TARGETS[@]} -gt 0 ]]; then
+    ninja -C "$BUILD" "${NINJA_TARGETS[@]}"
+else
+    ninja -C "$BUILD"
+fi
 
-# Install into the build's --prefix. libweston has its module-search
-# directory baked in at compile time (= ${prefix}/lib64/libweston-14),
-# so weston only finds the headless backend if the install populates
-# that directory. We use a writable temp prefix; nothing global is
-# touched.
+# Install into the build's --prefix. libweston bakes its module-search
+# directory in at compile time (= ${prefix}/lib64/libweston-14), so
+# weston only finds the backends if the install populates that
+# directory. We use a writable temp prefix; nothing global is touched.
 DESTDIR= ninja -C "$BUILD" install >/dev/null
 
-PREFIX=/tmp/qdwin-libweston-prefix
-
 echo
+echo "Profile:         $PROFILE"
 echo "Built libweston: $BUILD/libweston/libweston-14.so.0.0.2"
-echo "Built backend:   $BUILD/libweston/backend-headless/headless-backend.so"
 echo "Installed under: $PREFIX"
-ls -la "$PREFIX/lib64/libweston-14.so"* "$PREFIX/lib64/libweston-14/headless-backend.so"
+ls -la "$PREFIX/lib64/libweston-14.so"*
+echo "Backends:"
+ls -1 "$PREFIX/lib64/libweston-14/"*.so 2>/dev/null | sed 's/^/  /'
 echo
-echo "Use with:"
-echo "  LD_LIBRARY_PATH=$PREFIX/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} <qdwin-launch-cmd>"
+if [[ "$PROFILE" == production ]]; then
+    echo "Stage into a VM/image with:"
+    echo "  QDWIN_LIBWESTON_PREFIX=$PREFIX \\"
+    echo "    qdistro/scripts/install/install-vendored-libweston.sh"
+else
+    echo "Use with:"
+    echo "  LD_LIBRARY_PATH=$PREFIX/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} <qdwin-launch-cmd>"
+fi

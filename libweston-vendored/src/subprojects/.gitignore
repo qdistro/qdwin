@@ -1,2 +1,6 @@
 /display-info
-
+# Meson subproject build artifacts created by the production-profile
+# build (libdisplay-info wrap fallback): the lock file and the
+# downloaded-tarball cache. Never committed.
+/.wraplock
+/packagecache
