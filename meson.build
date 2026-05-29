@@ -547,6 +547,24 @@ executable('qdwin-output-probe',
   install: true,
 )
 
+# qdwin_nested_v1 negative/gating probe. Binds qdwin_shell_v1 (as the shell)
+# + qdwin_nested_manager_v1 on one client, advertises an inner toplevel, and
+# exercises the advertise -> nested_proxy_pending -> nested_proxy_decision
+# state machine (allow/deny/defer/stale/double), plus the bind-uid gate,
+# destroy ordering, and malformed/placeholder advertises. Driven by
+# tests/host/16-nested-protocol.md.
+executable('qdwin-nested-probe',
+  sources: [
+    'test-client/qdwin-nested-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+    qdwin_nested_client_header,
+    qdwin_nested_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 # xdg-activation negative-path probe. Drives qdwin_activation_activate with an
 # unknown/forged token and asserts the compositor drops it without a protocol
 # error or crash. Driven by tests/host/09-xdg-activation-gating.md.
