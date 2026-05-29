@@ -1020,6 +1020,26 @@ qdwin_desktop_surface_peer(struct weston_desktop_surface *dsurf,
 	return 1;
 }
 
+/* §6.8 nested-proxy identity hardening: read the peer uid of a connected
+ * AF_UNIX socket fd via SO_PEERCRED. Returns 1 and fills *uid_out on
+ * success, 0 on failure (the credential is unreadable, e.g. not a unix
+ * socket). Callers MUST fail closed when this returns 0 — an unverifiable
+ * peer must never be treated as a trusted same-uid owner. */
+static int
+qdwin_fd_peer_uid(int fd, uid_t *uid_out)
+{
+	if (fd < 0)
+		return 0;
+	struct ucred cred;
+	socklen_t len = sizeof cred;
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 ||
+	    len != sizeof cred)
+		return 0;
+	if (uid_out)
+		*uid_out = cred.uid;
+	return 1;
+}
+
 /* Match a toplevel to the locker process by (pid, uid).  We cannot use
  * wl_client pointer comparison because qdlocker's Qt xdg_toplevel and its
  * pywayland control connection are separate wl_clients sharing a pid. */
@@ -13928,6 +13948,28 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 					uint32_t origin_uid)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+
+	/* Nested-proxy identity hardening: origin_uid is client-asserted and
+	 * feeds the per-uid colour chip + the broker authz decision, so it
+	 * must NOT be taken on the client's word. The advertising client is
+	 * the nested compositor (bound peer-uid-filtered to allowed_uid); in
+	 * the per-uid tier-2 model every inner client it can advertise runs
+	 * as that same uid. Bind origin_uid to the advertising client's
+	 * kernel-resolved peer uid: if the client asserts a different uid,
+	 * override it (and log the spoof attempt). Fail closed if the peer
+	 * credential is unreadable. */
+	pid_t peer_pid = 0; uid_t peer_uid = 0; gid_t peer_gid = 0;
+	wl_client_get_credentials(client, &peer_pid, &peer_uid, &peer_gid);
+	(void)peer_pid; (void)peer_gid;
+	if (origin_uid != (uint32_t)peer_uid) {
+		weston_log("qdwin: nested-toplevel advertise origin_uid=%u "
+			   "disagrees with advertising client peer uid=%u; "
+			   "overriding to peer uid (client cannot assert a "
+			   "foreign origin_uid)\n",
+			   origin_uid, (unsigned)peer_uid);
+		origin_uid = (uint32_t)peer_uid;
+	}
+
 	struct wl_resource *tl_res = wl_resource_create(
 		client, &qdwin_nested_toplevel_v1_interface,
 		wl_resource_get_version(resource), id);
@@ -13947,6 +13989,8 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 	t->input_sink  = input_sink ? strdup(input_sink) : NULL;
 	t->app_id      = app_id     ? strdup(app_id)     : NULL;
 	t->title       = title      ? strdup(title)      : NULL;
+	/* origin_uid here is the verified peer uid (see above), not the raw
+	 * client assertion. */
 	t->origin_uid  = origin_uid;
 	wl_list_insert(&qdwin->nested_toplevels, &t->link);
 
@@ -13955,12 +13999,13 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 				       qdwin_nested_toplevel_resource_destroy);
 
 	weston_log("qdwin: nested-toplevel advertise pw_node='%s' "
-		   "input_sink='%s' app_id=%s title=%s origin_uid=%u\n",
+		   "input_sink='%s' app_id=%s title=%s origin_uid=%u "
+		   "(peer uid=%u)\n",
 		   t->pw_node    ? t->pw_node    : "",
 		   t->input_sink ? t->input_sink : "",
 		   t->app_id     ? t->app_id     : "",
 		   t->title      ? t->title      : "",
-		   origin_uid);
+		   origin_uid, (unsigned)peer_uid);
 
 	/* §6.8 S2: synthesise the outer-side proxy toplevel + curtain. */
 	t->proxy_tl = qdwin_nested_proxy_create(qdwin, t,
@@ -13973,6 +14018,36 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 		t->proxy_tl->proxy_input_sink_fd = -1;
 		if (input_sink && *input_sink) {
 			int fd = qdwin_nested_input_sink_connect(input_sink);
+			/* Nested-proxy identity hardening: input_sink is a
+			 * client-asserted socket path that the outer side
+			 * *writes synthesised input into*. The path embeds a
+			 * /run/user/<uid>/ segment the client controls, so a
+			 * malicious advertiser could point it at another uid's
+			 * listener. Bind the sink to the advertising client's
+			 * verified identity: the connected peer's uid (via
+			 * SO_PEERCRED) must equal the verified origin_uid
+			 * (== advertising client peer uid). Reject on mismatch
+			 * or unreadable creds (fail closed: treat the proxy as
+			 * display-only rather than routing input to a sink we
+			 * can't attribute to the advertiser). */
+			if (fd >= 0) {
+				uid_t sink_uid = 0;
+				if (!qdwin_fd_peer_uid(fd, &sink_uid) ||
+				    sink_uid != (uid_t)origin_uid) {
+					weston_log("qdwin/nested-proxy: "
+						   "input-sink peer uid=%u does "
+						   "not match origin uid=%u "
+						   "(handle=%u path=%s) — "
+						   "refusing sink, proxy is "
+						   "display-only\n",
+						   (unsigned)sink_uid,
+						   (unsigned)origin_uid,
+						   t->proxy_tl->handle,
+						   input_sink);
+					close(fd);
+					fd = -1;
+				}
+			}
 			if (fd >= 0) {
 				t->proxy_tl->proxy_input_sink_fd = fd;
 				if (qdwin_nested_input_sink_send(fd, 1, NULL, 0) == 0)
@@ -15612,7 +15687,6 @@ qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	struct qdwin_toplevel *tl = qdwin_toplevel_from_handle(qdwin, handle);
-	(void)client;
 	/* §6.8 S2b: consumer wl_clients (qdistro-nested-pixelfeed) bind
 	 * qdwin_shell_v1 via the standard registry path (already
 	 * peer-uid-filtered to allowed_uid in bind_qdwin_shell), so we
@@ -15626,6 +15700,31 @@ qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 				       "bind_proxy_pixels: handle %u is not a "
 				       "nested-proxy", handle);
 		return;
+	}
+	/* Nested-proxy identity hardening: tie the pixel feed to the proxy's
+	 * verified owner. The binding client must run as the same uid that
+	 * advertised the proxy (proxy_origin_uid is the kernel-resolved
+	 * advertise-time peer uid, not a client assertion). Without this a
+	 * client could call bind_proxy_pixels on a proxy advertised by a
+	 * different uid and replace its pixels with attacker-controlled
+	 * content. Fail closed if the peer credential is unreadable. */
+	{
+		pid_t cpid = 0; uid_t cuid = 0; gid_t cgid = 0;
+		wl_client_get_credentials(client, &cpid, &cuid, &cgid);
+		(void)cpid; (void)cgid;
+		if (cuid != (uid_t)tl->proxy_origin_uid) {
+			weston_log("qdwin/nested-proxy: bind_proxy_pixels "
+				   "refused handle=%u: caller uid=%u != proxy "
+				   "origin uid=%u\n",
+				   handle, (unsigned)cuid,
+				   (unsigned)tl->proxy_origin_uid);
+			wl_resource_post_error(
+				resource,
+				QDWIN_SHELL_V1_ERROR_INVALID_HANDLE,
+				"bind_proxy_pixels: caller does not own "
+				"nested-proxy handle %u", handle);
+			return;
+		}
 	}
 	struct weston_surface *ws = wl_resource_get_user_data(surface_res);
 	if (!ws) {

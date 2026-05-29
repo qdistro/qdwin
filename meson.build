@@ -547,6 +547,23 @@ executable('qdwin-output-probe',
   install: true,
 )
 
+# qdwin_nested_v1 nested-proxy identity probe. Binds
+# qdwin_nested_manager_v1 and calls advertise_toplevel with a deliberately
+# FOREIGN origin_uid (and optionally a foreign-owned input_sink), so the
+# harness can assert (via the weston log) that qdwin overrides origin_uid
+# back to the advertising client's verified peer uid and refuses an
+# input_sink whose peer uid doesn't match. Driven by
+# tests/host/16-nested-identity.md.
+executable('qdwin-nested-probe',
+  sources: [
+    'test-client/qdwin-nested-probe.c',
+    qdwin_nested_client_header,
+    qdwin_nested_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 # xdg-activation negative-path probe. Drives qdwin_activation_activate with an
 # unknown/forged token and asserts the compositor drops it without a protocol
 # error or crash. Driven by tests/host/09-xdg-activation-gating.md.
@@ -699,6 +716,14 @@ test('xdg-activation-policy',
   python3,
   args: [
     files('qdwin/test_xdg_activation_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+test('nested-identity-policy',
+  python3,
+  args: [
+    files('qdwin/test_nested_identity_policy.py'),
     files('qdwin/qdwin.c'),
   ],
 )
