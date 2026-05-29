@@ -519,7 +519,10 @@ executable('qdwin-locker-probe',
 
 # ext-workspace-v1 server probe. Binds ext_workspace_manager_v1, syncs the
 # workspace set, and (with --activate=K) switches + re-reads the active
-# index. Driven by tests/host/11-workspace-protocol.md.
+# index. Also covers the bind-time group→output_enter association
+# (--expect-output-enter) and the atomic-commit staging of
+# create_workspace+activate (--batch-activate=K). Driven by
+# tests/host/11-workspace-protocol.md and 15-ext-workspace-batch.md.
 executable('qdwin-workspace-probe',
   sources: [
     'test-client/qdwin-workspace-probe.c',

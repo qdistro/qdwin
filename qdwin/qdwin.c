@@ -8260,6 +8260,21 @@ qdwin_workspace_remove(struct qdwin *qdwin, uint32_t index)
 
 /* ---- ext-workspace-v1 server objects ---------------------------- */
 
+/* A request staged on a manager between commits. The protocol requires
+ * activate/create_workspace/remove to take effect atomically on `commit`,
+ * not eagerly when the request arrives. */
+enum qdwin_ext_ws_pending_kind {
+	QDWIN_EXT_WS_PENDING_ACTIVATE,   /* activate handle at .index */
+	QDWIN_EXT_WS_PENDING_CREATE,     /* create a new workspace */
+	QDWIN_EXT_WS_PENDING_REMOVE,     /* remove handle at .index */
+};
+
+struct qdwin_ext_ws_pending_op {
+	struct wl_list link;             /* qdwin_ext_ws_manager::pending */
+	enum qdwin_ext_ws_pending_kind kind;
+	uint32_t index;                  /* workspace index for ACTIVATE/REMOVE */
+};
+
 struct qdwin_ext_ws_manager {
 	struct wl_list link;             /* qdwin::ext_ws_managers */
 	struct qdwin *qdwin;
@@ -8267,6 +8282,7 @@ struct qdwin_ext_ws_manager {
 	struct wl_resource *group;       /* the single ext_workspace_group_handle_v1 */
 	struct wl_resource *handles[QDWIN_MAX_WORKSPACES];  /* per workspace index */
 	uint32_t handle_count;
+	struct wl_list pending;          /* staged ops, applied on commit */
 	bool stopped;
 };
 
@@ -8410,6 +8426,61 @@ qdwin_ext_ws_broadcast_state(struct qdwin *qdwin)
 	}
 }
 
+/* ---- atomic-commit staging ---------------------------------------
+ * activate/create_workspace/remove are buffered per manager resource and
+ * applied as a batch from the manager's `commit` handler. */
+
+static void
+qdwin_ext_ws_pending_clear(struct qdwin_ext_ws_manager *mgr)
+{
+	struct qdwin_ext_ws_pending_op *op, *tmp;
+	wl_list_for_each_safe(op, tmp, &mgr->pending, link) {
+		wl_list_remove(&op->link);
+		free(op);
+	}
+}
+
+static void
+qdwin_ext_ws_pending_add(struct qdwin_ext_ws_manager *mgr,
+			 enum qdwin_ext_ws_pending_kind kind, uint32_t index)
+{
+	struct qdwin_ext_ws_pending_op *op = calloc(1, sizeof *op);
+	if (!op) {
+		wl_client_post_no_memory(wl_resource_get_client(mgr->resource));
+		return;
+	}
+	op->kind = kind;
+	op->index = index;
+	/* Preserve request order: requests are replayed front-to-back. */
+	wl_list_insert(mgr->pending.prev, &op->link);
+}
+
+static void
+qdwin_ext_ws_manager_flush(struct qdwin_ext_ws_manager *mgr)
+{
+	struct qdwin *qdwin = mgr->qdwin;
+	struct qdwin_ext_ws_pending_op *op, *tmp;
+	if (mgr->stopped || !qdwin) {
+		qdwin_ext_ws_pending_clear(mgr);
+		return;
+	}
+	wl_list_for_each_safe(op, tmp, &mgr->pending, link) {
+		switch (op->kind) {
+		case QDWIN_EXT_WS_PENDING_ACTIVATE:
+			qdwin_set_active_workspace(qdwin, op->index);
+			break;
+		case QDWIN_EXT_WS_PENDING_CREATE:
+			qdwin_workspace_create(qdwin);
+			break;
+		case QDWIN_EXT_WS_PENDING_REMOVE:
+			qdwin_workspace_remove(qdwin, op->index);
+			break;
+		}
+		wl_list_remove(&op->link);
+		free(op);
+	}
+}
+
 /* ---- ext_workspace_handle_v1 requests ---- */
 
 static void
@@ -8426,7 +8497,9 @@ qdwin_ext_ws_handle_activate(struct wl_client *client, struct wl_resource *resou
 	(void)client;
 	if (!ref || !ref->mgr || !ref->mgr->qdwin)
 		return;
-	qdwin_set_active_workspace(ref->mgr->qdwin, ref->index);
+	/* Staged until commit (atomic per protocol). */
+	qdwin_ext_ws_pending_add(ref->mgr, QDWIN_EXT_WS_PENDING_ACTIVATE,
+				 ref->index);
 }
 
 static void
@@ -8452,7 +8525,9 @@ qdwin_ext_ws_handle_remove(struct wl_client *client, struct wl_resource *resourc
 	(void)client;
 	if (!ref || !ref->mgr || !ref->mgr->qdwin)
 		return;
-	qdwin_workspace_remove(ref->mgr->qdwin, ref->index);
+	/* Staged until commit (atomic per protocol). */
+	qdwin_ext_ws_pending_add(ref->mgr, QDWIN_EXT_WS_PENDING_REMOVE,
+				 ref->index);
 }
 
 static const struct ext_workspace_handle_v1_interface qdwin_ext_ws_handle_impl = {
@@ -8486,7 +8561,8 @@ qdwin_ext_ws_group_create_workspace(struct wl_client *client,
 	(void)client; (void)workspace;  /* name is positional; ignored */
 	if (!mgr || !mgr->qdwin)
 		return;
-	qdwin_workspace_create(mgr->qdwin);
+	/* Staged until commit (atomic per protocol). */
+	qdwin_ext_ws_pending_add(mgr, QDWIN_EXT_WS_PENDING_CREATE, 0);
 }
 
 static void
@@ -8514,10 +8590,14 @@ qdwin_ext_ws_group_resource_destroy(struct wl_resource *resource)
 static void
 qdwin_ext_ws_manager_commit(struct wl_client *client, struct wl_resource *resource)
 {
-	/* qdwin applies activate/create/remove eagerly, so the atomic
-	 * commit boundary is a no-op here — the client's view is already
-	 * consistent per-request. */
-	(void)client; (void)resource;
+	struct qdwin_ext_ws_manager *mgr = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!mgr)
+		return;
+	/* Apply the batch of requests staged since the last commit
+	 * atomically. The applied workspace ops broadcast/resync to all
+	 * managers themselves. */
+	qdwin_ext_ws_manager_flush(mgr);
 }
 
 static void
@@ -8528,6 +8608,8 @@ qdwin_ext_ws_manager_stop(struct wl_client *client, struct wl_resource *resource
 	if (!mgr)
 		return;
 	mgr->stopped = true;
+	/* Per spec, requests staged but never committed are discarded. */
+	qdwin_ext_ws_pending_clear(mgr);
 	ext_workspace_manager_v1_send_finished(mgr->resource);
 	/* finished is a destructor event — tear the resource down now. The
 	 * manager resource destructor frees the struct and unlinks it. */
@@ -8547,6 +8629,7 @@ qdwin_ext_ws_manager_resource_destroy(struct wl_resource *resource)
 	if (!mgr)
 		return;
 	wl_list_remove(&mgr->link);
+	qdwin_ext_ws_pending_clear(mgr);
 	/* Null back-pointers so any late group/handle destructor (the
 	 * client may destroy them after the manager) does not deref freed
 	 * memory. The resources themselves are destroyed by the client. */
@@ -8563,6 +8646,70 @@ qdwin_ext_ws_manager_resource_destroy(struct wl_resource *resource)
 	free(mgr);
 }
 
+/* Find the wl_output protocol object that `client` has bound for `output`,
+ * or NULL if it hasn't bound that output's global yet. wl_output resources
+ * live on the driving weston_head's resource_list. */
+static struct wl_resource *
+qdwin_output_resource_for_client(struct weston_output *output,
+				 struct wl_client *client)
+{
+	struct weston_head *head;
+	wl_list_for_each(head, &output->head_list, output_link) {
+		struct wl_resource *res;
+		wl_resource_for_each(res, &head->resource_list) {
+			if (wl_resource_get_client(res) == client)
+				return res;
+		}
+	}
+	return NULL;
+}
+
+/* Associate the desktop-spanning group with each output this client can see
+ * (output_enter). Per-monitor bars key off this to know the group covers
+ * their output. Skips outputs the client hasn't bound yet. */
+static void
+qdwin_ext_ws_group_send_output_enters(struct qdwin_ext_ws_manager *mgr)
+{
+	struct qdwin *qdwin = mgr->qdwin;
+	struct wl_client *client = wl_resource_get_client(mgr->resource);
+	struct weston_output *output;
+	if (!mgr->group)
+		return;
+	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+		struct wl_resource *ores =
+			qdwin_output_resource_for_client(output, client);
+		if (ores)
+			ext_workspace_group_handle_v1_send_output_enter(
+				mgr->group, ores);
+	}
+}
+
+/* Hotplug: an output appeared or disappeared. Notify every live manager's
+ * group so per-monitor bars track the new/removed wl_output. `enter` selects
+ * output_enter vs output_leave. */
+static void
+qdwin_ext_ws_broadcast_output(struct qdwin *qdwin, struct weston_output *output,
+			      bool enter)
+{
+	struct qdwin_ext_ws_manager *mgr;
+	wl_list_for_each(mgr, &qdwin->ext_ws_managers, link) {
+		struct wl_resource *ores;
+		if (mgr->stopped || !mgr->group)
+			continue;
+		ores = qdwin_output_resource_for_client(output,
+				wl_resource_get_client(mgr->resource));
+		if (!ores)
+			continue;
+		if (enter)
+			ext_workspace_group_handle_v1_send_output_enter(
+				mgr->group, ores);
+		else
+			ext_workspace_group_handle_v1_send_output_leave(
+				mgr->group, ores);
+		ext_workspace_manager_v1_send_done(mgr->resource);
+	}
+}
+
 static void
 bind_ext_workspace_manager(struct wl_client *client, void *data,
 			   uint32_t version, uint32_t id)
@@ -8574,6 +8721,7 @@ bind_ext_workspace_manager(struct wl_client *client, void *data,
 		return;
 	}
 	mgr->qdwin = qdwin;
+	wl_list_init(&mgr->pending);
 	mgr->resource = wl_resource_create(client,
 		&ext_workspace_manager_v1_interface, version, id);
 	if (!mgr->resource) {
@@ -8595,6 +8743,9 @@ bind_ext_workspace_manager(struct wl_client *client, void *data,
 							      mgr->group);
 		ext_workspace_group_handle_v1_send_capabilities(mgr->group,
 			EXT_WORKSPACE_GROUP_HANDLE_V1_GROUP_CAPABILITIES_CREATE_WORKSPACE);
+		/* Associate the group with the client's outputs so per-monitor
+		 * bars know this group spans them. */
+		qdwin_ext_ws_group_send_output_enters(mgr);
 	}
 	qdwin_ext_ws_manager_create_handles(mgr);
 	ext_workspace_manager_v1_send_done(mgr->resource);
@@ -9915,6 +10066,9 @@ qdwin_on_output_destroyed(struct wl_listener *listener, void *data)
 		wl_container_of(listener, qdwin, output_destroyed_listener);
 	struct weston_output *output = data;
 	qdwin_send_output_removed(qdwin, output);
+	/* ext-workspace: drop the group's association with this output. */
+	if (output)
+		qdwin_ext_ws_broadcast_output(qdwin, output, false);
 	qdwin_om_resync_all(qdwin);
 }
 
@@ -9929,6 +10083,14 @@ qdwin_on_output_changed(struct wl_listener *listener, void *data)
 	qdwin_panels_on_output_change(qdwin);
 	if (output)
 		qdwin_send_output_created_evt(qdwin, output);
+	/* ext-workspace: associate the group with the newly created/enabled
+	 * output. Clients that bind this output's wl_output global only after
+	 * this fires are handled at their bind time (a client binding the
+	 * manager re-runs output_enter for all its outputs); for clients that
+	 * bound the wl_output late we rely on output-management's resync and the
+	 * fact that the group already spans the desktop. */
+	if (output)
+		qdwin_ext_ws_broadcast_output(qdwin, output, true);
 	/* v26: if the shell has forced the display off, a newly created /
 	 * re-enabled output must come up powered off too — otherwise a hotplug
 	 * or output-management re-enable during the display-off idle leaves that
