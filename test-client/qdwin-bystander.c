@@ -87,6 +87,11 @@
  *   subscribelast     → subscribe to the most recently added toplevel
  *   list              → print last seen toplevels to stderr
  *   maxlast / restorelast → operate on most recently added toplevel
+ *   tile <handle> <left|right|none>  → request_tile (v25)
+ *   fullscreen <handle> [0|1]        → request_fullscreen (v25)
+ *   wmpolicy <focus> <ffm_ms> <raise_click> <raise_hover> <placement>
+ *            <snap_en> <snap_dist>   → set_wm_policy (v25)
+ *   hotkey <id> <modifiers> <key>    → register_hotkey (v19/v25)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -107,7 +112,11 @@
 #include "qdwin-shell-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-#define BIND_VERSION 14
+/* v25: bind high enough to exercise set_wm_policy / request_fullscreen /
+ * request_tile and the v19 register_hotkey path (host test 13-wm-policy).
+ * v25 added only requests + enums (no new events), so the listener struct
+ * is unchanged. The bind is still clamped to the advertised version. */
+#define BIND_VERSION 25
 #define MAX_TOPS 16
 #define MAX_STREAMS 4
 #define FIFO_PATH_DEFAULT "/tmp/qdwin-cmd.fifo"
@@ -296,7 +305,13 @@ on_toplevel_added(void *d, struct qdwin_shell_v1 *s,
 /* ---- noop event listeners (signatures must match exactly) ---- */
 static void l_geom(void *d, struct qdwin_shell_v1 *s, uint32_t h,
 		   int32_t x, int32_t y, uint32_t w, uint32_t H)
-{ (void)d; (void)s; (void)h; (void)x; (void)y; (void)w; (void)H; }
+{
+	(void)d; (void)s;
+	/* Logged so host tests (e.g. tests/host/13-wm-policy.md) can scrape
+	 * the last geometry for a handle after a tile/fullscreen/placement. */
+	fprintf(stderr, "qdwin-bystander: toplevel_geometry handle=%u "
+		"x=%d y=%d w=%u h=%u\n", h, x, y, w, H);
+}
 static void l_state(void *d, struct qdwin_shell_v1 *s, uint32_t h, uint32_t st)
 {
 	(void)d; (void)s;
@@ -373,6 +388,45 @@ static void l_secctx(void *d, struct qdwin_shell_v1 *s,
 static void l_seat_focus_changed(void *d, struct qdwin_shell_v1 *s,
 				 const char *seat, uint32_t handle)
 { (void)d; (void)s; (void)seat; (void)handle; }
+/* v15-v25 events: the bystander binds at BIND_VERSION (25) so the
+ * compositor will deliver every event up to v25. libwayland aborts the
+ * client if any delivered event has a NULL listener slot, so provide a
+ * no-op (or logging) handler for each. hotkey_pressed logs so the
+ * register_hotkey host test can confirm delivery. */
+static void l_overlay_key(void *d, struct qdwin_shell_v1 *s, uint32_t role,
+			  uint32_t sym, const char *utf8, uint32_t state)
+{ (void)d; (void)s; (void)role; (void)sym; (void)utf8; (void)state; }
+static void l_selection_set_src_id(void *d, struct qdwin_shell_v1 *s,
+				   const char *eng, const char *app,
+				   const char *inst)
+{ (void)d; (void)s; (void)eng; (void)app; (void)inst; }
+static void l_peer_identity(void *d, struct qdwin_shell_v1 *s, uint32_t h,
+			    uint32_t pid, uint32_t st, uint32_t st_hi,
+			    uint32_t uid, const char *exe, const char *label)
+{ (void)d; (void)s; (void)h; (void)pid; (void)st; (void)st_hi; (void)uid;
+  (void)exe; (void)label; }
+static void l_data_offer_recv_pending(void *d, struct qdwin_shell_v1 *s,
+				      uint32_t rh, const char *seat,
+				      uint32_t src, uint32_t tgt,
+				      const char *mime)
+{ (void)d; (void)s; (void)rh; (void)seat; (void)src; (void)tgt; (void)mime; }
+static void l_hotkey_pressed(void *d, struct qdwin_shell_v1 *s, uint32_t id)
+{
+	(void)d; (void)s;
+	fprintf(stderr, "qdwin-bystander: hotkey_pressed id=%u\n", id);
+}
+static void l_chrome_button(void *d, struct qdwin_shell_v1 *s, uint32_t h,
+			    uint32_t side, wl_fixed_t sx, wl_fixed_t sy,
+			    uint32_t button, uint32_t state)
+{ (void)d; (void)s; (void)h; (void)side; (void)sx; (void)sy; (void)button;
+  (void)state; }
+static void l_popup_button(void *d, struct qdwin_shell_v1 *s, uint32_t h,
+			   wl_fixed_t sx, wl_fixed_t sy, uint32_t button,
+			   uint32_t state)
+{ (void)d; (void)s; (void)h; (void)sx; (void)sy; (void)button; (void)state; }
+static void l_toplevel_workspace(void *d, struct qdwin_shell_v1 *s,
+				 uint32_t h, uint32_t index)
+{ (void)d; (void)s; (void)h; (void)index; }
 
 static const struct qdwin_shell_v1_listener listener = {
 	.hello                  = on_hello,
@@ -396,7 +450,15 @@ static const struct qdwin_shell_v1_listener listener = {
 	.selection_set          = l_selection_set,
 	.activation_pending     = l_activation_pending,
 	.toplevel_security_context = l_secctx,
+	.toplevel_peer_identity = l_peer_identity,
 	.seat_focus_changed     = l_seat_focus_changed,
+	.overlay_key            = l_overlay_key,
+	.selection_set_source_identity = l_selection_set_src_id,
+	.data_offer_receive_pending = l_data_offer_recv_pending,
+	.hotkey_pressed         = l_hotkey_pressed,
+	.chrome_button          = l_chrome_button,
+	.popup_button           = l_popup_button,
+	.toplevel_workspace     = l_toplevel_workspace,
 };
 
 /* ---- qdwin_view_stream_v1 listener ---- */
@@ -728,6 +790,48 @@ process_command(struct app *a, char *line)
 	} else if (strcmp(cmd, "close") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd close handle=%u\n", handle);
 		qdwin_shell_v1_request_close(a->shell, handle);
+	} else if (strcmp(cmd, "tile") == 0 && has_handle) {
+		/* tile <handle> <left|right|none> — v25 half-screen tiling. */
+		char *edgearg = strtok(NULL, " \t\r\n");
+		uint32_t edge = 0; /* none */
+		if (edgearg && strcmp(edgearg, "left") == 0) edge = 1;
+		else if (edgearg && strcmp(edgearg, "right") == 0) edge = 2;
+		fprintf(stderr, "qdwin-bystander: cmd tile handle=%u edge=%u\n",
+			handle, edge);
+		qdwin_shell_v1_request_tile(a->shell, handle, edge);
+	} else if (strcmp(cmd, "fullscreen") == 0 && has_handle) {
+		/* fullscreen <handle> [0|1] — v25 shell-driven fullscreen. */
+		char *fsarg = strtok(NULL, " \t\r\n");
+		uint32_t fs = fsarg ? (uint32_t)strtoul(fsarg, NULL, 10) : 1;
+		fprintf(stderr, "qdwin-bystander: cmd fullscreen handle=%u fs=%u\n",
+			handle, fs);
+		qdwin_shell_v1_request_fullscreen(a->shell, handle, fs);
+	} else if (strcmp(cmd, "wmpolicy") == 0) {
+		/* wmpolicy <focus> <ffm_ms> <raise_click> <raise_hover>
+		 *          <placement> <snap_en> <snap_dist> — v25 policy.
+		 * `arg` already consumed the first field (focus). */
+		uint32_t fp = arg ? (uint32_t)strtoul(arg, NULL, 10) : 0;
+		char *t;
+		uint32_t ffm = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 0;
+		uint32_t rc  = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 0;
+		uint32_t rh  = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 0;
+		uint32_t pl  = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 2;
+		uint32_t se  = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 0;
+		uint32_t sd  = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 16;
+		fprintf(stderr, "qdwin-bystander: cmd wmpolicy focus=%u ffm=%u "
+			"rc=%u rh=%u place=%u snap=%u dist=%u\n",
+			fp, ffm, rc, rh, pl, se, sd);
+		qdwin_shell_v1_set_wm_policy(a->shell, fp, ffm, rc, rh, pl, se, sd);
+	} else if (strcmp(cmd, "hotkey") == 0) {
+		/* hotkey <id> <modifiers> <key> — register a hotkey (v19/v25).
+		 * `arg` already holds the id. */
+		uint32_t hid = arg ? (uint32_t)strtoul(arg, NULL, 10) : 0;
+		char *t;
+		uint32_t mods = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 0;
+		uint32_t key  = (t = strtok(NULL, " \t\r\n")) ? (uint32_t)strtoul(t, NULL, 10) : 0;
+		fprintf(stderr, "qdwin-bystander: cmd hotkey id=%u mods=%u key=%u\n",
+			hid, mods, key);
+		qdwin_shell_v1_register_hotkey(a->shell, hid, mods, key);
 	} else if (strcmp(cmd, "focus") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd focus handle=%u\n", handle);
 		qdwin_shell_v1_set_keyboard_focus(a->shell, "default", handle);

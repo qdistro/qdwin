@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="24">
+  <interface name="qdwin_shell_v1" version="25">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -149,6 +149,19 @@
       toplevel as workspace 0 (the pre-v24 behaviour). The compositor's
       internal workspace mechanics (hide/show on switch) are driven by
       the ext-workspace activate path regardless of the shell version.
+
+      Version 25 adds live window-manager policy so the qdshell
+      WindowManager settings tab applies instead of being persist-only:
+      `set_wm_policy` carries the focus model (click vs
+      focus-follows-mouse + settle delay), raise-on-click / raise-on-hover,
+      new-window placement strategy, and edge-snap enable + distance as
+      one idempotent snapshot. `request_fullscreen` and `request_tile`
+      add shell-driven fullscreen and half-screen tiling (the
+      counterparts of `request_maximize`); the shell wires its
+      close/maximize/fullscreen/tile keyboard shortcuts to these via the
+      existing v19 `register_hotkey` path. Pre-v25 shells get the
+      historical fixed behaviour (click-to-focus, centre+cascade
+      placement, no snapping/tiling).
     </description>
 
     <enum name="error">
@@ -1463,6 +1476,122 @@
       <arg name="handle" type="uint" summary="from toplevel_added"/>
       <arg name="index" type="uint" summary="workspace index, 0-based"/>
     </event>
+
+    <enum name="focus_policy" since="25">
+      <description summary="keyboard-focus model for set_wm_policy">
+        How keyboard focus follows the pointer. `click` is the
+        conservative default (focus only changes on a button press
+        inside a toplevel). `follow_mouse` retargets keyboard focus to
+        the toplevel under the pointer after `ffm_delay_ms` of the
+        pointer resting over it (focus-follows-mouse).
+      </description>
+      <entry name="click" value="0"/>
+      <entry name="follow_mouse" value="1"/>
+    </enum>
+
+    <enum name="placement" since="25">
+      <description summary="new-window placement strategy for set_wm_policy">
+        Where a freshly mapped toplevel is positioned on its output.
+        `center` centres it on the work area. `under_mouse` opens it
+        centred under the pointer. `smart` picks the least-overlapping
+        slot (falling back to centre). `cascade` steps each new window
+        down-right from the last (the historical qdwin default).
+      </description>
+      <entry name="center" value="0"/>
+      <entry name="under_mouse" value="1"/>
+      <entry name="smart" value="2"/>
+      <entry name="cascade" value="3"/>
+    </enum>
+
+    <enum name="tile_edge" since="25">
+      <description summary="half-screen tiling target for request_tile">
+        `none` restores the toplevel to its pre-tile geometry. `left` /
+        `right` tile it to the left / right half of the work area of its
+        current output (output minus panel exclusive zones, exactly as
+        maximise uses).
+      </description>
+      <entry name="none" value="0"/>
+      <entry name="left" value="1"/>
+      <entry name="right" value="2"/>
+    </enum>
+
+    <request name="set_wm_policy" since="25">
+      <description summary="apply live window-manager policy">
+        Sets the compositor's window-manager policy as a single
+        idempotent snapshot. The shell sends the full policy every time
+        any field changes; the compositor replaces its stored policy and
+        applies the new behaviour immediately (no per-window or deferred
+        apply). This is the live-apply counterpart to the qdshell
+        WindowManager settings tab — before v25 those settings were
+        persist-only.
+
+        Fields:
+        - `focus_policy`: a `focus_policy` enum value. Unknown values
+          fall back to `click`.
+        - `ffm_delay_ms`: focus-follows-mouse settle delay in
+          milliseconds (clamped to [0, 1000]); ignored under `click`.
+        - `raise_on_click`: 1 to raise a toplevel to the top of the
+          stack when it is clicked.
+        - `raise_on_hover`: 1 to also raise the focus-follows-mouse
+          target when focus moves to it (only meaningful under
+          `follow_mouse`).
+        - `placement`: a `placement` enum value for new-window
+          positioning. Unknown values fall back to `smart`.
+        - `snap_enabled`: 1 to enable edge snapping during an
+          interactive move.
+        - `snap_distance`: snap threshold in pixels (clamped to
+          [1, 64]).
+
+        Re-sending the same policy is a harmless no-op. The policy is
+        process-global (not per-seat / per-output) and is reset to the
+        compositor default when the shell binding is torn down.
+      </description>
+      <arg name="focus_policy" type="uint" summary="focus_policy enum"/>
+      <arg name="ffm_delay_ms" type="uint" summary="0..1000 ms"/>
+      <arg name="raise_on_click" type="uint" summary="1=raise on click"/>
+      <arg name="raise_on_hover" type="uint" summary="1=raise on hover"/>
+      <arg name="placement" type="uint" summary="placement enum"/>
+      <arg name="snap_enabled" type="uint" summary="1=enable edge snap"/>
+      <arg name="snap_distance" type="uint" summary="1..64 px"/>
+    </request>
+
+    <request name="request_fullscreen" since="25">
+      <description summary="toggle a toplevel's fullscreen state">
+        Shell-driven fullscreen toggle, mirroring `request_maximize`.
+        `fullscreen` non-zero puts the toplevel into compositor
+        fullscreen (filling the whole output, covering panels);
+        zero restores it. The shell drives this from its
+        toggle-fullscreen keyboard shortcut.
+
+        `handle` must be a live toplevel (else `invalid_handle`).
+        Refused while the compositor is `locked`. A no-op if the
+        toplevel is already in the requested state.
+      </description>
+      <arg name="handle" type="uint" summary="toplevel handle"/>
+      <arg name="fullscreen" type="uint" summary="1=fullscreen, 0=restore"/>
+    </request>
+
+    <request name="request_tile" since="25">
+      <description summary="half-screen tile a toplevel">
+        Tile `handle` to the left or right half of its output's work
+        area, or restore it (`tile_edge.none`). Tiling saves the
+        pre-tile floating geometry the first time it is applied and
+        restores it on `none`. An interactive move floats the window and
+        clears the tile. Maximise / fullscreen are layered on top of a
+        tile (they save the tiled rect as their own restore target), so
+        un-maximise / un-fullscreen returns to the tile and a later
+        `request_tile(none)` still restores the original floating
+        geometry. The shell drives this from its tile-left / tile-right
+        keyboard shortcuts.
+
+        `handle` must be a live toplevel (else `invalid_handle`).
+        `edge` out of range is treated as `none`. Refused while the
+        compositor is `locked`. Tiling a maximised or fullscreen window
+        first leaves that state, then tiles.
+      </description>
+      <arg name="handle" type="uint" summary="toplevel handle"/>
+      <arg name="edge" type="uint" summary="tile_edge enum"/>
+    </request>
   </interface>
 
   <interface name="qdwin_background_v1" version="1">

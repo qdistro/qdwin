@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/input-event-codes.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +235,27 @@ qdwin_handle_activation_decision(struct wl_client *client,
 				 uint32_t decision,
 				 const char *reason);
 struct qdwin;  /* not yet defined here */
+/* v25 window-manager policy forward decls — implementations live in the
+ * "live window-manager policy" block; the default pointer grab (focus
+ * follows mouse + raise-on-click) and the map handler (placement) call
+ * these before that block. */
+struct qdwin_wm_policy;
+static void qdwin_wm_policy_set_defaults(struct qdwin_wm_policy *p);
+static void qdwin_ffm_consider(struct qdwin *qdwin,
+			       struct weston_pointer *pointer);
+static void qdwin_ffm_cancel(struct qdwin *qdwin);
+static void qdwin_toplevel_raise(struct qdwin_toplevel *tl);
+static void qdwin_toplevel_focus(struct qdwin *qdwin,
+				 struct qdwin_toplevel *tl, int raise);
+static void qdwin_compute_placement(struct qdwin *qdwin,
+				    struct qdwin_toplevel *tl,
+				    struct weston_surface *surface,
+				    struct weston_output *out,
+				    int *cx, int *cy);
+static void qdwin_snap_move_position(struct qdwin *qdwin,
+				     struct qdwin_toplevel *tl,
+				     double *nx, double *ny);
+static void qdwin_toplevel_clear_tiled(struct qdwin_toplevel *tl);
 static void qdwin_activation_pending_free_all(struct qdwin *qdwin);
 static void qdwin_data_offer_pending_free_all(struct qdwin *qdwin);
 static void qdwin_data_source_wraps_free_all(struct qdwin *qdwin);
@@ -268,6 +290,38 @@ bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 #define QDWIN_TS_URGENT     (1u << 3)
 #define QDWIN_TS_FOCUSED    (1u << 4)
 #define QDWIN_TS_FLOATING   (1u << 5)
+
+/* v25: live window-manager policy (qdwin_shell_v1.set_wm_policy). Mirrors
+ * the qdshell WindowManager settings tab; values match the protocol enums
+ * in qdwin-shell-v1.xml. */
+enum qdwin_focus_policy {
+	QDWIN_FOCUS_CLICK        = 0,  /* focus only on click */
+	QDWIN_FOCUS_FOLLOW_MOUSE = 1,  /* focus-follows-mouse */
+};
+enum qdwin_placement {
+	QDWIN_PLACE_CENTER      = 0,
+	QDWIN_PLACE_UNDER_MOUSE = 1,
+	QDWIN_PLACE_SMART       = 2,
+	QDWIN_PLACE_CASCADE     = 3,
+};
+/* request_tile edge (matches qdwin_shell_v1.tile_edge). */
+#define QDWIN_TILE_NONE  0u
+#define QDWIN_TILE_LEFT  1u
+#define QDWIN_TILE_RIGHT 2u
+
+#define QDWIN_FFM_DELAY_MAX  1000u
+#define QDWIN_SNAP_DIST_MIN  1u
+#define QDWIN_SNAP_DIST_MAX  64u
+
+struct qdwin_wm_policy {
+	uint32_t focus_policy;   /* enum qdwin_focus_policy */
+	uint32_t ffm_delay_ms;   /* 0..1000 */
+	int raise_on_click;
+	int raise_on_hover;
+	uint32_t placement;      /* enum qdwin_placement */
+	int snap_enabled;
+	uint32_t snap_distance;  /* 1..64 px */
+};
 
 struct qdwin_toplevel {
 	struct qdwin *qdwin;
@@ -352,6 +406,15 @@ struct qdwin_toplevel {
 	 * un-maximise. Outer dims (chrome-inclusive). */
 	int saved_outer_w, saved_outer_h;
 	double saved_x, saved_y;
+	/* v25: half-screen tiling (request_tile). `tiled` is a tile_edge
+	 * value (0=none, 1=left, 2=right). The tile_saved_* fields hold the
+	 * pre-tile geometry, captured on the first tile and consumed on
+	 * restore — kept separate from the maximise saved_* above so a
+	 * tile→maximise→restore round-trip doesn't lose the floating
+	 * geometry. */
+	uint32_t tiled;
+	int tile_saved_outer_w, tile_saved_outer_h;
+	double tile_saved_x, tile_saved_y;
 	/* Chrome surfaces/views, indexed by qdwin_side. */
 	struct qdwin_chrome chrome[QDWIN_SIDES];
 	/* At most one popup anchored to this toplevel; a second
@@ -548,6 +611,16 @@ struct qdwin {
 	 * sends qdwin_shell_v1.hotkey_pressed(id) on the shell resource.
 	 * Bindings are torn down on shell unbind or unregister_hotkey. */
 	struct wl_list hotkeys;             /* struct qdwin_hotkey::link */
+
+	/* v25: live window-manager policy (set_wm_policy). Process-global,
+	 * reset to compositor defaults when the shell binding is torn down.
+	 * ffm_timer / ffm_pending_handle implement the focus-follows-mouse
+	 * settle delay: pointer motion over a new toplevel (re)arms the
+	 * timer for wm_policy.ffm_delay_ms; the timer focuses the toplevel
+	 * only if the pointer is still over it when it fires. */
+	struct qdwin_wm_policy wm_policy;
+	struct wl_event_source *ffm_timer;
+	uint32_t ffm_pending_handle;
 
 	/* Overlay keyboard grab (B3+B4): captures keys while a launcher
 	 * (kind=0) or lock_surface is visible and forwards each press to
@@ -1406,22 +1479,14 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 			 */
 			struct weston_output *out = qdwin_primary_output(qdwin);
 			if (out) {
-				int siblings = 0;
-				struct qdwin_toplevel *t;
-				wl_list_for_each(t, &qdwin->toplevels, link) {
-					if (t == tl || t->is_nested_proxy)
-						continue;
-					if (t->mapped)
-						siblings++;
-				}
-				int offset = (siblings * 40) % 200;  /* wrap at 5 */
-				/* Pixel-coord math is int throughout; cast
-				 * pos.c.{x,y} (double) to int so clang-tidy
-				 * doesn't flag the intermediate int divisions as
-				 * occurring in a float context. Position values
-				 * are whole pixels in practice. */
-				int cx = (int)out->pos.c.x + (out->width  - surface->width)  / 2 + offset;
-				int cy = (int)out->pos.c.y + (out->height - surface->height) / 2 + offset;
+				/* v25: new-window placement follows the live WM
+				 * policy (centre / under-mouse / smart / cascade).
+				 * The compositor default is cascade, so a
+				 * shell-less / pre-v25 session keeps the historical
+				 * down-right stagger. */
+				int cx, cy;
+				qdwin_compute_placement(qdwin, tl, surface,
+							out, &cx, &cy);
 				if (cx < 0) cx = 0;
 				if (cy < 0) cy = 0;
 				struct weston_coord_global p = { .c = weston_coord(cx, cy) };
@@ -2292,6 +2357,12 @@ qdwin_toplevel_set_maximized(struct qdwin *qdwin,
 				   tl->handle);
 			return;
 		}
+		/* v25: maximising a tiled window saves the *tiled* rect into the
+		 * maximise slot (saved_*), so un-maximise returns to the tile.
+		 * We deliberately do NOT clear tl->tiled / tile_saved_* here:
+		 * those hold the pre-tile floating geometry, so a later
+		 * request_tile(none) still restores the original float. (Only an
+		 * interactive move floats the window and clears the tile.) */
 		struct weston_coord_global pos =
 			weston_view_get_pos_offset_global(tl->view);
 		tl->saved_x = pos.c.x;
@@ -2475,6 +2546,9 @@ qdwin_move_grab_motion(struct weston_pointer_grab *grab,
 
 	double nx = pointer->pos.c.x - qd->move_grab_anchor_dx;
 	double ny = pointer->pos.c.y - qd->move_grab_anchor_dy;
+	/* v25: edge snapping (no-op unless wm_policy.snap_enabled). Snaps
+	 * the dragged window's outer rect to work-area + neighbour edges. */
+	qdwin_snap_move_position(qd, tl, &nx, &ny);
 	struct weston_coord_global p = { .c = weston_coord(nx, ny) };
 	weston_view_set_position(tl->view, p);
 	weston_view_update_transform(tl->view);
@@ -2606,13 +2680,17 @@ qdwin_handle_begin_interactive_move(struct wl_client *client,
 		return;
 	}
 
-	/* Per XML: tiled / maximised / fullscreen refuse silently. */
+	/* Per XML: maximised / fullscreen refuse silently. */
 	if (tl->state & (QDWIN_TS_MAXIMIZED | QDWIN_TS_FULLSCREEN)) {
 		weston_log("qdwin: begin_interactive_move handle=%u "
 			   "ignored — toplevel is maximised/fullscreen\n",
 			   handle);
 		return;
 	}
+
+	/* v25: dragging a tiled window floats it — clear the tiled flag so a
+	 * later request_tile(none) doesn't snap it back to stale geometry. */
+	qdwin_toplevel_clear_tiled(tl);
 
 	/* Find a seat with an active pointer + start the grab on it.
 	 * MVP: first seat wins. Multi-seat drag is uncommon and adds
@@ -2938,6 +3016,12 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 		qdwin_install_default_cursor_on_pointer(qdwin_singleton, pointer);
 	weston_pointer_send_motion(pointer, time, event);
 
+	/* v25: focus-follows-mouse. Retarget keyboard focus to the toplevel
+	 * under the pointer (immediately or after the settle delay) when the
+	 * policy is follow_mouse; a no-op under click-to-focus. */
+	if (qdwin_singleton)
+		qdwin_ffm_consider(qdwin_singleton, pointer);
+
 	struct qdwin_toplevel *tl = qdwin_singleton ?
 		qdwin_singleton->active_input_proxy : NULL;
 	if (tl && tl->view && tl->view->surface &&
@@ -3093,8 +3177,12 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 		struct qdwin_toplevel *tl_under =
 			qdwin_toplevel_at_pos(qdwin_singleton, pointer->pos);
 		if (tl_under) {
-			/* Raise on the normal layer (re-stack to top). */
-			qdwin_toplevel_move_to_layer(tl_under,
+			/* Raise on the normal layer (re-stack to top). v25:
+			 * gated on the raise-on-click policy — focus still
+			 * transfers below, but the z-order only changes when
+			 * raise_on_click is set (default on). */
+			if (qdwin_singleton->wm_policy.raise_on_click)
+				qdwin_toplevel_move_to_layer(tl_under,
 						     &qdwin_singleton->normal_layer);
 			/* Move keyboard focus if it isn't already here. */
 			struct weston_keyboard *kb =
@@ -6036,6 +6124,576 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 }
 
 /* ------------------------------------------------------------------
+ * v25: live window-manager policy (set_wm_policy / request_fullscreen /
+ * request_tile). Focus-follows-mouse, raise-on-click/hover, new-window
+ * placement, edge snapping and half-screen tiling. The policy is a
+ * single idempotent snapshot pushed by the shell; the compositor stores
+ * it and changes behaviour immediately.
+ * ------------------------------------------------------------------ */
+
+/* Compositor defaults: the historical pre-v25 behaviour (click-to-focus,
+ * raise on click, centre+cascade placement, no snapping). Restored when
+ * the shell unbinds so a shell-less compositor keeps the old feel. */
+static void
+qdwin_wm_policy_set_defaults(struct qdwin_wm_policy *p)
+{
+	p->focus_policy   = QDWIN_FOCUS_CLICK;
+	p->ffm_delay_ms   = 0;
+	p->raise_on_click = 1;
+	p->raise_on_hover = 0;
+	p->placement      = QDWIN_PLACE_CASCADE;
+	p->snap_enabled   = 0;
+	p->snap_distance  = 16;
+}
+
+/* First seat with a pointer (qdwin is single-seat in practice; we walk
+ * the list defensively). NULL if no pointer-capable seat exists. */
+static struct weston_pointer *
+qdwin_first_pointer(struct qdwin *qdwin)
+{
+	struct weston_seat *seat;
+	wl_list_for_each(seat, &qdwin->compositor->seat_list, link) {
+		struct weston_pointer *ptr = weston_seat_get_pointer(seat);
+		if (ptr)
+			return ptr;
+	}
+	return NULL;
+}
+
+/* The output whose geometry contains the global coordinate, else the
+ * primary output. */
+static struct weston_output *
+qdwin_output_at_global(struct qdwin *qdwin, double gx, double gy)
+{
+	struct weston_output *out;
+	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		if (gx >= out->pos.c.x && gx < out->pos.c.x + out->width &&
+		    gy >= out->pos.c.y && gy < out->pos.c.y + out->height)
+			return out;
+	}
+	return qdwin_primary_output(qdwin);
+}
+
+/* Re-stack a toplevel to the top of the normal layer (only meaningful on
+ * the active workspace — raising an off-workspace window would leak it
+ * onto the current desktop, so we leave it parked). */
+static void
+qdwin_toplevel_raise(struct qdwin_toplevel *tl)
+{
+	if (!tl || !tl->qdwin)
+		return;
+	if (tl->state & QDWIN_TS_MINIMIZED)
+		return;
+	if (tl->workspace != tl->qdwin->active_workspace)
+		return;
+	qdwin_toplevel_move_to_layer(tl, &tl->qdwin->normal_layer);
+	weston_compositor_schedule_repaint(tl->qdwin->compositor);
+}
+
+/* Set keyboard focus to a toplevel across all seats (mirrors
+ * qdwin_toplevel_autofocus_if_ready but driven by policy, not by map),
+ * emitting seat_focus_changed and optionally raising it. */
+static void
+qdwin_toplevel_focus(struct qdwin *qdwin, struct qdwin_toplevel *tl, int raise)
+{
+	if (!qdwin || !tl || qdwin->locked)
+		return;
+	if (!tl->view || !tl->view->surface ||
+	    !weston_surface_is_mapped(tl->view->surface))
+		return;
+	if (tl->workspace != qdwin->active_workspace)
+		return;
+	if (raise)
+		qdwin_toplevel_raise(tl);
+	struct weston_seat *seat;
+	wl_list_for_each(seat, &qdwin->compositor->seat_list, link) {
+		struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
+		if (kbd && kbd->focus != tl->view->surface) {
+			weston_keyboard_set_focus(kbd, tl->view->surface);
+			qdwin_emit_seat_focus_changed(qdwin, seat, tl->handle);
+		}
+	}
+}
+
+/* focus-follows-mouse settle timer. Fires wm_policy.ffm_delay_ms after
+ * the pointer last moved onto a new toplevel; focuses it only if the
+ * pointer is still over the same toplevel (so a fast pass-through doesn't
+ * pull focus). */
+static int
+qdwin_ffm_timer_cb(void *data)
+{
+	struct qdwin *qdwin = data;
+	if (!qdwin || qdwin->locked || qdwin->move_grab_active)
+		return 0;
+	if (qdwin->wm_policy.focus_policy != QDWIN_FOCUS_FOLLOW_MOUSE)
+		return 0;
+	struct weston_pointer *ptr = qdwin_first_pointer(qdwin);
+	if (!ptr)
+		return 0;
+	struct qdwin_toplevel *tl = qdwin_toplevel_at_pos(qdwin, ptr->pos);
+	if (!tl || tl->handle != qdwin->ffm_pending_handle)
+		return 0;  /* pointer moved away before the timer fired */
+	qdwin_toplevel_focus(qdwin, tl, qdwin->wm_policy.raise_on_hover);
+	return 0;
+}
+
+/* Cancel any pending focus-follows-mouse retarget (pointer left all
+ * toplevels, focus policy changed, or shell unbound). */
+static void
+qdwin_ffm_cancel(struct qdwin *qdwin)
+{
+	qdwin->ffm_pending_handle = 0;
+	if (qdwin->ffm_timer)
+		wl_event_source_timer_update(qdwin->ffm_timer, 0);
+}
+
+/* Called from the default pointer-grab motion handler. Under
+ * focus-follows-mouse, retarget keyboard focus to the toplevel under the
+ * pointer, immediately when ffm_delay_ms == 0 or after a settle delay. */
+static void
+qdwin_ffm_consider(struct qdwin *qdwin, struct weston_pointer *pointer)
+{
+	if (!qdwin || qdwin->locked || qdwin->move_grab_active)
+		return;
+	if (qdwin->wm_policy.focus_policy != QDWIN_FOCUS_FOLLOW_MOUSE)
+		return;
+	struct qdwin_toplevel *tl = qdwin_toplevel_at_pos(qdwin, pointer->pos);
+	if (!tl) {
+		/* Pointer over the background / a panel — leave focus where
+		 * it is (sloppy-focus, matching xfwm/kwin), just disarm any
+		 * pending retarget. */
+		qdwin_ffm_cancel(qdwin);
+		return;
+	}
+	/* Already focused here — nothing to do. */
+	struct weston_keyboard *kbd =
+		weston_seat_get_keyboard(pointer->seat);
+	if (kbd && tl->view && kbd->focus == tl->view->surface) {
+		qdwin_ffm_cancel(qdwin);
+		return;
+	}
+	if (qdwin->wm_policy.ffm_delay_ms == 0) {
+		qdwin->ffm_pending_handle = 0;
+		qdwin_toplevel_focus(qdwin, tl, qdwin->wm_policy.raise_on_hover);
+		return;
+	}
+	/* Arm / re-arm the settle timer for this toplevel. */
+	if (!qdwin->ffm_timer) {
+		qdwin->ffm_timer = wl_event_loop_add_timer(
+			wl_display_get_event_loop(qdwin->compositor->wl_display),
+			qdwin_ffm_timer_cb, qdwin);
+		if (!qdwin->ffm_timer)
+			return;
+	}
+	if (qdwin->ffm_pending_handle != tl->handle) {
+		qdwin->ffm_pending_handle = tl->handle;
+		uint32_t d = qdwin->wm_policy.ffm_delay_ms;
+		if (d > QDWIN_FFM_DELAY_MAX)
+			d = QDWIN_FFM_DELAY_MAX;
+		wl_event_source_timer_update(qdwin->ffm_timer, (int)d);
+	}
+}
+
+/* Compute the new-window content top-left (global px) per the placement
+ * policy. Mirrors the legacy centre+cascade math; cx/cy are the content
+ * origin the caller hands to weston_view_set_position. */
+static void
+qdwin_compute_placement(struct qdwin *qdwin, struct qdwin_toplevel *tl,
+			struct weston_surface *surface,
+			struct weston_output *out, int *cx, int *cy)
+{
+	int sw = surface->width  > 0 ? surface->width  : 800;
+	int sh = surface->height > 0 ? surface->height : 600;
+	int wx, wy, ww, wh;
+	qdwin_output_work_area(qdwin, out, &wx, &wy, &ww, &wh);
+	int center_x = wx + (ww - sw) / 2;
+	int center_y = wy + (wh - sh) / 2;
+
+	int px = center_x, py = center_y;
+	switch (qdwin->wm_policy.placement) {
+	case QDWIN_PLACE_CENTER:
+		break;  /* px/py already centred */
+	case QDWIN_PLACE_UNDER_MOUSE: {
+		struct weston_pointer *ptr = qdwin_first_pointer(qdwin);
+		if (ptr) {
+			px = (int)ptr->pos.c.x - sw / 2;
+			py = (int)ptr->pos.c.y - sh / 2;
+		}
+		break;
+	}
+	case QDWIN_PLACE_SMART: {
+		/* Pick the candidate slot (a coarse grid over the work area)
+		 * with the least total overlap against existing mapped
+		 * toplevels. Centre wins ties (checked first). */
+		const int STEPS = 5;
+		long best_overlap = -1;
+		int best_x = center_x, best_y = center_y;
+		for (int gy = 0; gy < STEPS; gy++) {
+			for (int gx = 0; gx < STEPS; gx++) {
+				int ox = wx + (STEPS > 1 ?
+					(ww - sw) * gx / (STEPS - 1) : 0);
+				int oy = wy + (STEPS > 1 ?
+					(wh - sh) * gy / (STEPS - 1) : 0);
+				if (ox < wx) ox = wx;
+				if (oy < wy) oy = wy;
+				long overlap = 0;
+				struct qdwin_toplevel *t;
+				wl_list_for_each(t, &qdwin->toplevels, link) {
+					if (t == tl || t->is_nested_proxy ||
+					    !t->mapped || !t->view)
+						continue;
+					struct weston_coord_global vp =
+					 weston_view_get_pos_offset_global(t->view);
+					struct weston_surface *ts =
+						t->view->surface;
+					int tw = ts ? ts->width : 0;
+					int th = ts ? ts->height : 0;
+					int ix = (ox > (int)vp.c.x) ? ox
+						: (int)vp.c.x;
+					int iy = (oy > (int)vp.c.y) ? oy
+						: (int)vp.c.y;
+					int ax = (ox + sw < (int)vp.c.x + tw)
+						? ox + sw : (int)vp.c.x + tw;
+					int ay = (oy + sh < (int)vp.c.y + th)
+						? oy + sh : (int)vp.c.y + th;
+					if (ax > ix && ay > iy)
+						overlap += (long)(ax - ix) *
+							   (ay - iy);
+				}
+				/* Prefer centre on ties: seed best with the
+				 * centre slot (gx==gy==middle handled by < ). */
+				if (best_overlap < 0 || overlap < best_overlap) {
+					best_overlap = overlap;
+					best_x = ox;
+					best_y = oy;
+					if (overlap == 0)
+						goto smart_done;
+				}
+			}
+		}
+smart_done:
+		px = best_x;
+		py = best_y;
+		break;
+	}
+	case QDWIN_PLACE_CASCADE:
+	default: {
+		int siblings = 0;
+		struct qdwin_toplevel *t;
+		wl_list_for_each(t, &qdwin->toplevels, link) {
+			if (t == tl || t->is_nested_proxy)
+				continue;
+			if (t->mapped)
+				siblings++;
+		}
+		int offset = (siblings * 40) % 200;  /* wrap at 5 */
+		px = center_x + offset;
+		py = center_y + offset;
+		break;
+	}
+	}
+	if (px < wx) px = wx;
+	if (py < wy) py = wy;
+	*cx = px;
+	*cy = py;
+}
+
+/* Snap one edge value `v` to `target` when within snap_distance; returns
+ * the (possibly snapped) value and records whether it snapped via *did. */
+static double
+qdwin_snap1(double v, double target, uint32_t dist, int *did)
+{
+	if (!*did && fabs(v - target) <= (double)dist) {
+		*did = 1;
+		return target;
+	}
+	return v;
+}
+
+/* Edge snapping during an interactive move. nx/ny are the dragged
+ * window's content origin; we snap its OUTER rectangle (chrome-inclusive)
+ * to the work-area edges and to other mapped toplevels' outer edges,
+ * then translate back to a content origin. */
+static void
+qdwin_snap_move_position(struct qdwin *qdwin, struct qdwin_toplevel *tl,
+			 double *nx, double *ny)
+{
+	if (!qdwin->wm_policy.snap_enabled)
+		return;
+	uint32_t dist = qdwin->wm_policy.snap_distance;
+	if (dist < QDWIN_SNAP_DIST_MIN) dist = QDWIN_SNAP_DIST_MIN;
+	if (dist > QDWIN_SNAP_DIST_MAX) dist = QDWIN_SNAP_DIST_MAX;
+
+	struct weston_surface *surf =
+		tl->view ? tl->view->surface : NULL;
+	int ow = tl->outer_width  > 0 ? tl->outer_width
+		: (surf ? surf->width  : 0) + tl->inset_w + tl->inset_e;
+	int oh = tl->outer_height > 0 ? tl->outer_height
+		: (surf ? surf->height : 0) + tl->inset_n + tl->inset_s;
+	if (ow <= 0 || oh <= 0)
+		return;
+
+	double left = *nx - tl->inset_w;
+	double top  = *ny - tl->inset_n;
+
+	struct weston_output *out =
+		qdwin_output_at_global(qdwin, left, top);
+	if (!out)
+		return;
+	int wx, wy, ww, wh;
+	qdwin_output_work_area(qdwin, out, &wx, &wy, &ww, &wh);
+
+	int did_x = 0, did_y = 0;
+	/* Work-area edges. */
+	left = qdwin_snap1(left, wx, dist, &did_x);
+	left = qdwin_snap1(left, wx + ww - ow, dist, &did_x);
+	top  = qdwin_snap1(top, wy, dist, &did_y);
+	top  = qdwin_snap1(top, wy + wh - oh, dist, &did_y);
+
+	/* Other windows' outer edges (left↔right, right↔left, top/bottom).
+	 * Only visible windows on the active workspace are snap targets —
+	 * minimised / off-workspace toplevels are parked on hidden layers with
+	 * stale geometry, so snapping to them would pull toward an invisible
+	 * window. */
+	struct qdwin_toplevel *t;
+	wl_list_for_each(t, &qdwin->toplevels, link) {
+		if (t == tl || t->is_nested_proxy || !t->mapped || !t->view)
+			continue;
+		if (t->state & QDWIN_TS_MINIMIZED)
+			continue;
+		if (t->workspace != qdwin->active_workspace)
+			continue;
+		struct weston_coord_global vp =
+			weston_view_get_pos_offset_global(t->view);
+		double tleft = vp.c.x - t->inset_w;
+		double ttop  = vp.c.y - t->inset_n;
+		struct weston_surface *ts = t->view->surface;
+		int tow = t->outer_width  > 0 ? t->outer_width
+			: (ts ? ts->width  : 0) + t->inset_w + t->inset_e;
+		int toh = t->outer_height > 0 ? t->outer_height
+			: (ts ? ts->height : 0) + t->inset_n + t->inset_s;
+		left = qdwin_snap1(left, tleft + tow, dist, &did_x); /* abut right */
+		left = qdwin_snap1(left, tleft - ow, dist, &did_x);  /* abut left  */
+		left = qdwin_snap1(left, tleft, dist, &did_x);       /* align left */
+		top  = qdwin_snap1(top, ttop + toh, dist, &did_y);
+		top  = qdwin_snap1(top, ttop - oh, dist, &did_y);
+		top  = qdwin_snap1(top, ttop, dist, &did_y);
+	}
+
+	*nx = left + tl->inset_w;
+	*ny = top  + tl->inset_n;
+}
+
+/* Clear the tiled flag without moving the window — used when another
+ * state change (maximise, fullscreen, interactive move) supersedes the
+ * tile so a later request_tile(none) doesn't try to "restore" stale
+ * geometry. */
+static void
+qdwin_toplevel_clear_tiled(struct qdwin_toplevel *tl)
+{
+	tl->tiled = QDWIN_TILE_NONE;
+}
+
+/* request_tile core: tile to a half of the work area, or restore. */
+static void
+qdwin_toplevel_set_tiled(struct qdwin *qdwin, struct qdwin_toplevel *tl,
+			 uint32_t edge)
+{
+	if (edge != QDWIN_TILE_LEFT && edge != QDWIN_TILE_RIGHT)
+		edge = QDWIN_TILE_NONE;
+
+	/* Restore. */
+	if (edge == QDWIN_TILE_NONE) {
+		if (tl->tiled == QDWIN_TILE_NONE)
+			return;  /* not tiled — no-op */
+		tl->outer_width  = tl->tile_saved_outer_w;
+		tl->outer_height = tl->tile_saved_outer_h;
+		struct weston_coord_global pos = {
+			.c = weston_coord(tl->tile_saved_x, tl->tile_saved_y),
+		};
+		weston_view_set_position(tl->view, pos);
+		/* Nested-proxy toplevels (tier-4 VM windows) have no
+		 * desktop_surface; apply_inset's nested branch ignores
+		 * outer_* and the inner client is resized via the curtain's
+		 * set_geometry, exactly as maximise/fullscreen do. */
+		if (tl->is_nested_proxy)
+			qdwin_nested_proxy_set_geometry(tl, tl->outer_width,
+							tl->outer_height);
+		else
+			qdwin_toplevel_apply_inset(tl);
+		qdwin_toplevel_position_chrome(tl);
+		tl->tiled = QDWIN_TILE_NONE;
+		weston_log("qdwin: tile handle=%u restored %dx%d@(%.0f,%.0f)\n",
+			   tl->handle, tl->outer_width, tl->outer_height,
+			   tl->tile_saved_x, tl->tile_saved_y);
+		weston_compositor_schedule_repaint(qdwin->compositor);
+		return;
+	}
+
+	/* Tiling a maximised/fullscreen window first leaves that state so
+	 * the saved floating geometry is the pre-special-state one. */
+	if (tl->state & QDWIN_TS_MAXIMIZED)
+		qdwin_toplevel_set_maximized(qdwin, tl, false);
+	if (tl->state & QDWIN_TS_FULLSCREEN)
+		qdwin_toplevel_set_fullscreen(qdwin, tl, false, NULL);
+
+	struct weston_coord_global cur =
+		weston_view_get_pos_offset_global(tl->view);
+	struct weston_output *out =
+		qdwin_output_at_global(qdwin, cur.c.x, cur.c.y);
+	if (!out) {
+		weston_log("qdwin: tile handle=%u: no output\n", tl->handle);
+		return;
+	}
+
+	/* Save the pre-tile geometry only on the first tile (so left↔right
+	 * re-tiling keeps the original floating geometry to restore to). */
+	if (tl->tiled == QDWIN_TILE_NONE) {
+		if (tl->outer_width == 0 || tl->outer_height == 0) {
+			struct weston_surface *surface = tl->view ?
+				tl->view->surface : NULL;
+			int sw = surface ? surface->width  : tl->last_width;
+			int sh = surface ? surface->height : tl->last_height;
+			tl->outer_width  = sw > 0 ? sw : 800;
+			tl->outer_height = sh > 0 ? sh : 600;
+		}
+		tl->tile_saved_outer_w = tl->outer_width;
+		tl->tile_saved_outer_h = tl->outer_height;
+		tl->tile_saved_x = cur.c.x;
+		tl->tile_saved_y = cur.c.y;
+	}
+
+	int wx, wy, ww, wh;
+	qdwin_output_work_area(qdwin, out, &wx, &wy, &ww, &wh);
+	/* Left gets floor(ww/2); right gets the remainder so the two halves
+	 * abut with no gap on an odd-width work area. */
+	int left_w = ww / 2;
+	int tile_w = (edge == QDWIN_TILE_RIGHT) ? (ww - left_w) : left_w;
+	int tx     = (edge == QDWIN_TILE_RIGHT) ? (wx + left_w) : wx;
+
+	tl->outer_width  = tile_w;
+	tl->outer_height = wh;
+	struct weston_coord_global origin = {
+		.c = weston_coord(tx + tl->inset_w, wy + tl->inset_n),
+	};
+	weston_view_set_position(tl->view, origin);
+	if (tl->is_nested_proxy)
+		qdwin_nested_proxy_set_geometry(tl, tl->outer_width,
+						tl->outer_height);
+	else
+		qdwin_toplevel_apply_inset(tl);
+	qdwin_toplevel_position_chrome(tl);
+	tl->tiled = edge;
+	weston_log("qdwin: tile handle=%u edge=%s outer=%dx%d at (%d,%d)\n",
+		   tl->handle, edge == QDWIN_TILE_LEFT ? "left" : "right",
+		   tl->outer_width, tl->outer_height, tx, wy);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
+static void
+qdwin_handle_set_wm_policy(struct wl_client *client,
+			   struct wl_resource *resource,
+			   uint32_t focus_policy, uint32_t ffm_delay_ms,
+			   uint32_t raise_on_click, uint32_t raise_on_hover,
+			   uint32_t placement, uint32_t snap_enabled,
+			   uint32_t snap_distance)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+
+	struct qdwin_wm_policy *p = &qdwin->wm_policy;
+	p->focus_policy = (focus_policy == QDWIN_FOCUS_FOLLOW_MOUSE)
+		? QDWIN_FOCUS_FOLLOW_MOUSE : QDWIN_FOCUS_CLICK;
+	p->ffm_delay_ms = ffm_delay_ms > QDWIN_FFM_DELAY_MAX
+		? QDWIN_FFM_DELAY_MAX : ffm_delay_ms;
+	p->raise_on_click = raise_on_click ? 1 : 0;
+	p->raise_on_hover = raise_on_hover ? 1 : 0;
+	switch (placement) {
+	case QDWIN_PLACE_CENTER:
+	case QDWIN_PLACE_UNDER_MOUSE:
+	case QDWIN_PLACE_SMART:
+	case QDWIN_PLACE_CASCADE:
+		p->placement = placement;
+		break;
+	default:
+		p->placement = QDWIN_PLACE_SMART;
+		break;
+	}
+	p->snap_enabled = snap_enabled ? 1 : 0;
+	if (snap_distance < QDWIN_SNAP_DIST_MIN)
+		snap_distance = QDWIN_SNAP_DIST_MIN;
+	if (snap_distance > QDWIN_SNAP_DIST_MAX)
+		snap_distance = QDWIN_SNAP_DIST_MAX;
+	p->snap_distance = snap_distance;
+
+	/* Leaving follow-mouse: drop any armed retarget. */
+	if (p->focus_policy != QDWIN_FOCUS_FOLLOW_MOUSE)
+		qdwin_ffm_cancel(qdwin);
+
+	weston_log("qdwin: set_wm_policy focus=%u ffm_delay=%u raise_click=%d "
+		   "raise_hover=%d placement=%u snap=%d dist=%u\n",
+		   p->focus_policy, p->ffm_delay_ms, p->raise_on_click,
+		   p->raise_on_hover, p->placement, p->snap_enabled,
+		   p->snap_distance);
+}
+
+static void
+qdwin_handle_request_fullscreen(struct wl_client *client,
+				struct wl_resource *resource,
+				uint32_t handle, uint32_t fullscreen)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct qdwin_toplevel *tl;
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+	tl = qdwin_toplevel_from_handle(qdwin, handle);
+	if (!tl) {
+		wl_resource_post_error(resource,
+			QDWIN_SHELL_V1_ERROR_INVALID_HANDLE,
+			"request_fullscreen: unknown handle %u", handle);
+		return;
+	}
+	/* Like maximise: fullscreening a tiled window saves the tiled rect into
+	 * the fullscreen slot (saved_*) so un-fullscreen returns to the tile,
+	 * while tl->tiled / tile_saved_* keep the pre-tile float for a later
+	 * request_tile(none). Do NOT clear the tile here. */
+	qdwin_toplevel_set_fullscreen(qdwin, tl, fullscreen != 0, NULL);
+}
+
+static void
+qdwin_handle_request_tile(struct wl_client *client,
+			  struct wl_resource *resource,
+			  uint32_t handle, uint32_t edge)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct qdwin_toplevel *tl;
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+	tl = qdwin_toplevel_from_handle(qdwin, handle);
+	if (!tl) {
+		wl_resource_post_error(resource,
+			QDWIN_SHELL_V1_ERROR_INVALID_HANDLE,
+			"request_tile: unknown handle %u", handle);
+		return;
+	}
+	qdwin_toplevel_set_tiled(qdwin, tl, edge);
+}
+
+/* ------------------------------------------------------------------
  * v19: shell-driven global hotkeys (register_hotkey/unregister_hotkey/
  * hotkey_pressed). Backed by weston_compositor_add_key_binding which
  * is already excluded by every active grab — overlays, switcher, and
@@ -6222,6 +6880,9 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.register_hotkey = qdwin_handle_register_hotkey,
 	.unregister_hotkey = qdwin_handle_unregister_hotkey,
 	.move_toplevel_to_workspace = qdwin_handle_move_toplevel_to_workspace,
+	.set_wm_policy = qdwin_handle_set_wm_policy,
+	.request_fullscreen = qdwin_handle_request_fullscreen,
+	.request_tile = qdwin_handle_request_tile,
 };
 
 static void
@@ -6235,6 +6896,11 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 			if (qdwin->move_grab.pointer)
 				weston_pointer_end_grab(qdwin->move_grab.pointer);
 		}
+		/* v25: drop live WM policy back to the compositor default so a
+		 * shell-less compositor keeps the historical feel, and disarm
+		 * any pending focus-follows-mouse retarget. */
+		qdwin_ffm_cancel(qdwin);
+		qdwin_wm_policy_set_defaults(&qdwin->wm_policy);
 		qdwin->shell_resource = NULL;
 		qdwin->shell_bound = 0;
 		qdwin->shell_pid = 0;
@@ -9289,6 +9955,10 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->ext_ws_global);
 	if (qdwin->output_mgmt_global)
 		wl_global_destroy(qdwin->output_mgmt_global);
+	if (qdwin->ffm_timer) {
+		wl_event_source_remove(qdwin->ffm_timer);
+		qdwin->ffm_timer = NULL;
+	}
 	if (qdwin->nested_outer_event_source) {
 		wl_event_source_remove(qdwin->nested_outer_event_source);
 		qdwin->nested_outer_event_source = NULL;
@@ -15754,6 +16424,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	weston_compositor_set_default_pointer_grab(
 		ec, &qdwin_proxy_default_pointer_grab_iface);
 	wl_list_init(&qdwin->hotkeys);
+	qdwin_wm_policy_set_defaults(&qdwin->wm_policy);
 	wl_list_init(&qdwin->toplevels);
 	wl_list_init(&qdwin->view_streams);
 	wl_list_init(&qdwin->seat_trackers);
@@ -15862,7 +16533,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       24, qdwin, bind_qdwin_shell);
+					       25, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
