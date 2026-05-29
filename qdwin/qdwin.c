@@ -60,6 +60,7 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "cursor-shape-v1-server-protocol.h"
 #include "fractional-scale-v1-server-protocol.h"
 #include "ext-workspace-v1-server-protocol.h"
+#include "wlr-output-management-unstable-v1-server-protocol.h"
 #include "primary-selection-unstable-v1-server-protocol.h"
 #include "security-context-v1-server-protocol.h"
 #include "qdwin-nested-v1-server-protocol.h"
@@ -188,6 +189,10 @@ static void qdwin_emit_toplevel_workspace(struct qdwin *qdwin,
 					  struct qdwin_toplevel *tl);
 static void qdwin_ext_ws_broadcast_state(struct qdwin *qdwin);
 static void qdwin_ext_ws_resync_all(struct qdwin *qdwin);
+/* Output (display) management: re-emit the head/mode/state set to every
+ * bound wlr-output-management manager (with a fresh serial) after an output
+ * hotplug/resize. Defined near the rest of the output-management code. */
+static void qdwin_om_resync_all(struct qdwin *qdwin);
 /* §6.8 cursor-sprite full theme forward decl (impl table at L3577 needs
  * the symbol; definition lives near the rest of the cursor-shape code). */
 static void qdwin_handle_set_cursor_sprite(struct wl_client *client,
@@ -743,6 +748,18 @@ struct qdwin {
 	 * todo/decisions/qdwin-workspaces-ext-protocol.md. */
 	struct wl_global *ext_ws_global;
 	struct wl_list ext_ws_managers;  /* qdwin_ext_ws_manager::link */
+
+	/* Output (display) management: wlr-output-management-unstable-v1
+	 * server. The manager global is advertised to all clients (an output-
+	 * config protocol; no uid gate). Heads/modes are derived live from the
+	 * compositor's output_list + head_list and re-synced on output
+	 * hotplug. Each bound manager keeps its own head/mode resources
+	 * tracked in om_managers. The current configuration serial bumps on
+	 * every done; create_configuration validates the serial. See
+	 * todo/decisions/qdwin-output-management.md. */
+	struct wl_global *output_mgmt_global;
+	struct wl_list om_managers;       /* qdwin_om_manager::link */
+	uint32_t om_serial;               /* current configuration serial */
 };
 
 #define QDWIN_MAX_WORKSPACES 32
@@ -7871,6 +7888,1063 @@ bind_ext_workspace_manager(struct wl_client *client, void *data,
 		   qdwin->workspace_count, qdwin->active_workspace);
 }
 
+/* ==================================================================
+ * Output (display) management — wlr-output-management-unstable-v1.
+ *
+ * qdwin implements the standard wlroots output-management protocol so the
+ * qdshell Display layout tab (and tools like wlr-randr / kanshi) can
+ * enumerate heads + modes and apply a whole layout ATOMICALLY with a
+ * test/apply boundary. We model the producer/consumer exactly on the
+ * ext-workspace-v1 code above: one global advertised to all clients, per-
+ * manager resource lists, full re-sync on output hotplug, inert objects on
+ * teardown.
+ *
+ * Live-apply surface (what weston-14 can enact on the running backend):
+ *   - position   weston_output_move()
+ *   - scale      weston_output_set_scale()
+ *   - transform  weston_output_set_transform()  (rotation/flip)
+ *   - mode       weston_output_mode_switch_to_temporary()
+ *   - enable/disable  weston_output_enable()/weston_output_disable()
+ * If any leg fails mid-apply we ROLL BACK every output we already touched to
+ * its captured prior state and answer `failed` — never a partial layout.
+ *
+ * Untrusted strings: head name/description/make/model/serial come straight
+ * from libweston (DRM connector + EDID). We forward them as protocol strings
+ * (the client renders them as PlainText); qdwin never shell-interpolates
+ * them. See todo/decisions/qdwin-output-management.md.
+ * ================================================================== */
+
+#define QDWIN_OM_VERSION 4  /* zwlr_output_manager_v1 version we advertise */
+
+struct qdwin_om_manager {
+	struct wl_list link;            /* qdwin::om_managers */
+	struct qdwin *qdwin;
+	struct wl_resource *resource;   /* zwlr_output_manager_v1 */
+	struct wl_list heads;           /* qdwin_om_head::link */
+	bool stopped;
+};
+
+struct qdwin_om_mode {
+	struct wl_list link;            /* qdwin_om_head::modes */
+	struct qdwin_om_head *head;
+	struct wl_resource *resource;   /* zwlr_output_mode_v1 */
+	struct weston_mode *mode;       /* the weston mode this advertises */
+};
+
+struct qdwin_om_head {
+	struct wl_list link;            /* qdwin_om_manager::heads */
+	struct qdwin_om_manager *mgr;
+	struct wl_resource *resource;   /* zwlr_output_head_v1 */
+	struct weston_head *head;       /* the libweston head this represents */
+	struct weston_output *output;   /* head's output, or NULL if disabled */
+	struct wl_list modes;           /* qdwin_om_mode::link */
+};
+
+/* ---- captured per-output state, for atomic rollback ---- */
+struct qdwin_om_saved {
+	struct weston_output *output;
+	bool was_enabled;
+	struct weston_coord_global pos;
+	int32_t scale;
+	uint32_t transform;
+	struct weston_mode *mode;
+};
+
+/* ---- a single head's requested config inside a configuration object ---- */
+struct qdwin_om_cfg_head {
+	struct wl_list link;            /* qdwin_om_config::cfg_heads */
+	struct wl_resource *resource;   /* zwlr_output_configuration_head_v1 */
+	struct qdwin_om_config *config;
+	struct weston_head *head;       /* head target (dedup key; never NULL) */
+	struct weston_output *output;   /* head's output, or NULL if disabled */
+	bool enabled;                   /* enable_head vs disable_head */
+	/* set_* flags + values; unset legs keep the output's current value */
+	bool set_mode;
+	struct weston_mode *mode;       /* an existing mode (set_mode) */
+	bool set_custom_mode;
+	int32_t custom_w, custom_h, custom_refresh;
+	bool set_position;
+	int32_t pos_x, pos_y;
+	bool set_transform;
+	uint32_t transform;
+	bool set_scale;
+	wl_fixed_t scale;
+};
+
+struct qdwin_om_config {
+	struct qdwin *qdwin;
+	struct wl_resource *resource;   /* zwlr_output_configuration_v1 */
+	uint32_t serial;                /* serial passed at create time */
+	bool used;                      /* apply/test already issued */
+	struct wl_list cfg_heads;       /* qdwin_om_cfg_head::link */
+};
+
+static const struct zwlr_output_head_v1_interface qdwin_om_head_impl;
+static const struct zwlr_output_mode_v1_interface qdwin_om_mode_impl;
+static const struct zwlr_output_configuration_v1_interface qdwin_om_config_impl;
+static const struct zwlr_output_configuration_head_v1_interface
+	qdwin_om_cfg_head_impl;
+static void qdwin_om_head_resource_destroy(struct wl_resource *resource);
+static void qdwin_om_mode_resource_destroy(struct wl_resource *resource);
+
+/* Find the qdwin_om_head a configuration request refers to, by matching the
+ * head resource against the live manager's head list. Returns NULL if the
+ * head is inert (output unplugged) or belongs to another manager. */
+static struct qdwin_om_head *
+qdwin_om_head_from_resource(struct wl_resource *res)
+{
+	struct qdwin_om_head *h = wl_resource_get_user_data(res);
+	return h;  /* user_data is the qdwin_om_head; may have output==NULL */
+}
+
+/* Emit one head's full property burst on creation. The head may be disabled
+ * (no driving output): we still advertise it (per spec, heads are advertised
+ * even when turned off) with enabled=0 and no mode/position/scale. */
+static void
+qdwin_om_send_head_details(struct qdwin_om_head *omh)
+{
+	struct weston_output *out = omh->output;
+	struct weston_head *wh = omh->head;
+	struct wl_resource *hr = omh->resource;
+	struct weston_mode *m;
+	const char *name, *make, *model, *serial;
+	if (!wh)
+		return;
+	name = weston_head_get_name(wh);
+	if (!name || !*name)
+		name = out && out->name ? out->name : "UNKNOWN";
+	/* name is required + immutable per head. */
+	zwlr_output_head_v1_send_name(hr, name);
+	/* description: human-readable, also untrusted. Build from the head's
+	 * make/model if present, else fall back to the name. */
+	make = wh->make;
+	model = wh->model;
+	serial = wh->serial_number;
+	{
+		char desc[256];
+		if (make || model)
+			snprintf(desc, sizeof desc, "%s %s",
+				 make ? make : "", model ? model : "");
+		else
+			snprintf(desc, sizeof desc, "%s", name);
+		zwlr_output_head_v1_send_description(hr, desc);
+	}
+	if (wh->mm_width > 0 || wh->mm_height > 0)
+		zwlr_output_head_v1_send_physical_size(hr, wh->mm_width,
+						       wh->mm_height);
+
+	if (!out) {
+		/* Truly outputless head (no driving weston_output at all): no
+		 * modes, position, scale, and it cannot be (re-)enabled. */
+		zwlr_output_head_v1_send_enabled(hr, 0);
+		if (wl_resource_get_version(hr) >= 2) {
+			if (make)
+				zwlr_output_head_v1_send_make(hr, make);
+			if (model)
+				zwlr_output_head_v1_send_model(hr, model);
+			if (serial)
+				zwlr_output_head_v1_send_serial_number(hr, serial);
+		}
+		return;
+	}
+
+	/* Modes. Create one zwlr_output_mode_v1 per weston_mode. The mode_list
+	 * is populated whether the output is enabled or disabled, so we always
+	 * advertise modes for a present output (a disabled output's modes are
+	 * what a re-enable picks from). zwlr_output_mode_v1 is capped at version
+	 * 3; the manager/head are version 4, so clamp the mode resource version
+	 * to the mode interface's max so we never create a v4 mode object. */
+	wl_list_for_each(m, &out->mode_list, link) {
+		struct qdwin_om_mode *omm = calloc(1, sizeof *omm);
+		struct wl_resource *mr;
+		uint32_t mode_ver = wl_resource_get_version(hr);
+		if (mode_ver > (uint32_t)zwlr_output_mode_v1_interface.version)
+			mode_ver = (uint32_t)zwlr_output_mode_v1_interface.version;
+		if (!omm)
+			continue;
+		mr = wl_resource_create(wl_resource_get_client(hr),
+			&zwlr_output_mode_v1_interface,
+			mode_ver, 0);
+		if (!mr) {
+			free(omm);
+			continue;
+		}
+		omm->head = omh;
+		omm->resource = mr;
+		omm->mode = m;
+		wl_resource_set_implementation(mr, &qdwin_om_mode_impl, omm,
+					       qdwin_om_mode_resource_destroy);
+		wl_list_insert(&omh->modes, &omm->link);
+		zwlr_output_head_v1_send_mode(hr, mr);
+		zwlr_output_mode_v1_send_size(mr, m->width, m->height);
+		if (m->refresh > 0)
+			zwlr_output_mode_v1_send_refresh(mr, m->refresh);
+		if (m->flags & WL_OUTPUT_MODE_PREFERRED)
+			zwlr_output_mode_v1_send_preferred(mr);
+	}
+
+	/* Dynamic state. */
+	zwlr_output_head_v1_send_enabled(hr, out->enabled ? 1 : 0);
+	if (out->enabled) {
+		/* current_mode references one of the mode resources above. */
+		struct qdwin_om_mode *omm;
+		wl_list_for_each(omm, &omh->modes, link) {
+			if (omm->mode == out->current_mode) {
+				zwlr_output_head_v1_send_current_mode(hr,
+					omm->resource);
+				break;
+			}
+		}
+		zwlr_output_head_v1_send_position(hr,
+			(int32_t)out->pos.c.x, (int32_t)out->pos.c.y);
+		zwlr_output_head_v1_send_transform(hr, out->transform);
+		zwlr_output_head_v1_send_scale(hr,
+			wl_fixed_from_int(out->current_scale > 0
+					  ? out->current_scale : 1));
+	}
+	/* make/model/serial (v2+) — untrusted EDID-derived strings, forwarded
+	 * verbatim as protocol strings (PlainText on the client). */
+	if (wl_resource_get_version(hr) >= 2) {
+		if (make)
+			zwlr_output_head_v1_send_make(hr, make);
+		if (model)
+			zwlr_output_head_v1_send_model(hr, model);
+		if (serial)
+			zwlr_output_head_v1_send_serial_number(hr, serial);
+	}
+}
+
+/* Tear down a head's mode resources (mark inert) and the head itself. */
+static void
+qdwin_om_head_destroy_modes(struct qdwin_om_head *omh)
+{
+	struct qdwin_om_mode *omm, *tmp;
+	wl_list_for_each_safe(omm, tmp, &omh->modes, link) {
+		zwlr_output_mode_v1_send_finished(omm->resource);
+		omm->mode = NULL;        /* inert */
+		wl_list_remove(&omm->link);
+		/* The resource stays alive until the client destroys it; its
+		 * user_data still points at omm. Sever the head link and the
+		 * mode pointer; the destructor frees omm. */
+		omm->head = NULL;
+	}
+}
+
+static void
+qdwin_om_manager_destroy_heads(struct qdwin_om_manager *mgr)
+{
+	struct qdwin_om_head *omh, *tmp;
+	wl_list_for_each_safe(omh, tmp, &mgr->heads, link) {
+		qdwin_om_head_destroy_modes(omh);
+		zwlr_output_head_v1_send_finished(omh->resource);
+		/* Inert: clear BOTH the head and output back-pointers. The
+		 * weston_head behind a finished resource may be freed before the
+		 * client destroys the resource, so a late enable_head/disable_head
+		 * on this resource must resolve to a NULL head (→ realize rejects
+		 * the config) rather than dereference a dangling weston_head. */
+		omh->head = NULL;
+		omh->output = NULL;
+		wl_list_remove(&omh->link);
+		omh->mgr = NULL;
+	}
+}
+
+static void
+qdwin_om_manager_create_heads(struct qdwin_om_manager *mgr)
+{
+	struct qdwin *qdwin = mgr->qdwin;
+	struct wl_client *client = wl_resource_get_client(mgr->resource);
+	uint32_t ver = wl_resource_get_version(mgr->resource);
+	struct weston_head *wh = NULL;
+
+	/* One head per libweston head — enabled OR disabled. Per the protocol
+	 * heads are advertised even when turned off (a disabled head reports
+	 * enabled=0 with no driving output), so the layout client can re-enable
+	 * one. Non-desktop heads (HMDs etc.) are skipped — they are not part of
+	 * the desktop layout. */
+	while ((wh = weston_compositor_iterate_heads(qdwin->compositor, wh))) {
+		struct qdwin_om_head *omh;
+		struct wl_resource *hr;
+		if (weston_head_is_non_desktop(wh))
+			continue;
+		omh = calloc(1, sizeof *omh);
+		if (!omh)
+			continue;
+		hr = wl_resource_create(client, &zwlr_output_head_v1_interface,
+					ver, 0);
+		if (!hr) {
+			free(omh);
+			continue;
+		}
+		omh->mgr = mgr;
+		omh->head = wh;
+		/* The head's output object survives a disable: weston moves a
+		 * disabled output to pending_output_list with enabled=false but
+		 * keeps head->output set (its head_list + mode_list stay intact),
+		 * so weston_output_enable() can later re-enable it. We therefore
+		 * keep omh->output whenever the head HAS an output, NULL only when
+		 * the head is truly outputless. The advertised `enabled` flag is
+		 * driven off out->enabled, not off the pointer — so a disabled
+		 * output can still be re-enabled by a (revert) apply. */
+		omh->output = weston_head_get_output(wh);
+		wl_list_init(&omh->modes);
+		omh->resource = hr;
+		wl_resource_set_implementation(hr, &qdwin_om_head_impl, omh,
+					       qdwin_om_head_resource_destroy);
+		wl_list_insert(&mgr->heads, &omh->link);
+		zwlr_output_manager_v1_send_head(mgr->resource, hr);
+		qdwin_om_send_head_details(omh);
+	}
+}
+
+static void
+qdwin_om_manager_resync(struct qdwin_om_manager *mgr)
+{
+	if (mgr->stopped)
+		return;
+	qdwin_om_manager_destroy_heads(mgr);
+	qdwin_om_manager_create_heads(mgr);
+	zwlr_output_manager_v1_send_done(mgr->resource, mgr->qdwin->om_serial);
+}
+
+static void
+qdwin_om_resync_all(struct qdwin *qdwin)
+{
+	struct qdwin_om_manager *mgr;
+	/* Each layout change bumps the serial so stale configurations created
+	 * against an older serial are rejected (`cancelled`). */
+	qdwin->om_serial++;
+	wl_list_for_each(mgr, &qdwin->om_managers, link)
+		qdwin_om_manager_resync(mgr);
+}
+
+/* ---- zwlr_output_mode_v1 ---- */
+static void
+qdwin_om_mode_release(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+static const struct zwlr_output_mode_v1_interface qdwin_om_mode_impl = {
+	.release = qdwin_om_mode_release,
+};
+static void
+qdwin_om_mode_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_om_mode *omm = wl_resource_get_user_data(resource);
+	if (!omm)
+		return;
+	if (omm->head)
+		wl_list_remove(&omm->link);
+	free(omm);
+}
+
+/* ---- zwlr_output_head_v1 ---- */
+static void
+qdwin_om_head_release(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+static const struct zwlr_output_head_v1_interface qdwin_om_head_impl = {
+	.release = qdwin_om_head_release,
+};
+static void
+qdwin_om_head_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_om_head *omh = wl_resource_get_user_data(resource);
+	if (!omh)
+		return;
+	/* Mode resources owned by this head still reference omh via ->head.
+	 * They are destroyed by the client independently; sever the link so
+	 * their destructor doesn't touch a freed list head. */
+	{
+		struct qdwin_om_mode *omm;
+		wl_list_for_each(omm, &omh->modes, link)
+			omm->head = NULL;
+	}
+	if (omh->mgr)
+		wl_list_remove(&omh->link);
+	free(omh);
+}
+
+/* ---- zwlr_output_configuration_head_v1 ---- */
+static void
+qdwin_om_cfg_head_set_mode(struct wl_client *client, struct wl_resource *res,
+			   struct wl_resource *mode_res)
+{
+	struct qdwin_om_cfg_head *ch = wl_resource_get_user_data(res);
+	struct qdwin_om_mode *omm;
+	(void)client;
+	if (!ch)
+		return;
+	if (ch->set_mode || ch->set_custom_mode) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_ALREADY_SET,
+			"mode already set");
+		return;
+	}
+	omm = mode_res ? wl_resource_get_user_data(mode_res) : NULL;
+	/* The mode must belong to THIS head (by head identity, not by shared
+	 * output — cloned heads can share one weston_output, so comparing the
+	 * output would wrongly accept another head's mode resource). */
+	if (!omm || !omm->mode || !omm->head ||
+	    omm->head->head != ch->head) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_INVALID_MODE,
+			"mode does not belong to head");
+		return;
+	}
+	ch->set_mode = true;
+	ch->mode = omm->mode;
+}
+static void
+qdwin_om_cfg_head_set_custom_mode(struct wl_client *client,
+				  struct wl_resource *res,
+				  int32_t w, int32_t h, int32_t refresh)
+{
+	struct qdwin_om_cfg_head *ch = wl_resource_get_user_data(res);
+	(void)client;
+	if (!ch)
+		return;
+	if (ch->set_mode || ch->set_custom_mode) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_ALREADY_SET,
+			"mode already set");
+		return;
+	}
+	if (w <= 0 || h <= 0 || refresh < 0) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_INVALID_CUSTOM_MODE,
+			"invalid custom mode");
+		return;
+	}
+	ch->set_custom_mode = true;
+	ch->custom_w = w;
+	ch->custom_h = h;
+	ch->custom_refresh = refresh;
+}
+static void
+qdwin_om_cfg_head_set_position(struct wl_client *client,
+			       struct wl_resource *res, int32_t x, int32_t y)
+{
+	struct qdwin_om_cfg_head *ch = wl_resource_get_user_data(res);
+	(void)client;
+	if (!ch)
+		return;
+	if (ch->set_position) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_ALREADY_SET,
+			"position already set");
+		return;
+	}
+	ch->set_position = true;
+	ch->pos_x = x;
+	ch->pos_y = y;
+}
+static void
+qdwin_om_cfg_head_set_transform(struct wl_client *client,
+				struct wl_resource *res, int32_t transform)
+{
+	struct qdwin_om_cfg_head *ch = wl_resource_get_user_data(res);
+	(void)client;
+	if (!ch)
+		return;
+	if (ch->set_transform) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_ALREADY_SET,
+			"transform already set");
+		return;
+	}
+	if (transform < WL_OUTPUT_TRANSFORM_NORMAL ||
+	    transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_INVALID_TRANSFORM,
+			"transform value outside enum");
+		return;
+	}
+	ch->set_transform = true;
+	ch->transform = (uint32_t)transform;
+}
+static void
+qdwin_om_cfg_head_set_scale(struct wl_client *client,
+			    struct wl_resource *res, wl_fixed_t scale)
+{
+	struct qdwin_om_cfg_head *ch = wl_resource_get_user_data(res);
+	(void)client;
+	if (!ch)
+		return;
+	if (ch->set_scale) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_ALREADY_SET,
+			"scale already set");
+		return;
+	}
+	if (scale <= 0) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_HEAD_V1_ERROR_INVALID_SCALE,
+			"scale negative or zero");
+		return;
+	}
+	ch->set_scale = true;
+	ch->scale = scale;
+}
+static void
+qdwin_om_cfg_head_set_adaptive_sync(struct wl_client *client,
+				    struct wl_resource *res, uint32_t state)
+{
+	/* weston-14 has no per-output VRR toggle we can drive live; accept the
+	 * request but treat it as a no-op (the layout still applies). We do not
+	 * pretend it took effect — the next done re-reports the real state. */
+	(void)client; (void)res; (void)state;
+}
+static const struct zwlr_output_configuration_head_v1_interface
+	qdwin_om_cfg_head_impl = {
+	.set_mode = qdwin_om_cfg_head_set_mode,
+	.set_custom_mode = qdwin_om_cfg_head_set_custom_mode,
+	.set_position = qdwin_om_cfg_head_set_position,
+	.set_transform = qdwin_om_cfg_head_set_transform,
+	.set_scale = qdwin_om_cfg_head_set_scale,
+	.set_adaptive_sync = qdwin_om_cfg_head_set_adaptive_sync,
+};
+static void
+qdwin_om_cfg_head_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_om_cfg_head *ch = wl_resource_get_user_data(resource);
+	if (!ch)
+		return;
+	/* Unlinked + freed by the owning configuration's destructor; only free
+	 * here if it is still linked (defensive — config destroy clears the
+	 * list first). */
+	if (ch->link.next)
+		wl_list_remove(&ch->link);
+	free(ch);
+}
+
+/* ---- zwlr_output_configuration_v1 ---- */
+/* Dedup key is the weston_head (stable whether the head is enabled or not),
+ * NOT the output (which is NULL for all disabled heads and would collide). */
+static struct qdwin_om_cfg_head *
+qdwin_om_config_find_head(struct qdwin_om_config *cfg,
+			  struct weston_head *wh)
+{
+	struct qdwin_om_cfg_head *ch;
+	wl_list_for_each(ch, &cfg->cfg_heads, link)
+		if (ch->head == wh)
+			return ch;
+	return NULL;
+}
+
+static void
+qdwin_om_config_enable_head(struct wl_client *client, struct wl_resource *res,
+			    uint32_t id, struct wl_resource *head_res)
+{
+	struct qdwin_om_config *cfg = wl_resource_get_user_data(res);
+	struct qdwin_om_head *omh = qdwin_om_head_from_resource(head_res);
+	struct qdwin_om_cfg_head *ch;
+	struct wl_resource *chr;
+	struct weston_head *wh = omh ? omh->head : NULL;
+	struct weston_output *out = omh ? omh->output : NULL;
+	if (!cfg)
+		return;
+	if (cfg->used) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_USED,
+			"configuration already applied/tested");
+		return;
+	}
+	if (wh && qdwin_om_config_find_head(cfg, wh)) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_CONFIGURED_HEAD,
+			"head configured twice");
+		return;
+	}
+	ch = calloc(1, sizeof *ch);
+	chr = wl_resource_create(client,
+		&zwlr_output_configuration_head_v1_interface,
+		wl_resource_get_version(res), id);
+	if (!ch || !chr) {
+		free(ch);
+		if (chr)
+			wl_resource_destroy(chr);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	ch->config = cfg;
+	ch->resource = chr;
+	ch->head = wh;        /* NULL only if the head went inert mid-config */
+	ch->output = out;     /* NULL if the head is currently disabled */
+	ch->enabled = true;
+	wl_resource_set_implementation(chr, &qdwin_om_cfg_head_impl, ch,
+				       qdwin_om_cfg_head_resource_destroy);
+	wl_list_insert(&cfg->cfg_heads, &ch->link);
+}
+
+static void
+qdwin_om_config_disable_head(struct wl_client *client, struct wl_resource *res,
+			     struct wl_resource *head_res)
+{
+	struct qdwin_om_config *cfg = wl_resource_get_user_data(res);
+	struct qdwin_om_head *omh = qdwin_om_head_from_resource(head_res);
+	struct qdwin_om_cfg_head *ch;
+	struct weston_head *wh = omh ? omh->head : NULL;
+	struct weston_output *out = omh ? omh->output : NULL;
+	(void)client;
+	if (!cfg)
+		return;
+	if (cfg->used) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_USED,
+			"configuration already applied/tested");
+		return;
+	}
+	if (wh && qdwin_om_config_find_head(cfg, wh)) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_CONFIGURED_HEAD,
+			"head configured twice");
+		return;
+	}
+	ch = calloc(1, sizeof *ch);
+	if (!ch) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	ch->config = cfg;
+	ch->head = wh;
+	ch->output = out;
+	ch->enabled = false;
+	wl_list_insert(&cfg->cfg_heads, &ch->link);
+}
+
+/* Count every output (enabled + pending/disabled) so the caller can size
+ * the rollback buffer and refuse an apply it could not fully roll back. */
+static uint32_t
+qdwin_om_output_count(struct qdwin *qdwin)
+{
+	struct weston_output *out;
+	uint32_t n = 0;
+	wl_list_for_each(out, &qdwin->compositor->output_list, link)
+		n++;
+	wl_list_for_each(out, &qdwin->compositor->pending_output_list, link)
+		n++;
+	return n;
+}
+
+/* Capture the current state of every output (enabled AND disabled/pending) so
+ * a failed apply can be rolled back atomically — including re-disabling an
+ * output the apply just re-enabled. Returns count, fills `saved[]`
+ * (caller-sized to qdwin_om_output_count). */
+static uint32_t
+qdwin_om_capture(struct qdwin *qdwin, struct qdwin_om_saved *saved,
+		 uint32_t max)
+{
+	struct weston_output *out;
+	uint32_t n = 0;
+	struct wl_list *lists[2] = {
+		&qdwin->compositor->output_list,
+		&qdwin->compositor->pending_output_list,
+	};
+	for (int l = 0; l < 2; l++) {
+		wl_list_for_each(out, lists[l], link) {
+			if (n >= max)
+				break;
+			saved[n].output = out;
+			saved[n].was_enabled = out->enabled;
+			saved[n].pos = out->pos;
+			saved[n].scale = out->current_scale;
+			saved[n].transform = out->transform;
+			saved[n].mode = out->current_mode;
+			n++;
+		}
+	}
+	return n;
+}
+
+static void
+qdwin_om_restore(struct qdwin_om_saved *saved, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		struct weston_output *out = saved[i].output;
+		if (!out)
+			continue;
+		/* If we disabled this output during the failed apply, bring it
+		 * back up FIRST (it comes up with whatever mode/scale/transform it
+		 * had when disabled, i.e. the captured prior state) so the
+		 * mode/scale/transform restores below run on a LIVE output —
+		 * switch_mode / set_transform are not valid on a disabled output
+		 * (same constraint as the forward apply path). Conversely an
+		 * output we ENABLED during the apply but that ended DISABLED needs
+		 * no per-output config restore — it is back to its prior off state.
+		 * Only touch mode/scale/transform when the output is live. */
+		if (saved[i].was_enabled && !out->enabled)
+			weston_output_enable(out);
+		if (out->enabled) {
+			if (saved[i].mode && saved[i].mode != out->current_mode)
+				weston_output_mode_switch_to_temporary(out,
+					saved[i].mode, saved[i].scale);
+			if (saved[i].scale != out->current_scale)
+				weston_output_set_scale(out, saved[i].scale);
+			if (saved[i].transform != out->transform)
+				weston_output_set_transform(out, saved[i].transform);
+		}
+		weston_output_move(out, saved[i].pos);
+		/* An output we ENABLED during the failed apply must be re-disabled
+		 * so `failed` leaves the prior layout intact (protocol req). */
+		if (!saved[i].was_enabled && out->enabled)
+			weston_output_disable(out);
+	}
+}
+
+/* Validate then apply (or just test) a configuration. Returns true on
+ * success. On a failed apply every already-touched output is restored. */
+static bool
+qdwin_om_config_realize(struct qdwin_om_config *cfg, bool test_only)
+{
+	struct qdwin *qdwin = cfg->qdwin;
+	struct qdwin_om_cfg_head *ch;
+#define QDWIN_OM_MAX_OUTPUTS 32
+	struct qdwin_om_saved saved[QDWIN_OM_MAX_OUTPUTS];
+	uint32_t saved_n;
+
+	/* Refuse (rather than silently half-roll-back) a configuration on a
+	 * machine with more outputs than the rollback buffer can hold. 32 is
+	 * far beyond any real desktop; this is a hard safety net, not a limit
+	 * users hit. Checked up front so both test and apply agree. */
+	if (qdwin_om_output_count(qdwin) > QDWIN_OM_MAX_OUTPUTS)
+		return false;
+
+	/* Validation pass (always run, for both test and apply):
+	 *  - a cfg_head must not reference a head that went inert mid-config
+	 *  - ENABLING a head with NO weston_output at all is rejected: qdwin
+	 *    cannot conjure a backend output from a bare head, so per the
+	 *    no-faking rule we say `failed`. A head whose output merely sits
+	 *    DISABLED (still attached, in pending_output_list) CAN be re-enabled
+	 *    via weston_output_enable() — this is what confirm-or-revert relies
+	 *    on to restore a layout that turned an output off. Disabling an
+	 *    already-disabled output is a no-op.
+	 *  - a set_mode mode must belong to the head (re-checked here)
+	 *  - a custom mode must match some advertised mode (we do not support
+	 *    truly arbitrary modelines on weston-14; reject otherwise)
+	 *  - at least one head must remain enabled. */
+	bool any_enabled = false;
+	wl_list_for_each(ch, &cfg->cfg_heads, link) {
+		if (!ch->head)
+			return false;   /* head went inert mid-config */
+		if (ch->enabled && !ch->output)
+			return false;   /* no output object at all → can't enable */
+		if (ch->enabled)
+			any_enabled = true;
+		if (ch->enabled && ch->set_custom_mode) {
+			struct weston_mode *m;
+			bool match = false;
+			wl_list_for_each(m, &ch->output->mode_list, link) {
+				if (m->width == ch->custom_w &&
+				    m->height == ch->custom_h &&
+				    (ch->custom_refresh == 0 ||
+				     m->refresh == (uint32_t)ch->custom_refresh)) {
+					ch->set_mode = true;
+					ch->mode = m;
+					match = true;
+					break;
+				}
+			}
+			if (!match)
+				return false;
+		}
+	}
+	if (!any_enabled)
+		return false;       /* refuse an all-disabled layout */
+
+	if (test_only)
+		return true;
+
+	/* Apply pass — capture for rollback first. */
+	saved_n = qdwin_om_capture(qdwin, saved,
+				   sizeof saved / sizeof saved[0]);
+
+	wl_list_for_each(ch, &cfg->cfg_heads, link) {
+		struct weston_output *out = ch->output;
+		if (!ch->enabled) {
+			/* Disable requested. weston-14's headless/most backends
+			 * keep a single output; disabling the only output is
+			 * already excluded by the any_enabled check. A head that is
+			 * already disabled has no output → nothing to do. */
+			if (out)
+				weston_output_disable(out);
+			continue;
+		}
+		/* A disabled output cannot safely take a mode switch or a
+		 * scale/transform change: those drive the backend / rebuild the
+		 * output geometry, which is invalid while the output's rendering
+		 * surface is torn down. So bring a disabled output UP FIRST with
+		 * its preserved current mode/scale/transform (weston_output_enable
+		 * asserts those are already set, which they are for a previously-
+		 * enabled output), then apply mode/scale/transform/position on the
+		 * now-LIVE output — the same path an already-enabled output takes. */
+		if (!out->enabled && weston_output_enable(out) < 0) {
+			qdwin_om_restore(saved, saved_n);
+			return false;
+		}
+		if (ch->set_mode && ch->mode &&
+		    ch->mode != out->current_mode) {
+			int32_t sc = ch->set_scale
+				? wl_fixed_to_int(ch->scale)
+				: out->current_scale;
+			if (weston_output_mode_switch_to_temporary(out,
+					ch->mode, sc) < 0) {
+				qdwin_om_restore(saved, saved_n);
+				return false;
+			}
+		}
+		if (ch->set_scale) {
+			int32_t sc = wl_fixed_to_int(ch->scale);
+			if (sc < 1)
+				sc = 1;
+			weston_output_set_scale(out, sc);
+		}
+		if (ch->set_transform)
+			weston_output_set_transform(out, ch->transform);
+		if (ch->set_position) {
+			struct weston_coord_global pos = {
+				.c = weston_coord(ch->pos_x, ch->pos_y),
+			};
+			weston_output_move(out, pos);
+		}
+	}
+
+	/* Re-derive dependent shell state (background/panels/fractional-scale)
+	 * the same way the output_changed listener does. */
+	qdwin_refresh_background(qdwin);
+	qdwin_fractional_scale_broadcast(qdwin);
+	qdwin_panels_on_output_change(qdwin);
+	return true;
+}
+
+/* Protocol requires every advertised head to be configured (enabled or
+ * disabled) exactly once. Post `unconfigured_head` if a desktop head is
+ * missing from the configuration. Returns true if the config is complete. */
+static bool
+qdwin_om_config_all_heads_set(struct qdwin_om_config *cfg)
+{
+	struct qdwin *qdwin = cfg->qdwin;
+	struct weston_head *wh = NULL;
+	while ((wh = weston_compositor_iterate_heads(qdwin->compositor, wh))) {
+		if (weston_head_is_non_desktop(wh))
+			continue;
+		if (!qdwin_om_config_find_head(cfg, wh)) {
+			wl_resource_post_error(cfg->resource,
+				ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_UNCONFIGURED_HEAD,
+				"head not configured");
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+qdwin_om_config_apply(struct wl_client *client, struct wl_resource *res)
+{
+	struct qdwin_om_config *cfg = wl_resource_get_user_data(res);
+	(void)client;
+	if (!cfg)
+		return;
+	if (cfg->used) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_USED,
+			"configuration already applied/tested");
+		return;
+	}
+	cfg->used = true;
+	/* Serial check FIRST: if the serial is stale (an output hotplugged /
+	 * changed since the client's last done) the client's view of the head
+	 * set is outdated, so cancel gracefully rather than posting a fatal
+	 * `unconfigured_head` protocol error for a head the client never saw. */
+	if (cfg->serial != cfg->qdwin->om_serial) {
+		zwlr_output_configuration_v1_send_cancelled(res);
+		return;
+	}
+	if (!qdwin_om_config_all_heads_set(cfg))
+		return;  /* protocol error already posted */
+	if (qdwin_om_config_realize(cfg, false)) {
+		zwlr_output_configuration_v1_send_succeeded(res);
+		/* Broadcast the new current configuration to all managers. */
+		qdwin_om_resync_all(cfg->qdwin);
+	} else {
+		zwlr_output_configuration_v1_send_failed(res);
+	}
+}
+
+static void
+qdwin_om_config_test(struct wl_client *client, struct wl_resource *res)
+{
+	struct qdwin_om_config *cfg = wl_resource_get_user_data(res);
+	(void)client;
+	if (!cfg)
+		return;
+	if (cfg->used) {
+		wl_resource_post_error(res,
+			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_USED,
+			"configuration already applied/tested");
+		return;
+	}
+	cfg->used = true;
+	/* Serial check before completeness check (see apply): a stale config is
+	 * cancelled, not failed with a protocol error. */
+	if (cfg->serial != cfg->qdwin->om_serial) {
+		zwlr_output_configuration_v1_send_cancelled(res);
+		return;
+	}
+	if (!qdwin_om_config_all_heads_set(cfg))
+		return;  /* protocol error already posted */
+	if (qdwin_om_config_realize(cfg, true))
+		zwlr_output_configuration_v1_send_succeeded(res);
+	else
+		zwlr_output_configuration_v1_send_failed(res);
+}
+
+static void
+qdwin_om_config_destroy(struct wl_client *client, struct wl_resource *res)
+{
+	(void)client;
+	wl_resource_destroy(res);
+}
+
+static const struct zwlr_output_configuration_v1_interface
+	qdwin_om_config_impl = {
+	.enable_head = qdwin_om_config_enable_head,
+	.disable_head = qdwin_om_config_disable_head,
+	.apply = qdwin_om_config_apply,
+	.test = qdwin_om_config_test,
+	.destroy = qdwin_om_config_destroy,
+};
+
+static void
+qdwin_om_config_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_om_config *cfg = wl_resource_get_user_data(resource);
+	struct qdwin_om_cfg_head *ch, *tmp;
+	if (!cfg)
+		return;
+	/* Per spec, destroying the configuration also destroys every
+	 * zwlr_output_configuration_head_v1 created via it (the child interface
+	 * has NO destroy request, so the compositor must do it). Destroying the
+	 * enable_head child resources runs their resource destructor which frees
+	 * the struct; disable_head children have no resource (calloc'd directly),
+	 * so free them here. We unlink first so the child destructor (which also
+	 * unlinks via the ch->link.next guard) is a no-op on the list. */
+	wl_list_for_each_safe(ch, tmp, &cfg->cfg_heads, link) {
+		wl_list_remove(&ch->link);
+		ch->link.next = NULL;
+		ch->config = NULL;
+		if (ch->resource) {
+			/* enable_head child — destroy the resource; its destructor
+			 * frees ch (and re-checks ch->link.next, now NULL → no-op). */
+			wl_resource_destroy(ch->resource);
+		} else {
+			/* disable_head child — no resource backing it; free directly. */
+			free(ch);
+		}
+	}
+	free(cfg);
+}
+
+/* ---- zwlr_output_manager_v1 ---- */
+static void
+qdwin_om_manager_create_configuration(struct wl_client *client,
+				      struct wl_resource *res,
+				      uint32_t id, uint32_t serial)
+{
+	struct qdwin_om_manager *mgr = wl_resource_get_user_data(res);
+	struct qdwin_om_config *cfg;
+	struct wl_resource *cr;
+	if (!mgr)
+		return;
+	cfg = calloc(1, sizeof *cfg);
+	cr = wl_resource_create(client,
+		&zwlr_output_configuration_v1_interface,
+		wl_resource_get_version(res), id);
+	if (!cfg || !cr) {
+		free(cfg);
+		if (cr)
+			wl_resource_destroy(cr);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	cfg->qdwin = mgr->qdwin;
+	cfg->resource = cr;
+	cfg->serial = serial;
+	wl_list_init(&cfg->cfg_heads);
+	wl_resource_set_implementation(cr, &qdwin_om_config_impl, cfg,
+				       qdwin_om_config_resource_destroy);
+}
+
+static void
+qdwin_om_manager_stop(struct wl_client *client, struct wl_resource *res)
+{
+	struct qdwin_om_manager *mgr = wl_resource_get_user_data(res);
+	(void)client;
+	if (!mgr)
+		return;
+	mgr->stopped = true;
+	zwlr_output_manager_v1_send_finished(mgr->resource);
+	/* finished is a destructor event — tear down now. */
+	wl_resource_destroy(res);
+}
+
+static const struct zwlr_output_manager_v1_interface qdwin_om_manager_impl = {
+	.create_configuration = qdwin_om_manager_create_configuration,
+	.stop = qdwin_om_manager_stop,
+};
+
+static void
+qdwin_om_manager_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_om_manager *mgr = wl_resource_get_user_data(resource);
+	struct qdwin_om_head *omh, *tmp;
+	if (!mgr)
+		return;
+	wl_list_remove(&mgr->link);
+	/* Null head/mode back-pointers; the client destroys those resources. */
+	wl_list_for_each_safe(omh, tmp, &mgr->heads, link) {
+		struct qdwin_om_mode *omm;
+		wl_list_for_each(omm, &omh->modes, link)
+			omm->head = NULL;
+		wl_list_remove(&omh->link);
+		omh->mgr = NULL;
+		omh->head = NULL;
+		omh->output = NULL;
+	}
+	free(mgr);
+}
+
+static void
+bind_output_manager(struct wl_client *client, void *data,
+		    uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct qdwin_om_manager *mgr = calloc(1, sizeof *mgr);
+	if (!mgr) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	mgr->qdwin = qdwin;
+	wl_list_init(&mgr->heads);
+	mgr->resource = wl_resource_create(client,
+		&zwlr_output_manager_v1_interface, version, id);
+	if (!mgr->resource) {
+		free(mgr);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(mgr->resource, &qdwin_om_manager_impl,
+				       mgr, qdwin_om_manager_resource_destroy);
+	wl_list_insert(&qdwin->om_managers, &mgr->link);
+	qdwin_om_manager_create_heads(mgr);
+	zwlr_output_manager_v1_send_done(mgr->resource, qdwin->om_serial);
+	weston_log("qdwin: zwlr_output_manager bound (serial=%u)\n",
+		   qdwin->om_serial);
+}
+
 static void
 qdwin_on_keyboard_focus_changed(struct wl_listener *listener, void *data)
 {
@@ -8127,6 +9201,7 @@ qdwin_on_output_destroyed(struct wl_listener *listener, void *data)
 		wl_container_of(listener, qdwin, output_destroyed_listener);
 	struct weston_output *output = data;
 	qdwin_send_output_removed(qdwin, output);
+	qdwin_om_resync_all(qdwin);
 }
 
 static void
@@ -8140,6 +9215,7 @@ qdwin_on_output_changed(struct wl_listener *listener, void *data)
 	qdwin_panels_on_output_change(qdwin);
 	if (output)
 		qdwin_send_output_created_evt(qdwin, output);
+	qdwin_om_resync_all(qdwin);
 }
 
 static void
@@ -8151,6 +9227,7 @@ qdwin_on_output_resized(struct wl_listener *listener, void *data)
 	qdwin_refresh_background(qdwin);
 	qdwin_fractional_scale_broadcast(qdwin);
 	qdwin_panels_on_output_change(qdwin);
+	qdwin_om_resync_all(qdwin);
 }
 
 /* ------------------------------------------------------------------
@@ -8210,6 +9287,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->xdg_decoration_manager_global);
 	if (qdwin->ext_ws_global)
 		wl_global_destroy(qdwin->ext_ws_global);
+	if (qdwin->output_mgmt_global)
+		wl_global_destroy(qdwin->output_mgmt_global);
 	if (qdwin->nested_outer_event_source) {
 		wl_event_source_remove(qdwin->nested_outer_event_source);
 		qdwin->nested_outer_event_source = NULL;
@@ -14693,6 +15772,8 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * headless probes; the shell reconciles it to qdshell settings at
 	 * session start (create_workspace / workspace.remove). */
 	wl_list_init(&qdwin->ext_ws_managers);
+	wl_list_init(&qdwin->om_managers);
+	qdwin->om_serial = 1;  /* configs created against serial 0 are stale */
 	qdwin->workspace_count = QDWIN_DEFAULT_WORKSPACES;
 	qdwin->active_workspace = 0;
 	{
@@ -14796,6 +15877,18 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	if (!qdwin->ext_ws_global)
 		weston_log("qdwin: ext_workspace_manager_v1 global create failed "
 			   "(workspaces unavailable)\n");
+
+	/* Output (display) management: wlr-output-management-unstable-v1
+	 * manager global. Public output-config protocol (no uid gate); the
+	 * qdshell Display layout tab is the primary consumer. See
+	 * todo/decisions/qdwin-output-management.md. */
+	qdwin->output_mgmt_global = wl_global_create(ec->wl_display,
+						     &zwlr_output_manager_v1_interface,
+						     QDWIN_OM_VERSION, qdwin,
+						     bind_output_manager);
+	if (!qdwin->output_mgmt_global)
+		weston_log("qdwin: zwlr_output_manager_v1 global create failed "
+			   "(output management unavailable)\n");
 
 	/* qdwin_locker_v1 — peer locker global. Defaults to the same uid
 	 * as the shell unless overridden (single-admin assumption per
