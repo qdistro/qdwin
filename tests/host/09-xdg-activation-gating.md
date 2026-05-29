@@ -113,6 +113,45 @@ if [ "$RC" -eq 0 ] && [ "$ALIVE" -eq 0 ] && [ "$POST" -eq $((PRE + 5)) ]; then e
 - `kill -0 weston` succeeds — the compositor process is still running
   after the burst (harness-side liveness, independent of the probe). HARD.
 
+### S4 — a legitimately-issued token is single-use (replay is dropped)
+
+The token lifecycle/expiry edge from §3: a token obtained through the full
+`get_activation_token` + `commit` flow is non-empty, is CONSUMED on the first
+`activate`, and a REPLAY of the same token then takes the unknown-token drop
+path. Proves an attacker can't capture-and-replay a once-valid token.
+
+```bash
+ISSUED="qdwin: xdg-activation token issued"
+NOTOP="qdwin: xdg-activation target surface has no toplevel"
+PRE_UTOK=$(grep -cF "$UTOK" "$WLOG" || true)
+PRE_NOTOP=$(grep -cF "$NOTOP" "$WLOG" || true)
+PRE_ISSUED=$(grep -cF "$ISSUED" "$WLOG" || true)
+if run --token-lifecycle; then RC=0; else RC=$?; fi
+POST_UTOK=$(grep -cF "$UTOK" "$WLOG" || true)
+POST_NOTOP=$(grep -cF "$NOTOP" "$WLOG" || true)
+POST_ISSUED=$(grep -cF "$ISSUED" "$WLOG" || true)
+if kill -0 "$WPID" 2>/dev/null; then ALIVE=0; else ALIVE=1; fi
+if [ "$RC" -eq 0 ] && [ "$ALIVE" -eq 0 ] \
+   && [ "$POST_ISSUED" -eq $((PRE_ISSUED + 1)) ] \
+   && [ "$POST_NOTOP" -eq $((PRE_NOTOP + 1)) ] \
+   && [ "$POST_UTOK" -eq $((PRE_UTOK + 1)) ]; then echo "S4 PASS"; else
+    echo "S4 FAIL (exit=$RC want 0; alive=$ALIVE want 0; issued $PRE_ISSUED->$POST_ISSUED want +1; no-toplevel $PRE_NOTOP->$POST_NOTOP want +1; unknown-token $PRE_UTOK->$POST_UTOK want +1)"; fi
+```
+
+**Assert (S4):**
+- `RC == 0` — the probe got a NON-EMPTY token from `done`, the first
+  `activate` round-tripped, and the replay round-tripped (no protocol error).
+- the `token issued` log count grew by exactly 1 — a real token was minted.
+  HARD.
+- the `target surface has no toplevel` count grew by exactly 1 — the FIRST
+  activate found the (real) token and consumed it, then bailed because the
+  roleless surface has no toplevel (a valid token still can't steal focus
+  onto a roleless surface). HARD.
+- the `unknown token` count grew by exactly 1 — the SECOND activate of the
+  SAME token found nothing, proving the token was single-use (consumed on
+  first use, not replayable). HARD.
+- `kill -0 weston` succeeds. HARD.
+
 ## Teardown
 
 ```bash
@@ -121,5 +160,6 @@ $HT/stop.sh $ID
 
 ## Pass criteria
 
-All three asserts hold: S1 `RC==0` + unknown-token log, S2 `RC==0`,
-S3 `RC==0` + weston still alive.
+All four asserts hold: S1 `RC==0` + unknown-token log, S2 `RC==0`, S3 `RC==0`
++ weston still alive, S4 `RC==0` + token-issued/no-toplevel/unknown-token
+counts each +1 (legitimate token is single-use; replay dropped).

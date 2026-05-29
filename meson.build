@@ -547,6 +547,106 @@ executable('qdwin-output-probe',
   install: true,
 )
 
+# qdwin_nested_v1 negative/gating probe. Binds qdwin_shell_v1 (as the shell)
+# + qdwin_nested_manager_v1 on one client, advertises an inner toplevel, and
+# exercises the advertise -> nested_proxy_pending -> nested_proxy_decision
+# state machine (allow/deny/defer/stale/double), plus the bind-uid gate,
+# destroy ordering, and malformed/placeholder advertises. Driven by
+# tests/host/16-nested-protocol.md.
+executable('qdwin-nested-probe',
+  sources: [
+    'test-client/qdwin-nested-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+    qdwin_nested_client_header,
+    qdwin_nested_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Client header for the cursor-shape probe (qdwin-cursor-probe).
+cursor_shape_client_header = custom_target(
+  'cursor-shape-v1-client-header',
+  input: cursor_shape_xml,
+  output: 'cursor-shape-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+# cursor-shape-v1's get_tablet_tool_v2 references zwp_tablet_tool_v2, so the
+# generated protocol code needs the tablet-v2 interface symbols linked too.
+tablet_v2_client_protocol_code = custom_target(
+  'tablet-v2-client-private-code',
+  input: tablet_v2_xml,
+  output: 'tablet-v2-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+cursor_shape_client_protocol_code = custom_target(
+  'cursor-shape-v1-client-private-code',
+  input: cursor_shape_xml,
+  output: 'cursor-shape-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+# wp_cursor_shape_v1 negative/edge probe. Binds wl_seat + the cursor-shape
+# manager, makes a device via get_pointer, and exercises invalid-shape
+# rejection (invalid_shape), valid shapes, a shape burst, and a second
+# device (cursor-after-focus-change). Driven by tests/host/17-cursor-shape.md.
+executable('qdwin-cursor-probe',
+  sources: [
+    'test-client/qdwin-cursor-probe.c',
+    cursor_shape_client_header,
+    cursor_shape_client_protocol_code,
+    tablet_v2_client_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# v19 global-hotkey REGISTER-edge probe. Binds qdwin_shell_v1 (v19) +
+# bind_as_shell and drives register/unregister/replace/duplicate-across-ids/
+# modifier-only no-op; the observable postconditions are weston-log
+# register_hotkey/unregister_hotkey lines. The real keypress->hotkey_pressed
+# DELIVERY half needs input injection (a seat) and is VM-only. Driven by
+# tests/host/19-hotkey-edges.md.
+executable('qdwin-hotkey-probe',
+  sources: [
+    'test-client/qdwin-hotkey-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Client header + code for the fractional-scale probe (qdwin-fractional-probe).
+fractional_scale_client_header = custom_target(
+  'fractional-scale-v1-client-header',
+  input: fractional_scale_xml,
+  output: 'fractional-scale-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+fractional_scale_client_protocol_code = custom_target(
+  'fractional-scale-v1-client-private-code',
+  input: fractional_scale_xml,
+  output: 'fractional-scale-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+# wp_fractional_scale_v1 probe. Binds wl_compositor + the fractional-scale
+# manager, gets a fractional-scale object on a surface, and asserts the
+# initial preferred_scale value (incl. a forced non-integer via
+# QDWIN_FRACTIONAL_SCALE), commit dedup, and multi-object broadcast. Driven
+# by tests/host/18-fractional-scale.md.
+executable('qdwin-fractional-probe',
+  sources: [
+    'test-client/qdwin-fractional-probe.c',
+    fractional_scale_client_header,
+    fractional_scale_client_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 # xdg-activation negative-path probe. Drives qdwin_activation_activate with an
 # unknown/forged token and asserts the compositor drops it without a protocol
 # error or crash. Driven by tests/host/09-xdg-activation-gating.md.
