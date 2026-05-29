@@ -246,6 +246,35 @@ ext_workspace_client_header = custom_target(
   command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
 )
 
+# Output (display) management: wlr-output-management-unstable-v1. qdwin
+# implements the standard wlroots output-management protocol (manager +
+# head + mode + configuration objects) so the Display layout tab in qdshell
+# (and any other wlr-output-management client, e.g. wlr-randr / kanshi) can
+# enumerate heads/modes and apply an ATOMIC layout with test/apply + revert.
+# Unlike ext-workspace-v1 this protocol is NOT in wayland-protocols (it is a
+# wlr-protocols extension), so the xml is vendored under qdwin/protocols/.
+# See todo/decisions/qdwin-output-management.md.
+wlr_output_mgmt_xml = files('qdwin/protocols/wlr-output-management-unstable-v1.xml')
+wlr_output_mgmt_server_header = custom_target(
+  'wlr-output-management-v1-server-header',
+  input: wlr_output_mgmt_xml,
+  output: 'wlr-output-management-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+wlr_output_mgmt_protocol_code = custom_target(
+  'wlr-output-management-v1-private-code',
+  input: wlr_output_mgmt_xml,
+  output: 'wlr-output-management-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+# Client header for the host output probe (qdwin-output-probe).
+wlr_output_mgmt_client_header = custom_target(
+  'wlr-output-management-v1-client-header',
+  input: wlr_output_mgmt_xml,
+  output: 'wlr-output-management-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
 # §6.10: wp_security_context_v1 — sandboxed-client identity. Lets
 # waypipe (and any other sandbox engine) tag the bridged Wayland
 # connection so the compositor can apply per-app policy without
@@ -417,6 +446,8 @@ qdwin_plugin = shared_library(
     fractional_scale_protocol_code,
     ext_workspace_server_header,
     ext_workspace_protocol_code,
+    wlr_output_mgmt_server_header,
+    wlr_output_mgmt_protocol_code,
     primary_selection_server_header,
     primary_selection_protocol_code,
     security_context_server_header,
@@ -491,6 +522,20 @@ executable('qdwin-workspace-probe',
     'test-client/qdwin-workspace-probe.c',
     ext_workspace_client_header,
     ext_workspace_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# wlr-output-management-v1 server probe. Binds zwlr_output_manager_v1, syncs
+# the head/mode set, prints "heads=N", and (with --apply / --test) builds a
+# configuration and exercises the atomic apply/test + succeeded/failed/
+# cancelled path. Driven by tests/host/12-output-protocol.md.
+executable('qdwin-output-probe',
+  sources: [
+    'test-client/qdwin-output-probe.c',
+    wlr_output_mgmt_client_header,
+    wlr_output_mgmt_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,
