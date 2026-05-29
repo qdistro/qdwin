@@ -26,11 +26,28 @@
  *               (qdwin issues non-empty tokens, and an alloc-fail token is
  *               "" which is also unfindable), so it takes the same
  *               unknown-token drop path.
+ *   --token-lifecycle  Drive the FULL legitimate token flow + single-use
+ *               consumption (the token expiry/reuse edge in §3):
+ *                 1. get_activation_token + set_app_id + commit; assert the
+ *                    `done(token)` event delivers a NON-EMPTY token (qdwin
+ *                    never issues an empty token on the success path);
+ *                 2. activate(token, roleless surface): the token IS known,
+ *                    but the surface has no qdwin toplevel, so qdwin logs
+ *                    "target surface has no toplevel" and FREES the token;
+ *                 3. activate(token AGAIN): the token was consumed in step 2,
+ *                    so this hits the UNKNOWN-token drop — proving a
+ *                    committed token is single-use and cannot be replayed.
+ *               Asserts no protocol error throughout and the compositor stays
+ *               alive. (The "no toplevel" outcome is expected: a roleless
+ *               wl_surface is used precisely so a VALID token still cannot
+ *               steal focus — the consumption is what's under test.)
  *
  * Exit codes:
  *   0  every activate() round-tripped cleanly AND the compositor answered a
- *      post-activate registry roundtrip (still alive)
- *   1  a protocol error was posted, or the liveness roundtrip failed
+ *      post-activate registry roundtrip (still alive); for --token-lifecycle,
+ *      the issued token was non-empty and the replay was dropped
+ *   1  a protocol error was posted, the liveness roundtrip failed, or
+ *      --token-lifecycle saw an empty/missing issued token
  *   2  setup/other error (no display, a required global not advertised)
  *
  * SPDX-License-Identifier: MIT
@@ -51,6 +68,22 @@ struct probe {
 	struct wl_registry *registry;
 	struct wl_compositor *compositor;
 	struct xdg_activation_v1 *activation;
+	char issued_token[128];
+	int got_done;
+};
+
+static void
+on_token_done(void *data, struct xdg_activation_token_v1 *tok,
+	      const char *token)
+{
+	struct probe *p = data;
+	(void)tok;
+	p->got_done = 1;
+	snprintf(p->issued_token, sizeof p->issued_token, "%s",
+		 token ? token : "");
+}
+static const struct xdg_activation_token_v1_listener token_listener = {
+	.done = on_token_done,
 };
 
 static void
@@ -100,6 +133,7 @@ roundtrip_err(struct probe *p, const char *what)
 int main(int argc, char *argv[])
 {
 	int repeat = 1;
+	int lifecycle = 0;
 	const char *token = "qdwin-bogus-forged-token";
 	for (int i = 1; i < argc; i++) {
 		if (strncmp(argv[i], "--repeat=", 9) == 0) {
@@ -108,6 +142,8 @@ int main(int argc, char *argv[])
 				repeat = 1;
 		} else if (strcmp(argv[i], "--empty") == 0) {
 			token = "";
+		} else if (strcmp(argv[i], "--token-lifecycle") == 0) {
+			lifecycle = 1;
 		}
 	}
 
@@ -138,6 +174,55 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "qdwin-activation-probe: create_surface "
 			"failed\n");
 		return 2;
+	}
+
+	if (lifecycle) {
+		/* Step 1: legitimate token request + commit → done(token). */
+		struct xdg_activation_token_v1 *tok =
+			xdg_activation_v1_get_activation_token(p.activation);
+		if (!tok) {
+			fprintf(stderr, "qdwin-activation-probe: "
+				"get_activation_token NULL\n");
+			return 2;
+		}
+		xdg_activation_token_v1_add_listener(tok, &token_listener, &p);
+		xdg_activation_token_v1_set_app_id(tok,
+			"org.qdistro.test.activation");
+		xdg_activation_token_v1_commit(tok);
+		if (roundtrip_err(&p, "token commit") != 0)
+			return 1;
+		if (!p.got_done) {
+			fprintf(stderr, "qdwin-activation-probe: no `done` event "
+				"after token commit\n");
+			return 1;
+		}
+		if (p.issued_token[0] == '\0') {
+			fprintf(stderr, "qdwin-activation-probe: issued token is "
+				"EMPTY (qdwin must never issue an empty token on "
+				"the success path)\n");
+			return 1;
+		}
+
+		/* Step 2: activate with the REAL token against a roleless
+		 * surface. Token is known → consumed (freed); surface has no
+		 * toplevel → no focus change. */
+		xdg_activation_v1_activate(p.activation, p.issued_token, surface);
+		if (roundtrip_err(&p, "activate(real token, roleless)") != 0)
+			return 1;
+
+		/* Step 3: replay the SAME token. It was consumed in step 2, so
+		 * this must hit the unknown-token drop (single-use property). */
+		xdg_activation_v1_activate(p.activation, p.issued_token, surface);
+		if (roundtrip_err(&p, "activate(replayed token)") != 0)
+			return 1;
+
+		struct wl_registry *rl = wl_display_get_registry(p.display);
+		if (!rl || roundtrip_err(&p, "post-lifecycle liveness") != 0)
+			return 1;
+		printf("qdwin-activation-probe: issued non-empty token, "
+		       "consumed on first activate, replay dropped, compositor "
+		       "alive\n");
+		return 0;
 	}
 
 	for (int i = 0; i < repeat; i++) {
