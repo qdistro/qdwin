@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="25">
+  <interface name="qdwin_shell_v1" version="26">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -162,6 +162,13 @@
       existing v19 `register_hotkey` path. Pre-v25 shells get the
       historical fixed behaviour (click-to-focus, centre+cascade
       placement, no snapping/tiling).
+
+      Version 26 adds `set_display_power` so the Power tab's display-off
+      timer applies live: the shell owns the idle timing (via the standard
+      `ext-idle-notify-v1`, which qdwin already implements) and forces all
+      outputs off/on through this request. The inactivity *action*
+      (suspend/lock/…) is also shell-driven from ext-idle-notify and needs
+      no new request. Outputs are forced back on if the shell unbinds.
     </description>
 
     <enum name="error">
@@ -1591,6 +1598,27 @@
       </description>
       <arg name="handle" type="uint" summary="toplevel handle"/>
       <arg name="edge" type="uint" summary="tile_edge enum"/>
+    </request>
+
+    <request name="set_display_power" since="26">
+      <description summary="turn all outputs on or off (DPMS)">
+        Force every output on (`on` non-zero) or off (`on` zero) — the
+        display-power side of the Power settings. The shell drives this
+        from its own idle source (`ext-idle-notify-v1`): on the display-off
+        idle it calls `set_display_power(0)`, and on resume (input wakes the
+        compositor) it calls `set_display_power(1)`.
+
+        Off ceases rendering on each output and DPMS-powers it down where
+        the backend supports it (no-op on backends without DPMS, e.g.
+        headless); on restores normal power. Idempotent. The compositor
+        forces all outputs back on when the shell binding is torn down so a
+        crashed shell can never leave the screen dark.
+
+        Display power is intentionally NOT tied to the compositor's own
+        idle timer: the shell owns the idle timing (via ext-idle-notify)
+        and the action policy, the compositor only enacts the power state.
+      </description>
+      <arg name="on" type="uint" summary="1=power on, 0=power off"/>
     </request>
   </interface>
 

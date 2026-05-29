@@ -622,6 +622,11 @@ struct qdwin {
 	struct wl_event_source *ffm_timer;
 	uint32_t ffm_pending_handle;
 
+	/* v26: 1 while the shell has forced the display off (set_display_power
+	 * 0). Cleared (and outputs forced back on) when the shell unbinds, so a
+	 * crashed shell never leaves the screen dark. */
+	int display_forced_off;
+
 	/* Overlay keyboard grab (B3+B4): captures keys while a launcher
 	 * (kind=0) or lock_surface is visible and forwards each press to
 	 * the shell as overlay_key (qdwin_shell_v1 v17). The shell decodes
@@ -6693,6 +6698,42 @@ qdwin_handle_request_tile(struct wl_client *client,
 	qdwin_toplevel_set_tiled(qdwin, tl, edge);
 }
 
+/* v26: force all outputs on/off (DPMS), the display-power side of the
+ * Power settings. The shell owns the idle timing (ext-idle-notify) and
+ * the action policy; here the compositor only enacts the power state.
+ * weston_output_power_off/on cease/restore rendering and drive DPMS where
+ * the backend supports it (a no-op on headless, whose outputs have a NULL
+ * set_dpms — safe to call). */
+static void
+qdwin_set_all_outputs_power(struct qdwin *qdwin, int on)
+{
+	struct weston_output *output;
+	int n = 0;
+	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+		if (on)
+			weston_output_power_on(output);
+		else
+			weston_output_power_off(output);
+		n++;
+	}
+	weston_log("qdwin: set_display_power on=%d (%d output%s)\n",
+		   on, n, n == 1 ? "" : "s");
+}
+
+static void
+qdwin_handle_set_display_power(struct wl_client *client,
+			       struct wl_resource *resource, uint32_t on)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	/* No locked-state refusal: turning the display back on must work even
+	 * while locked (the locker is up, the user wakes the screen). */
+	qdwin->display_forced_off = on ? 0 : 1;
+	qdwin_set_all_outputs_power(qdwin, on != 0);
+}
+
 /* ------------------------------------------------------------------
  * v19: shell-driven global hotkeys (register_hotkey/unregister_hotkey/
  * hotkey_pressed). Backed by weston_compositor_add_key_binding which
@@ -6883,6 +6924,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_wm_policy = qdwin_handle_set_wm_policy,
 	.request_fullscreen = qdwin_handle_request_fullscreen,
 	.request_tile = qdwin_handle_request_tile,
+	.set_display_power = qdwin_handle_set_display_power,
 };
 
 static void
@@ -6901,6 +6943,12 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 		 * any pending focus-follows-mouse retarget. */
 		qdwin_ffm_cancel(qdwin);
 		qdwin_wm_policy_set_defaults(&qdwin->wm_policy);
+		/* v26: never leave the display dark if the shell that turned it
+		 * off goes away. */
+		if (qdwin->display_forced_off) {
+			qdwin->display_forced_off = 0;
+			qdwin_set_all_outputs_power(qdwin, 1);
+		}
 		qdwin->shell_resource = NULL;
 		qdwin->shell_bound = 0;
 		qdwin->shell_pid = 0;
@@ -9881,6 +9929,12 @@ qdwin_on_output_changed(struct wl_listener *listener, void *data)
 	qdwin_panels_on_output_change(qdwin);
 	if (output)
 		qdwin_send_output_created_evt(qdwin, output);
+	/* v26: if the shell has forced the display off, a newly created /
+	 * re-enabled output must come up powered off too — otherwise a hotplug
+	 * or output-management re-enable during the display-off idle leaves that
+	 * output lit until the next set_display_power. */
+	if (qdwin->display_forced_off && output)
+		weston_output_power_off(output);
 	qdwin_om_resync_all(qdwin);
 }
 
@@ -16533,7 +16587,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       25, qdwin, bind_qdwin_shell);
+					       26, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

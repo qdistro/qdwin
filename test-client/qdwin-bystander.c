@@ -92,6 +92,7 @@
  *   wmpolicy <focus> <ffm_ms> <raise_click> <raise_hover> <placement>
  *            <snap_en> <snap_dist>   → set_wm_policy (v25)
  *   hotkey <id> <modifiers> <key>    → register_hotkey (v19/v25)
+ *   displaypower <0|1>               → set_display_power (v26 DPMS)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -116,7 +117,7 @@
  * request_tile and the v19 register_hotkey path (host test 13-wm-policy).
  * v25 added only requests + enums (no new events), so the listener struct
  * is unchanged. The bind is still clamped to the advertised version. */
-#define BIND_VERSION 25
+#define BIND_VERSION 26
 #define MAX_TOPS 16
 #define MAX_STREAMS 4
 #define FIFO_PATH_DEFAULT "/tmp/qdwin-cmd.fifo"
@@ -822,6 +823,12 @@ process_command(struct app *a, char *line)
 			"rc=%u rh=%u place=%u snap=%u dist=%u\n",
 			fp, ffm, rc, rh, pl, se, sd);
 		qdwin_shell_v1_set_wm_policy(a->shell, fp, ffm, rc, rh, pl, se, sd);
+	} else if (strcmp(cmd, "displaypower") == 0) {
+		/* displaypower <0|1> — v26 DPMS all outputs off/on. `arg` is the
+		 * on flag. */
+		uint32_t on = arg ? (uint32_t)strtoul(arg, NULL, 10) : 1;
+		fprintf(stderr, "qdwin-bystander: cmd displaypower on=%u\n", on);
+		qdwin_shell_v1_set_display_power(a->shell, on);
 	} else if (strcmp(cmd, "hotkey") == 0) {
 		/* hotkey <id> <modifiers> <key> — register a hotkey (v19/v25).
 		 * `arg` already holds the id. */
