@@ -149,5 +149,53 @@ else
     echo "WARN: launcher opened but no qdwin: layer-popup grab started observed; the popup may not have requested grab on this path"
 fi
 
+# ---- Crash-log assertions ----------------------------------------------
+# A clean interaction must not have left compositor/shell crash evidence
+# in the boot journal. These patterns are deliberately specific so an
+# app-level Qt warning does not trip the gate.
+crashlog="$tmpdir/crash-scan.txt"
+vm_exec "journalctl _UID=1000 -b --no-pager 2>/dev/null" > "$crashlog" || true
+crash_hits=$(grep -nE \
+    'weston.*(Segmentation fault|assert|Aborted)|qs\[[0-9]+\]: .*(SIGSEGV|core dumped)|wl_display@[0-9]+: error|Fatal:.*qdwin|qdwin: .*FATAL' \
+    "$crashlog" || true)
+if [ -n "$crash_hits" ]; then
+    echo "$crash_hits" | tail -40 >&2
+    fail "crash/protocol-error evidence in qdwin/qdshell journal"
+fi
+pass "no crash/protocol-error evidence in journal"
+
+# coredumpctl (if present) is the authoritative crash record.
+if vm_exec "command -v coredumpctl >/dev/null 2>&1"; then
+    if vm_exec "coredumpctl --no-pager list 2>/dev/null | grep -qE 'weston|qs|quickshell'"; then
+        vm_exec "coredumpctl --no-pager list 2>/dev/null | grep -E 'weston|qs|quickshell'" >&2 || true
+        fail "coredumpctl recorded a weston/quickshell crash this boot"
+    fi
+    pass "no weston/quickshell coredumps recorded"
+fi
+
+# ---- Vendored-libweston escalation -------------------------------------
+# When the session is running the patched libweston (the shipped config),
+# the DEGRADED warnings must be ABSENT and the deeper popup-grab
+# behaviour gets its own gate. agent-vendored-libweston-verify.sh is the
+# live discriminator; here we just escalate the DEGRADED check from soft
+# to hard whenever the vendored tree is the loaded library.
+vendored_prefix=${QDWIN_VENDORED_LIBWESTON_PREFIX:-/usr/libexec/qdistro/qdwin-libweston}
+loaded_lw=$(vm_exec "pmap \$(pgrep -x weston | head -n1) 2>/dev/null | grep -o '/[^ ]*libweston-14\.so[^ ]*' | sort -u | head -n1" || true)
+case "$loaded_lw" in
+    "$vendored_prefix"/*)
+        if vm_exec "journalctl _UID=1000 -b --no-pager | grep -q 'layer-popup grab handler NOT registered'"; then
+            fail "vendored libweston is loaded ($loaded_lw) but qdwin logged DEGRADED grab-handler — patched symbols not resolved"
+        fi
+        pass "vendored libweston loaded ($loaded_lw) with no DEGRADED grab warning"
+        echo "INFO: run tests/gui/agent-vendored-libweston-verify.sh for the full live grab/dismiss discriminators"
+        ;;
+    "")
+        echo "WARN: could not determine the loaded libweston-14.so path"
+        ;;
+    *)
+        echo "GAP: session running NON-vendored libweston ($loaded_lw) — layer-popup grab paths are N/A; install-vendored-libweston.sh not applied or unit not restarted"
+        ;;
+esac
+
 qdwin_screenshot "/tmp/qdwin-protocol-audit-$VMNAME-$$.png" >/dev/null
 pass "artifact /tmp/qdwin-protocol-audit-$VMNAME-$$.png"

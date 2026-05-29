@@ -121,8 +121,35 @@ them out correctly under `/tmp/qdwin-libweston-prefix/`; rsyncing
 that tree into `/usr/libexec/qdistro/qdwin-libweston/` in a VM is
 sufficient.
 
+## Production build profile + install vehicle (DECIDED)
+
+The install vehicle is `/usr/libexec/qdistro/qdwin-libweston/` — see the
+decision record `qdwin/doc/decisions/0001-vendored-libweston-packaging.md`.
+
+`build-libweston.sh` has two profiles via `QDWIN_LIBWESTON_PROFILE`:
+
+- `headless` (default) — minimal headless-only build used by the
+  host-side protocol tests (`run-null-parent-test.sh`,
+  `run-protocol-tests.sh`); installs under `/tmp/qdwin-libweston-prefix`.
+- `production` — full backend set (drm + pipewire + rdp + wayland + x11
+  + headless + GL + lcms + xwayland) for shipping; installs under
+  `/tmp/qdwin-libweston-prod-prefix` by default. This is what qdistro's
+  `scripts/install/install-vendored-libweston.sh` builds (on demand) and
+  stages into `/usr/libexec/qdistro/qdwin-libweston/`.
+  `fresh-vm-bootstrap.sh` runs that staging right after building qdwin,
+  and `install-qdwin-session-for-vm.sh` points the qdwin `weston` unit's
+  `LD_LIBRARY_PATH` + `WESTON_MODULE_MAP` at the staged tree (core AND
+  backends from the same build).
+
+Headless CI gate (no VM): `run-production-symbols-test.sh` builds the
+production profile and asserts the four soft-linked
+`weston_desktop_xdg_popup_*` helper symbols are exported and the staging
+script lays a complete tree. Wired into qci as
+`host/qdwin-vendored-libweston-symbols`.
+
 ## Open follow-ups
 
-- Decide install vehicle: `/usr/libexec/qdistro/qdwin-libweston/` vs
-  bake into `compositor/build/` and reference from qdwin systemd unit.
 - Upstream the patch to weston master; spec wording supports it.
+- Live-VM grab/dismiss discriminators:
+  `qdwin/tests/gui/agent-vendored-libweston-verify.sh` (needs a VM with
+  this tree installed — see the decision doc).
