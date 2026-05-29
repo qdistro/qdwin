@@ -565,6 +565,22 @@ executable('qdwin-nested-probe',
   install: true,
 )
 
+# qdwin_nested_v1 nested-proxy identity probe. Binds qdwin_nested_manager_v1
+# and calls advertise_toplevel with a deliberately FOREIGN origin_uid (and
+# optionally a foreign-owned input_sink), so the harness can assert (via the
+# weston log) that qdwin overrides origin_uid back to the advertising client's
+# verified peer uid and refuses an input_sink whose peer uid doesn't match.
+# Driven by tests/host/16-nested-identity.md.
+executable('qdwin-nested-identity-probe',
+  sources: [
+    'test-client/qdwin-nested-identity-probe.c',
+    qdwin_nested_client_header,
+    qdwin_nested_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 # Client header for the cursor-shape probe (qdwin-cursor-probe).
 cursor_shape_client_header = custom_target(
   'cursor-shape-v1-client-header',
@@ -799,6 +815,14 @@ test('xdg-activation-policy',
   python3,
   args: [
     files('qdwin/test_xdg_activation_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+test('nested-identity-policy',
+  python3,
+  args: [
+    files('qdwin/test_nested_identity_policy.py'),
     files('qdwin/qdwin.c'),
   ],
 )
