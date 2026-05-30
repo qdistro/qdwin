@@ -1,7 +1,7 @@
 # Protocols
 
 qdwin exposes two private protocols (`qdwin_shell_v1`, currently
-at version 23, and `qdwin_locker_v1` v1 — see [locker.md](locker.md)),
+at version 28, and `qdwin_locker_v1` v1 — see [locker.md](locker.md)),
 one helper protocol for nested compositors (`qdwin_nested_v1`, see
 [nested.md](nested.md)), and a curated set of public Wayland
 protocols.
@@ -78,10 +78,28 @@ keystrokes.
 Built-in, registered unconditionally:
 
 - **xdg-shell** (stable) — via libweston-desktop.
-- **wl_seat / wl_output / wl_subcompositor / wl_data_device_manager**
-  — libweston defaults.
+- **wl_compositor** (v5), **wl_seat / wl_output / wl_subcompositor /
+  wl_shm / wl_data_device_manager**, **wp_viewporter**,
+  **wp_presentation**, **zxdg_output_manager_v1** (v2) — libweston
+  defaults. Note `wl_compositor` is pinned at v5 by vendored
+  libweston-14 (no v6 `preferred_buffer_*` events).
+- **zwp_linux_dmabuf_v1** — libweston default; advertised at v5 (with
+  dma-buf feedback) when a GL renderer is active, else v3.
+- **relative-pointer-v1**, **pointer-constraints-v1** (pointer
+  lock/confine), **zwp_input_timestamps_manager_v1**,
+  **wp_single_pixel_buffer_v1**, **wp_tearing_control_v1**,
+  **tablet-v2** — all registered *ungated* by libweston-14's
+  `weston_compositor_create` for every client (i.e. not curated by
+  qdwin; games / drawing tablets / VRR work without qdwin involvement).
 
 Built-in, registered by qdwin-shell.so:
+
+- **xdg-decoration** (`zxdg_decoration_manager_v1`) — server-side
+  decoration negotiation so toolkits don't self-draw chrome.
+- **wlr-output-management-unstable-v1** (`zwlr_output_manager_v1`) —
+  output layout/mode enumeration and configuration.
+- **ext-workspace-v1** (`ext_workspace_manager_v1`, since shell v24) —
+  workspace enumeration/switching surfaced to the shell.
 
 - **zwlr_layer_shell_v1** (v5) — vendored XML in
   `qdwin/wlr-layer-shell-unstable-v1.xml`. The protocol was never
@@ -97,7 +115,11 @@ Built-in, registered by qdwin-shell.so:
 - **primary-selection-unstable-v1** — middle-click clipboard.
 - **wp_security_context_v1** — sandbox-engine identity tag carried
   through `wl_socket_create_listener` mode.
-- **tablet-v2** — referenced by `cursor-shape-v1`; not used standalone.
+
+Note: `tablet-v2`, `relative-pointer`, `pointer-constraints`,
+`tearing-control` and `single-pixel-buffer` are the ungated libweston
+defaults listed above — advertised to every client, not curated or
+gated by qdwin.
 
 ### Development-only screenshooter
 

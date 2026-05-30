@@ -25,7 +25,7 @@ Legend:
 
 | Protocol | Ver | Source | qdshell / Quickshell use | qdwin status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `wl_compositor` | 6 | libweston | every QML surface | OK | |
+| `wl_compositor` | 5 | libweston | every QML surface | OK | vendored libweston-14 pins v5 (`compositor.c` `wl_compositor_interface, 5`); v6 `preferred_buffer_scale`/`preferred_buffer_transform` events not emitted — toolkits fall back |
 | `wl_shm` | 1+ | libweston | software buffers (pixman path) | OK | |
 | `wl_seat` | — | libweston | pointer / keyboard input | OK | single-seat per session |
 | `wl_output` | — | libweston | `Quickshell.screens`, per-monitor panels | OK | |
@@ -68,7 +68,7 @@ Legend:
 | --- | --- | --- | --- | --- | --- |
 | `wl_data_device` selection | 3 | libweston + qdwin | clipboard, `cliphist` (231 `clipboard` refs) | GATED | qdwin private clipboard gate; qdshell receive-time gate listener still stubbed in the plugin (tracked) |
 | `zwp_primary_selection_device_manager_v1` | — | qdwin | middle-click paste | OK | |
-| `zwlr_screencopy_manager_v1` | — | libweston (weston) | screenshots / `ScreencopyView` | OK | qdwin uses §6.5 view_stream (pipewire) for its own forwarding; wlr-screencopy is the Quickshell-visible path |
+| `zwlr_screencopy_manager_v1` | — | — | screenshots / `ScreencopyView` | **ABSENT** | qdwin does NOT advertise wlr-screencopy (no such global anywhere in the source tree). Whole-output capture is the env-gated weston `weston_capture_v1`/`weston-screenshooter` path (`QDWIN_ENABLE_SCREENSHOOTER=1`, dev/test only); qdwin's own forwarding uses the private §6.5 `qdwin_view_stream_v1` (PipeWire). Third-party `grim`/portal-wlr screencopy clients will not find a global |
 | `zwp_linux_dmabuf_v1` | — | libweston | GPU buffer import (GL clients) | OK | linux-dmabuf.c; advertised when a GL renderer is active |
 
 ## qdistro-private

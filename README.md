@@ -90,11 +90,15 @@ See `plan2/tasks/P10-tier4-guest-image-nested-qdwin.md` and
 ## Protocol
 
 qdwin exposes a private protocol (`qdwin_shell_v1`, currently at
-version 21) plus a nested-compositor protocol (`qdwin_nested_v1`) for
+version 28) plus a nested-compositor protocol (`qdwin_nested_v1`) for
 proxying second-tier compositors. Public protocols supported:
-xdg-shell, xdg-activation, ext-idle-notify, idle-inhibit-unstable-v1,
-cursor-shape-v1, fractional-scale-v1, primary-selection-unstable-v1,
-security-context-v1, zwlr-layer-shell-v1.
+xdg-shell, xdg-decoration, xdg-activation, ext-idle-notify,
+idle-inhibit-unstable-v1, cursor-shape-v1, fractional-scale-v1,
+primary-selection-unstable-v1, security-context-v1, zwlr-layer-shell-v1,
+wlr-output-management-unstable-v1, ext-workspace-v1. (libweston-14 also
+contributes the core globals and, ungated, relative-pointer,
+pointer-constraints, tablet-v2, tearing-control, single-pixel-buffer
+and dmabuf — see doc/protocol.md.)
 
 See [doc/protocol.md](doc/protocol.md), [doc/architecture.md](doc/architecture.md),
 and [doc/nested.md](doc/nested.md).
