@@ -871,6 +871,8 @@ static void qdwin_default_cursor_on_focus_changed(struct wl_listener *l,
  * because they walk seat_trackers via wl_list_for_each on the `link`
  * field which needs the struct to be complete. */
 static void qdwin_seat_emit_focus_now(struct qdwin_seat_tracker *tr);
+static int qdwin_seat_tracker_rebind_focus_listener(
+	struct qdwin_seat_tracker *tr);
 static void qdwin_seat_focus_recover_idle_cb(void *data);
 static void qdwin_emit_seat_focus_changed(struct qdwin *qdwin,
 					  struct weston_seat *seat,
@@ -1805,9 +1807,25 @@ qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl)
 	wl_list_for_each(seat, &tl->qdwin->compositor->seat_list, link) {
 		struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
 		if (kbd && kbd->focus != tl->view->surface) {
+			struct qdwin_seat_tracker *tr =
+				qdwin_seat_tracker_for_seat(tl->qdwin, seat);
+			/* RDP-headless: the backend can swap the wl_keyboard
+			 * after we registered our focus_signal listener, so
+			 * the listener may be sitting on a stale keyboard and
+			 * never fire for this set_focus. Reconcile it onto the
+			 * live keyboard first; then the focus_signal emitted by
+			 * weston_keyboard_set_focus reaches our listener and
+			 * focus propagates organically (the DRM path already
+			 * had a live binding, so this is a no-op there). */
+			qdwin_seat_tracker_rebind_focus_listener(tr);
 			weston_keyboard_set_focus(kbd, tl->view->surface);
-			qdwin_seat_emit_focus_now(
-				qdwin_seat_tracker_for_seat(tl->qdwin, seat));
+			/* Immediate-emit backstop for any case where the
+			 * focus_signal still doesn't reach us. Dedupe-safe:
+			 * qdwin_seat_emit_focus_now short-circuits on
+			 * last_focused_handle, so if the listener already
+			 * emitted for this handle this is a no-op (no
+			 * double-emit on either backend). */
+			qdwin_seat_emit_focus_now(tr);
 		}
 	}
 }
@@ -7403,6 +7421,12 @@ struct qdwin_seat_tracker {
 	struct wl_listener selection_listener;     /* spec/10 */
 	struct wl_listener kbd_focus_listener;     /* spec/10 v14 focus-aware */
 	int kbd_focus_listener_installed;
+	/* The weston_keyboard object kbd_focus_listener is currently bound
+	 * to. Used to detect a backend keyboard swap (RDP-headless replaces
+	 * the wl_keyboard during peer-activate seat bring-up) and rebind the
+	 * focus_signal listener onto the live keyboard even when no
+	 * updated_caps_signal reaches us. NULL when no listener installed. */
+	struct weston_keyboard *kbd_focus_listener_kbd;
 	struct wl_listener pointer_focus_listener; /* B6 default-cursor restore */
 	int pointer_focus_listener_installed;
 	uint32_t last_focused_handle;              /* dedup seat_focus_changed */
@@ -9904,10 +9928,60 @@ qdwin_install_focus_listener_if_needed(struct qdwin_seat_tracker *tr)
 	tr->kbd_focus_listener.notify = qdwin_on_keyboard_focus_changed;
 	wl_signal_add(&kbd->focus_signal, &tr->kbd_focus_listener);
 	tr->kbd_focus_listener_installed = 1;
+	tr->kbd_focus_listener_kbd = kbd;
 	/* Emit current state so the shell starts coherent — this is also
 	 * what bind_as_shell relies on for late-binding shells. */
 	tr->last_focused_handle = UINT32_MAX;  /* force a fresh emit */
 	qdwin_seat_emit_focus_now(tr);
+}
+
+/* Reconcile kbd_focus_listener against the seat's *live* weston_keyboard.
+ *
+ * Background: the RDP-headless backend brings its seat up lazily inside
+ * rdp_peer_activate() — weston_seat_init() fires seat_created_signal (so
+ * qdwin_track_seat runs and tries to install the focus listener) BEFORE
+ * weston_seat_init_keyboard() has created seat->keyboard_state. The
+ * keyboard then appears via updated_caps_signal, which our
+ * qdwin_on_seat_updated_caps handler observes to (re)install the listener.
+ *
+ * That covers the normal ordering, but it leaves the listener's correctness
+ * implicitly dependent on updated_caps_signal firing for every keyboard
+ * swap. This helper makes the binding self-healing and ordering-independent:
+ * it compares the keyboard the listener is bound to against the keyboard the
+ * seat currently exposes and, if they differ (a swap, or a first-time
+ * appearance the caps path missed), moves the listener onto the live object.
+ *
+ * Called from the autofocus path right before weston_keyboard_set_focus(),
+ * so that the subsequent focus_signal emission reaches a listener that is
+ * guaranteed to be on the current keyboard — letting focus propagate
+ * organically on RDP-headless rather than relying solely on the
+ * immediate-emit fallback. The immediate-emit remains as a dedupe-safe
+ * backstop (qdwin_seat_emit_focus_now short-circuits on last_focused_handle).
+ *
+ * Returns 1 if a (re)bind happened, 0 otherwise. Idempotent: a no-op when
+ * the listener is already on the live keyboard. */
+static int
+qdwin_seat_tracker_rebind_focus_listener(struct qdwin_seat_tracker *tr)
+{
+	if (!tr || !tr->seat)
+		return 0;
+	struct weston_keyboard *kbd = weston_seat_get_keyboard(tr->seat);
+	if (tr->kbd_focus_listener_installed &&
+	    tr->kbd_focus_listener_kbd == kbd)
+		return 0;  /* already bound to the live keyboard (or both NULL) */
+	/* Drop any stale binding. Removing a stale focus_signal link before
+	 * re-arming is mandatory: a listener must never sit on two signal
+	 * lists at once or wl_signal_emit would walk a corrupted list — the
+	 * exact wedge (100% CPU) seen on weston-rdp keyboard re-init. */
+	if (tr->kbd_focus_listener_installed) {
+		wl_list_remove(&tr->kbd_focus_listener.link);
+		tr->kbd_focus_listener_installed = 0;
+		tr->kbd_focus_listener_kbd = NULL;
+	}
+	if (!kbd)
+		return 0;  /* no live keyboard yet; caps path will retry */
+	qdwin_install_focus_listener_if_needed(tr);
+	return tr->kbd_focus_listener_kbd == kbd;
 }
 
 /* B6: install a pointer-focus listener so we can restore the default
@@ -9961,6 +10035,7 @@ qdwin_seat_tracker_destroy(struct qdwin_seat_tracker *tr, int emit_removed)
 	if (tr->kbd_focus_listener_installed) {
 		wl_list_remove(&tr->kbd_focus_listener.link);
 		tr->kbd_focus_listener_installed = 0;
+		tr->kbd_focus_listener_kbd = NULL;
 	}
 	if (tr->pointer_focus_listener_installed) {
 		wl_list_remove(&tr->pointer_focus_listener.link);
@@ -10015,19 +10090,14 @@ qdwin_on_seat_updated_caps(struct wl_listener *listener, void *data)
 	struct weston_seat *seat = data;
 	if (seat == tr->seat) {
 		qdwin_install_default_keyboard_grab(seat);
-		/* spec/10 v14: keyboard may have just appeared; install the
-		 * focus listener now if we hadn't yet. If we previously
-		 * installed on an older keyboard, remove that link first
-		 * before re-arming so the listener can never be on two
-		 * focus_signal lists at once (which would have wl_signal_emit
-		 * iterating a corrupted list — and on at least one
-		 * weston-rdp keyboard re-init the result was a wedged
-		 * compositor at 100% CPU). */
-		if (tr->kbd_focus_listener_installed) {
-			wl_list_remove(&tr->kbd_focus_listener.link);
-			tr->kbd_focus_listener_installed = 0;
-		}
-		qdwin_install_focus_listener_if_needed(tr);
+		/* spec/10 v14: keyboard may have just appeared or been swapped
+		 * (RDP backend). Reconcile the focus listener against the live
+		 * keyboard; the helper removes any stale binding before
+		 * re-arming so the listener can never be on two focus_signal
+		 * lists at once (which would have wl_signal_emit iterating a
+		 * corrupted list — the wedged-at-100%-CPU weston-rdp re-init
+		 * case). */
+		qdwin_seat_tracker_rebind_focus_listener(tr);
 		/* B6: same drill for the pointer focus signal. */
 		if (tr->pointer_focus_listener_installed) {
 			wl_list_remove(&tr->pointer_focus_listener.link);
