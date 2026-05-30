@@ -188,6 +188,9 @@ static void qdwin_workspace_create(struct qdwin *qdwin);
 static void qdwin_workspace_remove(struct qdwin *qdwin, uint32_t index);
 static void qdwin_emit_toplevel_workspace(struct qdwin *qdwin,
 					  struct qdwin_toplevel *tl);
+/* v27: re-broadcast ext_workspace_handle_v1.name for one workspace index on
+ * every bound ext-workspace manager (after the shell set/cleared a name). */
+static void qdwin_ext_ws_broadcast_name(struct qdwin *qdwin, uint32_t index);
 static void qdwin_ext_ws_broadcast_state(struct qdwin *qdwin);
 static void qdwin_ext_ws_resync_all(struct qdwin *qdwin);
 /* Output (display) management: re-emit the head/mode/state set to every
@@ -480,6 +483,12 @@ struct qdwin_view_stream {
 	struct wl_list link;              /* qdwin::view_streams */
 };
 
+#define QDWIN_MAX_WORKSPACES 32
+#define QDWIN_DEFAULT_WORKSPACES 4
+/* v27: max stored workspace-name length (bytes). Bounds an unbounded
+ * shell; over-long names are truncated rather than erroring. */
+#define QDWIN_WORKSPACE_NAME_MAX 256
+
 struct qdwin {
 	struct weston_compositor *compositor;
 	struct weston_desktop *desktop;
@@ -564,6 +573,13 @@ struct qdwin {
 	 * pre-workspace code paths behave exactly as before. */
 	uint32_t workspace_count;   /* >= 1, <= QDWIN_MAX_WORKSPACES */
 	uint32_t active_workspace;  /* < workspace_count */
+	/* v27: per-index custom names pushed by the shell via
+	 * qdwin_shell_v1.set_workspace_name. NULL (or empty) means "use the
+	 * positional default" — qdwin then advertises "1".."N" on the
+	 * standard ext_workspace_handle_v1.name so every ext-workspace client
+	 * sees the same names the shell would otherwise only overlay locally.
+	 * Keyed by index (workspaces are positional). */
+	char *workspace_names[QDWIN_MAX_WORKSPACES];
 
 	/* §6.6 S5: single lock view. Legacy lock surfaces own a dedicated
 	 * weston_view; qdlocker now uses its real Qt xdg_toplevel, whose
@@ -839,9 +855,6 @@ struct qdwin {
 	struct wl_list om_managers;       /* qdwin_om_manager::link */
 	uint32_t om_serial;               /* current configuration serial */
 };
-
-#define QDWIN_MAX_WORKSPACES 32
-#define QDWIN_DEFAULT_WORKSPACES 4
 
 struct qdwin_seat_tracker;
 
@@ -6929,6 +6942,57 @@ qdwin_handle_move_toplevel_to_workspace(struct wl_client *client,
 	qdwin_emit_toplevel_workspace(qdwin, tl);
 }
 
+/* v27: set the per-index workspace display name the compositor advertises
+ * via ext_workspace_handle_v1.name, so the user's custom names (qdshell
+ * settings) reach ALL ext-workspace clients — see
+ * qdwin-shell-v1.xml set_workspace_name and todo/qdwin/other-shells.md.
+ * Empty name reverts to the positional default. Out-of-range index is
+ * ignored (the shell may push ahead of create_workspace). Idempotent. */
+static void
+qdwin_handle_set_workspace_name(struct wl_client *client,
+				struct wl_resource *resource,
+				uint32_t index, const char *name)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	char *stored;
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (index >= QDWIN_MAX_WORKSPACES) {
+		weston_log("qdwin: set_workspace_name ignored index=%u (max %u)\n",
+			   index, (unsigned)QDWIN_MAX_WORKSPACES);
+		return;
+	}
+	/* Empty name => revert to positional default (drop any stored name). */
+	if (!name || !name[0]) {
+		if (qdwin->workspace_names[index]) {
+			free(qdwin->workspace_names[index]);
+			qdwin->workspace_names[index] = NULL;
+			weston_log("qdwin: workspace %u name cleared "
+				   "(positional default)\n", index);
+			qdwin_ext_ws_broadcast_name(qdwin, index);
+		}
+		return;
+	}
+	/* Idempotent: a redundant set is a cheap no-op (no name/done churn). */
+	if (qdwin->workspace_names[index] &&
+	    strcmp(qdwin->workspace_names[index], name) == 0)
+		return;
+	/* Bound the stored string (fail-safe against an unbounded shell). */
+	stored = strndup(name, QDWIN_WORKSPACE_NAME_MAX);
+	if (!stored) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	free(qdwin->workspace_names[index]);
+	qdwin->workspace_names[index] = stored;
+	weston_log("qdwin: workspace %u name=\"%s\"\n", index, stored);
+	/* Only echoed to clients if the index is currently a live workspace;
+	 * the broadcast helper skips indices beyond the current handles. The
+	 * stored value still applies the next time handles are (re)created. */
+	qdwin_ext_ws_broadcast_name(qdwin, index);
+}
+
 static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.bind_as_shell = qdwin_handle_bind_as_shell,
 	.destroy = qdwin_handle_destroy,
@@ -6963,6 +7027,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.request_fullscreen = qdwin_handle_request_fullscreen,
 	.request_tile = qdwin_handle_request_tile,
 	.set_display_power = qdwin_handle_set_display_power,
+	.set_workspace_name = qdwin_handle_set_workspace_name,
 };
 
 static void
@@ -8347,14 +8412,21 @@ qdwin_ext_ws_send_handle_details(struct qdwin *qdwin,
 		? EXT_WORKSPACE_HANDLE_V1_STATE_ACTIVE : 0;
 	struct wl_array coords;
 	uint32_t *c;
+	const char *name;
 	snprintf(idbuf, sizeof idbuf, "qdwin-ws-%u", index);
 	snprintf(namebuf, sizeof namebuf, "%u", index + 1u);
-	/* id: stable across the workspace's lifetime (positional). name:
-	 * "1".."N" — the user's custom names are a shell-side display
-	 * overlay (qdshell settings), since ext-workspace-v1 has no rename
-	 * request. coordinates: 1-D = index, so a bar can order cells. */
+	/* id: stable across the workspace's lifetime (positional).
+	 * name: the user's custom name pushed via
+	 * qdwin_shell_v1.set_workspace_name (v27), so EVERY ext-workspace
+	 * client sees it — falling back to the positional "1".."N" when the
+	 * shell never set one (empty/NULL). coordinates: 1-D = index, so a
+	 * bar can order cells. */
+	name = (index < QDWIN_MAX_WORKSPACES &&
+		qdwin->workspace_names[index] &&
+		qdwin->workspace_names[index][0])
+		? qdwin->workspace_names[index] : namebuf;
 	ext_workspace_handle_v1_send_id(h, idbuf);
-	ext_workspace_handle_v1_send_name(h, namebuf);
+	ext_workspace_handle_v1_send_name(h, name);
 	wl_array_init(&coords);
 	c = wl_array_add(&coords, sizeof *c);
 	if (c)
@@ -8467,6 +8539,32 @@ qdwin_ext_ws_broadcast_state(struct qdwin *qdwin)
 		}
 		if (sent)
 			ext_workspace_manager_v1_send_done(mgr->resource);
+	}
+}
+
+/* v27: re-send ext_workspace_handle_v1.name for one workspace index on every
+ * live manager after the shell changed (or cleared) its name. The name value
+ * is recomputed from qdwin->workspace_names[index] (positional fallback when
+ * unset) — identical to what qdwin_ext_ws_send_handle_details would emit. No
+ * resync of the handle list: only the name changed. */
+static void
+qdwin_ext_ws_broadcast_name(struct qdwin *qdwin, uint32_t index)
+{
+	struct qdwin_ext_ws_manager *mgr;
+	char namebuf[16];
+	const char *name;
+	if (index >= QDWIN_MAX_WORKSPACES)
+		return;
+	snprintf(namebuf, sizeof namebuf, "%u", index + 1u);
+	name = (qdwin->workspace_names[index] && qdwin->workspace_names[index][0])
+		? qdwin->workspace_names[index] : namebuf;
+	wl_list_for_each(mgr, &qdwin->ext_ws_managers, link) {
+		if (mgr->stopped)
+			continue;
+		if (index >= mgr->handle_count || !mgr->handles[index])
+			continue;
+		ext_workspace_handle_v1_send_name(mgr->handles[index], name);
+		ext_workspace_manager_v1_send_done(mgr->resource);
 	}
 }
 
@@ -10291,6 +10389,9 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	for (int i = 0; i < 4; i++)
 		weston_layer_fini(&qdwin->layer_shell_layer[i]);
 	wl_list_remove(&qdwin->destroy_listener.link);
+	/* v27: release any per-index custom workspace names (strndup'd). */
+	for (uint32_t wi = 0; wi < QDWIN_MAX_WORKSPACES; wi++)
+		free(qdwin->workspace_names[wi]);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
 	free(qdwin->allowed_layershell_exe);
