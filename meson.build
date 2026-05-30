@@ -826,3 +826,13 @@ test('nested-identity-policy',
     files('qdwin/qdwin.c'),
   ],
 )
+
+# RDP-headless focus-listener rebind invariants. Driven by
+# tests/host/20-rdp-focus-rebind.md (live VM half is PENDING residue).
+test('rdp-focus-rebind',
+  python3,
+  args: [
+    files('qdwin/test_rdp_focus_rebind.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
