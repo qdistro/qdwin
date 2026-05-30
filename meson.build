@@ -533,6 +533,24 @@ executable('qdwin-workspace-probe',
   install: true,
 )
 
+# v27 workspace-NAME parity probe. Binds qdwin_shell_v1 (as the shell) AND
+# ext_workspace_manager_v1 (as any third-party bar would), pushes a custom
+# name via set_workspace_name, and asserts the name is echoed back through
+# the standard ext_workspace_handle_v1.name event — and (with
+# --expect-revert) that an empty name reverts to the positional default.
+# Driven by tests/host/21-ext-workspace-names.md.
+executable('qdwin-wsname-probe',
+  sources: [
+    'test-client/qdwin-wsname-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+    ext_workspace_client_header,
+    ext_workspace_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 # wlr-output-management-v1 server probe. Binds zwlr_output_manager_v1, syncs
 # the head/mode set, prints "heads=N", and (with --apply / --test) builds a
 # configuration and exercises the atomic apply/test + succeeded/failed/
@@ -833,6 +851,18 @@ test('rdp-focus-rebind',
   python3,
   args: [
     files('qdwin/test_rdp_focus_rebind.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+# v27 ext-workspace-v1 workspace-NAME parity invariants
+# (qdwin_shell_v1.set_workspace_name). Driven by
+# tests/host/21-ext-workspace-names.md; the live-VM half (a real
+# third-party ext-workspace bar showing the user's names) is PENDING.
+test('workspace-name-policy',
+  python3,
+  args: [
+    files('qdwin/test_workspace_name_policy.py'),
     files('qdwin/qdwin.c'),
   ],
 )

@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="26">
+  <interface name="qdwin_shell_v1" version="27">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1619,6 +1619,37 @@
         and the action policy, the compositor only enacts the power state.
       </description>
       <arg name="on" type="uint" summary="1=power on, 0=power off"/>
+    </request>
+
+    <request name="set_workspace_name" since="27">
+      <description summary="set a workspace's display name (ext-workspace parity)">
+        v27: push the user's custom display name for a workspace so the
+        compositor advertises it on the STANDARD
+        ext_workspace_handle_v1.name event to every ext-workspace client
+        (qdshell AND any third-party bar, e.g. waybar) — not just as a
+        shell-side overlay. ext-workspace-v1 itself has no rename request,
+        so this private sidecar carries the name into the compositor.
+
+        index is the positional workspace index (0-based), matching the
+        ext_workspace_handle_v1 ordering qdwin advertises. An index at or
+        beyond the maximum number of workspaces (32) is ignored.
+
+        name is the display name. An empty name reverts the workspace to
+        its positional default ("1".."N"). The compositor bounds the
+        stored name to a fixed maximum length (currently 256 bytes);
+        over-long names are truncated rather than treated as an error, so
+        a misbehaving shell can never make the compositor allocate
+        unboundedly.
+
+        The name persists for the lifetime of the compositor process (or
+        until changed/cleared); it is re-applied whenever the workspace's
+        ext_workspace_handle_v1 is (re)created. Pushing the same name
+        again is an idempotent no-op. Only the shell (bind_as_shell) may
+        call this; a non-shell caller is ignored.
+      </description>
+      <arg name="index" type="uint" summary="0-based positional workspace index"/>
+      <arg name="name" type="string"
+	   summary="display name, or empty to revert to the positional default"/>
     </request>
   </interface>
 
