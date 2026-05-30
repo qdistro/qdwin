@@ -10389,6 +10389,9 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	for (int i = 0; i < 4; i++)
 		weston_layer_fini(&qdwin->layer_shell_layer[i]);
 	wl_list_remove(&qdwin->destroy_listener.link);
+	/* v27: release any per-index custom workspace names (strndup'd). */
+	for (uint32_t wi = 0; wi < QDWIN_MAX_WORKSPACES; wi++)
+		free(qdwin->workspace_names[wi]);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
 	free(qdwin->allowed_layershell_exe);
