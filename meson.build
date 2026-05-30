@@ -46,6 +46,9 @@ if not dep_libweston.found()
 endif
 dep_wayland_server = dependency('wayland-server')
 dep_wayland_scanner = dependency('wayland-scanner', native: true)
+# v28: set_pointer_config applies the libinput_device_config_* API to the
+# DRM/libinput backend's input devices. Header + lib come from libinput.
+dep_libinput = dependency('libinput')
 
 # Private protocol codegen.
 wayland_scanner = find_program(
@@ -466,7 +469,7 @@ qdwin_plugin = shared_library(
     xdg_decoration_protocol_code,
   ],
   dependencies: [dep_libweston, dep_wayland_server, dep_wayland_client,
-                 dep_xcursor],
+                 dep_xcursor, dep_libinput],
   name_prefix: '',
   install: true,
   install_dir: get_option('libdir') / 'weston',
@@ -546,6 +549,22 @@ executable('qdwin-wsname-probe',
     qdwin_shell_protocol_code,
     ext_workspace_client_header,
     ext_workspace_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# v28 input-config conformance probe. Binds qdwin_shell_v1 (as the shell),
+# asserts the global advertises >= v28, and pushes a valid then a
+# deliberately out-of-range set_pointer_config / set_key_repeat snapshot,
+# proving the compositor accepts the new requests and clamps/normalises
+# bogus values server-side instead of raising a protocol error.
+# Driven by tests/host/22-input-config.md.
+executable('qdwin-input-probe',
+  sources: [
+    'test-client/qdwin-input-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,
@@ -863,6 +882,17 @@ test('workspace-name-policy',
   python3,
   args: [
     files('qdwin/test_workspace_name_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+# v28 live input-config invariants (qdwin_shell_v1.set_pointer_config /
+# set_key_repeat). Driven by tests/host/22-input-config.md; the live-VM
+# half (a real mouse/touchpad / physical keyboard reacting) is PENDING.
+test('input-config-policy',
+  python3,
+  args: [
+    files('qdwin/test_input_config_policy.py'),
     files('qdwin/qdwin.c'),
   ],
 )

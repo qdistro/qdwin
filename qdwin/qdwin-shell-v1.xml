@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="27">
+  <interface name="qdwin_shell_v1" version="28">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -169,6 +169,13 @@
       outputs off/on through this request. The inactivity *action*
       (suspend/lock/…) is also shell-driven from ext-idle-notify and needs
       no new request. Outputs are forced back on if the shell unbinds.
+
+      Version 28 adds live pointer/touchpad (`set_pointer_config`) and
+      keyboard-repeat (`set_key_repeat`) config so the qdshell Mouse and
+      Keyboard settings tabs apply instead of being persist-only. Both
+      fail safe on out-of-range values and no-op on backends without
+      libinput devices (e.g. headless); pre-v28 shells keep those tabs
+      persist-only. See the per-request docs below.
     </description>
 
     <enum name="error">
@@ -1650,6 +1657,103 @@
       <arg name="index" type="uint" summary="0-based positional workspace index"/>
       <arg name="name" type="string"
 	   summary="display name, or empty to revert to the positional default"/>
+    </request>
+
+    <enum name="accel_profile" since="28">
+      <description summary="pointer acceleration profile for set_pointer_config">
+        Mirrors libinput's pointer-acceleration profile. `flat` applies a
+        constant factor with no acceleration (1:1 device-to-screen at the
+        configured speed); `adaptive` is libinput's default speed-dependent
+        curve. Unknown values fall back to `adaptive`. A device that does
+        not advertise the requested profile is left at its current profile
+        (no error).
+      </description>
+      <entry name="adaptive" value="0"/>
+      <entry name="flat" value="1"/>
+    </enum>
+
+    <enum name="scroll_method" since="28">
+      <description summary="touchpad/pointer scroll method for set_pointer_config">
+        Mirrors libinput's scroll method. `two_finger` is the touchpad
+        default; `edge` scrolls along the touchpad edge; `on_button_down`
+        scrolls while a designated button is held; `none` disables
+        software scroll. Unknown values fall back to `two_finger`. A device
+        that does not advertise the requested method is left unchanged
+        (no error).
+      </description>
+      <entry name="none" value="0"/>
+      <entry name="two_finger" value="1"/>
+      <entry name="edge" value="2"/>
+      <entry name="on_button_down" value="3"/>
+    </enum>
+
+    <request name="set_pointer_config" since="28">
+      <description summary="apply live libinput pointer/touchpad config">
+        Sets the compositor's pointer/touchpad policy as a single
+        idempotent snapshot, applied to EVERY libinput pointer and
+        touchpad device across the seats. The shell sends the full policy
+        every time any field changes; the compositor stores it and applies
+        the new behaviour immediately. This is the live-apply counterpart
+        to the qdshell Mouse settings tab — before v28 those settings were
+        persist-only.
+
+        Each field is applied per-device only when libinput advertises
+        that capability for the device (`*_is_available` /
+        `*_has_*` guard); an unsupported field is skipped for that device
+        rather than raising an error, so a single snapshot can target a
+        mixed mouse + touchpad seat. The policy is process-global (not
+        per-seat / per-device) and is reset to the libinput per-device
+        defaults when the shell binding is torn down.
+
+        Fields:
+        - `accel_speed`: pointer acceleration speed, expressed as a signed
+          fixed value in milli-units in the range [-1000, 1000] mapping to
+          libinput's [-1.0, 1.0]. Out-of-range values are clamped.
+        - `accel_profile`: an `accel_profile` enum value. Unknown values
+          fall back to `adaptive`.
+        - `natural_scroll`: 1 to enable natural (reverse) scrolling.
+        - `tap_to_click`: 1 to enable tap-to-click (touchpads).
+        - `left_handed`: 1 to swap left/right buttons.
+        - `middle_emulation`: 1 to enable middle-button emulation
+          (left+right chord → middle).
+        - `disable_while_typing`: 1 to disable the touchpad while typing.
+        - `scroll_method`: a `scroll_method` enum value. Unknown values
+          fall back to `two_finger`.
+
+        Re-sending the same policy is a harmless no-op. On backends with no
+        libinput devices (e.g. headless) the snapshot is stored but applies
+        to nothing — not an error.
+      </description>
+      <arg name="accel_speed" type="int"
+           summary="acceleration speed in milli-units, -1000..1000"/>
+      <arg name="accel_profile" type="uint" summary="accel_profile enum"/>
+      <arg name="natural_scroll" type="uint" summary="1=natural scroll"/>
+      <arg name="tap_to_click" type="uint" summary="1=tap to click"/>
+      <arg name="left_handed" type="uint" summary="1=left handed"/>
+      <arg name="middle_emulation" type="uint" summary="1=middle-button emulation"/>
+      <arg name="disable_while_typing" type="uint" summary="1=disable while typing"/>
+      <arg name="scroll_method" type="uint" summary="scroll_method enum"/>
+    </request>
+
+    <request name="set_key_repeat" since="28">
+      <description summary="apply live xkb key-repeat rate and delay">
+        Sets the keyboard key-repeat policy and re-advertises it to every
+        bound wl_keyboard via `wl_keyboard.repeat_info`. This is the
+        live-apply counterpart to the qdshell Keyboard settings tab's
+        repeat controls — before v28 the compositor only sent its built-in
+        repeat info at keyboard-bind time.
+
+        `rate` is the repeat rate in characters per second (Hz), clamped to
+        [0, 255]; 0 disables key repeat entirely (per the wl_keyboard
+        repeat_info contract). `delay` is the initial delay in
+        milliseconds before repeat begins, clamped to [1, 10000].
+
+        The policy is process-global and is reset to the compositor default
+        repeat rate/delay when the shell binding is torn down. Re-sending
+        the same values is a harmless no-op.
+      </description>
+      <arg name="rate" type="uint" summary="repeat rate in Hz, 0..255 (0=off)"/>
+      <arg name="delay" type="uint" summary="initial delay in ms, 1..10000"/>
     </request>
   </interface>
 

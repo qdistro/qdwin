@@ -46,6 +46,7 @@
 #include <libweston/shell-utils.h>
 #include <libweston/xwayland-api.h>
 #include <wayland-server-core.h>
+#include <libinput.h>
 #include <X11/Xcursor/Xcursor.h>
 
 /* Exported by the weston frontend binary; not in the installed plugin
@@ -324,6 +325,60 @@ struct qdwin_wm_policy {
 	uint32_t placement;      /* enum qdwin_placement */
 	int snap_enabled;
 	uint32_t snap_distance;  /* 1..64 px */
+};
+
+/* v28: live libinput pointer/touchpad config (qdwin_shell_v1.set_pointer_config)
+ * and xkb key-repeat (set_key_repeat). Values match the protocol enums /
+ * ranges in qdwin-shell-v1.xml. */
+#define QDWIN_ACCEL_SPEED_MIN  (-1000)
+#define QDWIN_ACCEL_SPEED_MAX  (1000)
+#define QDWIN_KB_RATE_MAX      255u    /* wl_keyboard repeat rate (Hz), 0=off */
+#define QDWIN_KB_DELAY_MIN     1u
+#define QDWIN_KB_DELAY_MAX     10000u
+
+enum qdwin_accel_profile {
+	QDWIN_ACCEL_ADAPTIVE = 0,
+	QDWIN_ACCEL_FLAT     = 1,
+};
+enum qdwin_scroll_method {
+	QDWIN_SCROLL_NONE           = 0,
+	QDWIN_SCROLL_TWO_FINGER     = 1,
+	QDWIN_SCROLL_EDGE           = 2,
+	QDWIN_SCROLL_ON_BUTTON_DOWN = 3,
+};
+
+/* Minimal ABI mirrors of libweston's backend-libinput internal structs
+ * (src/libweston/libinput-seat.h, libinput-device.h). We do NOT include
+ * those internal headers (they pull in a private config.h and aren't part
+ * of the installed -devel package); instead we replicate the exact field
+ * PREFIX we read so wl_list iteration and the libinput_device pointer land
+ * at the right offsets. Reached only under the DRM/libinput backend
+ * (qdwin->libinput_backend), where weston_seat IS the first member of
+ * udev_seat. Keep these in sync with the vendored libweston if it bumps. */
+struct qdwin_udev_seat_abi {
+	struct weston_seat base;        /* MUST be first — matches udev_seat */
+	struct wl_list devices_list;    /* struct evdev_device::link */
+	/* (remaining udev_seat fields omitted — never read) */
+};
+struct qdwin_evdev_device_abi {
+	struct weston_seat *seat;
+	int seat_caps;                  /* enum evdev_device_seat_capability */
+	struct libinput_device *device;
+	struct weston_touch_device *touch_device;
+	struct wl_list link;            /* into udev_seat::devices_list */
+	/* (remaining evdev_device fields omitted — never read) */
+};
+
+struct qdwin_pointer_config {
+	int valid;                  /* 0 until the shell pushes a snapshot */
+	int32_t accel_speed;        /* milli-units, -1000..1000 */
+	uint32_t accel_profile;     /* enum qdwin_accel_profile */
+	int natural_scroll;
+	int tap_to_click;
+	int left_handed;
+	int middle_emulation;
+	int disable_while_typing;
+	uint32_t scroll_method;     /* enum qdwin_scroll_method */
 };
 
 struct qdwin_toplevel {
@@ -642,6 +697,21 @@ struct qdwin {
 	 * 0). Cleared (and outputs forced back on) when the shell unbinds, so a
 	 * crashed shell never leaves the screen dark. */
 	int display_forced_off;
+
+	/* v28: live libinput pointer config (set_pointer_config). Process-global
+	 * snapshot, applied to every pointer/touchpad device. Reset (libinput
+	 * per-device defaults left in place) when the shell unbinds.
+	 * libinput_backend is 1 only under the DRM/libinput backend, where the
+	 * weston_seat embeds a struct udev_seat with a real devices_list; it
+	 * gates the udev_seat reinterpret so we never read a bogus list on
+	 * headless / RDP / nested seats. kb_repeat_* shadow the compositor's
+	 * repeat rate/delay so they can be restored on unbind; default_kb_*
+	 * capture the boot-time values. */
+	struct qdwin_pointer_config pointer_config;
+	int libinput_backend;
+	int32_t default_kb_repeat_rate;
+	int32_t default_kb_repeat_delay;
+	int kb_repeat_overridden;
 
 	/* Overlay keyboard grab (B3+B4): captures keys while a launcher
 	 * (kind=0) or lock_surface is visible and forwards each press to
@@ -6786,6 +6856,307 @@ qdwin_handle_set_display_power(struct wl_client *client,
 }
 
 /* ------------------------------------------------------------------
+ * v28: live libinput pointer/touchpad config (set_pointer_config) and
+ * xkb key-repeat (set_key_repeat).
+ *
+ * Pointer config is applied per libinput device through the public
+ * libinput_device_config_* API. We reach the devices by walking each
+ * weston_seat and, under the libinput/DRM backend, treating it as the
+ * struct udev_seat that embeds it (weston_seat is udev_seat's first
+ * member) — exactly how libweston's own backend-libinput touches device
+ * config. On backends with no libinput devices (e.g. headless) the
+ * snapshot is stored but applies to nothing, which is a safe no-op.
+ *
+ * Each field is guarded by libinput's own *_is_available / *_has_*
+ * capability query so a mixed mouse + touchpad seat takes the relevant
+ * subset per device and never errors on an unsupported field.
+ * ------------------------------------------------------------------ */
+
+static enum libinput_config_accel_profile
+qdwin_accel_profile_to_libinput(uint32_t p)
+{
+	return (p == QDWIN_ACCEL_FLAT)
+		? LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT
+		: LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE;
+}
+
+static enum libinput_config_scroll_method
+qdwin_scroll_method_to_libinput(uint32_t m)
+{
+	switch (m) {
+	case QDWIN_SCROLL_NONE:           return LIBINPUT_CONFIG_SCROLL_NO_SCROLL;
+	case QDWIN_SCROLL_EDGE:           return LIBINPUT_CONFIG_SCROLL_EDGE;
+	case QDWIN_SCROLL_ON_BUTTON_DOWN: return LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN;
+	case QDWIN_SCROLL_TWO_FINGER:
+	default:                          return LIBINPUT_CONFIG_SCROLL_2FG;
+	}
+}
+
+/* Apply the stored snapshot to one libinput device, honouring each
+ * capability guard. Safe to call on any device kind. */
+static void
+qdwin_pointer_config_apply_device(const struct qdwin_pointer_config *pc,
+				  struct libinput_device *dev)
+{
+	if (!pc->valid || !dev)
+		return;
+
+	if (libinput_device_config_accel_is_available(dev)) {
+		double speed = (double)pc->accel_speed / 1000.0;
+		libinput_device_config_accel_set_speed(dev, speed);
+		uint32_t profiles = libinput_device_config_accel_get_profiles(dev);
+		enum libinput_config_accel_profile want =
+			qdwin_accel_profile_to_libinput(pc->accel_profile);
+		if (profiles & want)
+			libinput_device_config_accel_set_profile(dev, want);
+	}
+	if (libinput_device_config_scroll_has_natural_scroll(dev))
+		libinput_device_config_scroll_set_natural_scroll_enabled(
+			dev, pc->natural_scroll ? 1 : 0);
+	if (libinput_device_config_tap_get_finger_count(dev) > 0)
+		libinput_device_config_tap_set_enabled(
+			dev, pc->tap_to_click
+				? LIBINPUT_CONFIG_TAP_ENABLED
+				: LIBINPUT_CONFIG_TAP_DISABLED);
+	if (libinput_device_config_left_handed_is_available(dev))
+		libinput_device_config_left_handed_set(
+			dev, pc->left_handed ? 1 : 0);
+	if (libinput_device_config_middle_emulation_is_available(dev))
+		libinput_device_config_middle_emulation_set_enabled(
+			dev, pc->middle_emulation
+				? LIBINPUT_CONFIG_MIDDLE_EMULATION_ENABLED
+				: LIBINPUT_CONFIG_MIDDLE_EMULATION_DISABLED);
+	if (libinput_device_config_dwt_is_available(dev))
+		libinput_device_config_dwt_set_enabled(
+			dev, pc->disable_while_typing
+				? LIBINPUT_CONFIG_DWT_ENABLED
+				: LIBINPUT_CONFIG_DWT_DISABLED);
+	{
+		uint32_t methods = libinput_device_config_scroll_get_methods(dev);
+		enum libinput_config_scroll_method want =
+			qdwin_scroll_method_to_libinput(pc->scroll_method);
+		/* NO_SCROLL is always representable; others are gated. */
+		if (want == LIBINPUT_CONFIG_SCROLL_NO_SCROLL || (methods & want))
+			libinput_device_config_scroll_set_method(dev, want);
+	}
+}
+
+/* Reset one libinput device to its per-device defaults (used on shell
+ * unbind so a shell-less compositor reverts to stock behaviour). Each field
+ * is guarded by the same capability query as the apply path. */
+static void
+qdwin_pointer_config_reset_device(struct libinput_device *dev)
+{
+	if (!dev)
+		return;
+	if (libinput_device_config_accel_is_available(dev)) {
+		libinput_device_config_accel_set_speed(
+			dev, libinput_device_config_accel_get_default_speed(dev));
+		enum libinput_config_accel_profile def =
+			libinput_device_config_accel_get_default_profile(dev);
+		if (libinput_device_config_accel_get_profiles(dev) & def)
+			libinput_device_config_accel_set_profile(dev, def);
+	}
+	if (libinput_device_config_scroll_has_natural_scroll(dev))
+		libinput_device_config_scroll_set_natural_scroll_enabled(dev,
+			libinput_device_config_scroll_get_default_natural_scroll_enabled(dev));
+	if (libinput_device_config_tap_get_finger_count(dev) > 0)
+		libinput_device_config_tap_set_enabled(dev,
+			libinput_device_config_tap_get_default_enabled(dev));
+	if (libinput_device_config_left_handed_is_available(dev))
+		libinput_device_config_left_handed_set(dev,
+			libinput_device_config_left_handed_get_default(dev));
+	if (libinput_device_config_middle_emulation_is_available(dev))
+		libinput_device_config_middle_emulation_set_enabled(dev,
+			libinput_device_config_middle_emulation_get_default_enabled(dev));
+	if (libinput_device_config_dwt_is_available(dev))
+		libinput_device_config_dwt_set_enabled(dev,
+			libinput_device_config_dwt_get_default_enabled(dev));
+	{
+		enum libinput_config_scroll_method def =
+			libinput_device_config_scroll_get_default_method(dev);
+		if (def == LIBINPUT_CONFIG_SCROLL_NO_SCROLL ||
+		    (libinput_device_config_scroll_get_methods(dev) & def))
+			libinput_device_config_scroll_set_method(dev, def);
+	}
+}
+
+/* Walk every libinput device on every libinput-backed seat, invoking `fn`
+ * (apply current snapshot, or reset to defaults). Returns the number of
+ * devices touched — 0 on a backend with no libinput seats (e.g. headless).
+ *
+ * The struct udev_seat cast is only valid under the DRM/libinput backend
+ * (qdwin->libinput_backend); a plain weston_seat is NOT embedded in a
+ * udev_seat, so reading devices_list off one would walk past the object.
+ * Even under the libinput backend, qdwin's own synthetic seats (created
+ * directly via weston_seat_init — RDP "rdp-*", per-stream "qdwin-stream-*",
+ * nested inner "qdwin-nested-*") are NOT udev_seats; the libinput backend
+ * never uses the "qdwin-" prefix, so skipping it (plus "rdp-") leaves
+ * exactly the real libinput seats. */
+static int
+qdwin_pointer_config_walk(struct qdwin *qdwin,
+			  void (*fn)(struct libinput_device *dev,
+				     const struct qdwin_pointer_config *pc),
+			  const struct qdwin_pointer_config *pc)
+{
+	struct weston_seat *seat;
+	int n = 0;
+	if (!qdwin->libinput_backend)
+		return 0;
+	wl_list_for_each(seat, &qdwin->compositor->seat_list, link) {
+		const char *name = seat->seat_name ? seat->seat_name : "";
+		if (strncmp(name, "rdp-", 4) == 0 ||
+		    strncmp(name, "qdwin-", 6) == 0)
+			continue;
+		struct qdwin_udev_seat_abi *useat =
+			(struct qdwin_udev_seat_abi *)seat;
+		struct qdwin_evdev_device_abi *device;
+		wl_list_for_each(device, &useat->devices_list, link) {
+			fn(device->device, pc);
+			n++;
+		}
+	}
+	return n;
+}
+
+/* Walker adapters. */
+static void
+qdwin_pointer_apply_cb(struct libinput_device *dev,
+		       const struct qdwin_pointer_config *pc)
+{
+	qdwin_pointer_config_apply_device(pc, dev);
+}
+static void
+qdwin_pointer_reset_cb(struct libinput_device *dev,
+		       const struct qdwin_pointer_config *pc)
+{
+	(void)pc;
+	qdwin_pointer_config_reset_device(dev);
+}
+
+static int
+qdwin_pointer_config_apply_all(struct qdwin *qdwin)
+{
+	if (!qdwin->pointer_config.valid)
+		return 0;
+	return qdwin_pointer_config_walk(qdwin, qdwin_pointer_apply_cb,
+					 &qdwin->pointer_config);
+}
+
+static int
+qdwin_pointer_config_reset_all(struct qdwin *qdwin)
+{
+	return qdwin_pointer_config_walk(qdwin, qdwin_pointer_reset_cb, NULL);
+}
+
+static void
+qdwin_handle_set_pointer_config(struct wl_client *client,
+				struct wl_resource *resource,
+				int32_t accel_speed, uint32_t accel_profile,
+				uint32_t natural_scroll, uint32_t tap_to_click,
+				uint32_t left_handed, uint32_t middle_emulation,
+				uint32_t disable_while_typing,
+				uint32_t scroll_method)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+
+	struct qdwin_pointer_config *pc = &qdwin->pointer_config;
+	if (accel_speed < QDWIN_ACCEL_SPEED_MIN)
+		accel_speed = QDWIN_ACCEL_SPEED_MIN;
+	if (accel_speed > QDWIN_ACCEL_SPEED_MAX)
+		accel_speed = QDWIN_ACCEL_SPEED_MAX;
+	pc->accel_speed = accel_speed;
+	pc->accel_profile = (accel_profile == QDWIN_ACCEL_FLAT)
+		? QDWIN_ACCEL_FLAT : QDWIN_ACCEL_ADAPTIVE;
+	pc->natural_scroll = natural_scroll ? 1 : 0;
+	pc->tap_to_click = tap_to_click ? 1 : 0;
+	pc->left_handed = left_handed ? 1 : 0;
+	pc->middle_emulation = middle_emulation ? 1 : 0;
+	pc->disable_while_typing = disable_while_typing ? 1 : 0;
+	switch (scroll_method) {
+	case QDWIN_SCROLL_NONE:
+	case QDWIN_SCROLL_TWO_FINGER:
+	case QDWIN_SCROLL_EDGE:
+	case QDWIN_SCROLL_ON_BUTTON_DOWN:
+		pc->scroll_method = scroll_method;
+		break;
+	default:
+		pc->scroll_method = QDWIN_SCROLL_TWO_FINGER;
+		break;
+	}
+	pc->valid = 1;
+
+	int n = qdwin_pointer_config_apply_all(qdwin);
+	weston_log("qdwin: set_pointer_config accel=%d profile=%u natural=%d "
+		   "tap=%d left=%d middle=%d dwt=%d scroll=%u (%d device%s)\n",
+		   pc->accel_speed, pc->accel_profile, pc->natural_scroll,
+		   pc->tap_to_click, pc->left_handed, pc->middle_emulation,
+		   pc->disable_while_typing, pc->scroll_method,
+		   n, n == 1 ? "" : "s");
+}
+
+/* Re-send wl_keyboard.repeat_info to every bound keyboard resource on every
+ * seat, so a live rate/delay change reaches already-connected clients (the
+ * compositor otherwise only sends repeat_info at keyboard-bind time). */
+static void
+qdwin_resend_repeat_info(struct qdwin *qdwin)
+{
+	struct weston_seat *seat;
+	wl_list_for_each(seat, &qdwin->compositor->seat_list, link) {
+		struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
+		struct wl_resource *res;
+		if (!kbd)
+			continue;
+		wl_resource_for_each(res, &kbd->resource_list) {
+			if (wl_resource_get_version(res) >=
+			    WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
+				wl_keyboard_send_repeat_info(
+					res, qdwin->compositor->kb_repeat_rate,
+					qdwin->compositor->kb_repeat_delay);
+		}
+		wl_resource_for_each(res, &kbd->focus_resource_list) {
+			if (wl_resource_get_version(res) >=
+			    WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
+				wl_keyboard_send_repeat_info(
+					res, qdwin->compositor->kb_repeat_rate,
+					qdwin->compositor->kb_repeat_delay);
+		}
+	}
+}
+
+static void
+qdwin_handle_set_key_repeat(struct wl_client *client,
+			    struct wl_resource *resource,
+			    uint32_t rate, uint32_t delay)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+
+	if (rate > QDWIN_KB_RATE_MAX)
+		rate = QDWIN_KB_RATE_MAX;
+	if (delay < QDWIN_KB_DELAY_MIN)
+		delay = QDWIN_KB_DELAY_MIN;
+	if (delay > QDWIN_KB_DELAY_MAX)
+		delay = QDWIN_KB_DELAY_MAX;
+
+	/* Remember the compositor default once so unbind can restore it. */
+	if (!qdwin->kb_repeat_overridden) {
+		qdwin->default_kb_repeat_rate = qdwin->compositor->kb_repeat_rate;
+		qdwin->default_kb_repeat_delay = qdwin->compositor->kb_repeat_delay;
+		qdwin->kb_repeat_overridden = 1;
+	}
+	qdwin->compositor->kb_repeat_rate = (int32_t)rate;
+	qdwin->compositor->kb_repeat_delay = (int32_t)delay;
+	qdwin_resend_repeat_info(qdwin);
+	weston_log("qdwin: set_key_repeat rate=%u delay=%u\n", rate, delay);
+}
+
+/* ------------------------------------------------------------------
  * v19: shell-driven global hotkeys (register_hotkey/unregister_hotkey/
  * hotkey_pressed). Backed by weston_compositor_add_key_binding which
  * is already excluded by every active grab — overlays, switcher, and
@@ -7028,6 +7399,8 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.request_tile = qdwin_handle_request_tile,
 	.set_display_power = qdwin_handle_set_display_power,
 	.set_workspace_name = qdwin_handle_set_workspace_name,
+	.set_pointer_config = qdwin_handle_set_pointer_config,
+	.set_key_repeat = qdwin_handle_set_key_repeat,
 };
 
 static void
@@ -7051,6 +7424,23 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 		if (qdwin->display_forced_off) {
 			qdwin->display_forced_off = 0;
 			qdwin_set_all_outputs_power(qdwin, 1);
+		}
+		/* v28: revert every libinput device to its per-device defaults
+		 * (so a shell-less compositor keeps stock behaviour) and drop the
+		 * live snapshot, then restore the compositor's boot-time
+		 * key-repeat. Reset must run BEFORE clearing valid is irrelevant
+		 * (reset_all ignores the snapshot), but we clear valid after so a
+		 * stray late apply can't re-push. */
+		if (qdwin->pointer_config.valid)
+			qdwin_pointer_config_reset_all(qdwin);
+		qdwin->pointer_config.valid = 0;
+		if (qdwin->kb_repeat_overridden) {
+			qdwin->compositor->kb_repeat_rate =
+				qdwin->default_kb_repeat_rate;
+			qdwin->compositor->kb_repeat_delay =
+				qdwin->default_kb_repeat_delay;
+			qdwin->kb_repeat_overridden = 0;
+			qdwin_resend_repeat_info(qdwin);
 		}
 		qdwin->shell_resource = NULL;
 		qdwin->shell_bound = 0;
@@ -16911,6 +17301,12 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		ec, &qdwin_proxy_default_pointer_grab_iface);
 	wl_list_init(&qdwin->hotkeys);
 	qdwin_wm_policy_set_defaults(&qdwin->wm_policy);
+	/* v28: only the DRM/libinput backend's seats embed a real udev_seat
+	 * with a devices_list we can walk for set_pointer_config. */
+	qdwin->libinput_backend =
+		(ec->primary_backend &&
+		 weston_get_backend_type(ec->primary_backend) ==
+			 WESTON_BACKEND_DRM) ? 1 : 0;
 	wl_list_init(&qdwin->toplevels);
 	wl_list_init(&qdwin->view_streams);
 	wl_list_init(&qdwin->seat_trackers);
@@ -17017,9 +17413,13 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		goto fail;
 	}
 
+	/* Advertise the full interface version so the shell can bind every
+	 * request up to v28 (set_pointer_config / set_key_repeat). This also
+	 * fixes v27 (set_workspace_name) being unreachable when the global was
+	 * pinned at 26. */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       26, qdwin, bind_qdwin_shell);
+					       28, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
