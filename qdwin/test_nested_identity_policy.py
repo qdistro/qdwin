@@ -160,6 +160,275 @@ def check_bind_proxy_pixels_ownership(source):
     return 0
 
 
+def check_bind_proxy_pixels_preserves_pending_gate(source):
+    body, err = _function_body(
+        source,
+        r"qdwin_handle_bind_proxy_pixels\s*\(\s*struct wl_client",
+        "qdwin_handle_bind_proxy_pixels",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in body:
+        return fail("bind_proxy_pixels does not consult pending broker gate")
+    if "&qdwin->held_layer.view_list" not in body:
+        return fail("bind_proxy_pixels never keeps pending pixels on held layer")
+    if not re.search(
+            r"tl->nested_proxy_pending_decision\s*\?\s*"
+            r"&qdwin->held_layer\.view_list\s*:\s*"
+            r"&qdwin->normal_layer\.view_list",
+            body, re.DOTALL):
+        return fail("bind_proxy_pixels does not choose held vs normal layer "
+                    "from nested_proxy_pending_decision")
+    return 0
+
+
+def check_pixel_destroy_preserves_pending_gate(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_proxy_pixel_surface_destroyed\s*\(",
+        "qdwin_proxy_pixel_surface_destroyed",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in body:
+        return fail("pixel-surface destroy path does not consult pending gate")
+    if "&qdwin->held_layer.view_list" not in body:
+        return fail("pixel-surface destroy path cannot restore held curtain")
+    return 0
+
+
+def check_geometry_resize_preserves_pending_gate(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_nested_proxy_set_geometry\s*\(",
+        "qdwin_nested_proxy_set_geometry",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in body:
+        return fail("nested-proxy geometry resize does not consult pending gate")
+    if "&qdwin->held_layer.view_list" not in body:
+        return fail("nested-proxy geometry resize cannot keep pending curtain "
+                    "on held layer")
+    return 0
+
+
+def check_stale_decisions_are_idempotent(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_handle_nested_proxy_decision\s*\(",
+        "qdwin_handle_nested_proxy_decision",
+    )
+    if err:
+        return fail(err)
+    deny_case = re.search(
+        r"case\s+1:\s*/\*\s*deny\s*\*/(.*?)case\s+2:",
+        body, re.DOTALL)
+    if not deny_case:
+        return fail("nested_proxy_decision deny case not found")
+    text = deny_case.group(1)
+    if "!tl->nested_proxy_pending_decision" not in text:
+        return fail("nested_proxy_decision deny does not ignore non-pending "
+                    "handles")
+    if not re.search(
+            r"if\s*\(\s*!tl->nested_proxy_pending_decision\s*\)\s*\{"
+            r".*?return;",
+            text, re.DOTALL):
+        return fail("nested_proxy_decision stale deny does not return before "
+                    "destroying proxy")
+
+    defer_case = re.search(
+        r"case\s+2:\s*/\*\s*defer\s*\*/(.*?)default:",
+        body, re.DOTALL)
+    if not defer_case:
+        return fail("nested_proxy_decision defer case not found")
+    text = defer_case.group(1)
+    if "!tl->nested_proxy_pending_decision" not in text:
+        return fail("nested_proxy_decision defer does not ignore non-pending "
+                    "handles")
+    if not re.search(
+            r"if\s*\(\s*!tl->nested_proxy_pending_decision\s*\)\s*\{"
+            r".*?return;",
+            text, re.DOTALL):
+        return fail("nested_proxy_decision stale defer does not return as "
+                    "an idempotent no-op")
+    return 0
+
+
+def check_focus_requests_preserve_pending_gate(source):
+    for fn in ("qdwin_handle_set_keyboard_focus",
+               "qdwin_handle_set_keyboard_focus_v2"):
+        body, err = _function_body(
+            source,
+            rf"static void\s+{fn}\s*\(",
+            fn,
+        )
+        if err:
+            return fail(err)
+        if "tl->nested_proxy_pending_decision" not in body:
+            return fail(f"{fn} does not reject pending nested proxies")
+        if not re.search(
+                r"if\s*\(\s*tl->nested_proxy_pending_decision\s*\)\s*\{"
+                r".*?return;",
+                body, re.DOTALL):
+            return fail(f"{fn} pending nested-proxy branch does not return "
+                        "before focusing")
+    return 0
+
+
+def check_minimize_preserves_pending_gate(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_toplevel_set_minimized\s*\(",
+        "qdwin_toplevel_set_minimized",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in body:
+        return fail("minimize path does not reject pending nested proxies")
+    if not re.search(
+            r"if\s*\(\s*tl->nested_proxy_pending_decision\s*\)\s*\{"
+            r".*?return;",
+            body, re.DOTALL):
+        return fail("minimize pending nested-proxy branch does not return "
+                    "before moving layers")
+    return 0
+
+
+def check_view_stream_preserves_pending_gate(source):
+    subscribe_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_handle_subscribe_view_stream\s*\(",
+        "qdwin_handle_subscribe_view_stream",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in subscribe_body:
+        return fail("subscribe_view_stream does not reject pending nested "
+                    "proxies")
+    if "qdwin_view_stream_v1_send_denied" not in subscribe_body:
+        return fail("subscribe_view_stream pending nested-proxy branch does "
+                    "not send a denied event")
+
+    pin_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_view_stream_pin\s*\(",
+        "qdwin_view_stream_pin",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in pin_body:
+        return fail("view_stream_pin lacks defense-in-depth pending gate")
+
+    focus_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_stream_seat_assert_focus\s*\(",
+        "qdwin_stream_seat_assert_focus",
+    )
+    if err:
+        return fail(err)
+    if "s->tl->nested_proxy_pending_decision" not in focus_body:
+        return fail("stream input focus lacks defense-in-depth pending gate")
+    return 0
+
+
+def check_state_requests_preserve_pending_gate(source):
+    for fn in ("qdwin_toplevel_set_maximized",
+               "qdwin_toplevel_set_fullscreen",
+               "qdwin_toplevel_set_tiled"):
+        body, err = _function_body(
+            source,
+            rf"static void\s+{fn}\s*\(",
+            fn,
+        )
+        if err:
+            return fail(err)
+        if "tl->nested_proxy_pending_decision" not in body:
+            return fail(f"{fn} does not reject pending nested proxies")
+        if not re.search(
+                r"if\s*\(\s*tl->nested_proxy_pending_decision\s*\)\s*\{"
+                r".*?return;",
+                body, re.DOTALL):
+            return fail(f"{fn} pending nested-proxy branch does not return "
+                        "before moving/resizing")
+
+    move_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_handle_begin_interactive_move\s*\(",
+        "qdwin_handle_begin_interactive_move",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in move_body:
+        return fail("begin_interactive_move does not reject pending nested "
+                    "proxies")
+    return 0
+
+
+def check_pixel_destroy_preserves_position(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_proxy_pixel_surface_destroyed\s*\(",
+        "qdwin_proxy_pixel_surface_destroyed",
+    )
+    if err:
+        return fail(err)
+    if "weston_view_get_pos_offset_global" not in body:
+        return fail("pixel-surface destroy path does not preserve current "
+                    "pixel-feed position")
+    if "qdwin_primary_output" in body:
+        return fail("pixel-surface destroy path recenters fallback curtain "
+                    "instead of preserving position")
+    return 0
+
+
+def check_generic_raise_paths_preserve_pending_gate(source):
+    move_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_toplevel_move_to_layer\s*\(",
+        "qdwin_toplevel_move_to_layer",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in move_body:
+        return fail("generic toplevel move helper does not guard pending "
+                    "nested proxies")
+    if "&tl->qdwin->held_layer" not in move_body:
+        return fail("generic toplevel move helper does not redirect pending "
+                    "normal-layer moves to held_layer")
+
+    request_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_handle_request_raise\s*\(",
+        "qdwin_handle_request_raise",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in request_body:
+        return fail("request_raise does not ignore pending nested proxies")
+
+    hit_body, err = _function_body(
+        source,
+        r"static struct qdwin_toplevel \*\s+qdwin_toplevel_at_pos\s*\(",
+        "qdwin_toplevel_at_pos",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in hit_body:
+        return fail("click hit-test does not skip pending nested proxies")
+
+    chrome_body, err = _function_body(
+        source,
+        r"static struct qdwin_toplevel \*\s+qdwin_chrome_at_pos\s*\(",
+        "qdwin_chrome_at_pos",
+    )
+    if err:
+        return fail(err)
+    if "tl->nested_proxy_pending_decision" not in chrome_body:
+        return fail("chrome hit-test does not skip pending nested proxies")
+    return 0
+
+
 def check_stream_input_helper_bound(source):
     """The view-stream input claim must remain tied to the spawned helper
     pid (defence-in-depth alongside the one-shot access_token). This is the
@@ -189,6 +458,16 @@ def main():
         check_advertise_binds_origin_uid,
         check_input_sink_peercred,
         check_bind_proxy_pixels_ownership,
+        check_bind_proxy_pixels_preserves_pending_gate,
+        check_pixel_destroy_preserves_pending_gate,
+        check_geometry_resize_preserves_pending_gate,
+        check_stale_decisions_are_idempotent,
+        check_focus_requests_preserve_pending_gate,
+        check_minimize_preserves_pending_gate,
+        check_view_stream_preserves_pending_gate,
+        check_state_requests_preserve_pending_gate,
+        check_pixel_destroy_preserves_position,
+        check_generic_raise_paths_preserve_pending_gate,
         check_stream_input_helper_bound,
     )
     for check in checks:

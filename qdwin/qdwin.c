@@ -1347,6 +1347,9 @@ static void
 qdwin_toplevel_move_to_layer(struct qdwin_toplevel *tl,
 			     struct weston_layer *layer)
 {
+	if (tl->nested_proxy_pending_decision &&
+	    layer == &tl->qdwin->normal_layer)
+		layer = &tl->qdwin->held_layer;
 	weston_view_move_to_layer(tl->view, &layer->view_list);
 	for (int s = 0; s < QDWIN_SIDES; s++) {
 		if (tl->chrome[s].view)
@@ -2313,6 +2316,11 @@ qdwin_handle_request_minimize(struct wl_client *client,
 static void
 qdwin_toplevel_set_minimized(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: set_minimized handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", tl->handle);
+		return;
+	}
 	if (tl->state & QDWIN_TS_MINIMIZED)
 		return;
 	qdwin_toplevel_move_to_layer(tl, &qdwin->minimized_layer);
@@ -2368,6 +2376,11 @@ qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
 			      bool fullscreen,
 			      struct weston_output *output)
 {
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: set_fullscreen handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", tl->handle);
+		return;
+	}
 	int want_fs = fullscreen ? 1 : 0;
 	int is_fs   = (tl->state & QDWIN_TS_FULLSCREEN) ? 1 : 0;
 	if (want_fs == is_fs) {
@@ -2468,6 +2481,11 @@ qdwin_toplevel_set_maximized(struct qdwin *qdwin,
 			     struct qdwin_toplevel *tl,
 			     bool maximized)
 {
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: set_maximized handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", tl->handle);
+		return;
+	}
 	int want_max = maximized ? 1 : 0;
 	int is_max   = (tl->state & QDWIN_TS_MAXIMIZED) ? 1 : 0;
 	if (want_max == is_max) {
@@ -2597,6 +2615,11 @@ qdwin_handle_request_raise(struct wl_client *client,
 	tl = qdwin_toplevel_from_handle(qdwin, handle);
 	if (!tl) {
 		weston_log("qdwin: request_raise unknown handle=%u\n", handle);
+		return;
+	}
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: request_raise handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", handle);
 		return;
 	}
 
@@ -2803,6 +2826,11 @@ qdwin_handle_begin_interactive_move(struct wl_client *client,
 	if (!tl || !tl->view) {
 		weston_log("qdwin: begin_interactive_move handle=%u "
 			   "ignored — no such toplevel\n", handle);
+		return;
+	}
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: begin_interactive_move handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", handle);
 		return;
 	}
 
@@ -3186,6 +3214,8 @@ qdwin_chrome_at_pos(struct qdwin *qdwin, struct weston_coord_global pos,
 		return NULL;
 	struct qdwin_toplevel *tl;
 	wl_list_for_each(tl, &qdwin->toplevels, link) {
+		if (tl->nested_proxy_pending_decision)
+			continue;
 		for (int s = 0; s < QDWIN_SIDES; s++) {
 			struct weston_view *cv = tl->chrome[s].view;
 			struct weston_surface *cs = tl->chrome[s].surface;
@@ -3222,6 +3252,8 @@ qdwin_toplevel_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
 	if (tl)
 		return tl;
 	wl_list_for_each(tl, &qdwin->toplevels, link) {
+		if (tl->nested_proxy_pending_decision)
+			continue;
 		struct weston_view *v = tl->view;
 		struct weston_surface *cs = v ? v->surface : NULL;
 		if (!v || !cs || cs->width <= 0 || cs->height <= 0)
@@ -3752,6 +3784,8 @@ qdwin_view_stream_pin(struct qdwin_view_stream *s)
 	struct weston_output *pw = s->pw_output;
 	if (!tl || !tl->view || !pw)
 		return;
+	if (tl->nested_proxy_pending_decision)
+		return;
 
 	/* Remember where the view was so we can restore on teardown. */
 	s->prev_pos = weston_view_get_pos_offset_global(tl->view);
@@ -4081,6 +4115,18 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 		return;
 	}
 
+	if (tl->nested_proxy_pending_decision) {
+		wl_resource_set_implementation(stream_resource,
+					       &qdwin_stream_impl,
+					       NULL, NULL);
+		qdwin_view_stream_v1_send_denied(
+			stream_resource,
+			"nested proxy is waiting for admin decision");
+		weston_log("qdwin: subscribe_view_stream denied handle=%u "
+			   "(nested-proxy pending admin decision)\n", handle);
+		return;
+	}
+
 	struct weston_output *pw = qdwin_find_free_pipewire_output(qdwin);
 	if (!pw) {
 		/* Attach a minimal impl so destroy still frees the resource;
@@ -4249,6 +4295,8 @@ static void
 qdwin_stream_seat_assert_focus(struct qdwin_view_stream *s)
 {
 	if (!s->seat_inited || !s->tl || !s->tl->view || !s->tl->view->surface)
+		return;
+	if (s->tl->nested_proxy_pending_decision)
 		return;
 
 	struct weston_pointer *ptr = weston_seat_get_pointer(&s->stream_seat);
@@ -6092,13 +6140,20 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 	}
 	struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
 	struct weston_surface *target = NULL;
-	if (target_handle != UINT32_MAX) {
-		struct qdwin_toplevel *tl;
-		wl_list_for_each(tl, &qdwin->toplevels, link) {
-			if (tl->handle == target_handle) {
-				if (tl->view && tl->view->surface)
-					target = tl->view->surface;
-				break;
+		if (target_handle != UINT32_MAX) {
+			struct qdwin_toplevel *tl;
+			wl_list_for_each(tl, &qdwin->toplevels, link) {
+				if (tl->handle == target_handle) {
+					if (tl->nested_proxy_pending_decision) {
+						weston_log("qdwin: set_keyboard_focus "
+							   "handle=%u ignored — nested-proxy "
+							   "waiting for admin decision\n",
+							   target_handle);
+						return;
+					}
+					if (tl->view && tl->view->surface)
+						target = tl->view->surface;
+					break;
 			}
 		}
 		if (!target) {
@@ -6180,13 +6235,20 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 	}
 	struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
 	struct weston_surface *target = NULL;
-	if (target_handle != UINT32_MAX) {
-		struct qdwin_toplevel *tl;
-		wl_list_for_each(tl, &qdwin->toplevels, link) {
-			if (tl->handle == target_handle) {
-				if (tl->view && tl->view->surface)
-					target = tl->view->surface;
-				break;
+		if (target_handle != UINT32_MAX) {
+			struct qdwin_toplevel *tl;
+			wl_list_for_each(tl, &qdwin->toplevels, link) {
+				if (tl->handle == target_handle) {
+					if (tl->nested_proxy_pending_decision) {
+						weston_log("qdwin: set_keyboard_focus_v2 "
+							   "handle=%u ignored — nested-proxy "
+							   "waiting for admin decision\n",
+							   target_handle);
+						return;
+					}
+					if (tl->view && tl->view->surface)
+						target = tl->view->surface;
+					break;
 			}
 		}
 		if (!target) {
@@ -6308,6 +6370,8 @@ qdwin_toplevel_raise(struct qdwin_toplevel *tl)
 {
 	if (!tl || !tl->qdwin)
 		return;
+	if (tl->nested_proxy_pending_decision)
+		return;
 	if (tl->state & QDWIN_TS_MINIMIZED)
 		return;
 	if (tl->workspace != tl->qdwin->active_workspace)
@@ -6323,6 +6387,8 @@ static void
 qdwin_toplevel_focus(struct qdwin *qdwin, struct qdwin_toplevel *tl, int raise)
 {
 	if (!qdwin || !tl || qdwin->locked)
+		return;
+	if (tl->nested_proxy_pending_decision)
 		return;
 	if (!tl->view || !tl->view->surface ||
 	    !weston_surface_is_mapped(tl->view->surface))
@@ -6625,6 +6691,11 @@ static void
 qdwin_toplevel_set_tiled(struct qdwin *qdwin, struct qdwin_toplevel *tl,
 			 uint32_t edge)
 {
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: tile handle=%u ignored — nested-proxy "
+			   "waiting for admin decision\n", tl->handle);
+		return;
+	}
 	if (edge != QDWIN_TILE_LEFT && edge != QDWIN_TILE_RIGHT)
 		edge = QDWIN_TILE_NONE;
 
@@ -16151,6 +16222,12 @@ qdwin_handle_nested_proxy_decision(struct wl_client *client,
 			   "reason='%s'\n", handle, reason ? reason : "");
 		break;
 	case 1: /* deny */
+		if (!tl->nested_proxy_pending_decision) {
+			weston_log("qdwin: nested_proxy_decision handle=%u "
+				   "deny: not pending (idempotent no-op)\n",
+				   handle);
+			return;
+		}
 		weston_log("qdwin: nested_proxy_decision handle=%u DENY "
 			   "reason='%s'\n", handle, reason ? reason : "");
 		if (tl->proxy_nested_owner) {
@@ -16177,6 +16254,12 @@ qdwin_handle_nested_proxy_decision(struct wl_client *client,
 		qdwin_nested_proxy_destroy(tl);
 		break;
 	case 2: /* defer */
+		if (!tl->nested_proxy_pending_decision) {
+			weston_log("qdwin: nested_proxy_decision handle=%u "
+				   "defer: not pending (idempotent no-op)\n",
+				   handle);
+			return;
+		}
 		weston_log("qdwin: nested_proxy_decision handle=%u DEFER "
 			   "reason='%s' (proxy stays held)\n",
 			   handle, reason ? reason : "");
@@ -16201,8 +16284,10 @@ qdwin_proxy_pixel_surface_destroyed(struct wl_listener *listener, void *data)
 	struct qdwin_toplevel *tl =
 		wl_container_of(listener, tl, proxy_pixel_destroy_listener);
 	struct qdwin *qdwin = tl->qdwin;
+	struct weston_coord_global pos = weston_view_get_pos_offset_global(
+		tl->view);
 	weston_log("qdwin/nested-proxy: pixel surface destroyed handle=%u "
-		   "(reverting to placeholder curtain)\n", tl->handle);
+	   "(reverting to placeholder curtain)\n", tl->handle);
 	if (tl->proxy_pixel_view) {
 		weston_view_destroy(tl->proxy_pixel_view);
 		tl->proxy_pixel_view = NULL;
@@ -16211,23 +16296,13 @@ qdwin_proxy_pixel_surface_destroyed(struct wl_listener *listener, void *data)
 	wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
 	wl_list_init(&tl->proxy_pixel_destroy_listener.link);
 
-	/* Re-create a placeholder curtain at the last known position +
+	/* Re-create a placeholder curtain at the current pixel-feed position +
 	 * size so the user still sees something. */
 	int w = tl->last_width  > 0 ? tl->last_width  : 800;
 	int h = tl->last_height > 0 ? tl->last_height : 600;
-	struct weston_output *out = qdwin_primary_output(qdwin);
-	int cx = 0, cy = 0;
-	if (out) {
-		/* Pixel-coord math; cast pos.c.{x,y} (double) to int so the
-		 * integer division isn't flagged as float-context loss. */
-		cx = (int)out->pos.c.x + (out->width  - w) / 2;
-		cy = (int)out->pos.c.y + (out->height - h) / 2;
-		if (cx < 0) cx = 0;
-		if (cy < 0) cy = 0;
-	}
 	struct weston_curtain_params params = {
 		.r = 0.20f, .g = 0.22f, .b = 0.28f, .a = 1.0f,
-		.pos = { .c = weston_coord(cx, cy) },
+		.pos = pos,
 		.width = w,
 		.height = h,
 	};
@@ -16235,8 +16310,11 @@ qdwin_proxy_pixel_surface_destroyed(struct wl_listener *listener, void *data)
 		qdwin->compositor, &params);
 	if (tl->proxy_curtain) {
 		tl->view = tl->proxy_curtain->view;
-		weston_view_move_to_layer(tl->view,
-					  &qdwin->normal_layer.view_list);
+		weston_view_move_to_layer(
+			tl->view,
+			tl->nested_proxy_pending_decision
+				? &qdwin->held_layer.view_list
+				: &qdwin->normal_layer.view_list);
 	}
 }
 
@@ -16332,14 +16410,19 @@ qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 	wl_signal_add(&ws->destroy_signal, &tl->proxy_pixel_destroy_listener);
 
 	weston_view_set_position(tl->view, pos);
-	weston_view_move_to_layer(tl->view, &qdwin->normal_layer.view_list);
+	weston_view_move_to_layer(
+		tl->view,
+		tl->nested_proxy_pending_decision
+			? &qdwin->held_layer.view_list
+			: &qdwin->normal_layer.view_list);
 	if (!weston_surface_is_mapped(ws))
 		weston_surface_map(ws);
 	weston_view_update_transform(tl->view);
 
 	weston_log("qdwin/nested-proxy: bind_proxy_pixels handle=%u "
-		   "surface=%p (curtain swapped for live feed)\n",
-		   handle, (void *)ws);
+		   "surface=%p (curtain swapped for live feed, pending=%d)\n",
+		   handle, (void *)ws,
+		   tl->nested_proxy_pending_decision ? 1 : 0);
 }
 
 static void
@@ -16443,7 +16526,11 @@ qdwin_nested_proxy_set_geometry(struct qdwin_toplevel *tl, int w, int h)
 		return;
 	}
 	tl->view = tl->proxy_curtain->view;
-	weston_view_move_to_layer(tl->view, &qdwin->normal_layer.view_list);
+	weston_view_move_to_layer(
+		tl->view,
+		tl->nested_proxy_pending_decision
+			? &qdwin->held_layer.view_list
+			: &qdwin->normal_layer.view_list);
 	tl->last_width  = w;
 	tl->last_height = h;
 
