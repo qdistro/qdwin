@@ -1742,6 +1742,13 @@ qdwin_shell_require_bound(struct qdwin *qdwin, struct wl_resource *resource)
 	return 0;
 }
 
+static bool
+qdwin_client_is_bound_shell(struct qdwin *qdwin, struct wl_client *client)
+{
+	return qdwin->shell_bound && qdwin->shell_resource &&
+	       client == wl_resource_get_client(qdwin->shell_resource);
+}
+
 static void
 qdwin_handle_bind_as_shell(struct wl_client *client,
 			   struct wl_resource *resource)
@@ -7462,6 +7469,13 @@ bind_qdwin_shell(struct wl_client *client, void *data,
 
 	weston_log("qdwin: bind attempt pid=%d uid=%u (allowed_uid=%u)\n",
 		   (int)pid, (unsigned)uid, (unsigned)qdwin->allowed_uid);
+
+	if (qdwin->shell_bound && !qdwin_client_is_bound_shell(qdwin, client)) {
+		wl_client_post_implementation_error(
+			client,
+			"qdwin_shell_v1: shell role already claimed");
+		return;
+	}
 
 	if (uid != qdwin->allowed_uid) {
 		wl_client_post_implementation_error(
@@ -17108,9 +17122,197 @@ qdwin_secctx_manager_impl = {
 	.create_listener = qdwin_secctx_manager_create_listener,
 };
 
+static bool
+qdwin_secctx_open_dev_mode(void)
+{
+	const char *open_env = getenv("QDWIN_SECCTX_OPEN");
+	return open_env && strcmp(open_env, "1") == 0;
+}
+
+static bool
+qdwin_secctx_exe_allowed(const char *exe)
+{
+	const char *env = getenv("QDWIN_ALLOWED_SECCTX_HELPER_EXE");
+
+	if (!exe || !*exe)
+		return false;
+	if (env && *env)
+		return strcmp(exe, env) == 0;
+	return strcmp(exe, "/usr/bin/qdistro-secctx-exec") == 0 ||
+	       strcmp(exe, "/usr/local/bin/qdistro-secctx-exec") == 0;
+}
+
+static int
+qdwin_proc_environ_has(pid_t pid, const char *needle)
+{
+	char path[64], buf[4096], prev_tail[256];
+	int fd;
+	ssize_t n;
+	size_t needle_len = strlen(needle);
+	bool prefix = needle_len > 0 && needle[needle_len - 1] == '=';
+	size_t tail_len = 0;
+	size_t total = 0;
+	bool tail_starts_entry = false;
+
+	if (pid <= 0 || needle_len == 0 || needle_len >= sizeof prev_tail)
+		return -1;
+	snprintf(path, sizeof path, "/proc/%d/environ", (int)pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	while ((n = read(fd, buf, sizeof buf)) > 0) {
+		char window[sizeof prev_tail + sizeof buf];
+		size_t window_len = tail_len + (size_t)n;
+		bool window_starts_entry = total == 0 || tail_starts_entry;
+
+		if (total + (size_t)n > 65536) {
+			close(fd);
+			return -1;
+		}
+		memcpy(window, prev_tail, tail_len);
+		memcpy(window + tail_len, buf, (size_t)n);
+		for (size_t i = 0; i + needle_len <= window_len; i++) {
+			bool starts_entry = i == 0 ? window_starts_entry :
+						      window[i - 1] == '\0';
+			if (starts_entry &&
+			    memcmp(window + i, needle, needle_len) == 0 &&
+			    (prefix || i + needle_len == window_len ||
+			     window[i + needle_len] == '\0')) {
+				close(fd);
+				return 1;
+			}
+		}
+		tail_len = window_len < needle_len ?
+			window_len : needle_len - 1;
+		if (tail_len > 0) {
+			size_t start = window_len - tail_len;
+			tail_starts_entry = start == 0 ? window_starts_entry :
+						   window[start - 1] == '\0';
+		} else {
+			tail_starts_entry = false;
+		}
+		memcpy(prev_tail, window + window_len - tail_len, tail_len);
+		total += (size_t)n;
+	}
+	if (n < 0) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+static bool
+qdwin_proc_status_uid_ppid(pid_t pid, uid_t *uid_out, pid_t *ppid_out)
+{
+	char path[64];
+	char line[256];
+	FILE *f;
+	bool saw_uid = false, saw_ppid = false;
+
+	if (pid <= 0)
+		return false;
+	snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
+	f = fopen(path, "re");
+	if (!f)
+		return false;
+	while (fgets(line, sizeof line, f)) {
+		unsigned int uid;
+		int ppid;
+
+		if (sscanf(line, "Uid:\t%u", &uid) == 1) {
+			*uid_out = (uid_t)uid;
+			saw_uid = true;
+		} else if (sscanf(line, "PPid:\t%d", &ppid) == 1) {
+			*ppid_out = (pid_t)ppid;
+			saw_ppid = true;
+		}
+	}
+	fclose(f);
+	return saw_uid && saw_ppid;
+}
+
+static bool
+qdwin_secctx_helper_has_root_launcher_parent(pid_t pid)
+{
+	uid_t client_uid = (uid_t)-1;
+	uid_t parent_uid = (uid_t)-1;
+	pid_t parent_pid = 0;
+	pid_t parent_ppid = 0;
+	uint64_t st_before, st_after;
+	char *parent_exe, *base;
+	bool ok = false;
+
+	if (!qdwin_proc_status_uid_ppid(pid, &client_uid, &parent_pid) ||
+	    parent_pid <= 1)
+		return false;
+	if (!qdwin_proc_status_uid_ppid(parent_pid, &parent_uid, &parent_ppid) ||
+	    parent_uid != 0)
+		return false;
+	(void)parent_ppid;
+	st_before = qdwin_proc_starttime(parent_pid);
+	parent_exe = qdwin_proc_exe(parent_pid);
+	if (!parent_exe)
+		return false;
+	base = strrchr(parent_exe, '/');
+	base = base ? base + 1 : parent_exe;
+	ok = strcmp(base, "runuser") == 0 ||
+	     strcmp(base, "su") == 0 ||
+	     strcmp(base, "sudo") == 0 ||
+	     strcmp(base, "pkexec") == 0;
+	free(parent_exe);
+	st_after = qdwin_proc_starttime(parent_pid);
+	return ok && st_before != 0 && st_after != 0 && st_before == st_after;
+}
+
+static bool
+qdwin_secctx_client_is_authorized(struct qdwin *qdwin,
+				  struct wl_client *client,
+				  pid_t pid, uid_t uid)
+{
+	uint64_t st_before, st_after;
+	char *exe;
+	bool ok;
+
+	if (qdwin_client_is_bound_shell(qdwin, client))
+		return true;
+	if (qdwin_secctx_open_dev_mode())
+		return true;
+	if (uid != qdwin->allowed_uid && uid != 0)
+		return false;
+
+	st_before = qdwin_proc_starttime(pid);
+	exe = qdwin_proc_exe(pid);
+	ok = qdwin_secctx_exe_allowed(exe);
+	free(exe);
+	if (ok && uid == qdwin->allowed_uid &&
+	    !qdwin_secctx_helper_has_root_launcher_parent(pid)) {
+		weston_log("qdwin/secctx: helper pid=%d lacks direct root "
+			   "launcher parent; refusing\n", (int)pid);
+		ok = false;
+	}
+	if (ok && uid != 0) {
+		int env_has = qdwin_proc_environ_has(
+			pid, "QDISTRO_SECCTX_EXEC_ALLOW_UNTRUSTED=");
+		if (env_has != 0) {
+			weston_log("qdwin/secctx: helper pid=%d %s; refusing "
+				   "because QDWIN_SECCTX_OPEN is not set\n",
+				   (int)pid,
+				   env_has > 0 ?
+				   "carries dev-only "
+				   "QDISTRO_SECCTX_EXEC_ALLOW_UNTRUSTED" :
+				   "environment could not be fully checked");
+			ok = false;
+		}
+	}
+	st_after = qdwin_proc_starttime(pid);
+	return ok && st_before != 0 && st_after != 0 && st_before == st_after;
+}
+
 /* Block sandboxed clients from binding the manager (per protocol's
- * nesting prohibition). Installed as a wl_global_filter; returns true
- * to allow this client to see/bind the global. */
+ * nesting prohibition), and hide the global from unauthorized clients.
+ * Installed as a wl_global_filter; returns true to allow this client to
+ * see/bind the global. */
 static bool
 qdwin_secctx_global_filter(const struct wl_client *client,
 			   const struct wl_global *global, void *data)
@@ -17119,7 +17321,13 @@ qdwin_secctx_global_filter(const struct wl_client *client,
 	if (global != qdwin->security_context_manager_global)
 		return true;  /* only filter the secctx manager */
 	struct wl_client *cw = (struct wl_client *)client;
-	return qdwin_secctx_client_find(qdwin, cw) == NULL;
+	if (qdwin_secctx_client_find(qdwin, cw) != NULL)
+		return false;
+	{
+		pid_t pid; uid_t uid; gid_t gid;
+		wl_client_get_credentials(cw, &pid, &uid, &gid);
+		return qdwin_secctx_client_is_authorized(qdwin, cw, pid, uid);
+	}
 }
 
 static void
@@ -17130,50 +17338,25 @@ bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 	pid_t pid; uid_t uid; gid_t gid;
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 
-	/* Option A (secctx-identity-contract.md): only the bound shell
-	 * (qdshell) may set security context strings.  The shell is the
-	 * trusted launcher — it knows what it spawned and can vouch for the
-	 * secctx triple.  Any other client binding the manager gets a
-	 * warning log and a refused bind so its subsequent set_sandbox_engine
-	 * / set_app_id / commit calls never reach the protocol handler.
-	 *
-	 * When no shell is bound yet (early startup race or standalone
-	 * probe), fall back to the uid allowlist: only qdwin's allowed_uid
-	 * may bind.  This covers the waypipe->spawn-tier3 path where qdshell
-	 * calls spawn-tier3 which calls waypipe, and waypipe — running as
-	 * the same uid — binds the manager on behalf of the silo client.
-	 *
-	 * The env var QDWIN_SECCTX_OPEN=1 disables this gate for developer
-	 * workflows / CLI smoke tests (decision doc open-questions). */
-	{
-		const char *open_env = getenv("QDWIN_SECCTX_OPEN");
-		int secctx_open = open_env && strcmp(open_env, "1") == 0;
-
-		if (!secctx_open) {
-			int from_shell = 0;
-			if (qdwin->shell_bound && qdwin->shell_resource) {
-				struct wl_client *shell_client =
-					wl_resource_get_client(
-						qdwin->shell_resource);
-				from_shell = (client == shell_client);
-			}
-			if (!from_shell && uid != qdwin->allowed_uid) {
-				weston_log("qdwin/secctx: REJECTED manager "
-					   "bind from uid=%u pid=%d "
-					   "(not shell client, not "
-					   "allowed_uid=%u)\n",
-					   (unsigned)uid, (int)pid,
-					   (unsigned)qdwin->allowed_uid);
-				wl_client_post_implementation_error(
-					client,
-					"wp_security_context_manager_v1: "
-					"only the trusted launcher (qdshell) "
-					"may bind this global "
-					"(uid=%u not permitted)",
-					(unsigned)uid);
-				return;
-			}
-		}
+	/* Option A/B transition (secctx-identity-contract.md): the manager is
+	 * no longer authorized by same uid. Production admits only the bound
+	 * shell client and the installed qdistro-secctx-exec helper path used
+	 * by root/broker launchers. The helper's strings are not sufficient
+	 * policy identity by themselves; qdistro must resolve the resulting
+	 * pid/starttime against launch records before trusting sandbox_engine /
+	 * app_id / instance_id. QDWIN_SECCTX_OPEN=1 is the explicit dev/test
+	 * escape hatch. */
+	if (!qdwin_secctx_client_is_authorized(qdwin, client, pid, uid)) {
+		weston_log("qdwin/secctx: REJECTED manager "
+			   "bind from uid=%u pid=%d "
+			   "(not shell or authorized helper)\n",
+			   (unsigned)uid, (int)pid);
+		wl_client_post_implementation_error(
+			client,
+			"wp_security_context_manager_v1: "
+			"only the bound shell or authorized secctx helper "
+			"may bind this global");
+		return;
 	}
 
 	struct wl_resource *r = wl_resource_create(client,
@@ -17186,9 +17369,8 @@ bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 				       qdwin, NULL);
 	weston_log("qdwin/secctx: manager bound by uid=%u pid=%d%s\n",
 		   (unsigned)uid, (int)pid,
-		   (qdwin->shell_bound && qdwin->shell_resource &&
-		    client == wl_resource_get_client(qdwin->shell_resource))
-		       ? " (shell)" : "");
+		   qdwin_client_is_bound_shell(qdwin, client) ? " (shell)" :
+		   qdwin_secctx_open_dev_mode() ? " (dev-open)" : " (helper)");
 }
 
 WL_EXPORT int

@@ -499,6 +499,8 @@ executable('qdwin-probe',
 executable('qdwin-secctx-probe',
   sources: [
     'test-client/qdwin-secctx-probe.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
     security_context_client_header,
     security_context_protocol_code,
   ],
