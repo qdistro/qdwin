@@ -5,11 +5,11 @@ four configurations and check that qdwin's
 `wp_security_context_manager_v1` bind gate (`bind_qdwin_secctx_manager`,
 `qdwin/qdwin.c`) refuses an ordinary same-UID client, accepts the bound
 shell client, honours the `QDWIN_SECCTX_OPEN` developer override, and does
-not admit a helper executable path without a direct root launcher parent.
+not admit a helper executable path that lacks installed-helper integrity.
 Production also admits the installed `qdistro-secctx-exec` helper path;
 the positive helper path is covered by qdistro integration tests because
-it depends on the installed executable location, root launcher ancestry,
-and broker launch-record rollout.
+it depends on the installed executable location, root ownership, root
+launcher ancestry, and broker launch-record rollout.
 
 **Why**: the broker-attested secctx identity contract is only sound if
 the compositor refuses manager binds from arbitrary same-session clients.
@@ -99,11 +99,12 @@ if [ "$RC" -eq 0 ] && [ "$LOGHIT" -eq 0 ]; then echo "S3 PASS"; else
   otherwise-refused non-shell client can bind and commit.
 - the weston log marks the bind as `(dev-open)`.
 
-### S4 — helper executable path without root parent is REFUSED
+### S4 — helper executable path without installed-helper integrity is REFUSED
 
 Start qdwin without a shell and point the helper-executable override at
-the probe itself. This proves executable identity alone is not enough:
-the same-UID helper path must also have a direct root launcher parent.
+the probe itself. This proves a matching helper path alone is not enough:
+the helper executable must also be root-owned and not group/world-writable
+before the root-parent test can matter.
 
 ```bash
 ID=06-secctx-helper-no-root-parent
@@ -111,17 +112,17 @@ QDWIN_ALLOWED_SECCTX_HELPER_EXE="$PROBE" $HT/start.sh $ID --no-shell --no-termin
 RUNTIME=$(ht_runtime $ID); SOCK=$(ht_socket $ID); WLOG=$(ht_log_weston $ID)
 
 if XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY="$SOCK" "$PROBE"; then RC=0; else RC=$?; fi
-if grep -qF "lacks direct root" "$WLOG"; then LOGHIT=0; else LOGHIT=1; fi
+if grep -qF "executable is not root-owned" "$WLOG"; then LOGHIT=0; else LOGHIT=1; fi
 $HT/stop.sh $ID
 if [ "$RC" -eq 2 ] && [ "$LOGHIT" -eq 0 ]; then echo "S4 PASS"; else
-    echo "S4 FAIL (exit=$RC want 2; root-parent-log hit=$LOGHIT want 0)"; fi
+    echo "S4 FAIL (exit=$RC want 2; helper-integrity-log hit=$LOGHIT want 0)"; fi
 ```
 
 **Assert (S4):**
 - `RC == 2` — the global filter hid the manager from a process whose
-  executable matched `QDWIN_ALLOWED_SECCTX_HELPER_EXE` but whose parent was
-  not a root launcher.
-- the weston log contains `lacks direct root launcher parent`.
+  executable matched `QDWIN_ALLOWED_SECCTX_HELPER_EXE` but was not a
+  root-owned, non-group/world-writable installed helper.
+- the weston log contains `executable is not root-owned`.
 
 ## Teardown
 
@@ -134,4 +135,4 @@ tear each one down individually:
 ## Pass criteria
 
 All four asserts hold: S1 `RC==2`, S2 `RC==0` + shell-bound log,
-S3 `RC==0` + dev-open log, S4 `RC==2` + root-parent rejection log.
+S3 `RC==0` + dev-open log, S4 `RC==2` + helper-integrity rejection log.

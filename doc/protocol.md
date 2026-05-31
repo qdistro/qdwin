@@ -252,9 +252,12 @@ installed helper path (overrideable for packaged layouts with
 connect time or running as qdwin's configured `allowed_uid` with a direct
 root launcher parent (`runuser`, `su`, `sudo`, or `pkexec`). Helpers under
 any other uid are refused; deployments should keep tier launchers on the
-compositor admin uid or run the helper as root. qdwin also rejects helpers
-carrying `QDISTRO_SECCTX_EXEC_ALLOW_UNTRUSTED=1` on the admin-uid path
-unless qdwin itself is in `QDWIN_SECCTX_OPEN=1` mode. Root-owned helper
+compositor admin uid or run the helper as root. The helper executable inode
+must be owned by root and not writable by group or other users; otherwise a
+same-uid process could replace a misinstalled helper before a root launcher
+runs it. qdwin also rejects helpers carrying
+`QDISTRO_SECCTX_EXEC_ALLOW_UNTRUSTED=1` on the admin-uid path unless qdwin
+itself is in `QDWIN_SECCTX_OPEN=1` mode. Root-owned helper
 clients are already privileged and may not expose a readable `/proc`
 environment to qdwin, so they are admitted by uid/executable identity.
 For admin-uid helpers, the root launcher must remain the live direct

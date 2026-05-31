@@ -17203,6 +17203,20 @@ qdwin_proc_environ_has(pid_t pid, const char *needle)
 }
 
 static bool
+qdwin_proc_exe_is_root_trusted(pid_t pid)
+{
+	char path[64];
+	struct stat st;
+
+	if (pid <= 0)
+		return false;
+	snprintf(path, sizeof path, "/proc/%d/exe", (int)pid);
+	if (stat(path, &st) < 0)
+		return false;
+	return st.st_uid == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static bool
 qdwin_proc_status_uid_ppid(pid_t pid, uid_t *uid_out, pid_t *ppid_out)
 {
 	char path[64];
@@ -17285,6 +17299,12 @@ qdwin_secctx_client_is_authorized(struct qdwin *qdwin,
 	exe = qdwin_proc_exe(pid);
 	ok = qdwin_secctx_exe_allowed(exe);
 	free(exe);
+	if (ok && !qdwin_proc_exe_is_root_trusted(pid)) {
+		weston_log("qdwin/secctx: helper pid=%d executable is not "
+			   "root-owned and non-writable by group/other; "
+			   "refusing\n", (int)pid);
+		ok = false;
+	}
 	if (ok && uid == qdwin->allowed_uid &&
 	    !qdwin_secctx_helper_has_root_launcher_parent(pid)) {
 		weston_log("qdwin/secctx: helper pid=%d lacks direct root "
