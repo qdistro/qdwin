@@ -9,10 +9,11 @@ protocols.
 ## qdwin_shell_v1 (private, single-client)
 
 The shell-management protocol. The global is registered via
-`wl_global_create`; the bind handler (`bind_qdwin_shell`) rejects
-clients whose uid does not match `allowed_uid`. Only one client
-claims the shell role (via `bind_as_shell`); subsequent binds from
-the same uid succeed but do not gain shell privileges until claimed.
+`wl_global_create`; the bind handler (`bind_qdwin_shell`) uses
+`allowed_uid` only for bootstrap before a shell role exists. Once a
+client has claimed the shell role via `bind_as_shell`, later binds from
+other clients are rejected even when they share the same uid. Same uid is
+not an authorization basis for shell privileges.
 
 ### Sub-interfaces
 
@@ -232,10 +233,37 @@ See `todo/qdwin-codex-review.md` finding #1 for the original review.
 Any client that can bind the manager can set arbitrary tag values.
 
 Bind-time mitigation: `bind_qdwin_secctx_manager` restricts the manager
-global to the shell client (qdshell) or `allowed_uid`, and a global
-filter (`qdwin_secctx_global_filter`) hides the global from
-already-sandboxed clients so nesting is impossible. The env var
-`QDWIN_SECCTX_OPEN=1` disables the bind gate for developer workflows.
+global to the bound shell client or the installed `qdistro-secctx-exec`
+helper executable. Same uid is deliberately not an authorization basis. A
+global filter (`qdwin_secctx_global_filter`) hides the global from
+already-sandboxed clients and other unauthorized peers so nesting and
+same-session self-minting are impossible. The env var
+`QDWIN_SECCTX_OPEN=1` disables the bind gate for developer workflows and
+tests.
+
+Registry timing note: a client that becomes the bound shell after its
+initial registry roundtrip must re-read the registry before binding the
+manager, because the global is hidden until the shell role is claimed.
+
+Compatibility note: qdistro's current tier launchers still use
+`qdistro-secctx-exec` to create the listener. qdwin admits only the
+installed helper path (overrideable for packaged layouts with
+`QDWIN_ALLOWED_SECCTX_HELPER_EXE`) when the helper is either root-owned at
+connect time or running as qdwin's configured `allowed_uid` with a direct
+root launcher parent (`runuser`, `su`, `sudo`, or `pkexec`). Helpers under
+any other uid are refused; deployments should keep tier launchers on the
+compositor admin uid or run the helper as root. The helper executable inode
+must be owned by root and not writable by group or other users; otherwise a
+same-uid process could replace a misinstalled helper before a root launcher
+runs it. qdwin also rejects helpers carrying
+`QDISTRO_SECCTX_EXEC_ALLOW_UNTRUSTED=1` on the admin-uid path unless qdwin
+itself is in `QDWIN_SECCTX_OPEN=1` mode. Root-owned helper
+clients are already privileged and may not expose a readable `/proc`
+environment to qdwin, so they are admitted by uid/executable identity.
+For admin-uid helpers, the root launcher must remain the live direct
+parent through manager bind time; double-forking launchers fail closed.
+The helper's strings are still advisory until the broker resolves the
+client pid/starttime against launch records.
 
 **Downstream verification (design intent):** qdwin forwards secctx tags
 to the shell, but the authoritative identity check happens in

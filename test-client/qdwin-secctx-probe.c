@@ -3,30 +3,22 @@
  * bind gate (bind_qdwin_secctx_manager, qdwin.c). Verifies the Option-A
  * launcher-gate from todo/decisions/secctx-identity-contract.md:
  *
- *   The compositor must REFUSE a manager bind from a client that is
- *   neither the bound qdshell client nor running as qdwin's allowed_uid,
- *   and must ACCEPT it (allowing a listener commit) from an authorized
- *   client.
- *
- * The gate is keyed on (!from_shell && uid != allowed_uid). A headless
- * host test cannot run two real uids, so the harness drives the
- * "unauthorized" case by starting qdwin with a FOREIGN QDWIN_ALLOWED_UID
- * (and --no-shell, so from_shell can't be true either); the probe's real
- * uid then mismatches allowed_uid and the reject branch fires. The
- * "authorized" case uses the normal allowed_uid (== this uid).
- *
- * NOTE: this cannot isolate the from_shell branch from the uid branch
- * headlessly — proving "shell client allowed despite wrong uid" needs the
- * shell under a different real uid (root / multi-uid VM). See the
- * companion scenario tests/host/06-secctx-bind-gate.md.
+ *   The compositor must REFUSE a manager bind from a generic same-uid client,
+ *   and must ACCEPT it (allowing a listener commit) from the bound shell
+ *   client. Production also admits the installed qdistro-secctx-exec helper;
+ *   this source-tree probe is intentionally not that helper.
  *
  * Modes:
- *   (default)         bind the manager, report whether the bind was
- *                     accepted or refused.
+ *   (default)         bind the manager as an ordinary non-shell client,
+ *                     report whether the bind was accepted or refused.
  *   --commit          on a successful bind, also create_listener + set the
  *                     secctx strings + commit, and report whether that
  *                     round-trips cleanly. This is the "can commit a
  *                     listener" half of the bind-gate item.
+ *   --as-shell        first bind qdwin_shell_v1 and claim the shell role on
+ *                     the same wl_client, then bind the manager. This drives
+ *                     the default positive path after same-uid manager binds
+ *                     were removed.
  *
  * Identity-edge modes (08-secctx-identity-edges.md) — each binds the
  * manager, create_listener's, then exercises one commit-sequence edge and
@@ -76,13 +68,71 @@
 #include <sys/un.h>
 
 #include <wayland-client.h>
+#include "qdwin-shell-v1-client-protocol.h"
 #include "security-context-v1-client-protocol.h"
 
 struct probe {
 	struct wl_display *display;
 	struct wl_registry *registry;
+	struct qdwin_shell_v1 *shell;
 	struct wp_security_context_manager_v1 *mgr;
 	int saw_manager;
+	int saw_shell;
+	uint32_t shell_name;
+	uint32_t shell_version;
+	uint32_t manager_name;
+	uint32_t manager_version;
+};
+
+static void
+shell_hello(void *data, struct qdwin_shell_v1 *shell, uint32_t uid)
+{ (void)data; (void)shell; (void)uid; }
+
+static void
+shell_toplevel_added(void *data, struct qdwin_shell_v1 *shell,
+		     uint32_t handle, uint32_t owner_uid,
+		     const char *app_id, const char *title, uint32_t is_xwayland)
+{
+	(void)data; (void)shell; (void)handle; (void)owner_uid;
+	(void)app_id; (void)title; (void)is_xwayland;
+}
+
+static void
+shell_toplevel_geometry(void *data, struct qdwin_shell_v1 *shell,
+			uint32_t handle, int32_t x, int32_t y,
+			uint32_t width, uint32_t height)
+{
+	(void)data; (void)shell; (void)handle; (void)x; (void)y;
+	(void)width; (void)height;
+}
+
+static void
+shell_toplevel_state(void *data, struct qdwin_shell_v1 *shell,
+		     uint32_t handle, uint32_t state)
+{ (void)data; (void)shell; (void)handle; (void)state; }
+
+static void
+shell_toplevel_title(void *data, struct qdwin_shell_v1 *shell,
+		     uint32_t handle, const char *title)
+{ (void)data; (void)shell; (void)handle; (void)title; }
+
+static void
+shell_toplevel_removed(void *data, struct qdwin_shell_v1 *shell,
+		       uint32_t handle)
+{ (void)data; (void)shell; (void)handle; }
+
+static void
+shell_locked_changed(void *data, struct qdwin_shell_v1 *shell, uint32_t locked)
+{ (void)data; (void)shell; (void)locked; }
+
+static const struct qdwin_shell_v1_listener shell_listener = {
+	.hello = shell_hello,
+	.toplevel_added = shell_toplevel_added,
+	.toplevel_geometry = shell_toplevel_geometry,
+	.toplevel_state = shell_toplevel_state,
+	.toplevel_title = shell_toplevel_title,
+	.toplevel_removed = shell_toplevel_removed,
+	.locked_changed = shell_locked_changed,
 };
 
 static void
@@ -90,16 +140,17 @@ on_global(void *data, struct wl_registry *reg, uint32_t name,
 	  const char *interface, uint32_t version)
 {
 	struct probe *p = data;
+	(void)reg;
+
 	if (strcmp(interface,
 		   wp_security_context_manager_v1_interface.name) == 0) {
 		p->saw_manager = 1;
-		/* Bind at the version qdwin advertises (cap to the one we
-		 * generated against). The bind itself is what the gate
-		 * accepts or refuses. */
-		p->mgr = wl_registry_bind(
-			reg, name,
-			&wp_security_context_manager_v1_interface,
-			version < 1 ? version : 1);
+		p->manager_name = name;
+		p->manager_version = version;
+	} else if (strcmp(interface, qdwin_shell_v1_interface.name) == 0) {
+		p->saw_shell = 1;
+		p->shell_name = name;
+		p->shell_version = version;
 	}
 }
 
@@ -189,9 +240,12 @@ enum secctx_mode {
 int main(int argc, char *argv[])
 {
 	enum secctx_mode mode = M_BIND;
+	int as_shell = 0;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--commit") == 0)
 			mode = M_COMMIT;
+		else if (strcmp(argv[i], "--as-shell") == 0)
+			as_shell = 1;
 		else if (strcmp(argv[i], "--commit-no-appid") == 0)
 			mode = M_COMMIT_NO_APPID;
 		else if (strcmp(argv[i], "--commit-bare") == 0)
@@ -219,16 +273,53 @@ int main(int argc, char *argv[])
 	p.registry = wl_display_get_registry(p.display);
 	wl_registry_add_listener(p.registry, &registry_listener, &p);
 
-	/* First roundtrip: discover globals; the manager bind is issued
-	 * from on_global during this dispatch. */
+	/* First roundtrip: discover globals. The manager bind is issued below
+	 * so --as-shell can claim qdwin_shell_v1 first. */
 	wl_display_roundtrip(p.display);
 
+	if (as_shell) {
+		if (!p.saw_shell) {
+			fprintf(stderr, "qdwin-secctx-probe: "
+				"qdwin_shell_v1 not advertised\n");
+			return 2;
+		}
+		p.shell = wl_registry_bind(
+			p.registry, p.shell_name, &qdwin_shell_v1_interface,
+			p.shell_version < 1 ? p.shell_version : 1);
+		if (!p.shell) {
+			fprintf(stderr, "qdwin-secctx-probe: qdwin_shell_v1 "
+				"bind returned NULL\n");
+			return 2;
+		}
+		qdwin_shell_v1_add_listener(p.shell, &shell_listener, &p);
+		qdwin_shell_v1_bind_as_shell(p.shell);
+		if (denied_or_ok_code(&p, "shell bind_as_shell",
+				      NULL, NULL) != 0)
+			return 1;
+		p.saw_manager = 0;
+		p.manager_name = 0;
+		p.manager_version = 0;
+		p.registry = wl_display_get_registry(p.display);
+		wl_registry_add_listener(p.registry, &registry_listener, &p);
+		wl_display_roundtrip(p.display);
+	}
+
 	if (!p.saw_manager) {
-		/* The global filter only hides the manager from clients that
-		 * are ALREADY secctx-tagged; an untagged probe must always
-		 * see it. Not seeing it is a harness/server problem. */
+		/* Hardened qdwin hides the manager from ordinary clients.
+		 * Non-shell probe modes use this as the expected refusal signal. */
 		fprintf(stderr, "qdwin-secctx-probe: "
 			"wp_security_context_manager_v1 not advertised\n");
+		return 2;
+	}
+
+	/* Bind at the version qdwin advertises (cap to the one we generated
+	 * against). The bind itself is what the gate accepts or refuses. */
+	p.mgr = wl_registry_bind(
+		p.registry, p.manager_name,
+		&wp_security_context_manager_v1_interface,
+		p.manager_version < 1 ? p.manager_version : 1);
+	if (!p.mgr) {
+		fprintf(stderr, "qdwin-secctx-probe: manager bind returned NULL\n");
 		return 2;
 	}
 

@@ -32,10 +32,10 @@ while [ $# -gt 0 ]; do
         --height)      HEIGHT=$2; shift 2 ;;
         --no-shell)    WANT_SHELL=0; shift ;;
         --no-terminal) WANT_TERMINAL=0; shift ;;
-        # Override qdwin's allowed_uid. The secctx / locker / layer-shell
-        # bind gates key on it; a scenario can set a FOREIGN uid here to
-        # drive the "unauthorized client" branch without a second real uid
-        # (see 06-secctx-bind-gate.md). Default: this uid.
+        # Override qdwin's allowed_uid. Shell bootstrap, locker, and
+        # layer-shell bind gates key on it; secctx manager binds do not
+        # authorize by uid except when QDWIN_SECCTX_OPEN=1 is set.
+        # Default: this uid.
         --allowed-uid) ALLOWED_UID=$2; shift 2 ;;
         *) echo "[start.sh] unknown opt $1" >&2; exit 2 ;;
     esac
