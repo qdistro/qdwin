@@ -105,6 +105,11 @@ const struct drm_property_info plane_props[] = {
 		.num_enum_values = WDRM_PLANE_ROTATION__COUNT,
 	 },
 	[WDRM_PLANE_ALPHA] = { .name = "alpha" },
+	/* Para-virtualized drivers (virtio-gpu, qxl, vmwgfx) expose these on
+	 * the cursor plane; they carry the pointer hotspot to the hypervisor
+	 * so it can position the host/client-side cursor. */
+	[WDRM_PLANE_HOTSPOT_X] = { .name = "HOTSPOT_X" },
+	[WDRM_PLANE_HOTSPOT_Y] = { .name = "HOTSPOT_Y" },
 };
 
 struct drm_property_enum_info dpms_state_enums[] = {
@@ -1197,6 +1202,39 @@ drm_connector_set_colorspace(struct drm_connector *connector,
 				  WDRM_CONNECTOR_COLORSPACE, enum_info->value);
 }
 
+/**
+ * Recover the pointer hotspot for a cursor-plane view.
+ *
+ * The view on the cursor plane is a pointer sprite; weston positions the
+ * sprite at (pointer_pos - hotspot), so the hotspot the client requested via
+ * wl_pointer.set_cursor lives on the owning weston_pointer. Para-virtualized
+ * drivers need it (HOTSPOT_X/Y) to place the host/client-side cursor. Hotspots
+ * are integral (set_cursor takes int offsets) so the cast is exact. Defaults
+ * to (0,0) if no matching pointer is found.
+ */
+static void
+drm_cursor_plane_hotspot(struct drm_backend *b, struct weston_view *cursor_view,
+			 int32_t *hotspot_x, int32_t *hotspot_y)
+{
+	struct weston_seat *seat;
+
+	*hotspot_x = 0;
+	*hotspot_y = 0;
+
+	if (!cursor_view)
+		return;
+
+	wl_list_for_each(seat, &b->compositor->seat_list, link) {
+		struct weston_pointer *pointer = weston_seat_get_pointer(seat);
+
+		if (pointer && pointer->sprite == cursor_view) {
+			*hotspot_x = (int32_t) pointer->hotspot.c.x;
+			*hotspot_y = (int32_t) pointer->hotspot.c.y;
+			return;
+		}
+	}
+}
+
 static int
 drm_output_apply_state_atomic(struct drm_output_state *state,
 			      drmModeAtomicReq *req,
@@ -1372,6 +1410,24 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 			ret |= plane_add_prop(req, plane,
 					      WDRM_PLANE_ALPHA,
 					      plane_state->alpha);
+
+		/* Virtualized cursor plane: forward the pointer hotspot so the
+		 * hypervisor (and thus the SPICE/RDP/VNC viewer) can position
+		 * its own cursor and the guest pointer stays off the scanout.
+		 * Only present on para-virtualized drivers (prop_id != 0). */
+		if (plane->type == WDRM_PLANE_TYPE_CURSOR &&
+		    plane->props[WDRM_PLANE_HOTSPOT_X].prop_id != 0 &&
+		    plane->props[WDRM_PLANE_HOTSPOT_Y].prop_id != 0) {
+			int32_t hotspot_x = 0, hotspot_y = 0;
+
+			if (plane_state->fb)
+				drm_cursor_plane_hotspot(b, plane_state->ev,
+							 &hotspot_x, &hotspot_y);
+			ret |= plane_add_prop(req, plane,
+					      WDRM_PLANE_HOTSPOT_X, hotspot_x);
+			ret |= plane_add_prop(req, plane,
+					      WDRM_PLANE_HOTSPOT_Y, hotspot_y);
+		}
 
 		if (ret != 0) {
 			weston_log("couldn't set plane state\n");
@@ -1884,6 +1940,27 @@ init_kms_caps(struct drm_device *device)
 	}
 	weston_log("DRM: %s atomic modesetting\n",
 		   device->atomic_modeset ? "supports" : "does not support");
+
+	/* Para-virtualized drivers (virtio-gpu, qxl, vmwgfx) hide their cursor
+	 * plane from atomic clients that haven't opted into the cursor-hotspot
+	 * protocol — see drm_mode_getplane_res() in the kernel. Without this
+	 * cap the cursor plane is absent from drmModeGetPlaneResources(), so
+	 * output->cursor_plane stays NULL and the pointer is composited into
+	 * the scanout (software cursor). Advertising the cap reveals the plane
+	 * and obliges us to set HOTSPOT_X/Y (done in the plane commit below).
+	 * On non-virtualized drivers this returns EOPNOTSUPP and is a harmless
+	 * no-op. */
+#ifndef DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT
+#define DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT 6
+#endif
+	if (device->atomic_modeset) {
+		ret = drmSetClientCap(device->drm.fd,
+				      DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1);
+		device->cursor_plane_hotspot = (ret == 0);
+		weston_log("DRM: %s cursor-plane hotspot (virtualized cursor)\n",
+			   device->cursor_plane_hotspot ? "supports"
+							: "does not support");
+	}
 
 	if (!getenv("WESTON_DISABLE_GBM_MODIFIERS")) {
 		ret = drmGetCap(device->drm.fd, DRM_CAP_ADDFB2_MODIFIERS, &cap);

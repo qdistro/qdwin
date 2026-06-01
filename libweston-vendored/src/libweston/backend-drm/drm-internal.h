@@ -209,6 +209,11 @@ struct drm_device {
 
 	bool atomic_modeset;
 
+	/* Driver exposes a virtualized cursor plane gated behind
+	 * DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT (virtio-gpu/qxl/vmwgfx) and we
+	 * successfully advertised that cap. */
+	bool cursor_plane_hotspot;
+
 	bool tearing_supported;
 
 	bool aspect_ratio_supported;
