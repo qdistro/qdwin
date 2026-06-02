@@ -6,7 +6,9 @@ check qdwin's `qdwin_locker_v1` bind gate (`bind_qdwin_locker` +
 refused at global bind, an authorized client binds and gets `ready`, and
 the "only one locker may exist at a time" semantics in the XML hold
 (double `bind_as_locker` on one resource is rejected with `already_bound`;
-a second locker resource replaces the first).
+a second locker bind while the first peer is alive is REFUSED with
+`locker_present` — the live locker is NOT evicted). It also checks the
+production default makes the locker exe mandatory (FINDING #5).
 
 **Why**: the locker is the only client allowed to drive compositor `locked`
 state. If an arbitrary same-session client could bind the locker global, it
@@ -29,9 +31,14 @@ screenshots — fully scriptable.
   "unauthorized" case is driven with a foreign `allowed_uid` + `--no-shell`
   (the probe's real uid then mismatches `allowed_locker_uid`). This
   faithfully exercises the uid reject branch.
-- The optional `--qdwin-allowed-locker-exe=` / `--qdwin-allowed-locker-label=`
-  peer checks are NOT exercised here (they need a configured expected
-  exe/label and a peer that matches/mismatches — a VM/policy follow-up).
+- The locker policy now defaults to a MANDATORY exe (`/usr/bin/qdlocker`)
+  when no explicit exe/label is configured (FINDING #5(a) fail-closed). The
+  headless probe is not that exe, so `start.sh` exports
+  `QDWIN_ALLOWED_LOCKER_ANY=1` to drop to the legacy uid-only policy for the
+  uid-gate positive paths (S2–S4). S5 overrides that to verify the
+  production mandatory-exe default itself. The optional
+  `--qdwin-allowed-locker-exe=` / `--qdwin-allowed-locker-label=` MATCH paths
+  (a peer whose exe/label matches) still need a VM/policy follow-up.
 - Overlay-key routing while locked and lock-surface destroy/recreate need a
   real lock cycle + input injection — left as VM follow-ups (see
   `tests/gui/`), not attempted headless.
@@ -134,43 +141,90 @@ if [ "$RC" -eq 3 ]; then echo "S3 PASS"; else
   and the SECOND raise exactly `QDWIN_LOCKER_V1_ERROR_ALREADY_BOUND` (=1).
   The probe distinguishes this from any other protocol error.
 
-### S4 — a second locker binding REPLACES the first (one-locker-at-a-time)
+### S4 — a second locker bind is REFUSED while the first peer is ALIVE (FINDING #5)
 
-The locker XML: "If a new locker comes up while the old one is still
-bound, qdwin destroys the old binding". The probe binds the global twice
-(two resources on one client) and calls `bind_as_locker` on each; the
-second must succeed (and qdwin destroys the prior binding server-side,
-which is not a protocol error on this client).
+Security fix: qdwin must NOT evict a live locker just because another
+same-uid client binds. The probe binds the global twice (two resources on
+one client — same live pid) and calls `bind_as_locker` on each. The first
+becomes the live locker; because the probe process (the locker peer) is
+still alive, the second `bind_as_locker` must be REFUSED with the
+dedicated `locker_present` (=5) error and the original binding left
+intact. Previously qdwin destroyed the old binding here, letting any
+same-uid client take over the locker and call `set_locked(0)`.
 
 ```bash
 ID=07-locker-rebind
 $HT/start.sh $ID --no-shell --no-terminal >/dev/null
 RUNTIME=$(ht_runtime $ID); SOCK=$(ht_socket $ID); WLOG=$(ht_log_weston $ID)
 
+# exit 5 = the expected locker_present rejection (probe's PASS signal); any
+# other value (incl. exit 1 from acceptance/eviction) is a fail.
 if XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY="$SOCK" "$PROBE" --rebind; then RC=0; else RC=$?; fi
-# Two successful binds means two "locker bound" log lines (the second
-# replaces the first). Capture the count set-e-safe.
+# Exactly ONE "locker bound" line (the first); the second was refused, so
+# no replacement bound line is emitted. The refusal log line is present.
 BOUND=$(grep -cF "qdwin: locker bound" "$WLOG" || true)
+if grep -qF "qdwin: locker bind REFUSED" "$WLOG"; then REFUSED=0; else REFUSED=1; fi
 $HT/stop.sh $ID
-if [ "$RC" -eq 0 ] && [ "$BOUND" -ge 2 ]; then echo "S4 PASS"; else
-    echo "S4 FAIL (exit=$RC want 0; bound-count=$BOUND want >=2)"; fi
+if [ "$RC" -eq 5 ] && [ "$BOUND" -eq 1 ] && [ "$REFUSED" -eq 0 ]; then echo "S4 PASS"; else
+    echo "S4 FAIL (exit=$RC want 5; bound-count=$BOUND want 1; refused-log=$REFUSED want 0)"; fi
 ```
 
-**Assert (S4):**
-- `RC == 0` — both `bind_as_locker` calls round-tripped without a fatal
-  client error; the second binding became authoritative.
-- the weston log shows at least two `qdwin: locker bound` lines (the
-  replacement happened). HARD.
+**Assert (S4):** all must hold:
+- `RC == 5` — the second `bind_as_locker` raised exactly
+  `QDWIN_LOCKER_V1_ERROR_LOCKER_PRESENT` (=5) on `qdwin_locker_v1`. The
+  probe distinguishes this from any other protocol error and from
+  acceptance. PRIMARY signal.
+- exactly ONE `qdwin: locker bound` line — the live locker was NOT
+  evicted/replaced. HARD.
+- a `qdwin: locker bind REFUSED … takeover denied` line is present. HARD.
+
+### S5 — mandatory-exe locker policy default (FINDING #5(a))
+
+Security fix: with no explicit exe/label policy, qdwin must default to a
+mandatory exe (`/usr/bin/qdlocker`) rather than uid-only. Start qdwin
+WITHOUT the dev/test opt-out and confirm the startup log shows the exe
+default (not `[UID-ONLY: INSECURE]`). The probe (not /usr/bin/qdlocker) is
+then rejected at bind because its exe does not match.
+
+```bash
+ID=07-locker-defexe
+QDWIN_ALLOWED_LOCKER_ANY= $HT/start.sh $ID --no-shell --no-terminal >/dev/null
+RUNTIME=$(ht_runtime $ID); SOCK=$(ht_socket $ID); WLOG=$(ht_log_weston $ID)
+
+# Policy line must name the default exe and must NOT be flagged uid-only.
+if grep -qE "qdwin: locker bind policy .*exe=/usr/bin/qdlocker" "$WLOG"; then POL=0; else POL=1; fi
+if grep -qF "[UID-ONLY: INSECURE]" "$WLOG"; then UIDONLY=1; else UIDONLY=0; fi
+# The probe's exe != /usr/bin/qdlocker, so bind_as_locker is rejected; no
+# "locker bound" line appears.
+if XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY="$SOCK" "$PROBE"; then RC=0; else RC=$?; fi
+if grep -qF "qdwin: locker bound" "$WLOG"; then BOUND=1; else BOUND=0; fi
+$HT/stop.sh $ID
+if [ "$POL" -eq 0 ] && [ "$UIDONLY" -eq 0 ] && [ "$BOUND" -eq 0 ]; then echo "S5 PASS"; else
+    echo "S5 FAIL (policy-exe=$POL want 0; uid-only-flag=$UIDONLY want 0; bound=$BOUND want 0; probe-rc=$RC)"; fi
+```
+
+**Assert (S5):**
+- the weston log policy line reads `exe=/usr/bin/qdlocker` (mandatory exe
+  defaulted) and NOT `[UID-ONLY: INSECURE]`. HARD.
+- NO `qdwin: locker bound` line — the non-matching-exe probe was rejected,
+  so uid-only takeover is closed. HARD.
+
+> Note: `start.sh` exports `QDWIN_ALLOWED_LOCKER_ANY=1` by default so the
+> uid-only positive paths (S2–S4) work with the test probe. S5 overrides
+> it to empty to exercise the production mandatory-exe default.
 
 ## Teardown
 
 `stop.sh` runs inline per case. If a case aborts before its `stop.sh`,
 tear each one down individually:
 `$HT/stop.sh 07-locker-reject`, `$HT/stop.sh 07-locker-allow`,
-`$HT/stop.sh 07-locker-double`, `$HT/stop.sh 07-locker-rebind`.
+`$HT/stop.sh 07-locker-double`, `$HT/stop.sh 07-locker-rebind`,
+`$HT/stop.sh 07-locker-defexe`.
 
 ## Pass criteria
 
-All four asserts hold: S1 `RC==4` (implementation-error reject) +
+All five asserts hold: S1 `RC==4` (implementation-error reject) +
 bind-attempt mismatch log + NO bound log, S2 `RC==0` + bound log, S3
-`RC==3` (already_bound), S4 `RC==0` + >=2 bound lines.
+`RC==3` (already_bound), S4 `RC==5` (locker_present) + exactly 1 bound
+line + REFUSED log, S5 mandatory-exe policy line + no uid-only flag + no
+bound line.

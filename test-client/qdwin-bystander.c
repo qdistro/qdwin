@@ -271,10 +271,15 @@ on_toplevel_added(void *d, struct qdwin_shell_v1 *s,
 		  const char *app_id, const char *title, uint32_t is_xwayland)
 {
 	struct app *a = d;
-	(void)owner_uid;
+	/* owner_uid is advertised as a uint32_t; the compositor sends
+	 * 0xFFFFFFFF ((uid_t)-1) for surfaces with no readable peer (XWayland
+	 * client==NULL). Log it so scenarios can assert XWayland windows are
+	 * reported as uid=4294967295 (unknown/untrusted), NOT the compositor's
+	 * own admin uid (FINDING #6). */
 	fprintf(stderr,
-		"qdwin-bystander: toplevel_added handle=%u app_id=\"%s\" title=\"%s\" xwayland=%u\n",
-		handle, app_id ? app_id : "", title ? title : "", is_xwayland);
+		"qdwin-bystander: toplevel_added handle=%u owner_uid=%u app_id=\"%s\" title=\"%s\" xwayland=%u\n",
+		handle, owner_uid, app_id ? app_id : "", title ? title : "",
+		is_xwayland);
 	qdwin_shell_v1_set_border_color(s, handle, 0x0088aaffu);
 	qdwin_shell_v1_set_keyboard_focus(s, "default", handle);
 	record_toplevel(a, handle);

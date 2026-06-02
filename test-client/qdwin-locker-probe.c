@@ -36,12 +36,14 @@
  *                   the FIRST succeeded (ready) and the SECOND raised
  *                   exactly that error.
  *   --rebind        Bind the global TWICE (two resources on one client);
- *                   call bind_as_locker on each. Per the XML "only one
- *                   locker may exist at a time": qdwin destroys the prior
- *                   binding and the new one becomes authoritative. Asserts
- *                   both bind_as_locker calls round-trip without a fatal
- *                   client error (the first resource is server-destroyed,
- *                   which is not a protocol error on this client).
+ *                   call bind_as_locker on each. The first becomes the
+ *                   live locker. Because this probe's process (the locker
+ *                   peer) is still ALIVE, qdwin REFUSES the second
+ *                   bind_as_locker with the dedicated `locker_present`
+ *                   (=5) error rather than evicting the live locker —
+ *                   the FINDING #5 takeover-rejection fix. Asserts the
+ *                   first bind_as_locker got `ready` and the second
+ *                   raised exactly locker_present on qdwin_locker_v1.
  *
  * Exit codes:
  *   0  expected-accept path completed cleanly
@@ -51,6 +53,8 @@
  *      error (wrong interface/code) — always a FAILURE
  *   3  --double-bind: second bind_as_locker raised the expected
  *      already_bound error on qdwin_locker_v1 (the PASS signal for that mode)
+ *   5  --rebind: second bind_as_locker (live-peer takeover) raised the
+ *      expected locker_present error (the PASS signal for that mode)
  *   2  setup/other error (no display, global not advertised, ...)
  *
  * SPDX-License-Identifier: MIT
@@ -239,16 +243,36 @@ int main(int argc, char *argv[])
 		qdwin_locker_v1_bind_as_locker(l);
 		if (roundtrip_err(&p, "first bind_as_locker", NULL, NULL) != 0)
 			return 1;
-		qdwin_locker_v1_bind_as_locker(l2);
-		/* qdwin destroys the prior binding server-side; that is not a
-		 * protocol error on this client. The second bind_as_locker
-		 * must round-trip cleanly and become authoritative. */
-		if (roundtrip_err(&p, "second bind_as_locker (rebind)",
-				  NULL, NULL) != 0)
+		if (!p.got_ready) {
+			fprintf(stderr, "qdwin-locker-probe: first bind_as_locker "
+				"accepted but no `ready`\n");
 			return 1;
-		printf("qdwin-locker-probe: rebind ACCEPTED (old binding "
-		       "replaced)\n");
-		return 0;
+		}
+		/* FINDING #5 fix: the first locker (this very process) is still
+		 * alive, so qdwin must REFUSE the takeover with locker_present
+		 * instead of evicting the live locker. */
+		uint32_t code = 0;
+		const struct wl_interface *iface = NULL;
+		qdwin_locker_v1_bind_as_locker(l2);
+		int err = roundtrip_err(&p, "second bind_as_locker (rebind)",
+					&code, &iface);
+		if (err == 0) {
+			fprintf(stderr, "qdwin-locker-probe: second bind_as_locker "
+				"was NOT rejected — live locker was evicted "
+				"(takeover vuln)\n");
+			return 1;
+		}
+		if (iface != &qdwin_locker_v1_interface ||
+		    code != QDWIN_LOCKER_V1_ERROR_LOCKER_PRESENT) {
+			fprintf(stderr, "qdwin-locker-probe: rebind got code=%u on "
+				"%s, want locker_present=%d on qdwin_locker_v1\n",
+				code, iface ? iface->name : "(none)",
+				QDWIN_LOCKER_V1_ERROR_LOCKER_PRESENT);
+			return 1;
+		}
+		printf("qdwin-locker-probe: rebind REFUSED with locker_present "
+		       "(live locker not evicted)\n");
+		return 5;
 	}
 
 	/* Default + double-bind both do a first bind_as_locker. */

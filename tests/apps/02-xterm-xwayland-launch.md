@@ -39,6 +39,19 @@ prompt visible — `admin@…> ` or similar).
 **Assert (1.2):** bystander log shows
 `toplevel_added handle=<N> ... title="xterm" xwayland=1`. Note the
 `xwayland=1` — that's the bug #3 fix for free.
+**Assert (1.2b) — FINDING #6:** that same `toplevel_added` line shows
+`owner_uid=4294967295` (i.e. `(uid_t)-1`, the explicit "unknown" sentinel),
+NOT the compositor/admin uid. XWayland surfaces have `client==NULL` so
+`qdwin_client_uid()` returns `(uid_t)-1`; downstream must treat unknown
+identity as untrusted, never as admin-local. Assert with:
+
+```bash
+qdwin_apps_log_grep 'toplevel_added .*owner_uid=4294967295 .*title="xterm" xwayland=1' \
+  || echo "FAIL: XWayland toplevel not attributed to uid=unknown (-1)"
+ADMIN_UID=$("$QDWIN_VM_EXEC" "$VMNAME" 'id -u admin')
+qdwin_apps_log_grep "toplevel_added .*owner_uid=${ADMIN_UID} .*title=\"xterm\"" \
+  && echo "FAIL: XWayland toplevel attributed to ADMIN uid (FINDING #6 regressed)" || true
+```
 **Assert (1.3):** weston pid did NOT change between Setup and now —
 proving qdwin didn't crash. Use:
 
@@ -72,6 +85,8 @@ qdwin_apps_ctl "close" || qdwin_apps_kill_all
 - xterm window visible in step 1 screenshot.
 - weston PID unchanged (no SIGSEGV restart).
 - bystander log records `xwayland=1` (proves bug #3 fix is also live).
+- bystander log records `owner_uid=4294967295` for the xterm toplevel
+  (FINDING #6: XWayland attributed to uid=unknown, not admin).
 
 ## Known failure modes
 

@@ -71,9 +71,15 @@
     <description summary="the qdwin locker attach point">
       The locker binds this global once and holds it for the lifetime
       of its process. qdwin rejects a second bind from the same
-      client. If a new locker comes up while the old one is still
-      bound, qdwin destroys the old binding (the old process is
-      considered dead — only one locker may exist at a time).
+      client. Only one locker may hold the role at a time. If a new
+      `bind_as_locker` arrives while another locker is still bound,
+      qdwin checks whether the current locker's peer process is still
+      alive (its pid still names the same process by /proc starttime):
+      if it is, the new bind is REFUSED with the `locker_present`
+      error and the existing locker is left untouched. A takeover only
+      succeeds once the prior locker's peer is proven dead (pid gone or
+      recycled). This prevents a live same-uid duplicate from evicting
+      the real locker and calling set_locked(0) to unlock the session.
 
       Bootstrap: after `bind_as_locker`, qdwin accepts
       `set_locked(1)` immediately. If the Qt lock toplevel has not
@@ -100,6 +106,13 @@
       <entry name="not_bound" value="4"
              summary="request issued before bind_as_locker (or after the
                       locker was torn down)"/>
+      <entry name="locker_present" value="5"
+             summary="bind_as_locker refused because another locker is
+                      already bound and its peer process is still alive.
+                      Only one locker may hold the role at a time; a
+                      takeover is permitted only once the prior locker's
+                      peer is proven dead. A live duplicate must not be
+                      able to evict the real locker and call set_locked(0)."/>
     </enum>
 
     <request name="bind_as_locker">

@@ -540,6 +540,16 @@ struct qdwin_view_stream {
 
 #define QDWIN_MAX_WORKSPACES 32
 #define QDWIN_DEFAULT_WORKSPACES 4
+/* Installed path of the canonical locker launcher (see qdistro
+ * scripts/install/qdistro-bootstrap.sh: the locker unit's ExecStart is
+ * rewritten to /usr/bin/qdlocker in every profile). When no explicit
+ * --qdwin-allowed-locker-exe / -label is configured, qdwin defaults the
+ * allowed locker exe to this path so the locker identity is verified by
+ * default (fail-closed) rather than degrading to a uid-only convention
+ * that any same-uid client could satisfy. Overridable at build time. */
+#ifndef QDWIN_DEFAULT_LOCKER_EXE
+#define QDWIN_DEFAULT_LOCKER_EXE "/usr/bin/qdlocker"
+#endif
 /* v27: max stored workspace-name length (bytes). Bounds an unbounded
  * shell; over-long names are truncated rather than erroring. */
 #define QDWIN_WORKSPACE_NAME_MAX 256
@@ -570,6 +580,15 @@ struct qdwin {
 	struct wl_global *locker_global;
 	struct wl_resource *locker_resource;
 	uid_t allowed_locker_uid;
+	/* Opt-out for the mandatory-exe default. When the admin configures
+	 * neither an explicit allowed_locker_exe nor allowed_locker_label,
+	 * qdwin defaults allowed_locker_exe to the installed locker path
+	 * (QDWIN_DEFAULT_LOCKER_EXE) so the locker identity is verified by
+	 * default (fail-closed). Dev/test can consciously drop back to the
+	 * weaker uid-only policy by setting --qdwin-allowed-locker-any /
+	 * QDWIN_ALLOWED_LOCKER_ANY=1, which sets this flag and suppresses the
+	 * default exe. It has no effect once an explicit exe/label is set. */
+	bool allowed_locker_any;
 	/* Expected resolved /proc/<pid>/exe of the locker process. When
 	 * non-NULL the bind handler rejects any peer whose exe does not
 	 * match (in addition to the uid check). NULL = exe check disabled
@@ -582,6 +601,13 @@ struct qdwin {
 	char *allowed_locker_label;
 	pid_t locker_pid;
 	uid_t locker_uid;
+	/* /proc/<pid>/stat starttime of the bound locker process, sampled at
+	 * bind time. Used by the bind handler to prove the *current* locker
+	 * peer is still the same live process before refusing a takeover bind:
+	 * if the pid is gone, or recycled into a different process (starttime
+	 * changed), the old binding is provably dead and may be replaced. 0 =
+	 * no live locker / starttime was unreadable at bind. */
+	uint64_t locker_starttime;
 	/* Which protocol owns the currently-attached lock_resource.
 	 * 0 = shell (qdwin_lock_surface_v1), 1 = locker
 	 * (qdwin_locker_surface_v1). Used so the destroy/dismiss path
@@ -1071,12 +1097,16 @@ qdwin_client_uid(struct weston_desktop_surface *dsurf)
 	 * own, only the parent Xwayland server does. wl_client_get_credentials
 	 * dereferences its argument, so without this guard the first X11
 	 * client connect SIGSEGVs weston (verified via coredumpctl bt). For
-	 * XWayland surfaces we currently have no peer-uid signal — return
-	 * the compositor's own uid; the shell can attribute via the
-	 * forthcoming is_xwayland flag (currently hard-coded 0) once that
-	 * lands. */
+	 * XWayland surfaces we have no per-window peer-uid signal, so we
+	 * return the explicit "unknown" sentinel (uid_t)-1 rather than
+	 * getuid(): attributing an X11 window to the compositor's own
+	 * (admin) uid would let downstream (qdshell/broker) misclassify a
+	 * legacy X11 client as trusted admin-local. The shell distinguishes
+	 * these via the is_xwayland flag on toplevel_added and MUST treat
+	 * uid==0xFFFFFFFF as untrusted/unknown, not as admin. Over the wire
+	 * the uid is a uint32_t so (uid_t)-1 serialises to 0xFFFFFFFF. */
 	if (!client)
-		return getuid();
+		return (uid_t)-1;
 	pid_t pid; uid_t uid; gid_t gid;
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 	(void)pid; (void)gid;
@@ -7580,6 +7610,39 @@ bind_qdwin_shell(struct wl_client *client, void *data,
  * removed and the version of qdwin_shell_v1 bumped.
  * ------------------------------------------------------------------ */
 
+/* Forward-declared here (full definition lives with the other /proc
+ * helpers) so the locker bind handler below can prove peer liveness. */
+static uint64_t qdwin_proc_starttime(pid_t pid);
+
+/* Is the currently-bound locker peer still the same live process that
+ * bound? Returns 1 if a locker is bound AND its pid still names the very
+ * process that bound it (verified by /proc starttime), 0 otherwise (no
+ * locker, pid gone, or pid recycled into a different process). Only a 0
+ * here may permit a takeover bind to replace the existing binding — a 1
+ * means the real locker is alive and must not be evicted. Fail-closed:
+ * if we recorded a starttime at bind but cannot read one now (pid gone),
+ * the peer is treated as dead (replaceable); if we could not record a
+ * starttime at bind (locker_starttime==0) we fall back to a kill(pid,0)
+ * existence probe so an unverifiable-but-present pid still blocks
+ * takeover. */
+static int
+qdwin_locker_peer_alive(struct qdwin *qdwin)
+{
+	if (!qdwin->locker_resource || qdwin->locker_pid <= 0)
+		return 0;
+	uint64_t st_now = qdwin_proc_starttime(qdwin->locker_pid);
+	if (qdwin->locker_starttime != 0) {
+		/* We have a trusted baseline: alive iff the pid still names
+		 * the same process (starttime matches). A 0 means the pid is
+		 * gone or unreadable => dead/replaceable. */
+		return st_now != 0 && st_now == qdwin->locker_starttime;
+	}
+	/* No baseline starttime (e.g. /proc was unreadable at bind). Fall
+	 * back to a plain existence probe: treat any live pid as the locker
+	 * to avoid evicting a present-but-unverifiable peer. */
+	return st_now != 0 || kill(qdwin->locker_pid, 0) == 0;
+}
+
 static void
 qdwin_locker_resource_destroy(struct wl_resource *resource)
 {
@@ -7593,6 +7656,7 @@ qdwin_locker_resource_destroy(struct wl_resource *resource)
 		qdwin->locker_resource = NULL;
 		qdwin->locker_pid = 0;
 		qdwin->locker_uid = (uid_t)-1;
+		qdwin->locker_starttime = 0;
 		weston_log("qdwin: locker unbound\n");
 		if (qdwin->overlay_grab_active && qdwin->overlay_grab_role == 2)
 			qdwin_overlay_grab_end(qdwin);
@@ -7622,16 +7686,38 @@ qdwin_handle_bind_as_locker(struct wl_client *client,
 		return;
 	}
 	if (qdwin->locker_resource) {
-		/* A fresh bind from a different client (or a different
-		 * resource of the same client) means either the prior
-		 * locker is dead or a duplicate is starting. Per the XML
-		 * "only one locker may exist at a time" — destroy the old
-		 * binding so the new one is authoritative. */
+		/* A fresh bind while another locker is already bound. Only one
+		 * locker may hold the role at a time. Historically qdwin
+		 * destroyed the old binding so the new client became
+		 * authoritative — but that let ANY same-uid client evict the
+		 * real qdlocker and then call set_locked(0) to unlock the
+		 * session (CRITICAL: locker takeover). Fail closed instead: if
+		 * the current locker's peer is still alive, REFUSE the takeover
+		 * and leave the existing binding untouched. Only permit a
+		 * replacement once the prior peer is proven dead (pid gone or
+		 * recycled), which is the legitimate "qdlocker crashed, a fresh
+		 * one is starting" path. */
+		if (qdwin_locker_peer_alive(qdwin)) {
+			weston_log("qdwin: locker bind REFUSED pid=%d uid=%u — a "
+				   "locker is already bound (pid=%d) and its peer "
+				   "is alive; takeover denied\n",
+				   (int)pid, (unsigned)uid,
+				   (int)qdwin->locker_pid);
+			wl_resource_post_error(resource,
+				QDWIN_LOCKER_V1_ERROR_LOCKER_PRESENT,
+				"qdwin_locker_v1: another locker is already bound "
+				"and alive; takeover refused");
+			return;
+		}
+		weston_log("qdwin: replacing stale locker binding (old pid=%d "
+			   "is dead) with pid=%d\n",
+			   (int)qdwin->locker_pid, (int)pid);
 		wl_resource_destroy(qdwin->locker_resource);
 	}
 	qdwin->locker_resource = resource;
 	qdwin->locker_pid = pid;
 	qdwin->locker_uid = uid;
+	qdwin->locker_starttime = qdwin_proc_starttime(pid);
 	weston_log("qdwin: locker bound pid=%d uid=%u (initially_locked=%d)\n",
 		   (int)pid, (unsigned)uid, qdwin->locked);
 	qdwin_locker_v1_send_ready(resource, qdwin->locked ? 1u : 0u);
@@ -16609,6 +16695,25 @@ qdwin_parse_str_opt(int argc, char *argv[], const char *argprefix,
 	return strdup(val);
 }
 
+/* Parse a boolean opt-in flag from a bare `--<flag>` argv switch or a
+ * truthy env var (argv presence OR env in {1,true,yes,on} => true).
+ * Used for conscious dev/test opt-outs (e.g. weakening the locker bind
+ * policy to uid-only). Returns true if the flag is set, false otherwise. */
+static bool
+qdwin_parse_flag(int argc, char *argv[], const char *argflag,
+		 const char *envname)
+{
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], argflag) == 0)
+			return true;
+	}
+	const char *v = envname ? getenv(envname) : NULL;
+	if (v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 ||
+		  strcmp(v, "yes") == 0 || strcmp(v, "on") == 0))
+		return true;
+	return false;
+}
+
 /* Parse an optional uid config value from `--<argprefix>=VALUE` or env
  * (argv wins). Tri-state, fail-closed:
  *   - unset/empty           -> returns true, *was_set=false (check skipped)
@@ -17578,6 +17683,46 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 			free(qdwin);
 			return -1;
 		}
+
+		/* CRITICAL hardening: a uid-only locker policy is exploitable —
+		 * any same-uid client (the shell and many desktop helpers run
+		 * as the admin uid) could bind qdwin_locker_v1 and drive
+		 * set_locked(0). Fail closed: when NEITHER an explicit exe nor
+		 * label is configured, default the allowed exe to the installed
+		 * locker path so the peer's identity is verified. An admin who
+		 * genuinely wants the old uid-only behaviour (dev/test, or a
+		 * locker installed at a non-standard path with a custom uid
+		 * split) must opt out CONSCIOUSLY via --qdwin-allowed-locker-any
+		 * / QDWIN_ALLOWED_LOCKER_ANY=1, which we log loudly. */
+		qdwin->allowed_locker_any =
+			qdwin_parse_flag(*argc, argv,
+					 "--qdwin-allowed-locker-any",
+					 "QDWIN_ALLOWED_LOCKER_ANY");
+		if (!exe_set && !label_set) {
+			if (qdwin->allowed_locker_any) {
+				weston_log("qdwin: WARNING locker bind policy is "
+					   "UID-ONLY (--qdwin-allowed-locker-any) — "
+					   "any same-uid client can bind the locker "
+					   "and unlock the session. Do NOT use this in "
+					   "production.\n");
+			} else {
+				qdwin->allowed_locker_exe =
+					strdup(QDWIN_DEFAULT_LOCKER_EXE);
+				if (!qdwin->allowed_locker_exe) {
+					weston_log("qdwin: failed to allocate "
+						   "default locker exe policy — "
+						   "refusing to start uid-only\n");
+					free(qdwin->allowed_locker_label);
+					free(qdwin);
+					return -1;
+				}
+				weston_log("qdwin: locker bind policy defaulting to "
+					   "exe=%s (no explicit policy configured); "
+					   "set --qdwin-allowed-locker-any to override "
+					   "to uid-only\n",
+					   qdwin->allowed_locker_exe);
+			}
+		}
 	}
 	/* §6.8 S3b: install our default-pointer-grab so nested-proxy
 	 * input forwarding lives even when no other grab is active.
@@ -17757,10 +17902,12 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		weston_log("qdwin: locker wl_global_create failed\n");
 		goto fail;
 	}
-	weston_log("qdwin: locker bind policy uid=%u exe=%s label=%s\n",
+	weston_log("qdwin: locker bind policy uid=%u exe=%s label=%s%s\n",
 		   (unsigned)qdwin->allowed_locker_uid,
 		   qdwin->allowed_locker_exe ? qdwin->allowed_locker_exe : "(any)",
-		   qdwin->allowed_locker_label ? qdwin->allowed_locker_label : "(any)");
+		   qdwin->allowed_locker_label ? qdwin->allowed_locker_label : "(any)",
+		   (!qdwin->allowed_locker_exe && !qdwin->allowed_locker_label)
+			   ? " [UID-ONLY: INSECURE]" : "");
 #else
 	/* role=guest: explicitly leave qdwin->locker_global NULL so any
 	 * code that later wants to broadcast through it short-circuits. */

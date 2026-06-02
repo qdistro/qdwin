@@ -59,6 +59,20 @@ chmod 0700 "$RUNTIME"
 
 export XDG_RUNTIME_DIR="$RUNTIME"
 export QDWIN_ALLOWED_UID=$ALLOWED_UID
+# Headless dev/test harness: the locker probe is not the installed
+# /usr/bin/qdlocker, so qdwin's production-default mandatory-exe locker
+# policy would reject it. Consciously drop to the uid-only locker policy
+# here (the exact dev/test opt-out the flag exists for). Tests that need
+# to exercise the mandatory-exe default itself set the policy explicitly
+# and must NOT inherit this — they pass QDWIN_ALLOWED_LOCKER_ANY= (empty
+# but SET) to disable it (see 07-locker-bind-gate S5). Only default when the
+# variable is entirely UNSET: the ${VAR+set} test (no colon) treats an
+# explicit empty value as "set", so the caller's empty value disables the
+# opt-out instead of being re-defaulted to 1.
+if [ -z "${QDWIN_ALLOWED_LOCKER_ANY+set}" ]; then
+    QDWIN_ALLOWED_LOCKER_ANY=1
+fi
+export QDWIN_ALLOWED_LOCKER_ANY
 # Host GUI scenarios use weston-screenshooter for assertions. qdwin keeps the
 # screenshooter interface production-disabled unless this explicit dev/test
 # flag is present.
