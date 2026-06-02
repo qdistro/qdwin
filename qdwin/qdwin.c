@@ -540,15 +540,34 @@ struct qdwin_view_stream {
 
 #define QDWIN_MAX_WORKSPACES 32
 #define QDWIN_DEFAULT_WORKSPACES 4
-/* Installed path of the canonical locker launcher (see qdistro
- * scripts/install/qdistro-bootstrap.sh: the locker unit's ExecStart is
- * rewritten to /usr/bin/qdlocker in every profile). When no explicit
- * --qdwin-allowed-locker-exe / -label is configured, qdwin defaults the
- * allowed locker exe to this path so the locker identity is verified by
- * default (fail-closed) rather than degrading to a uid-only convention
- * that any same-uid client could satisfy. Overridable at build time. */
-#ifndef QDWIN_DEFAULT_LOCKER_EXE
-#define QDWIN_DEFAULT_LOCKER_EXE "/usr/bin/qdlocker"
+/* Installed path(s) of the canonical locker *entrypoint script* — the
+ * console-script that systemd's qdlocker.service ExecStart launches.
+ * qdlocker is a Python setuptools console-script (qdlocker/pyproject.toml
+ * [project.scripts]), NOT a native ELF, so /proc/<pid>/exe of the running
+ * locker resolves to the *interpreter* (/usr/bin/python3.N), never to this
+ * path. The earlier hardening compared allowed_locker_exe against the exe
+ * path and therefore rejected the genuine locker in the default config (it
+ * can never match a script path — VM ground truth 2026-06-02:
+ * /proc/<pid>/exe -> /usr/bin/python3.13, argv[1] -> /usr/local/bin/qdlocker).
+ * The correct identity for a console-script is the launcher's argv: the
+ * kernel records the script path the shebang/systemd handed the interpreter
+ * as argv[1] in /proc/<pid>/cmdline. So we default to an *entrypoint* policy:
+ * exe must be a system interpreter AND argv[1] must realpath to one of these
+ * canonical, root-owned entrypoint files.
+ *
+ * The path is profile-dependent and there is NO single canonical location:
+ *   - dev / upstream pip --prefix=/usr/local (and the running daily VM):
+ *     /usr/local/bin/qdlocker          (qdlocker.service ships this ExecStart)
+ *   - bootstrap-installed (qdistro-bootstrap.sh rewrites ExecStart and
+ *     pip --prefix=/usr or the /opt wrapper):  /usr/bin/qdlocker
+ * Both files are root-owned. We therefore accept a colon-separated LIST of
+ * trusted entrypoints by default so the real locker binds regardless of which
+ * profile installed it, while still rejecting any same-uid impostor (whose
+ * argv[1] points at neither). An explicit --qdwin-allowed-locker-entrypoint=
+ * (also a colon-list) overrides the default. Overridable at build time. */
+#ifndef QDWIN_DEFAULT_LOCKER_ENTRYPOINT
+#define QDWIN_DEFAULT_LOCKER_ENTRYPOINT \
+	"/usr/local/bin/qdlocker:/usr/bin/qdlocker"
 #endif
 /* v27: max stored workspace-name length (bytes). Bounds an unbounded
  * shell; over-long names are truncated rather than erroring. */
@@ -580,19 +599,32 @@ struct qdwin {
 	struct wl_global *locker_global;
 	struct wl_resource *locker_resource;
 	uid_t allowed_locker_uid;
-	/* Opt-out for the mandatory-exe default. When the admin configures
-	 * neither an explicit allowed_locker_exe nor allowed_locker_label,
-	 * qdwin defaults allowed_locker_exe to the installed locker path
-	 * (QDWIN_DEFAULT_LOCKER_EXE) so the locker identity is verified by
+	/* Opt-out for the mandatory-identity default. When the admin
+	 * configures neither an explicit allowed_locker_exe nor
+	 * allowed_locker_label, qdwin defaults to the entrypoint policy
+	 * (allowed_locker_entrypoint) so the locker identity is verified by
 	 * default (fail-closed). Dev/test can consciously drop back to the
 	 * weaker uid-only policy by setting --qdwin-allowed-locker-any /
 	 * QDWIN_ALLOWED_LOCKER_ANY=1, which sets this flag and suppresses the
-	 * default exe. It has no effect once an explicit exe/label is set. */
+	 * default. It has no effect once an explicit exe/label/entrypoint is
+	 * configured. */
 	bool allowed_locker_any;
+	/* Expected canonical entrypoint *script* of the locker. qdlocker is
+	 * a Python console-script, so /proc/<pid>/exe is the interpreter and
+	 * the real launcher path is argv[1] (see QDWIN_DEFAULT_LOCKER_ENTRY-
+	 * POINT). When non-NULL the bind handler requires (a) the peer exe to
+	 * be a system interpreter and (b) the peer's argv[1] to resolve
+	 * (realpath) to this canonical, root-owned entrypoint file. This is
+	 * the DEFAULT production policy (set to QDWIN_DEFAULT_LOCKER_ENTRY-
+	 * POINT when no explicit exe/label is configured) and is also settable
+	 * via --qdwin-allowed-locker-entrypoint= / env. NULL = entrypoint
+	 * check disabled. */
+	char *allowed_locker_entrypoint;
 	/* Expected resolved /proc/<pid>/exe of the locker process. When
 	 * non-NULL the bind handler rejects any peer whose exe does not
-	 * match (in addition to the uid check). NULL = exe check disabled
-	 * (uid-only). Set via --qdwin-allowed-locker-exe= / env. */
+	 * match (in addition to the uid check). For a *native* locker only —
+	 * qdlocker (Python) is matched via allowed_locker_entrypoint instead.
+	 * NULL = exe check disabled. Set via --qdwin-allowed-locker-exe= / env. */
 	char *allowed_locker_exe;
 	/* Expected SELinux label of the locker process. When non-NULL the
 	 * bind handler rejects any peer whose /proc/<pid>/attr/current
@@ -7614,33 +7646,55 @@ bind_qdwin_shell(struct wl_client *client, void *data,
  * helpers) so the locker bind handler below can prove peer liveness. */
 static uint64_t qdwin_proc_starttime(pid_t pid);
 
-/* Is the currently-bound locker peer still the same live process that
- * bound? Returns 1 if a locker is bound AND its pid still names the very
- * process that bound it (verified by /proc starttime), 0 otherwise (no
- * locker, pid gone, or pid recycled into a different process). Only a 0
- * here may permit a takeover bind to replace the existing binding — a 1
- * means the real locker is alive and must not be evicted. Fail-closed:
- * if we recorded a starttime at bind but cannot read one now (pid gone),
- * the peer is treated as dead (replaceable); if we could not record a
- * starttime at bind (locker_starttime==0) we fall back to a kill(pid,0)
- * existence probe so an unverifiable-but-present pid still blocks
- * takeover. */
+/* Is the currently-bound locker peer still live? Returns 1 if a locker is
+ * bound and we cannot PROVE it dead, 0 only if it is provably gone or its
+ * pid has been recycled into a different process. Only a 0 here permits a
+ * takeover bind to replace the existing binding.
+ *
+ * This MUST fail CLOSED: a return of 0 lets a same-uid attacker evict the
+ * real qdlocker and then set_locked(0) to unlock the session, so any doubt
+ * about liveness must resolve to "alive" (deny takeover). In particular
+ * qdwin_proc_starttime() returns 0 on ANY /proc read failure — including a
+ * transient EMFILE/fd-exhaustion that a same-uid attacker can deliberately
+ * induce — NOT only when the pid is gone. Treating st_now==0 as "dead"
+ * would hand the attacker exactly the takeover this gate exists to stop.
+ *
+ * So we never infer death from an unreadable starttime alone. Death is
+ * concluded only from kill(pid,0)==ESRCH (the pid truly no longer exists)
+ * or from a starttime that is readable AND differs from the baseline (the
+ * pid was recycled into a different process). A readable-but-matching
+ * starttime is alive; an UNreadable starttime on a still-existing pid is
+ * treated as alive (fail closed). */
 static int
 qdwin_locker_peer_alive(struct qdwin *qdwin)
 {
 	if (!qdwin->locker_resource || qdwin->locker_pid <= 0)
 		return 0;
+
+	/* Authoritative death signal: the pid no longer exists at all.
+	 * kill(pid,0) returning -1/ESRCH is unambiguous; -1/EPERM means the
+	 * pid exists but is owned by someone we can't signal (still alive);
+	 * 0 means it exists and we could signal it (alive). */
+	if (kill(qdwin->locker_pid, 0) != 0 && errno == ESRCH)
+		return 0;
+
 	uint64_t st_now = qdwin_proc_starttime(qdwin->locker_pid);
 	if (qdwin->locker_starttime != 0) {
-		/* We have a trusted baseline: alive iff the pid still names
-		 * the same process (starttime matches). A 0 means the pid is
-		 * gone or unreadable => dead/replaceable. */
-		return st_now != 0 && st_now == qdwin->locker_starttime;
+		/* Trusted baseline. If we can read a starttime now and it
+		 * DIFFERS, the pid was recycled into a different process =>
+		 * the original peer is dead/replaceable. If the starttimes
+		 * MATCH, it is the same live process. If we cannot read one
+		 * now (st_now==0, e.g. attacker-induced fd exhaustion) but the
+		 * pid still exists (checked above), we must NOT conclude death:
+		 * fail closed and treat it as alive. */
+		if (st_now != 0)
+			return st_now == qdwin->locker_starttime;
+		return 1;   /* unreadable starttime, pid present => alive */
 	}
-	/* No baseline starttime (e.g. /proc was unreadable at bind). Fall
-	 * back to a plain existence probe: treat any live pid as the locker
-	 * to avoid evicting a present-but-unverifiable peer. */
-	return st_now != 0 || kill(qdwin->locker_pid, 0) == 0;
+	/* No baseline starttime (e.g. /proc was unreadable at bind). The pid
+	 * still exists (kill check above), so treat the present-but-
+	 * unverifiable peer as alive — fail closed, never evict. */
+	return 1;
 }
 
 static void
@@ -7854,10 +7908,15 @@ qdwin_handle_lock_acknowledged(struct wl_client *client,
 }
 
 /* Defined later (Option-B identity-capture helpers); the locker bind
- * handler below uses them for the optional exe/SELinux peer checks. */
+ * handler below uses them for the optional exe/entrypoint/SELinux peer
+ * checks. */
 static char *qdwin_proc_exe(pid_t pid);
+static char *qdwin_proc_argv1(pid_t pid);
 static char *qdwin_proc_selinux_label(pid_t pid);
 static uint64_t qdwin_proc_starttime(pid_t pid);
+static bool qdwin_exe_is_system_interpreter(const char *exe);
+static bool qdwin_path_is_trusted_entrypoint(const char *cand,
+					     const char *expected);
 
 static const struct qdwin_locker_v1_interface qdwin_locker_impl = {
 	.bind_as_locker = qdwin_handle_bind_as_locker,
@@ -7922,8 +7981,48 @@ bind_qdwin_locker(struct wl_client *client, void *data,
 	 * read, not that it still names the process that connected. The
 	 * residual same-process-exec / pre-read-reuse window is closed by
 	 * relying on service confinement (see doc/locker.md). */
-	if (qdwin->allowed_locker_exe || qdwin->allowed_locker_label) {
+	if (qdwin->allowed_locker_entrypoint || qdwin->allowed_locker_exe ||
+	    qdwin->allowed_locker_label) {
 		uint64_t st_before = qdwin_proc_starttime(pid);
+
+		/* DEFAULT production identity for the Python console-script
+		 * qdlocker: its /proc/<pid>/exe is the interpreter, so we verify
+		 * (a) the exe is a system interpreter (python under a trusted
+		 * bindir) AND (b) argv[1] resolves to the canonical, root-owned
+		 * entrypoint file. A casual same-uid impostor (the shell, a
+		 * desktop helper, a naive rogue) satisfies neither, so it is
+		 * rejected — while the genuine qdlocker passes. (argv is
+		 * process-writable, so a deliberate forge of BOTH a python exe
+		 * and an argv[1]=<entrypoint> is the residual window; the
+		 * stat()-the-named-file requirement plus service confinement
+		 * keep that out of reach of an ordinary same-uid client. A
+		 * dedicated locker uid / SELinux label remains the strongest
+		 * posture and overrides this.) */
+		if (qdwin->allowed_locker_entrypoint) {
+			char *exe = qdwin_proc_exe(pid);
+			char *argv1 = qdwin_proc_argv1(pid);
+			bool exe_ok = qdwin_exe_is_system_interpreter(exe);
+			bool ep_ok = qdwin_path_is_trusted_entrypoint(
+				argv1, qdwin->allowed_locker_entrypoint);
+			if (!exe_ok || !ep_ok) {
+				weston_log("qdwin: locker bind rejected pid=%d "
+					   "exe='%s' argv1='%s' (expected a system "
+					   "interpreter launching entrypoint '%s'; "
+					   "exe_ok=%d entrypoint_ok=%d)\n",
+					   (int)pid, exe ? exe : "(unreadable)",
+					   argv1 ? argv1 : "(unreadable)",
+					   qdwin->allowed_locker_entrypoint,
+					   (int)exe_ok, (int)ep_ok);
+				wl_client_post_implementation_error(client,
+					"qdwin_locker_v1: peer locker entrypoint "
+					"not permitted");
+				free(exe);
+				free(argv1);
+				return;
+			}
+			free(exe);
+			free(argv1);
+		}
 
 		if (qdwin->allowed_locker_exe) {
 			char *exe = qdwin_proc_exe(pid);
@@ -10953,6 +11052,7 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	/* v27: release any per-index custom workspace names (strndup'd). */
 	for (uint32_t wi = 0; wi < QDWIN_MAX_WORKSPACES; wi++)
 		free(qdwin->workspace_names[wi]);
+	free(qdwin->allowed_locker_entrypoint);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
 	free(qdwin->allowed_layershell_exe);
@@ -16980,6 +17080,138 @@ qdwin_proc_selinux_label(pid_t pid)
 	return strdup(buf);
 }
 
+/* Read argv[1] (the launcher's first argument) from /proc/<pid>/cmdline.
+ * For a Python console-script started as `ExecStart=/usr/local/bin/qdlocker`
+ * the kernel hands the shebang interpreter the script path as argv[1], so
+ * cmdline is "<interp>\0<script-path>\0...". This is how we recover the
+ * locker's real launcher path when /proc/<pid>/exe is only the interpreter.
+ * Returns a heap string the caller frees; "" on any read error or if there
+ * is no argv[1] (fail-closed — an empty expectation can never be matched).
+ *
+ * Caveat (documented at the call site): a process can rewrite its own argv
+ * memory, so cmdline is not as authoritative as exe. The default policy
+ * pairs this with a stat() of the *named file* (must be the canonical,
+ * root-owned entrypoint), which raises the bar well above "any same-uid
+ * binary": a casual impostor (the shell, weston-terminal, a naive rogue)
+ * has neither a python exe nor an argv[1] pointing at the entrypoint, so it
+ * is rejected. */
+static char *
+qdwin_proc_argv1(pid_t pid)
+{
+	if (pid <= 0)
+		return strdup("");
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return strdup("");
+	/* cmdline is NUL-separated argv. We only need the first two fields.
+	 * Bound the read; a path arg far longer than PATH_MAX is bogus. */
+	char buf[2 * PATH_MAX];
+	size_t off = 0;
+	ssize_t n;
+	while (off < sizeof buf - 1 &&
+	       (n = read(fd, buf + off, sizeof buf - 1 - off)) > 0)
+		off += (size_t)n;
+	close(fd);
+	if (off == 0)
+		return strdup("");
+	buf[off] = '\0';
+	/* argv[0] is the first NUL-terminated token; argv[1] starts after it. */
+	size_t a0 = strnlen(buf, off);
+	if (a0 >= off)            /* no NUL after argv[0] => no argv[1] */
+		return strdup("");
+	const char *a1 = buf + a0 + 1;
+	if (*a1 == '\0')          /* empty argv[1] */
+		return strdup("");
+	/* Reject a silently-truncated argv[1] (no terminating NUL within the
+	 * bytes we read) rather than risk matching a prefix of the entrypoint. */
+	size_t a1max = off - (a0 + 1);
+	if (strnlen(a1, a1max) >= a1max)
+		return strdup("");
+	return strdup(a1);
+}
+
+/* Is `exe` (a resolved /proc/<pid>/exe path) a system script interpreter
+ * that legitimately launches a console-script? We accept a python3.x binary
+ * living under a trusted system bindir. Basename must start with "python".
+ * This is deliberately narrow: the genuine qdlocker is launched via
+ * `#!/usr/bin/python3`, so its exe resolves to /usr/bin/python3.N. */
+static bool
+qdwin_exe_is_system_interpreter(const char *exe)
+{
+	if (!exe || !*exe)
+		return false;
+	/* Must be an absolute path under a trusted system bindir. */
+	static const char *const dirs[] = {
+		"/usr/bin/", "/bin/", "/usr/local/bin/",
+	};
+	const char *base = NULL;
+	for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+		size_t dl = strlen(dirs[i]);
+		if (strncmp(exe, dirs[i], dl) == 0) {
+			base = exe + dl;
+			break;
+		}
+	}
+	if (!base || !*base || strchr(base, '/'))
+		return false;           /* nested path => not a bare bindir entry */
+	return strncmp(base, "python", 6) == 0;
+}
+
+/* True iff `path` is the canonical, root-owned, non-group/other-writable
+ * regular file we expect the locker entrypoint to be. realpath() both the
+ * candidate and the configured entrypoint so symlinks/.. cannot disguise a
+ * different file, then require the resolved paths to be identical AND the
+ * file to be root-owned and not writable by group/other (so a same-uid
+ * attacker cannot have planted or rewritten it). Fail-closed on any error.
+ *
+ * `expected` may be a colon-separated LIST of acceptable entrypoint paths
+ * (the locker's install location is profile-dependent — /usr/local/bin vs
+ * /usr/bin — and there is no single canonical path). The candidate matches
+ * if it resolves to ANY listed entrypoint that also passes the ownership/
+ * permission checks. An empty/whitespace list element is ignored. */
+static bool
+qdwin_path_is_trusted_entrypoint(const char *cand, const char *expected)
+{
+	if (!cand || !*cand || !expected || !*expected)
+		return false;
+	char rc[PATH_MAX];
+	if (!realpath(cand, rc))
+		return false;
+
+	/* Iterate the colon-separated expected list. Copy onto the stack so
+	 * we can NUL-split without mutating the caller's string. A single
+	 * configured path (the common case) is just a one-element list. */
+	char list[2 * PATH_MAX];
+	if (strlen(expected) >= sizeof list)
+		return false;           /* implausibly long => fail closed */
+	memcpy(list, expected, strlen(expected) + 1);
+
+	char *save = NULL;
+	for (char *tok = strtok_r(list, ":", &save); tok;
+	     tok = strtok_r(NULL, ":", &save)) {
+		if (!*tok)
+			continue;
+		char re[PATH_MAX];
+		if (!realpath(tok, re))
+			continue;           /* this candidate path absent => try next */
+		if (strcmp(rc, re) != 0)
+			continue;
+		struct stat st;
+		if (stat(rc, &st) < 0)
+			return false;
+		if (!S_ISREG(st.st_mode))
+			return false;
+		if (st.st_uid != 0)
+			return false;
+		if (st.st_mode & (S_IWGRP | S_IWOTH))
+			return false;
+		return true;            /* matched a trusted entrypoint */
+	}
+	return false;
+}
+
 static int
 qdwin_secctx_listen_cb(int fd, uint32_t mask, void *data)
 {
@@ -17663,7 +17895,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * must not silently disable the check — abort init rather than fall
 	 * back to a weaker policy than the admin requested. */
 	{
-		bool exe_set = false, label_set = false;
+		bool exe_set = false, label_set = false, entry_set = false;
 		qdwin->allowed_locker_exe =
 			qdwin_parse_str_opt(*argc, argv,
 					    "--qdwin-allowed-locker-exe=",
@@ -17673,32 +17905,53 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 					    "--qdwin-allowed-locker-label=",
 					    "QDWIN_ALLOWED_LOCKER_LABEL",
 					    &label_set);
+		qdwin->allowed_locker_entrypoint =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-locker-entrypoint=",
+					    "QDWIN_ALLOWED_LOCKER_ENTRYPOINT",
+					    &entry_set);
 		if ((exe_set && !qdwin->allowed_locker_exe) ||
-		    (label_set && !qdwin->allowed_locker_label)) {
+		    (label_set && !qdwin->allowed_locker_label) ||
+		    (entry_set && !qdwin->allowed_locker_entrypoint)) {
 			weston_log("qdwin: failed to allocate locker bind "
 				   "policy — refusing to start with a weaker "
 				   "policy than configured\n");
 			free(qdwin->allowed_locker_exe);
 			free(qdwin->allowed_locker_label);
+			free(qdwin->allowed_locker_entrypoint);
 			free(qdwin);
 			return -1;
 		}
 
 		/* CRITICAL hardening: a uid-only locker policy is exploitable —
-		 * any same-uid client (the shell and many desktop helpers run
-		 * as the admin uid) could bind qdwin_locker_v1 and drive
-		 * set_locked(0). Fail closed: when NEITHER an explicit exe nor
-		 * label is configured, default the allowed exe to the installed
-		 * locker path so the peer's identity is verified. An admin who
-		 * genuinely wants the old uid-only behaviour (dev/test, or a
-		 * locker installed at a non-standard path with a custom uid
-		 * split) must opt out CONSCIOUSLY via --qdwin-allowed-locker-any
-		 * / QDWIN_ALLOWED_LOCKER_ANY=1, which we log loudly. */
+		 * any same-uid client (the shell and many desktop helpers run as
+		 * the admin uid) could bind qdwin_locker_v1 and drive
+		 * set_locked(0). Fail closed: when NO explicit identity policy
+		 * (exe, label, OR entrypoint) is configured, default to the
+		 * ENTRYPOINT policy so the peer's identity is verified.
+		 *
+		 * Why entrypoint, not exe: qdlocker is a Python setuptools
+		 * console-script (qdlocker/pyproject.toml [project.scripts];
+		 * systemd ExecStart=/usr/local/bin/qdlocker). Its /proc/<pid>/exe
+		 * therefore resolves to the *interpreter* (/usr/bin/python3.N),
+		 * never to the launcher path. The previous hardening defaulted
+		 * allowed_locker_exe=/usr/bin/qdlocker and compared it against
+		 * /proc/<pid>/exe — which can NEVER match for a script launcher,
+		 * so the genuine locker was rejected at bind and the session
+		 * could not lock at all. The entrypoint policy matches how the
+		 * locker is actually packaged: exe is a system interpreter AND
+		 * argv[1] resolves to the canonical, root-owned entrypoint file.
+		 *
+		 * An admin who genuinely wants uid-only (dev/test) must opt out
+		 * CONSCIOUSLY via --qdwin-allowed-locker-any /
+		 * QDWIN_ALLOWED_LOCKER_ANY=1, which we log loudly. A native
+		 * locker (or a dedicated locker uid) can set --qdwin-allowed-
+		 * locker-exe / -label explicitly to override. */
 		qdwin->allowed_locker_any =
 			qdwin_parse_flag(*argc, argv,
 					 "--qdwin-allowed-locker-any",
 					 "QDWIN_ALLOWED_LOCKER_ANY");
-		if (!exe_set && !label_set) {
+		if (!exe_set && !label_set && !entry_set) {
 			if (qdwin->allowed_locker_any) {
 				weston_log("qdwin: WARNING locker bind policy is "
 					   "UID-ONLY (--qdwin-allowed-locker-any) — "
@@ -17706,21 +17959,24 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 					   "and unlock the session. Do NOT use this in "
 					   "production.\n");
 			} else {
-				qdwin->allowed_locker_exe =
-					strdup(QDWIN_DEFAULT_LOCKER_EXE);
-				if (!qdwin->allowed_locker_exe) {
+				qdwin->allowed_locker_entrypoint =
+					strdup(QDWIN_DEFAULT_LOCKER_ENTRYPOINT);
+				if (!qdwin->allowed_locker_entrypoint) {
 					weston_log("qdwin: failed to allocate "
-						   "default locker exe policy — "
-						   "refusing to start uid-only\n");
+						   "default locker entrypoint "
+						   "policy — refusing to start "
+						   "uid-only\n");
+					free(qdwin->allowed_locker_exe);
 					free(qdwin->allowed_locker_label);
 					free(qdwin);
 					return -1;
 				}
 				weston_log("qdwin: locker bind policy defaulting to "
-					   "exe=%s (no explicit policy configured); "
-					   "set --qdwin-allowed-locker-any to override "
-					   "to uid-only\n",
-					   qdwin->allowed_locker_exe);
+					   "entrypoint=%s (system interpreter + "
+					   "root-owned entrypoint; no explicit policy "
+					   "configured); set --qdwin-allowed-locker-any "
+					   "to override to uid-only\n",
+					   qdwin->allowed_locker_entrypoint);
 			}
 		}
 	}
@@ -17902,11 +18158,15 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		weston_log("qdwin: locker wl_global_create failed\n");
 		goto fail;
 	}
-	weston_log("qdwin: locker bind policy uid=%u exe=%s label=%s%s\n",
+	weston_log("qdwin: locker bind policy uid=%u entrypoint=%s exe=%s "
+		   "label=%s%s\n",
 		   (unsigned)qdwin->allowed_locker_uid,
+		   qdwin->allowed_locker_entrypoint ?
+			   qdwin->allowed_locker_entrypoint : "(any)",
 		   qdwin->allowed_locker_exe ? qdwin->allowed_locker_exe : "(any)",
 		   qdwin->allowed_locker_label ? qdwin->allowed_locker_label : "(any)",
-		   (!qdwin->allowed_locker_exe && !qdwin->allowed_locker_label)
+		   (!qdwin->allowed_locker_entrypoint && !qdwin->allowed_locker_exe &&
+		    !qdwin->allowed_locker_label)
 			   ? " [UID-ONLY: INSECURE]" : "");
 #else
 	/* role=guest: explicitly leave qdwin->locker_global NULL so any
@@ -18233,6 +18493,7 @@ fail:
 	weston_layer_fini(&qdwin->popup_layer);
 	for (int i = 0; i < 4; i++)
 		weston_layer_fini(&qdwin->layer_shell_layer[i]);
+	free(qdwin->allowed_locker_entrypoint);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
 	free(qdwin->allowed_layershell_exe);
