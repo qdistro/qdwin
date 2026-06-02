@@ -66,16 +66,25 @@ if [ -z "${QDWIN_LW_PIPEWIRE:-}" ]; then
     fi
 fi
 
-# rdp backend needs FreeRDP devel (freerdp2 or freerdp3).
+# rdp backend needs the FULL FreeRDP devel set for one major version:
+# the client lib AND the matching freerdp-server* AND winpr* package.
+# Meson's backend-rdp/meson.build requires all three (and prefers v3 over
+# v2 when both are present), so a header-only or client-lib-only probe can
+# say "yes" while the actual meson configure still fails before the symbol
+# assertion is reached. Only enable RDP when pkg-config can satisfy the
+# complete set for v3, else v2; otherwise disable it.
 if [ -z "${QDWIN_LW_RDP:-}" ]; then
-    if pkg-config --exists freerdp2 2>/dev/null \
-        || pkg-config --exists freerdp3 2>/dev/null \
-        || header_available "freerdp2/freerdp/freerdp.h" \
-        || header_available "freerdp3/freerdp/freerdp.h"; then
+    if pkg-config --exists "freerdp3 >= 3.0.0" \
+                           "freerdp-server3 >= 3.0.0" \
+                           "winpr3 >= 3.0.0" 2>/dev/null; then
+        export QDWIN_LW_RDP=true
+    elif pkg-config --exists "freerdp2 >= 2.3.0" \
+                             "freerdp-server2 >= 2.3.0" \
+                             "winpr2 >= 2.3.0" 2>/dev/null; then
         export QDWIN_LW_RDP=true
     else
         export QDWIN_LW_RDP=false
-        notes+=("rdp backend (FreeRDP devel not found via pkg-config or headers)")
+        notes+=("rdp backend (complete FreeRDP server/winpr devel set not found via pkg-config)")
     fi
 fi
 
