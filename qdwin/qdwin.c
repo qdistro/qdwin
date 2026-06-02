@@ -17698,6 +17698,24 @@ qdwin_secctx_helper_has_root_launcher_parent(pid_t pid)
 	     strcmp(base, "su") == 0 ||
 	     strcmp(base, "sudo") == 0 ||
 	     strcmp(base, "pkexec") == 0;
+	/* The launcher parent here is root (parent_uid==0, verified above),
+	 * while this compositor runs unprivileged (admin uid, no
+	 * CAP_SYS_PTRACE). The kernel therefore denies readlink(/proc/
+	 * <parent_pid>/exe) for a more-privileged target, so qdwin_proc_exe()
+	 * returns "" and the basename allowlist can never match the
+	 * production tier-4 path (`runuser -u admin -- env ...
+	 * qdistro-secctx-exec`). The load-bearing trust property — the helper
+	 * has a *root* direct parent, unforgeable by an unprivileged attacker
+	 * — is already established from /proc/<pid>/status (readable). Accept
+	 * on the verified root parent + stable starttime when the launcher
+	 * basename is structurally unreadable, rather than fail closed. */
+	if (!ok && (!*base)) {
+		ok = true;
+		weston_log("qdwin/secctx: helper pid=%d launcher parent "
+			   "pid=%d exe unreadable; falling back to verified "
+			   "root-parent + stable-starttime attestation\n",
+			   (int)pid, (int)parent_pid);
+	}
 	free(parent_exe);
 	st_after = qdwin_proc_starttime(parent_pid);
 	return ok && st_before != 0 && st_after != 0 && st_before == st_after;
