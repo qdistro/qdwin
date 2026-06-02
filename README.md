@@ -10,6 +10,18 @@ but is published as a separate project: nothing in qdwin assumes the
 qdistro broker, the qdshell QML stack, or the qdistro userland is
 present. A different shell can adopt it.
 
+## Role in qdistro
+
+In qdistro, qdwin is the trusted Wayland compositor. It owns window placement,
+trusted chrome boundaries, lock-layer enforcement, private qdwin protocols, and
+the metadata that lets qdshell and the broker reason about which silo owns a
+surface. It deliberately stays small and C/libweston-based while the modifiable
+product code lives in Python/QML sibling repos.
+
+qdwin does not make policy decisions by itself. It exposes the mechanisms that
+qdshell, qdlocker, qdistro daemons, and the broker use to implement the current
+"one owner, many silos, dynamic sessions" model.
+
 If you ARE building qdistro: the umbrella repo expects qdwin checked
 out as a sibling directory (`../qdwin/`) so its daemons can compile
 against qdwin's protocol XML. See the qdistro umbrella README for
