@@ -109,9 +109,94 @@ SYMS=(
 
 fail() { echo "[prod-syms] FAIL: $*" >&2; exit 1; }
 
+# Locate the installed core library under $PREFIX without assuming a libdir:
+# meson installs to lib64 on openSUSE but to the arch multiarch dir
+# (lib/x86_64-linux-gnu) on Debian/Ubuntu, and build-libweston.sh deliberately
+# does not force --libdir. Echoes the core .so path, or nothing if not built.
+find_core() {
+    ls "$PREFIX"/lib64/libweston-14.so.0.0.2 \
+       "$PREFIX"/lib/*/libweston-14.so.0.0.2 \
+       "$PREFIX"/lib/libweston-14.so.0.0.2 2>/dev/null | head -n1
+}
+
+# Dependency preflight for the deps the auto-disable block above does NOT
+# guard. The orthogonal backends (GL/pipewire/RDP) are probed and toggled
+# off when missing, so they are intentionally excluded here. What remains are
+# the genuinely-required modules — the libweston-desktop core, the always-on
+# shared toytoolkit (cairo/png/pango/...), drm/seat/udev, VA-API, and the
+# lcms + x11 features that stay enabled — whose absence otherwise makes
+# `meson setup` die with a cryptic "Dependency X not found" deep in the build
+# (exactly how this gate failed in CI when cairo/libpng/lcms2 were absent).
+# Backend-feature rows honour the same QDWIN_LW_* toggles the auto-disable
+# block just set, so a degraded build never demands a dep it won't use.
+preflight_deps() {
+    command -v pkg-config >/dev/null 2>&1 \
+        || fail "pkg-config not found (install pkgconf / pkg-config)"
+
+    # module | apt package | zypper package | gate (always|lcms|gl|x11)
+    local specs=(
+        "wayland-client     libwayland-dev        wayland-devel            always"
+        "wayland-protocols  wayland-protocols     wayland-protocols-devel  always"
+        "xkbcommon          libxkbcommon-dev      libxkbcommon-devel       always"
+        "pixman-1           libpixman-1-dev       libpixman-1-0-devel      always"
+        "libinput           libinput-dev          libinput-devel           always"
+        "libevdev           libevdev-dev          libevdev-devel           always"
+        "libdrm             libdrm-dev            libdrm-devel             always"
+        "gbm                libgbm-dev            libgbm-devel             always"
+        "libseat            libseat-dev           seatd-devel              always"
+        "libudev            libudev-dev           systemd-devel            always"
+        "libdisplay-info    libdisplay-info-dev   libdisplay-info-devel    always"
+        "cairo              libcairo2-dev         cairo-devel              always"
+        "libpng             libpng-dev            libpng16-compat-devel    always"
+        "pango              libpango1.0-dev       pango-devel              always"
+        "pangocairo         libpango1.0-dev       pango-devel              always"
+        "fontconfig         libfontconfig-dev     fontconfig-devel         always"
+        "glib-2.0           libglib2.0-dev        glib2-devel              always"
+        "libva              libva-dev             libva-devel              always"
+        "lcms2              liblcms2-dev          lcms2-devel              lcms"
+        "egl                libegl-dev            Mesa-libEGL-devel        gl"
+        "glesv2             libgles-dev           Mesa-libGLESv2-devel     gl"
+        "x11                libx11-dev            libX11-devel             x11"
+        "x11-xcb            libx11-xcb-dev        libX11-devel             x11"
+        "xcb                libxcb1-dev           libxcb-devel             x11"
+        "xcb-shm            libxcb-shm0-dev       libxcb-devel             x11"
+    )
+
+    local -A gate_on=(
+        [always]=1
+        [lcms]=$([ "${QDWIN_LW_LCMS:-true}" = false ] && echo 0 || echo 1)
+        [gl]=$([ "${QDWIN_LW_GL:-true}" = false ] && echo 0 || echo 1)
+        [x11]=$([ "${QDWIN_LW_X11:-true}" = false ] && echo 0 || echo 1)
+    )
+
+    local missing_mods=() missing_apt=() missing_zyp=()
+    local line mod apt zyp gate
+    for line in "${specs[@]}"; do
+        read -r mod apt zyp gate <<<"$line"
+        [ "${gate_on[$gate]}" = 1 ] || continue
+        pkg-config --exists "$mod" 2>/dev/null && continue
+        missing_mods+=("$mod"); missing_apt+=("$apt"); missing_zyp+=("$zyp")
+    done
+    [ "${#missing_mods[@]}" -eq 0 ] && return 0
+
+    local uniq_apt uniq_zyp
+    uniq_apt=$(printf '%s\n' "${missing_apt[@]}" | sort -u | tr '\n' ' ')
+    uniq_zyp=$(printf '%s\n' "${missing_zyp[@]}" | sort -u | tr '\n' ' ')
+    echo "[prod-syms] missing build dependencies (pkg-config): ${missing_mods[*]}" >&2
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "[prod-syms] install with: sudo apt-get install -y $uniq_apt" >&2
+    elif command -v zypper >/dev/null 2>&1; then
+        echo "[prod-syms] install with: sudo zypper install -y $uniq_zyp" >&2
+    else
+        echo "[prod-syms] apt packages:    $uniq_apt" >&2
+        echo "[prod-syms] zypper packages: $uniq_zyp" >&2
+    fi
+    fail "production build prerequisites missing — install the packages above and re-run"
+}
+
 [ -x "$BUILD_SCRIPT" ] || fail "build script missing at $BUILD_SCRIPT"
 
-if [ ! -f "$PREFIX/lib64/libweston-14.so.0.0.2" ]; then
+if [ -z "$(find_core)" ]; then
     # build-libweston.sh only runs `meson setup` when build-prod/build.ninja
     # is ABSENT, so a stale build dir would silently keep an old backend
     # config and ignore the QDWIN_LW_* options we just decided on. Force a
@@ -121,13 +206,15 @@ if [ ! -f "$PREFIX/lib64/libweston-14.so.0.0.2" ]; then
         echo "[prod-syms] removing stale build dir $PROD_BUILD to force reconfigure" >&2
         rm -rf "$PROD_BUILD"
     fi
+    preflight_deps
     echo "[prod-syms] building production profile into $PREFIX ..."
     QDWIN_LIBWESTON_PROFILE=production QDWIN_LIBWESTON_PREFIX="$PREFIX" \
         bash "$BUILD_SCRIPT" || fail "production build failed"
 fi
 
-CORE="$PREFIX/lib64/libweston-14.so.0.0.2"
-[ -f "$CORE" ] || fail "no core library at $CORE after build"
+CORE="$(find_core)"
+[ -n "$CORE" ] && [ -f "$CORE" ] \
+    || fail "no libweston-14.so.0.0.2 under $PREFIX (lib64 or lib/<arch>) after build"
 
 # Capture the dynamic symbol table once. Piping nm into `grep -q` under
 # `pipefail` would report SIGPIPE (141) when grep exits early, so read

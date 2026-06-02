@@ -130,18 +130,28 @@ else
 fi
 
 # Install into the build's --prefix. libweston bakes its module-search
-# directory in at compile time (= ${prefix}/lib64/libweston-14), so
+# directory in at compile time (= ${prefix}/${libdir}/libweston-14), so
 # weston only finds the backends if the install populates that
 # directory. We use a writable temp prefix; nothing global is touched.
 DESTDIR= ninja -C "$BUILD" install >/dev/null
 
+# meson's default libdir is distro-dependent: lib64 on openSUSE, the arch
+# multiarch dir (lib/x86_64-linux-gnu) on Debian/Ubuntu. We deliberately do
+# NOT force --libdir, so locate whichever directory the install actually used
+# rather than assuming lib64.
+CORE_SO=$(ls "$PREFIX"/lib64/libweston-14.so.0.0.2 \
+             "$PREFIX"/lib/*/libweston-14.so.0.0.2 \
+             "$PREFIX"/lib/libweston-14.so.0.0.2 2>/dev/null | head -n1 || true)
+[[ -n "$CORE_SO" ]] || { echo "error: no libweston-14.so under $PREFIX after install" >&2; exit 1; }
+LIBDIR=$(dirname "$CORE_SO")
+
 echo
 echo "Profile:         $PROFILE"
 echo "Built libweston: $BUILD/libweston/libweston-14.so.0.0.2"
-echo "Installed under: $PREFIX"
-ls -la "$PREFIX/lib64/libweston-14.so"*
+echo "Installed under: $PREFIX (libdir: ${LIBDIR#$PREFIX/})"
+ls -la "$LIBDIR/libweston-14.so"*
 echo "Backends:"
-ls -1 "$PREFIX/lib64/libweston-14/"*.so 2>/dev/null | sed 's/^/  /'
+ls -1 "$LIBDIR/libweston-14/"*.so 2>/dev/null | sed 's/^/  /'
 echo
 if [[ "$PROFILE" == production ]]; then
     echo "Stage into a VM/image with:"
@@ -149,5 +159,5 @@ if [[ "$PROFILE" == production ]]; then
     echo "    qdistro/scripts/install/install-vendored-libweston.sh"
 else
     echo "Use with:"
-    echo "  LD_LIBRARY_PATH=$PREFIX/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} <qdwin-launch-cmd>"
+    echo "  LD_LIBRARY_PATH=$LIBDIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} <qdwin-launch-cmd>"
 fi
