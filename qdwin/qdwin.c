@@ -847,13 +847,17 @@ struct qdwin {
 	struct wl_listener idle_signal_listener;
 	struct wl_listener wake_signal_listener;
 	/* §6.7(a) follow-up: when weston's built-in idle timer is disabled
-	 * (`idle-time=0` in weston.ini), idle_signal never fires. We fall
-	 * back to a compositor-internal activity tracker: each notification
-	 * arms its own wl_event_source for `timeout_ms` on create, and
-	 * wake_signal (fired by weston_compositor_wake on input activity)
-	 * rearms them. Effective semantics: notification fires exactly
-	 * `timeout_ms` after last activity, bypassing weston's coarse
-	 * idle state entirely. 1 when compositor->idle_time == 0, else 0. */
+	 * (`idle-time=0` in weston.ini), qdwin falls back to an internal
+	 * activity tracker: each notification arms its own wl_event_source for
+	 * `timeout_ms` on create. The first ordinary inhibited-aware timer to
+	 * fire mirrors weston's idle transition (state + idle_signal), so later
+	 * real input produces wake_signal and resumes notifications. qdwin's
+	 * default input grabs rearm not-yet-idle timers on key/pointer/axis
+	 * activity while the compositor is already ACTIVE. The idle_signal
+	 * listener is a no-op in this mode because the per-client timers are
+	 * already armed relative to activity. input-idle notifications still only
+	 * notify their own client and do not mutate global state. 1 when
+	 * compositor->idle_time == 0, else 0. */
 	int idle_internal_mode;
 
 	/* §6.7: cursor-shape-v1 (accept + log; visual mapping deferred),
@@ -1096,6 +1100,7 @@ static void qdwin_on_alt_released(struct weston_keyboard *kb,
 static void qdwin_on_lock_key(struct weston_keyboard *kb,
 			      const struct timespec *t,
 			      uint32_t key, void *data);
+static void qdwin_idle_note_activity(struct qdwin *qdwin);
 
 /* B6: retry cursor install when pointer isn't ready at seat creation */
 static int qdwin_cursor_retry_timer_cb(void *data);
@@ -3199,6 +3204,7 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 				struct weston_pointer_motion_event *event)
 {
 	struct weston_pointer *pointer = grab->pointer;
+	qdwin_idle_note_activity(qdwin_singleton);
 	weston_pointer_move(pointer, event);
 	if (qdwin_singleton && qdwin_singleton->locked) {
 		struct weston_view *lv = qdwin_singleton->lock_view;
@@ -3345,6 +3351,7 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				uint32_t button, uint32_t state)
 {
 	struct weston_pointer *pointer = grab->pointer;
+	qdwin_idle_note_activity(qdwin_singleton);
 	if (qdwin_singleton && qdwin_singleton->locked) {
 		struct weston_view *lv = qdwin_singleton->lock_view;
 		if (pointer->focus != lv)
@@ -3490,6 +3497,7 @@ qdwin_proxy_default_grab_axis(struct weston_pointer_grab *grab,
 			      const struct timespec *time,
 			      struct weston_pointer_axis_event *event)
 {
+	qdwin_idle_note_activity(qdwin_singleton);
 	if (qdwin_singleton && qdwin_singleton->locked) {
 		weston_pointer_send_axis(grab->pointer, time, event);
 		return;
@@ -3565,6 +3573,7 @@ qdwin_proxy_default_grab_key(struct weston_keyboard_grab *grab,
 			     uint32_t key, uint32_t state)
 {
 	struct weston_keyboard *kb = grab->keyboard;
+	qdwin_idle_note_activity(qdwin_singleton);
 	weston_keyboard_send_key(kb, time, key, state);
 
 	struct qdwin_toplevel *tl = qdwin_singleton ?
@@ -11089,14 +11098,15 @@ qdwin_destroy(struct wl_listener *listener, void *data)
  * the notification was idle.
  *
  * If weston is configured with idle_time=0 (built-in idle timer
- * disabled), idle_signal never fires and notifications never fire —
- * a deployment choice outside this plugin's scope.
+ * disabled), qdwin internal-idle mode arms timers immediately at
+ * notification creation and rearms them on input activity/wake_signal.
  * ------------------------------------------------------------------ */
 
 struct qdwin_idle_notification {
 	struct qdwin *qdwin;
 	struct wl_resource *resource;
 	uint32_t timeout_ms;
+	uint64_t last_activity_msec;
 	int is_idle;
 	int ignore_inhibit;   /* v2 get_input_idle_notification */
 	/* §6.7(a): per-notification delay timer. Armed on weston idle_signal
@@ -11105,6 +11115,53 @@ struct qdwin_idle_notification {
 	struct wl_event_source *timer;
 	struct wl_list link;  /* qdwin::idle_notifications */
 };
+
+#define QDWIN_IDLE_INTERNAL_INHIBIT_POLL_MS 1000u
+
+static uint64_t
+qdwin_now_msec(void)
+{
+	struct timespec now;
+	weston_compositor_get_time(&now);
+	return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static int
+qdwin_idle_internal_next_delay(uint64_t now_msec,
+			       const struct qdwin_idle_notification *n)
+{
+	uint64_t elapsed = now_msec - n->last_activity_msec;
+	uint64_t remaining;
+	if (elapsed >= n->timeout_ms)
+		return 0;
+	remaining = n->timeout_ms - elapsed;
+	if (remaining == 0)
+		remaining = 1;
+	return (int)remaining;
+}
+
+static void
+qdwin_idle_note_activity(struct qdwin *qdwin)
+{
+	struct qdwin_idle_notification *n;
+	uint64_t now_msec;
+	if (!qdwin || !qdwin->idle_internal_mode)
+		return;
+	now_msec = qdwin_now_msec();
+	wl_list_for_each(n, &qdwin->idle_notifications, link) {
+		if (n->is_idle) {
+			if (qdwin->compositor->state != WESTON_COMPOSITOR_ACTIVE)
+				continue;
+			n->is_idle = 0;
+			ext_idle_notification_v1_send_resumed(n->resource);
+		}
+		n->last_activity_msec = now_msec;
+		if (n->timer && n->timeout_ms > 0)
+			wl_event_source_timer_update(
+				n->timer,
+				qdwin_idle_internal_next_delay(now_msec, n));
+	}
+}
 
 struct qdwin_idle_inhibitor {
 	struct qdwin *qdwin;
@@ -12853,11 +12910,45 @@ static int
 qdwin_idle_notification_timer_fire(void *data)
 {
 	struct qdwin_idle_notification *n = data;
+	uint64_t now_msec;
 	if (n->is_idle)
 		return 0;
-	if (!n->ignore_inhibit && n->qdwin->compositor->idle_inhibit > 0)
+	if (n->qdwin->idle_internal_mode && n->timeout_ms > 0) {
+		now_msec = qdwin_now_msec();
+		if (now_msec - n->last_activity_msec < n->timeout_ms) {
+			if (n->timer)
+				wl_event_source_timer_update(
+					n->timer,
+					qdwin_idle_internal_next_delay(
+						now_msec, n));
+			return 0;
+		}
+	}
+	if (!n->ignore_inhibit && n->qdwin->compositor->idle_inhibit > 0) {
+		if (n->qdwin->idle_internal_mode && n->timer &&
+		    n->timeout_ms > 0)
+			wl_event_source_timer_update(
+				n->timer,
+				(int)QDWIN_IDLE_INTERNAL_INHIBIT_POLL_MS);
 		return 0;
+	}
 	n->is_idle = 1;
+	/* In qdwin's internal-idle mode weston's built-in idle timer is
+	 * disabled, so the first ordinary (inhibitor-aware) notification timer
+	 * is the thing that makes the session idle. Mirror weston's idle_handler
+	 * state transition and signal pairing; otherwise later input calls
+	 * weston_compositor_wake() while the compositor is still ACTIVE,
+	 * libweston suppresses wake_signal, and ext-idle clients never receive
+	 * `resumed` (leaving qdshell's display-power-off path stuck black).
+	 * input-idle notifications deliberately ignore inhibitors and must not
+	 * move the compositor's global idle state. */
+	if (n->qdwin->idle_internal_mode &&
+	    !n->ignore_inhibit &&
+	    n->qdwin->compositor->state == WESTON_COMPOSITOR_ACTIVE) {
+		n->qdwin->compositor->state = WESTON_COMPOSITOR_IDLE;
+		wl_signal_emit(&n->qdwin->compositor->idle_signal,
+			       n->qdwin->compositor);
+	}
 	ext_idle_notification_v1_send_idled(n->resource);
 	return 0;
 }
@@ -12886,6 +12977,7 @@ qdwin_idle_notification_create(struct qdwin *qdwin,
 	n->qdwin = qdwin;
 	n->resource = resource;
 	n->timeout_ms = timeout_ms;
+	n->last_activity_msec = qdwin_now_msec();
 	n->ignore_inhibit = ignore_inhibit;
 	n->timer = wl_event_loop_add_timer(
 		wl_display_get_event_loop(qdwin->compositor->wl_display),
@@ -12900,7 +12992,9 @@ qdwin_idle_notification_create(struct qdwin *qdwin,
 	 * activity arrives; timer fire sends `idled`. Outside internal
 	 * mode, the timer stays disarmed until idle_signal fires. */
 	if (qdwin->idle_internal_mode && n->timer && n->timeout_ms > 0)
-		wl_event_source_timer_update(n->timer, (int)n->timeout_ms);
+		wl_event_source_timer_update(
+			n->timer,
+			qdwin_idle_internal_next_delay(n->last_activity_msec, n));
 	return n;
 }
 
@@ -12970,9 +13064,15 @@ qdwin_on_idle_signal(struct wl_listener *listener, void *data)
 	struct qdwin_idle_notification *n;
 	uint32_t weston_idle_ms;
 	(void)data;
-	/* weston idle_time is configured in seconds; 0 disables the
-	 * built-in idle timer, in which case idle_signal won't fire at
-	 * all and this handler is a no-op. */
+	/* In internal-idle mode qdwin emitted idle_signal only to pair the
+	 * compositor state transition with a later wake_signal. The individual
+	 * notification timers are already armed from create/wake and must not be
+	 * re-armed from this signal; doing so would delay sibling notifications. */
+	if (qdwin->idle_internal_mode)
+		return;
+	/* weston idle_time is configured in seconds. Outside internal-idle mode,
+	 * weston's built-in idle timer fired this signal and notifications with
+	 * longer client timeouts are armed for the remaining offset. */
 	weston_idle_ms = (uint32_t)qdwin->compositor->idle_time * 1000u;
 	wl_list_for_each(n, &qdwin->idle_notifications, link) {
 		if (n->is_idle)
@@ -13000,8 +13100,10 @@ qdwin_on_wake_signal(struct wl_listener *listener, void *data)
 	struct qdwin *qdwin =
 		wl_container_of(listener, qdwin, wake_signal_listener);
 	struct qdwin_idle_notification *n;
+	uint64_t now_msec = qdwin_now_msec();
 	(void)data;
 	wl_list_for_each(n, &qdwin->idle_notifications, link) {
+		n->last_activity_msec = now_msec;
 		/* §6.7(a) follow-up: in internal-idle mode, rearm the timer
 		 * to the full timeout so the notification fires exactly
 		 * timeout_ms after this activity. Outside internal mode,
@@ -13009,7 +13111,9 @@ qdwin_on_wake_signal(struct wl_listener *listener, void *data)
 		if (n->timer) {
 			if (qdwin->idle_internal_mode && n->timeout_ms > 0)
 				wl_event_source_timer_update(
-					n->timer, (int)n->timeout_ms);
+					n->timer,
+					qdwin_idle_internal_next_delay(
+						now_msec, n));
 			else
 				wl_event_source_timer_update(n->timer, 0);
 		}
