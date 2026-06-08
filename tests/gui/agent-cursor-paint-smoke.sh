@@ -159,6 +159,51 @@ vm_exec "journalctl _UID=1000 -b --no-pager 2>/dev/null | grep -qE 'cursor-shape
     || fail "no cursor sprite installed (mapped on cursor_layer) — cursor BO is likely blank/invisible"
 pass "cursor sprite installed (mapped on cursor_layer)"
 
+# ---- 4b. The installed sprite is NOT blank/transparent -----------------
+# "mapped on cursor_layer" + an allocated DRM fb (step 3) are both satisfied
+# by an all-transparent sprite — an invisible cursor. The compositor now logs
+# the introspected payload of the live wl_shm sprite path
+# ("payload=WxH nonzero_alpha=N"); require non-transparent pixels so a blank
+# BO fails here instead of silently shipping an invisible cursor. Solid-color
+# sprites (QDWIN_CURSOR_SPRITE_SOLID) are opaque by construction and logged
+# separately as "solid rgba=...,A" with A>0. Non-introspectable buffers log
+# "payload=non-shm" and fall back to the DRM-plane signal (a NOTE, not a fail).
+# NOTE: parse SIGNED nonzero_alpha (-?[0-9]+). The compositor logs -1 when the
+# SHM payload is non-introspectable (unknown format, or the hostile-stride
+# guard tripped). In this live session the sprite is always ARGB8888 with a
+# real count, so a 0 (blank) OR a -1 (introspection failed / abnormal) both
+# mean "we have no positive evidence of a visible cursor" → fail closed.
+# payload=none / payload=non-shm carry no nonzero_alpha field and fall through
+# to the DRM-plane NOTE.
+payload=$(vm_exec "journalctl _UID=1000 -b --no-pager 2>/dev/null | grep -oE 'mapped on cursor_layer \(hotspot=[-0-9,]+\) payload=[^ ]*( nonzero_alpha=-?[0-9]+)?' | tail -1" 2>/dev/null)
+solid=$(vm_exec "journalctl _UID=1000 -b --no-pager 2>/dev/null | grep -oE 'solid rgba=[0-9.,]+' | tail -1" 2>/dev/null)
+if grep -q 'nonzero_alpha=' <<<"$payload"; then
+    na=$(grep -oE 'nonzero_alpha=-?[0-9]+' <<<"$payload" | grep -oE '\-?[0-9]+')
+    if [ "${na:-0}" -eq 0 ]; then
+        fail "installed cursor sprite is BLANK/transparent (nonzero_alpha=0) — invisible cursor. Payload: $payload"
+    elif [ "${na:-0}" -lt 0 ]; then
+        fail "cursor sprite payload not introspectable (nonzero_alpha=$na) — unexpected for the live wl_shm ARGB8888 path (format change or malformed sprite). Payload: $payload"
+    fi
+    pass "cursor sprite payload non-transparent (nonzero_alpha=$na) — $payload"
+elif [ -n "$solid" ]; then
+    a=$(grep -oE '[0-9.]+$' <<<"$solid")
+    awk "BEGIN { exit !(${a:-0} > 0) }" \
+        || fail "solid cursor sprite is fully transparent ($solid) — invisible cursor"
+    pass "cursor sprite is opaque solid ($solid)"
+elif [ -n "$payload" ]; then
+    # An explicit payload=none / payload=non-shm line: the sprite mapped but
+    # its pixels genuinely can't be introspected here. Fall back to the
+    # DRM-plane checks (step 3) for non-blank evidence — a NOTE, not a fail.
+    echo "NOTE: cursor sprite payload not introspectable ($payload); relying on DRM-plane checks (step 3) for non-blank evidence"
+else
+    # No "mapped on cursor_layer ... payload=" line and no solid sprite at all.
+    # Step 4 can be satisfied by a bare "cursor-sprite registered shape=" log
+    # (the sprite was registered but never actually mapped onto a pointer), so
+    # reaching here means we have NO positive evidence a visible sprite was
+    # installed. Fail closed rather than NOTE-passing an unmapped cursor.
+    fail "no inspectable cursor sprite was mapped (neither a 'mapped on cursor_layer ... payload=' line nor a solid sprite found) — cursor likely registered-but-not-mapped, i.e. invisible"
+fi
+
 # ---- 5. Agent-assisted visual confirmation -----------------------------
 # Move the pointer to a known spot, screenshot, and let a vision LLM judge
 # the framebuffer. The hw-plane cursor is off-scanout, so the EXPECTED
