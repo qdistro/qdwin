@@ -13783,8 +13783,60 @@ qdwin_install_cursor_sprite_view(struct qdwin *qdwin,
 				  &qdwin->compositor->cursor_layer.view_list);
 
 	weston_compositor_schedule_repaint(qdwin->compositor);
-	weston_log("qdwin: %s: mapped on cursor_layer (hotspot=%d,%d)\n",
-		   log_prefix, hotspot_x, hotspot_y);
+
+	/* Blank-BO guard (verification aid): a sprite whose buffer is empty
+	 * or fully transparent maps onto the cursor_layer and reaches the hw
+	 * DRM plane exactly like a real one — the plane is active and the BO
+	 * is "allocated", but the cursor is invisible. The DRM-plane checks
+	 * and this "mapped on cursor_layer" log alone cannot tell the two
+	 * apart. So, for the introspectable case (the live path: wl_shm
+	 * ARGB8888 sprites from qdistro-cursor-sprites), count the
+	 * non-transparent pixels and surface it in the log so the GUI smoke
+	 * test can fail a blank/invisible cursor deterministically. Non-SHM
+	 * buffers aren't readable here and fall back to the DRM-plane signal. */
+	struct weston_buffer *cbuf = surface->buffer_ref.buffer;
+	if (!cbuf) {
+		weston_log("qdwin: %s: mapped on cursor_layer (hotspot=%d,%d) "
+			   "payload=none\n", log_prefix, hotspot_x, hotspot_y);
+	} else if (cbuf->type == WESTON_BUFFER_SHM && cbuf->shm_buffer) {
+		struct wl_shm_buffer *shm = cbuf->shm_buffer;
+		uint32_t fmt = wl_shm_buffer_get_format(shm);
+		int32_t pw = wl_shm_buffer_get_width(shm);
+		int32_t ph = wl_shm_buffer_get_height(shm);
+		int32_t pstride = wl_shm_buffer_get_stride(shm);
+		long opaque = -1;
+		/* Hostile-dimensions guard: wl_shm only validates
+		 * offset+stride*height <= pool_size, NOT stride >= width*4.
+		 * A client can attach stride < width*4, which would make the
+		 * per-row scan below read past the pool. Require a sane stride
+		 * (and positive dims); otherwise leave opaque=-1
+		 * (non-introspectable) and rely on the DRM-plane signal. */
+		bool sane = pw > 0 && ph > 0 && pstride >= (int64_t)pw * 4;
+		if (fmt == WL_SHM_FORMAT_XRGB8888 && sane) {
+			/* no alpha channel — every pixel is opaque */
+			opaque = (long)pw * ph;
+		} else if (fmt == WL_SHM_FORMAT_ARGB8888 && sane) {
+			wl_shm_buffer_begin_access(shm);
+			const uint8_t *d = wl_shm_buffer_get_data(shm);
+			long n = 0;
+			if (d) {
+				for (int32_t y = 0; y < ph; y++) {
+					const uint8_t *row = d + (size_t)y * pstride;
+					for (int32_t x = 0; x < pw; x++)
+						if (row[(size_t)x * 4 + 3] != 0)
+							n++;
+				}
+			}
+			wl_shm_buffer_end_access(shm);
+			opaque = n;
+		}
+		weston_log("qdwin: %s: mapped on cursor_layer (hotspot=%d,%d) "
+			   "payload=%dx%d nonzero_alpha=%ld\n",
+			   log_prefix, hotspot_x, hotspot_y, pw, ph, opaque);
+	} else {
+		weston_log("qdwin: %s: mapped on cursor_layer (hotspot=%d,%d) "
+			   "payload=non-shm\n", log_prefix, hotspot_x, hotspot_y);
+	}
 	return view;
 }
 
