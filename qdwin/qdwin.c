@@ -61,6 +61,7 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "idle-inhibit-unstable-v1-server-protocol.h"
 #include "cursor-shape-v1-server-protocol.h"
 #include "fractional-scale-v1-server-protocol.h"
+#include "text-input-unstable-v3-server-protocol.h"
 #include "ext-workspace-v1-server-protocol.h"
 #include "wlr-output-management-unstable-v1-server-protocol.h"
 #include "primary-selection-unstable-v1-server-protocol.h"
@@ -900,6 +901,16 @@ struct qdwin {
 	 * per live wp_fractional_scale_v1 resource. */
 	struct wl_list fractional_scales;  /* qdwin_fractional_scale::link */
 
+	/* Bucket A / P1: text-input-v3. Open, app-facing IME text-input
+	 * plane (zwp_text_input_manager_v3). One qdwin_text_input per live
+	 * zwp_text_input_v3 resource; enter/leave is driven off the same
+	 * keyboard focus_signal qdwin already tracks. Foundation only —
+	 * inert until an input-method-v2 IME exists (no preedit/commit is
+	 * ever sent). See todo/issues/qdwin/app-compat-protocol-gaps.md P1. */
+	struct wl_global *text_input_manager_global;
+	struct wl_list text_inputs;          /* qdwin_text_input::link */
+	struct wl_list text_input_managers;  /* qdwin_text_input_manager::link */
+
 	/* §6.7 primary-selection-unstable-v1. One global for the
 	 * device-manager; per-seat selection state lives on
 	 * qdwin_primary_seat entries. */
@@ -1024,6 +1035,18 @@ static void qdwin_emit_seat_focus_changed(struct qdwin *qdwin,
 					  uint32_t handle);
 static struct qdwin_seat_tracker *
 qdwin_seat_tracker_for_seat(struct qdwin *qdwin, struct weston_seat *seat);
+/* Bucket A / P1: recompute text-input-v3 enter/leave for a seat after a
+ * keyboard focus change. Defined with the rest of the text-input code far
+ * below; forward-declared so the focus_signal listener can call it. */
+static void qdwin_text_input_update_focus(struct qdwin *qdwin,
+					  struct weston_seat *seat);
+/* Drain live zwp_text_input_v3 objects + zwp_text_input_manager_v3 resources
+ * at compositor teardown, before free(qdwin) — otherwise a resource outliving
+ * qdwin would run its destroy handler against (or dispatch a request into) the
+ * freed qdwin. Both neutralize each resource's user_data so a late callback
+ * no-ops. */
+static void qdwin_text_inputs_destroy_all(struct qdwin *qdwin);
+static void qdwin_text_input_managers_destroy_all(struct qdwin *qdwin);
 /* spec/10 v16 accessors — forward-declared so set_keyboard_focus_v2
  * (which lives near the rest of the request handlers, above the
  * seat_tracker struct definition) can read/write last_target_silo
@@ -10627,6 +10650,12 @@ qdwin_on_keyboard_focus_changed(struct wl_listener *listener, void *data)
 	struct qdwin_seat_tracker *tr =
 		wl_container_of(listener, tr, kbd_focus_listener);
 	(void)data;
+	/* P1: keep text-input-v3 enter/leave in lockstep with keyboard
+	 * focus. Runs unconditionally (not behind the toplevel-handle dedup
+	 * in qdwin_seat_emit_focus_now) because text-input cares about the
+	 * focused wl_surface, which can change between non-toplevel surfaces
+	 * the handle dedup would collapse. */
+	qdwin_text_input_update_focus(tr->qdwin, tr->seat);
 	qdwin_seat_emit_focus_now(tr);
 }
 
@@ -11015,6 +11044,10 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->fractional_scale_manager_global);
 	if (qdwin->primary_selection_manager_global)
 		wl_global_destroy(qdwin->primary_selection_manager_global);
+	if (qdwin->text_input_manager_global)
+		wl_global_destroy(qdwin->text_input_manager_global);
+	qdwin_text_inputs_destroy_all(qdwin);
+	qdwin_text_input_managers_destroy_all(qdwin);
 	if (qdwin->security_context_manager_global)
 		wl_global_destroy(qdwin->security_context_manager_global);
 	qdwin_secctx_destroy_all(qdwin);
@@ -14260,6 +14293,395 @@ bind_qdwin_fractional_scale_manager(struct wl_client *client, void *data,
 	wl_resource_set_implementation(resource,
 				       &qdwin_fractional_scale_manager_impl,
 				       qdwin, NULL);
+}
+
+/* ------------------------------------------------------------------
+ * Bucket A / P1: text-input-unstable-v3 (zwp_text_input_manager_v3).
+ *
+ * App-facing IME text-input plane. Toolkits (GTK/Qt/Chromium) bind this
+ * directly to learn when a text field can receive input-method commits.
+ * qdwin advertises it OPEN (every app needs it) at interface version 1.
+ *
+ * Scope today = FOUNDATION ONLY: the compositor drives enter/leave off the
+ * keyboard focus it already tracks and accepts the double-buffered
+ * enable/disable + set_* state requests (stored, otherwise no-ops), but it
+ * never emits preedit_string / commit_string / done — there is no
+ * input-method-v2 IME wired in yet (the input-method side is gated on the
+ * IME-identity decision, see todo/issues/qdwin/app-compat-protocol-gaps.md
+ * P1). A bound client therefore correctly sees focus enter/leave but
+ * receives no composed text until an IME exists — the standard
+ * "text-input advertised, no IME running" state. Safe: per-seat,
+ * focus-gated, no cross-client surface; qdwin's peer-uid plugin gate
+ * already limits clients to a single uid.
+ * ------------------------------------------------------------------ */
+
+struct qdwin_text_input {
+	struct qdwin *qdwin;
+	struct wl_resource *resource;     /* zwp_text_input_v3 */
+	struct weston_seat *seat;         /* seat passed to get_text_input */
+	struct wl_client *client;
+	/* Double-buffered enable state (enable/disable are pending until
+	 * commit). We don't act on the content, but tracking it keeps a
+	 * future input-method wiring a drop-in. */
+	int pending_enabled;
+	int current_enabled;
+	uint32_t commit_count;            /* serial echoed in done (future IME) */
+	/* Surface this text_input currently holds enter on (NULL = none).
+	 * Tracked so we send exactly one leave per enter and never touch a
+	 * destroyed surface: the destroy listener clears it WITHOUT a leave
+	 * (the wl_surface resource is already gone by then). */
+	struct weston_surface *entered;
+	struct wl_listener entered_destroy_listener;
+	struct wl_list link;              /* qdwin::text_inputs */
+};
+
+static void
+qdwin_text_input_clear_entered(struct qdwin_text_input *ti)
+{
+	if (!ti->entered)
+		return;
+	wl_list_remove(&ti->entered_destroy_listener.link);
+	wl_list_init(&ti->entered_destroy_listener.link);
+	ti->entered = NULL;
+}
+
+static void
+qdwin_text_input_entered_destroyed(struct wl_listener *l, void *data)
+{
+	struct qdwin_text_input *ti =
+		wl_container_of(l, ti, entered_destroy_listener);
+	(void)data;
+	/* The focused surface is going away; its wl_surface resource is no
+	 * longer usable, so we cannot (and per spec need not) send leave —
+	 * just drop the tracking. The follow-up focus_signal settles the
+	 * new focus. */
+	qdwin_text_input_clear_entered(ti);
+}
+
+static void
+qdwin_text_input_set_entered(struct qdwin_text_input *ti,
+			     struct weston_surface *surface)
+{
+	ti->entered = surface;
+	ti->entered_destroy_listener.notify =
+		qdwin_text_input_entered_destroyed;
+	wl_signal_add(&surface->destroy_signal,
+		      &ti->entered_destroy_listener);
+}
+
+/* Recompute enter/leave for every text_input on `seat` after a keyboard
+ * focus change. Defined here; forward-declared near the focus listener. */
+static void
+qdwin_text_input_update_focus(struct qdwin *qdwin, struct weston_seat *seat)
+{
+	struct weston_keyboard *kbd =
+		seat ? weston_seat_get_keyboard(seat) : NULL;
+	struct weston_surface *focus = kbd ? kbd->focus : NULL;
+	struct qdwin_text_input *ti;
+
+	wl_list_for_each(ti, &qdwin->text_inputs, link) {
+		struct weston_surface *want = NULL;
+		if (ti->seat != seat)
+			continue;
+		/* A text_input only enters a surface owned by its OWN client
+		 * — the wl_surface resource we pass in enter must belong to
+		 * that client. */
+		if (focus && focus->resource &&
+		    wl_resource_get_client(focus->resource) == ti->client)
+			want = focus;
+		if (want == ti->entered)
+			continue;
+		if (ti->entered) {
+			/* Still alive (the destroy listener would have cleared
+			 * it otherwise) → safe to send leave with its
+			 * resource. */
+			zwp_text_input_v3_send_leave(ti->resource,
+						     ti->entered->resource);
+			qdwin_text_input_clear_entered(ti);
+		}
+		if (want) {
+			zwp_text_input_v3_send_enter(ti->resource,
+						     want->resource);
+			qdwin_text_input_set_entered(ti, want);
+		}
+	}
+}
+
+/* ---- zwp_text_input_v3 requests ---- */
+
+static void
+qdwin_text_input_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void
+qdwin_text_input_enable(struct wl_client *client, struct wl_resource *resource)
+{
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	(void)client;
+	if (ti)
+		ti->pending_enabled = 1;
+}
+
+static void
+qdwin_text_input_disable(struct wl_client *client, struct wl_resource *resource)
+{
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	(void)client;
+	if (ti)
+		ti->pending_enabled = 0;
+}
+
+static void
+qdwin_text_input_set_surrounding_text(struct wl_client *client,
+				      struct wl_resource *resource,
+				      const char *text,
+				      int32_t cursor, int32_t anchor)
+{
+	(void)client; (void)resource; (void)text; (void)cursor; (void)anchor;
+	/* No IME consumer yet — accepted and dropped. */
+}
+
+static void
+qdwin_text_input_set_text_change_cause(struct wl_client *client,
+				       struct wl_resource *resource,
+				       uint32_t cause)
+{
+	(void)client; (void)resource; (void)cause;
+}
+
+static void
+qdwin_text_input_set_content_type(struct wl_client *client,
+				  struct wl_resource *resource,
+				  uint32_t hint, uint32_t purpose)
+{
+	(void)client; (void)resource; (void)hint; (void)purpose;
+}
+
+static void
+qdwin_text_input_set_cursor_rectangle(struct wl_client *client,
+				      struct wl_resource *resource,
+				      int32_t x, int32_t y,
+				      int32_t width, int32_t height)
+{
+	(void)client; (void)resource; (void)x; (void)y;
+	(void)width; (void)height;
+}
+
+static void
+qdwin_text_input_commit(struct wl_client *client, struct wl_resource *resource)
+{
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!ti)
+		return;
+	/* Atomically apply the buffered enable state and bump the serial the
+	 * spec requires us to echo in `done`. With no IME there is no
+	 * preedit/commit/delete state to batch, so we deliberately send no
+	 * `done` — a text_input with no input-method behind it stays inert
+	 * after commit. The serial is maintained so input-method wiring later
+	 * is a drop-in. */
+	ti->current_enabled = ti->pending_enabled;
+	ti->commit_count++;
+}
+
+/* v2-only requests (we advertise v1, but libwayland dispatches by opcode,
+ * not resource version — a misbehaving client could still send these, so
+ * provide safe no-ops rather than NULL slots). */
+static void
+qdwin_text_input_set_available_actions(struct wl_client *client,
+				       struct wl_resource *resource,
+				       struct wl_array *available_actions)
+{
+	(void)client; (void)resource; (void)available_actions;
+}
+
+static void
+qdwin_text_input_show_input_panel(struct wl_client *client,
+				  struct wl_resource *resource)
+{
+	(void)client; (void)resource;
+}
+
+static void
+qdwin_text_input_hide_input_panel(struct wl_client *client,
+				  struct wl_resource *resource)
+{
+	(void)client; (void)resource;
+}
+
+static const struct zwp_text_input_v3_interface qdwin_text_input_impl = {
+	.destroy               = qdwin_text_input_destroy,
+	.enable                = qdwin_text_input_enable,
+	.disable               = qdwin_text_input_disable,
+	.set_surrounding_text  = qdwin_text_input_set_surrounding_text,
+	.set_text_change_cause = qdwin_text_input_set_text_change_cause,
+	.set_content_type      = qdwin_text_input_set_content_type,
+	.set_cursor_rectangle  = qdwin_text_input_set_cursor_rectangle,
+	.commit                = qdwin_text_input_commit,
+	.set_available_actions = qdwin_text_input_set_available_actions,
+	.show_input_panel      = qdwin_text_input_show_input_panel,
+	.hide_input_panel      = qdwin_text_input_hide_input_panel,
+};
+
+static void
+qdwin_text_input_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	if (!ti)
+		return;
+	qdwin_text_input_clear_entered(ti);
+	wl_list_remove(&ti->link);
+	free(ti);
+}
+
+/* Compositor-teardown drain (called from qdwin_destroy before free(qdwin)).
+ * A client's zwp_text_input_v3 resource can outlive the shell plugin; if it
+ * does, its destroy callback would later run wl_list_remove against the freed
+ * qdwin->text_inputs list head. Neutralize each resource's user_data (the
+ * destroy callback no-ops on NULL) and unlink+free now, so teardown is safe
+ * regardless of libwayland's client/resource destroy ordering. Mirrors
+ * qdwin_secctx_destroy_all's "detach the resource too" handling. */
+static void
+qdwin_text_inputs_destroy_all(struct qdwin *qdwin)
+{
+	struct qdwin_text_input *ti, *tmp;
+	wl_list_for_each_safe(ti, tmp, &qdwin->text_inputs, link) {
+		wl_resource_set_user_data(ti->resource, NULL);
+		qdwin_text_input_clear_entered(ti);
+		wl_list_remove(&ti->link);
+		free(ti);
+	}
+}
+
+/* ---- zwp_text_input_manager_v3 ---- */
+
+/* One per live manager resource. The back-pointer to qdwin is neutralized to
+ * NULL at compositor teardown (qdwin_text_input_managers_destroy_all) because
+ * a manager resource can outlive the shell plugin — without this a late
+ * get_text_input would dereference a freed qdwin. */
+struct qdwin_text_input_manager {
+	struct qdwin *qdwin;          /* NULL after teardown neutralization */
+	struct wl_resource *resource;
+	struct wl_list link;          /* qdwin::text_input_managers */
+};
+
+static void
+qdwin_text_input_manager_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_text_input_manager *mgr =
+		wl_resource_get_user_data(resource);
+	if (!mgr)
+		return;
+	wl_list_remove(&mgr->link);
+	free(mgr);
+}
+
+static void
+qdwin_text_input_managers_destroy_all(struct qdwin *qdwin)
+{
+	struct qdwin_text_input_manager *mgr, *tmp;
+	wl_list_for_each_safe(mgr, tmp, &qdwin->text_input_managers, link) {
+		wl_resource_set_user_data(mgr->resource, NULL);
+		wl_list_remove(&mgr->link);
+		free(mgr);
+	}
+}
+
+static void
+qdwin_text_input_manager_destroy(struct wl_client *client,
+				 struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void
+qdwin_text_input_manager_get_text_input(struct wl_client *client,
+					struct wl_resource *resource,
+					uint32_t id,
+					struct wl_resource *seat_resource)
+{
+	struct qdwin_text_input_manager *mgr =
+		wl_resource_get_user_data(resource);
+	struct qdwin *qdwin = mgr ? mgr->qdwin : NULL;
+	struct weston_seat *seat =
+		seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
+	struct qdwin_text_input *ti;
+	struct wl_resource *ti_res;
+
+	if (!qdwin) {
+		/* Manager outlived qdwin (teardown). Honour the new_id with an
+		 * inert object (NULL user_data → every handler no-ops) rather
+		 * than dereferencing freed state or desyncing the client's id
+		 * allocation. */
+		ti_res = wl_resource_create(client, &zwp_text_input_v3_interface,
+					    wl_resource_get_version(resource), id);
+		if (ti_res)
+			wl_resource_set_implementation(ti_res,
+				&qdwin_text_input_impl, NULL, NULL);
+		return;
+	}
+
+	ti = calloc(1, sizeof *ti);
+	if (!ti) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	ti_res = wl_resource_create(client, &zwp_text_input_v3_interface,
+				    wl_resource_get_version(resource), id);
+	if (!ti_res) {
+		free(ti);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	ti->qdwin = qdwin;
+	ti->resource = ti_res;
+	ti->seat = seat;
+	ti->client = client;
+	wl_list_init(&ti->entered_destroy_listener.link);
+	wl_list_insert(&qdwin->text_inputs, &ti->link);
+	wl_resource_set_implementation(ti_res, &qdwin_text_input_impl, ti,
+				       qdwin_text_input_resource_destroy);
+	/* If the seat's keyboard already focuses one of this client's
+	 * surfaces, deliver the initial enter right away. */
+	qdwin_text_input_update_focus(qdwin, seat);
+}
+
+static const struct zwp_text_input_manager_v3_interface
+qdwin_text_input_manager_impl = {
+	.destroy        = qdwin_text_input_manager_destroy,
+	.get_text_input = qdwin_text_input_manager_get_text_input,
+};
+
+static void
+bind_qdwin_text_input_manager(struct wl_client *client, void *data,
+			      uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct qdwin_text_input_manager *mgr;
+	struct wl_resource *resource;
+
+	mgr = calloc(1, sizeof *mgr);
+	if (!mgr) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	resource = wl_resource_create(
+		client, &zwp_text_input_manager_v3_interface, version, id);
+	if (!resource) {
+		free(mgr);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	mgr->qdwin = qdwin;
+	mgr->resource = resource;
+	wl_list_insert(&qdwin->text_input_managers, &mgr->link);
+	wl_resource_set_implementation(
+		resource, &qdwin_text_input_manager_impl, mgr,
+		qdwin_text_input_manager_resource_destroy);
 }
 
 /* ------------------------------------------------------------------
@@ -18129,6 +18551,8 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_list_init(&qdwin->idle_notifications);
 	wl_list_init(&qdwin->idle_inhibitors);
 	wl_list_init(&qdwin->fractional_scales);
+	wl_list_init(&qdwin->text_inputs);
+	wl_list_init(&qdwin->text_input_managers);
 	wl_list_init(&qdwin->primary_seats);
 	wl_list_init(&qdwin->nested_toplevels);
 	qdwin->next_stream_port = 3401;  /* pool start for per-stream ports */
@@ -18386,6 +18810,17 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		1, qdwin, bind_qdwin_primary_manager);
 	if (!qdwin->primary_selection_manager_global) {
 		weston_log("qdwin: primary-selection wl_global_create failed\n");
+		goto fail;
+	}
+
+	/* Bucket A / P1: text-input-v3 (open, app-facing). Advertise v1 —
+	 * the lowest common denominator every text-input-v3 toolkit speaks;
+	 * v2 adds input-panel/actions we don't drive without an IME. */
+	qdwin->text_input_manager_global = wl_global_create(
+		ec->wl_display, &zwp_text_input_manager_v3_interface,
+		1, qdwin, bind_qdwin_text_input_manager);
+	if (!qdwin->text_input_manager_global) {
+		weston_log("qdwin: text-input wl_global_create failed\n");
 		goto fail;
 	}
 

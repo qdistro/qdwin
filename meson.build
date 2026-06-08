@@ -220,6 +220,27 @@ fractional_scale_protocol_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# Bucket A / P1: text-input-v3. Open, app-facing IME text-input plane so
+# GTK/Qt/Chromium see zwp_text_input_manager_v3. Foundation only — enter/leave
+# focus wiring + buffered enable; inert until an input-method-v2 IME exists (the
+# input-method side is gated on a separate identity decision, see
+# todo/issues/qdwin/app-compat-protocol-gaps.md P1).
+text_input_xml = files(
+  wayland_protocols_dir / 'unstable/text-input/text-input-unstable-v3.xml',
+)
+text_input_server_header = custom_target(
+  'text-input-v3-server-header',
+  input: text_input_xml,
+  output: 'text-input-unstable-v3-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+text_input_protocol_code = custom_target(
+  'text-input-v3-private-code',
+  input: text_input_xml,
+  output: 'text-input-unstable-v3-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 # v24 workspaces: ext-workspace-v1 (server). qdwin implements the standard
 # workspace protocol so any taskbar (qdshell + others) can list/activate
 # workspaces. The window->workspace mapping the bar needs for occupancy is
@@ -450,6 +471,8 @@ qdwin_plugin = shared_library(
     tablet_v2_protocol_code,
     fractional_scale_server_header,
     fractional_scale_protocol_code,
+    text_input_server_header,
+    text_input_protocol_code,
     ext_workspace_server_header,
     ext_workspace_protocol_code,
     wlr_output_mgmt_server_header,
@@ -762,6 +785,33 @@ executable('qdwin-bystander',
 # call xdg_toplevel.set_title at startup, leaving waypipe's
 # --title-prefix nothing to prepend. Reusable for any future test
 # that needs a controllable-title window.
+# Client header for the text-input-v3 probe (qdwin-textinput-probe). The
+# manager global is server-side in qdwin-shell.so; the probe is a plain
+# client. Reuses text_input_protocol_code (private-code) for the wl_interface
+# symbols, same as the server.
+text_input_client_header = custom_target(
+  'text-input-v3-client-header',
+  input: text_input_xml,
+  output: 'text-input-unstable-v3-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+# text-input-unstable-v3 probe. Binds zwp_text_input_manager_v3, exercises the
+# full request set, and asserts the foundation contract: enter is focus-driven
+# (one enter on a mapped+focused surface) and NO IME/done events fire without
+# an input-method. Driven by tests/host/21-text-input.md.
+executable('qdwin-textinput-probe',
+  sources: [
+    'test-client/qdwin-textinput-probe.c',
+    text_input_client_header,
+    text_input_protocol_code,
+    xdg_shell_client_header,
+    xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 executable('qdistro-test-window',
   sources: [
     'test-client/qdistro-test-window.c',
@@ -872,6 +922,18 @@ test('rdp-focus-rebind',
   python3,
   args: [
     files('qdwin/test_rdp_focus_rebind.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+# text-input-unstable-v3 foundation invariants (Bucket A / P1): manager open
+# at v1, focus-driven client-scoped enter/leave, and the inert "no IME events
+# without an input-method" contract. Driven by tests/host/21-text-input.md;
+# the live enter/leave half is seat/VM-gated (headless has no wl_seat).
+test('text-input-foundation',
+  python3,
+  args: [
+    files('qdwin/test_text_input.py'),
     files('qdwin/qdwin.c'),
   ],
 )
