@@ -63,6 +63,7 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "fractional-scale-v1-server-protocol.h"
 #include "text-input-unstable-v3-server-protocol.h"
 #include "input-method-unstable-v2-server-protocol.h"
+#include "virtual-keyboard-unstable-v1-server-protocol.h"
 #include "ext-workspace-v1-server-protocol.h"
 #include "wlr-output-management-unstable-v1-server-protocol.h"
 #include "primary-selection-unstable-v1-server-protocol.h"
@@ -931,6 +932,28 @@ struct qdwin {
 	char *allowed_ime_exe;               /* optional resolved-exe pin (NULL=skip) */
 	char *allowed_ime_label;             /* optional SELinux-label pin (NULL=skip) */
 
+	/* Bucket A / P1 companion: virtual-keyboard-unstable-v1
+	 * (zwp_virtual_keyboard_manager_v1). The other half of a grabbing IME:
+	 * once an input-method-v2 IME grabs the seat keyboard, it passes the
+	 * keys it does NOT compose back to apps by injecting them through a
+	 * virtual keyboard. Equally privileged (arbitrary keystroke injection
+	 * into the focused app), so it is identity-gated EXACTLY like
+	 * input-method-v2 — same allowed_ime_uid + secctx/sandbox deny via the
+	 * global filter (shared gate: qdwin_ime_family_bind_allowed). The
+	 * server injects via notify_key / notify_modifiers on the seat. See
+	 * todo/open-followups.md + app-compat-protocol-gaps.md P1. */
+	struct wl_global *virtual_keyboard_manager_global;
+	struct wl_list virtual_keyboards;          /* qdwin_virtual_keyboard::link */
+	struct wl_list virtual_keyboard_managers;  /* qdwin_virtual_keyboard_manager::link */
+	/* Set to the injecting virtual keyboard's wl_client for the duration of a
+	 * single notify_key/notify_modifiers injection, so an active IME keyboard
+	 * grab can recognise its OWN virtual keyboard's keys and pass them through
+	 * to the focused app instead of looping them back to the IME (the whole
+	 * point of the companion — fcitx5 grabs, then re-injects non-composed keys
+	 * which must reach the app). Mirrors sway's keyboard_get_im_grab
+	 * same-client bypass. NULL except inside an injection. */
+	struct wl_client *vk_injecting_client;
+
 	/* §6.7 primary-selection-unstable-v1. One global for the
 	 * device-manager; per-seat selection state lives on
 	 * qdwin_primary_seat entries. */
@@ -1078,6 +1101,12 @@ static void qdwin_im_text_input_gone(struct qdwin *qdwin,
 				     struct qdwin_text_input *ti);
 static void qdwin_input_methods_destroy_all(struct qdwin *qdwin);
 static void qdwin_input_method_managers_destroy_all(struct qdwin *qdwin);
+/* Bucket A / P1 companion: virtual-keyboard-v1 teardown drains. Defined with
+ * the virtual-keyboard code far below; forward-declared so qdwin_destroy can
+ * drain them (both neutralize each resource's user_data so a late callback
+ * no-ops). */
+static void qdwin_virtual_keyboards_destroy_all(struct qdwin *qdwin);
+static void qdwin_virtual_keyboard_managers_destroy_all(struct qdwin *qdwin);
 /* spec/10 v16 accessors — forward-declared so set_keyboard_focus_v2
  * (which lives near the rest of the request handlers, above the
  * seat_tracker struct definition) can read/write last_target_silo
@@ -11082,6 +11111,13 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->input_method_manager_global);
 	qdwin_input_methods_destroy_all(qdwin);
 	qdwin_input_method_managers_destroy_all(qdwin);
+	/* P1 companion: virtual keyboards inject into the seat but hold no
+	 * references to text_inputs/input_methods, so their drain order is
+	 * independent; drain here alongside the IME family. */
+	if (qdwin->virtual_keyboard_manager_global)
+		wl_global_destroy(qdwin->virtual_keyboard_manager_global);
+	qdwin_virtual_keyboards_destroy_all(qdwin);
+	qdwin_virtual_keyboard_managers_destroy_all(qdwin);
 	if (qdwin->text_input_manager_global)
 		wl_global_destroy(qdwin->text_input_manager_global);
 	qdwin_text_inputs_destroy_all(qdwin);
@@ -15073,9 +15109,25 @@ qdwin_im_grab_key(struct weston_keyboard_grab *grab,
 {
 	struct qdwin_im_keyboard_grab *g =
 		wl_container_of(grab, g, base);
+	struct qdwin *qdwin = qdwin_singleton;
 	struct wl_display *display;
 	uint32_t serial, msecs;
-	qdwin_idle_note_activity(qdwin_singleton);
+	qdwin_idle_note_activity(qdwin);
+	/* Same-client virtual-keyboard passthrough: when the IME re-injects a key
+	 * it did NOT compose through its OWN virtual keyboard, that key must reach
+	 * the focused app — not loop back into this grab and re-enter the IME.
+	 * qdwin_vk_req_key marks the injecting client for the duration of the
+	 * notify_key; if it is this grab's IME client, hand the event to the
+	 * default grab (normal app delivery) and stop. Mirrors sway's
+	 * keyboard_get_im_grab same-client bypass. */
+	if (qdwin && qdwin->vk_injecting_client && g->im &&
+	    qdwin->vk_injecting_client == g->im->client) {
+		struct weston_keyboard *kbd = grab->keyboard;
+		if (kbd)
+			kbd->default_grab.interface->key(&kbd->default_grab,
+							 time, key, state);
+		return;
+	}
 	if (!g->resource)
 		return;
 	display = grab->keyboard->seat->compositor->wl_display;
@@ -15092,6 +15144,19 @@ qdwin_im_grab_modifiers(struct weston_keyboard_grab *grab, uint32_t serial,
 {
 	struct qdwin_im_keyboard_grab *g =
 		wl_container_of(grab, g, base);
+	struct qdwin *qdwin = qdwin_singleton;
+	/* Same-client passthrough, exactly as qdwin_im_grab_key: a modifier
+	 * update injected by the IME's own virtual keyboard goes to the app, not
+	 * back to the IME. */
+	if (qdwin && qdwin->vk_injecting_client && g->im &&
+	    qdwin->vk_injecting_client == g->im->client) {
+		struct weston_keyboard *kbd = grab->keyboard;
+		if (kbd)
+			kbd->default_grab.interface->modifiers(
+				&kbd->default_grab, serial, mods_depressed,
+				mods_latched, mods_locked, group);
+		return;
+	}
 	if (!g->resource)
 		return;
 	zwp_input_method_keyboard_grab_v2_send_modifiers(
@@ -15471,41 +15536,50 @@ qdwin_im_manager_impl = {
 	.destroy          = qdwin_im_manager_destroy,
 };
 
-static void
-bind_qdwin_input_method_manager(struct wl_client *client, void *data,
-				uint32_t version, uint32_t id)
+/* Shared identity gate for the privileged IME-family protocols
+ * (zwp_input_method_manager_v2 + its companion zwp_virtual_keyboard_manager_v1).
+ * Both grant keystroke capture / arbitrary injection across the focused app, so
+ * both must be admitted ONLY to the trusted IME, gated identically: never a
+ * sandboxed/secctx silo client (else one silo could keylog/inject into
+ * another), only allowed_ime_uid (default allowed_uid), and — if configured —
+ * the IME's own resolved exe / SELinux label, bracketed by a starttime
+ * double-read so a recycled pid fails closed. Returns true if `client` may
+ * bind; otherwise posts an implementation error on `client` (so the caller's
+ * early-return is fail-closed) and returns false. `proto` names the interface
+ * for the error/log text. Keeping ONE gate for both protocols guarantees they
+ * cannot drift apart. */
+static bool
+qdwin_ime_family_bind_allowed(struct qdwin *qdwin, struct wl_client *client,
+			      const char *proto)
 {
-	struct qdwin *qdwin = data;
-	struct wl_resource *resource;
 	pid_t pid; uid_t uid; gid_t gid;
 	uid_t allowed = qdwin->allowed_ime_uid != (uid_t)-1 ?
 		qdwin->allowed_ime_uid : qdwin->allowed_uid;
 
 	wl_client_get_credentials(client, &pid, &uid, &gid);
-	weston_log("qdwin: input-method bind attempt pid=%d uid=%u "
+	weston_log("qdwin: %s bind attempt pid=%d uid=%u "
 		   "(allowed_ime_uid=%u)\n",
-		   (int)pid, (unsigned)uid, (unsigned)allowed);
+		   proto, (int)pid, (unsigned)uid, (unsigned)allowed);
 
 	/* Sandboxed/secctx clients (silo apps) must never become the IME — that
 	 * would let one silo keylog/inject into another. The global filter
-	 * already hides this global from them; reject here too as defence in
+	 * already hides these globals from them; reject here too as defence in
 	 * depth in case a client obtained the global another way. */
 	if (qdwin_secctx_client_find(qdwin, client) != NULL) {
 		wl_client_post_implementation_error(client,
-			"zwp_input_method_manager_v2: sandboxed clients may not "
-			"act as an input method");
-		return;
+			"%s: sandboxed clients may not act as an input method",
+			proto);
+		return false;
 	}
 	if (uid != allowed) {
 		wl_client_post_implementation_error(client,
-			"zwp_input_method_manager_v2: uid %u not permitted "
-			"(allowed ime uid=%u)",
-			(unsigned)uid, (unsigned)allowed);
-		return;
+			"%s: uid %u not permitted (allowed ime uid=%u)",
+			proto, (unsigned)uid, (unsigned)allowed);
+		return false;
 	}
 	/* Optional defence-in-depth peer pins (resolved exe / SELinux label),
 	 * bracketed by a starttime double-read so a recycled pid fails closed —
-	 * mirrors the locker bind. Unreadable /proc maps to "" so a configured
+	 * mirrors the locker bind. Unreadable /proc maps to NULL so a configured
 	 * non-empty expectation always fails closed. */
 	if (qdwin->allowed_ime_exe || qdwin->allowed_ime_label) {
 		uint64_t st_before = qdwin_proc_starttime(pid);
@@ -15516,12 +15590,12 @@ bind_qdwin_input_method_manager(struct wl_client *client, void *data,
 				  strcmp(exe, qdwin->allowed_ime_exe) == 0);
 			free(exe);
 			if (!ok) {
-				weston_log("qdwin: input-method bind rejected "
-					   "pid=%d (exe mismatch)\n", (int)pid);
+				weston_log("qdwin: %s bind rejected "
+					   "pid=%d (exe mismatch)\n",
+					   proto, (int)pid);
 				wl_client_post_implementation_error(client,
-					"zwp_input_method_manager_v2: peer exe "
-					"not permitted");
-				return;
+					"%s: peer exe not permitted", proto);
+				return false;
 			}
 		}
 		if (qdwin->allowed_ime_label) {
@@ -15530,22 +15604,39 @@ bind_qdwin_input_method_manager(struct wl_client *client, void *data,
 				  strcmp(label, qdwin->allowed_ime_label) == 0);
 			free(label);
 			if (!ok) {
-				weston_log("qdwin: input-method bind rejected "
-					   "pid=%d (label mismatch)\n", (int)pid);
+				weston_log("qdwin: %s bind rejected "
+					   "pid=%d (label mismatch)\n",
+					   proto, (int)pid);
 				wl_client_post_implementation_error(client,
-					"zwp_input_method_manager_v2: peer "
-					"label not permitted");
-				return;
+					"%s: peer label not permitted", proto);
+				return false;
 			}
 		}
 		st_after = qdwin_proc_starttime(pid);
 		if (st_before == 0 || st_after == 0 || st_before != st_after) {
 			wl_client_post_implementation_error(client,
-				"zwp_input_method_manager_v2: peer identity "
-				"unstable");
-			return;
+				"%s: peer identity unstable", proto);
+			return false;
 		}
 	}
+	return true;
+}
+
+static void
+bind_qdwin_input_method_manager(struct wl_client *client, void *data,
+				uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct wl_resource *resource;
+	pid_t pid; uid_t uid; gid_t gid;
+
+	/* Identity gate (secctx-deny + allowed_ime_uid + optional exe/label),
+	 * shared with the virtual-keyboard companion. Fail-closed: on reject the
+	 * helper posts the error and we return BEFORE creating the resource. */
+	if (!qdwin_ime_family_bind_allowed(qdwin, client,
+					   "zwp_input_method_manager_v2"))
+		return;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
 
 	resource = wl_resource_create(
 		client, &zwp_input_method_manager_v2_interface, version, id);
@@ -15591,6 +15682,342 @@ qdwin_input_methods_destroy_all(struct qdwin *qdwin)
 		wl_resource_set_user_data(im->resource, NULL);
 		wl_list_remove(&im->link);
 		free(im);
+	}
+}
+
+/* ==================================================================
+ * Bucket A / P1 companion: virtual-keyboard-unstable-v1
+ * (zwp_virtual_keyboard_manager_v1).
+ *
+ * The other half of a grabbing IME. input-method-v2 lets fcitx5/ibus grab the
+ * seat keyboard and compose; for the keys it does NOT compose, it passes them
+ * back to the focused app by injecting them through a virtual keyboard. Without
+ * this companion a grabbing IME would simply swallow passthrough keys (hence it
+ * is a hard prerequisite before enabling a real IME in production — see
+ * todo/open-followups.md).
+ *
+ * The compositor injects each key via notify_key() and each modifier/group
+ * update via notify_modifiers() on the target seat — i.e. straight into the
+ * seat's keyboard, exactly as a hardware key would arrive, so the focused
+ * client sees ordinary wl_keyboard events.
+ *
+ * KEYMAP: the protocol has the client upload its own keymap. qdwin does NOT
+ * swap the shared seat keymap to a per-virtual-keyboard one (that would mutate
+ * the real keyboard's keymap for every client and race the hardware keyboard);
+ * instead injected keycodes are interpreted with the seat keymap. For the one
+ * supported use case — an IME re-injecting the very keys it received from the
+ * seat keyboard grab — the keymaps are identical (the IME got the keymap from
+ * the compositor via the grab's send_keymap), so this is correct. We still
+ * enforce the protocol contract: the format must be XKB_V1 and a keymap must be
+ * set before key/modifiers (else the protocol-mandated no_keymap /
+ * invalid_keymap_format errors).
+ *
+ * Trust: a virtual keyboard injects arbitrary keystrokes into whatever app is
+ * focused — equally privileged to input-method-v2's keystroke capture. It is
+ * gated IDENTICALLY: hidden from secctx/sandboxed clients by the global filter
+ * and bind-gated via the SAME qdwin_ime_family_bind_allowed() helper
+ * (allowed_ime_uid + secctx deny + optional exe/label pins). No silo app may
+ * ever obtain one.
+ * ================================================================== */
+
+struct qdwin_virtual_keyboard {
+	struct qdwin *qdwin;
+	struct wl_resource *resource;     /* zwp_virtual_keyboard_v1 */
+	struct weston_seat *seat;         /* NULL after seat destroy (inert) */
+	struct wl_client *client;
+	int has_keymap;                   /* keymap set → key/modifiers allowed */
+	struct wl_listener seat_destroy_listener;
+	struct wl_list link;              /* qdwin::virtual_keyboards */
+};
+
+/* Detach from the seat (drop the destroy listener) and mark inert. Idempotent;
+ * used by resource-destroy, seat-destroy and teardown. */
+static void
+qdwin_virtual_keyboard_detach(struct qdwin_virtual_keyboard *vk)
+{
+	if (vk->seat) {
+		wl_list_remove(&vk->seat_destroy_listener.link);
+		wl_list_init(&vk->seat_destroy_listener.link);
+		vk->seat = NULL;
+	}
+}
+
+/* ---- zwp_virtual_keyboard_v1 requests ---- */
+
+static void
+qdwin_vk_req_keymap(struct wl_client *client, struct wl_resource *resource,
+		    uint32_t format, int32_t fd, uint32_t size)
+{
+	struct qdwin_virtual_keyboard *vk = wl_resource_get_user_data(resource);
+	(void)client;
+	(void)size;
+	/* Only the standard xkb v1 text keymap is accepted. We do not apply the
+	 * keymap to the seat (see the section comment), but we must still
+	 * validate the format per the protocol and always consume the fd so it
+	 * does not leak. */
+	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+		if (fd >= 0)
+			close(fd);
+		wl_resource_post_error(resource,
+			ZWP_VIRTUAL_KEYBOARD_V1_ERROR_INVALID_KEYMAP_FORMAT,
+			"unsupported keymap format %u (only XKB_V1)",
+			(unsigned)format);
+		return;
+	}
+	if (fd >= 0)
+		close(fd);
+	if (vk)
+		vk->has_keymap = 1;
+}
+
+static void
+qdwin_vk_req_key(struct wl_client *client, struct wl_resource *resource,
+		 uint32_t time, uint32_t key, uint32_t state)
+{
+	struct qdwin_virtual_keyboard *vk = wl_resource_get_user_data(resource);
+	struct timespec ts;
+	(void)client;
+	if (!vk)
+		return;
+	/* Protocol: a keymap must be set before any key event. */
+	if (!vk->has_keymap) {
+		wl_resource_post_error(resource,
+			ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP,
+			"key event before keymap was set");
+		return;
+	}
+	/* Inert once the seat is gone, or while the seat has no keyboard. */
+	if (!vk->seat || !weston_seat_get_keyboard(vk->seat))
+		return;
+	/* Synthetic input still counts as activity (resets the idle timer),
+	 * mirroring the IME keyboard-grab path. */
+	qdwin_idle_note_activity(vk->qdwin);
+	ts = qdwin_ts_from_msec(time);
+	/* Mark the injecting client so an active same-client IME keyboard grab
+	 * passes this key through to the app instead of looping it back to the
+	 * IME (see qdwin_im_grab_key). Cleared immediately after — the marker is
+	 * only meaningful for the synchronous notify_key dispatch. */
+	vk->qdwin->vk_injecting_client = vk->client;
+	/* STATE_UPDATE_AUTOMATIC so an injected modifier *keycode* updates the
+	 * seat's xkb modifier state just like a hardware key — the focused app
+	 * then sees correct modifiers on subsequent keys. The explicit
+	 * modifiers request below complements this for latched/locked/group. */
+	notify_key(vk->seat, &ts, key,
+		   state ? WL_KEYBOARD_KEY_STATE_PRESSED
+			 : WL_KEYBOARD_KEY_STATE_RELEASED,
+		   STATE_UPDATE_AUTOMATIC);
+	vk->qdwin->vk_injecting_client = NULL;
+}
+
+static void
+qdwin_vk_req_modifiers(struct wl_client *client, struct wl_resource *resource,
+		       uint32_t mods_depressed, uint32_t mods_latched,
+		       uint32_t mods_locked, uint32_t group)
+{
+	struct qdwin_virtual_keyboard *vk = wl_resource_get_user_data(resource);
+	struct weston_keyboard *kbd;
+	(void)client;
+	if (!vk)
+		return;
+	if (!vk->has_keymap) {
+		wl_resource_post_error(resource,
+			ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP,
+			"modifiers before keymap was set");
+		return;
+	}
+	if (!vk->seat)
+		return;
+	kbd = weston_seat_get_keyboard(vk->seat);
+	if (!kbd || !kbd->xkb_state.state)
+		return;
+	/* Set the seat keyboard's xkb modifier/group state explicitly, then let
+	 * notify_modifiers() re-serialize it and fan out to clients/grabs — the
+	 * same path weston's own update_modifier_state() uses. (group maps to
+	 * the locked layout index.) The injecting-client marker routes a
+	 * same-client IME grab's modifiers to the app (see qdwin_im_grab_modifiers). */
+	xkb_state_update_mask(kbd->xkb_state.state, mods_depressed, mods_latched,
+			      mods_locked, 0, 0, group);
+	vk->qdwin->vk_injecting_client = vk->client;
+	notify_modifiers(vk->seat,
+			 wl_display_next_serial(vk->qdwin->compositor->wl_display));
+	vk->qdwin->vk_injecting_client = NULL;
+}
+
+static const struct zwp_virtual_keyboard_v1_interface
+qdwin_virtual_keyboard_impl = {
+	.keymap    = qdwin_vk_req_keymap,
+	.key       = qdwin_vk_req_key,
+	.modifiers = qdwin_vk_req_modifiers,
+	.destroy   = qdwin_im_generic_destroy,  /* shared: only wl_resource_destroy */
+};
+
+static void
+qdwin_virtual_keyboard_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_virtual_keyboard *vk = wl_resource_get_user_data(resource);
+	if (!vk)
+		return;
+	qdwin_virtual_keyboard_detach(vk);
+	wl_list_remove(&vk->link);
+	free(vk);
+}
+
+static void
+qdwin_vk_seat_destroyed(struct wl_listener *l, void *data)
+{
+	struct qdwin_virtual_keyboard *vk =
+		wl_container_of(l, vk, seat_destroy_listener);
+	(void)data;
+	/* The seat (hence its keyboard) is going away; the vk can no longer
+	 * inject. The resource stays alive but inert (key/modifiers drop on a
+	 * NULL seat). */
+	qdwin_virtual_keyboard_detach(vk);
+}
+
+/* ---- zwp_virtual_keyboard_manager_v1 ---- */
+
+/* One per live manager resource. The back-pointer to qdwin is neutralized to
+ * NULL at compositor teardown so a create_virtual_keyboard on a manager that
+ * outlives the plugin returns an inert object instead of dereferencing freed
+ * qdwin. Mirrors qdwin_input_method_manager. */
+struct qdwin_virtual_keyboard_manager {
+	struct qdwin *qdwin;          /* NULL after teardown neutralization */
+	struct wl_resource *resource;
+	struct wl_list link;          /* qdwin::virtual_keyboard_managers */
+};
+
+static void
+qdwin_vk_manager_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_virtual_keyboard_manager *mgr =
+		wl_resource_get_user_data(resource);
+	if (!mgr)
+		return;
+	wl_list_remove(&mgr->link);
+	free(mgr);
+}
+
+static void
+qdwin_virtual_keyboard_managers_destroy_all(struct qdwin *qdwin)
+{
+	struct qdwin_virtual_keyboard_manager *mgr, *tmp;
+	wl_list_for_each_safe(mgr, tmp, &qdwin->virtual_keyboard_managers, link) {
+		wl_resource_set_user_data(mgr->resource, NULL);
+		wl_list_remove(&mgr->link);
+		free(mgr);
+	}
+}
+
+static void
+qdwin_vk_manager_create_virtual_keyboard(struct wl_client *client,
+					 struct wl_resource *resource,
+					 struct wl_resource *seat_resource,
+					 uint32_t id)
+{
+	struct qdwin_virtual_keyboard_manager *mgr =
+		wl_resource_get_user_data(resource);
+	struct qdwin *qdwin = mgr ? mgr->qdwin : NULL;
+	struct weston_seat *seat =
+		seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
+	struct qdwin_virtual_keyboard *vk;
+	struct wl_resource *vk_res;
+
+	vk_res = wl_resource_create(client, &zwp_virtual_keyboard_v1_interface,
+				    wl_resource_get_version(resource), id);
+	if (!vk_res) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	if (!qdwin) {
+		/* Manager outlived qdwin (teardown). Honour the new_id with an
+		 * inert object (NULL user_data → key/modifiers no-op) rather
+		 * than dereferencing freed state. */
+		wl_resource_set_implementation(vk_res,
+			&qdwin_virtual_keyboard_impl, NULL, NULL);
+		return;
+	}
+	vk = calloc(1, sizeof *vk);
+	if (!vk) {
+		wl_resource_set_implementation(vk_res,
+			&qdwin_virtual_keyboard_impl, NULL, NULL);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	vk->qdwin = qdwin;
+	vk->resource = vk_res;
+	vk->seat = seat;
+	vk->client = client;
+	wl_list_init(&vk->seat_destroy_listener.link);
+	wl_list_insert(&qdwin->virtual_keyboards, &vk->link);
+	wl_resource_set_implementation(vk_res, &qdwin_virtual_keyboard_impl, vk,
+				       qdwin_virtual_keyboard_resource_destroy);
+	/* No seat (invalid seat_resource): the object is live and tracked but
+	 * inert (no injection target). The protocol allows several virtual
+	 * keyboards per seat, so there is no single-claimant restriction. */
+	if (seat) {
+		vk->seat_destroy_listener.notify = qdwin_vk_seat_destroyed;
+		wl_signal_add(&seat->destroy_signal, &vk->seat_destroy_listener);
+	}
+}
+
+static const struct zwp_virtual_keyboard_manager_v1_interface
+qdwin_vk_manager_impl = {
+	.create_virtual_keyboard = qdwin_vk_manager_create_virtual_keyboard,
+};
+
+static void
+bind_qdwin_virtual_keyboard_manager(struct wl_client *client, void *data,
+				    uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct wl_resource *resource;
+	pid_t pid; uid_t uid; gid_t gid;
+
+	/* SAME identity gate as input-method-v2 (shared helper): a virtual
+	 * keyboard injects arbitrary keystrokes into the focused app, so it is
+	 * equally privileged. Fail-closed — on reject the helper posts the error
+	 * and we return BEFORE creating the resource. */
+	if (!qdwin_ime_family_bind_allowed(qdwin, client,
+					   "zwp_virtual_keyboard_manager_v1"))
+		return;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+
+	resource = wl_resource_create(
+		client, &zwp_virtual_keyboard_manager_v1_interface, version, id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	{
+		struct qdwin_virtual_keyboard_manager *mgr = calloc(1, sizeof *mgr);
+		if (!mgr) {
+			wl_resource_set_implementation(resource,
+				&qdwin_vk_manager_impl, NULL, NULL);
+			wl_client_post_no_memory(client);
+			return;
+		}
+		mgr->qdwin = qdwin;
+		mgr->resource = resource;
+		wl_list_insert(&qdwin->virtual_keyboard_managers, &mgr->link);
+		wl_resource_set_implementation(resource, &qdwin_vk_manager_impl,
+					       mgr, qdwin_vk_manager_resource_destroy);
+	}
+	weston_log("qdwin: virtual-keyboard manager bound by uid=%u pid=%d\n",
+		   (unsigned)uid, (int)pid);
+}
+
+/* Compositor-teardown drain: neutralize every live virtual-keyboard resource so
+ * a late destroy callback no-ops, and detach seat state. Mirrors
+ * qdwin_input_methods_destroy_all. */
+static void
+qdwin_virtual_keyboards_destroy_all(struct qdwin *qdwin)
+{
+	struct qdwin_virtual_keyboard *vk, *tmp;
+	wl_list_for_each_safe(vk, tmp, &qdwin->virtual_keyboards, link) {
+		qdwin_virtual_keyboard_detach(vk);
+		wl_resource_set_user_data(vk->resource, NULL);
+		wl_list_remove(&vk->link);
+		free(vk);
 	}
 }
 
@@ -19225,6 +19652,12 @@ qdwin_secctx_global_filter(const struct wl_client *client,
 	if (qdwin->input_method_manager_global &&
 	    global == qdwin->input_method_manager_global)
 		return qdwin_secctx_client_find(qdwin, cw) == NULL;
+	/* P1 companion: the virtual-keyboard manager is equally privileged
+	 * (arbitrary keystroke injection) — hide it from sandboxed/silo clients
+	 * for the same reason, so one silo cannot inject into another. */
+	if (qdwin->virtual_keyboard_manager_global &&
+	    global == qdwin->virtual_keyboard_manager_global)
+		return qdwin_secctx_client_find(qdwin, cw) == NULL;
 	if (global != qdwin->security_context_manager_global)
 		return true;  /* only filter the secctx manager */
 	if (qdwin_secctx_client_find(qdwin, cw) != NULL)
@@ -19522,6 +19955,8 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_list_init(&qdwin->text_input_managers);
 	wl_list_init(&qdwin->input_methods);
 	wl_list_init(&qdwin->input_method_managers);
+	wl_list_init(&qdwin->virtual_keyboards);
+	wl_list_init(&qdwin->virtual_keyboard_managers);
 	wl_list_init(&qdwin->primary_seats);
 	wl_list_init(&qdwin->nested_toplevels);
 	qdwin->next_stream_port = 3401;  /* pool start for per-stream ports */
@@ -19801,6 +20236,18 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		1, qdwin, bind_qdwin_input_method_manager);
 	if (!qdwin->input_method_manager_global) {
 		weston_log("qdwin: input-method wl_global_create failed\n");
+		goto fail;
+	}
+
+	/* P1 companion: virtual-keyboard-unstable-v1 (privileged key injection).
+	 * v1 — the only interface version. Hidden from sandboxed clients by the
+	 * global filter and bind-gated to allowed_ime_uid via the SAME helper as
+	 * input-method-v2; see the section comment far above. */
+	qdwin->virtual_keyboard_manager_global = wl_global_create(
+		ec->wl_display, &zwp_virtual_keyboard_manager_v1_interface,
+		1, qdwin, bind_qdwin_virtual_keyboard_manager);
+	if (!qdwin->virtual_keyboard_manager_global) {
+		weston_log("qdwin: virtual-keyboard wl_global_create failed\n");
 		goto fail;
 	}
 

@@ -108,6 +108,7 @@ require_global "$globals_file" wp_cursor_shape_manager_v1
 require_global "$globals_file" wp_fractional_scale_manager_v1
 require_global "$globals_file" zwp_text_input_manager_v3
 require_global "$globals_file" zwp_input_method_manager_v2
+require_global "$globals_file" zwp_virtual_keyboard_manager_v1
 require_global "$globals_file" qdwin_shell_v1
 
 static_file="$tmpdir/qdshell-static-protocol-use.txt"

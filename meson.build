@@ -266,6 +266,29 @@ input_method_protocol_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# Bucket A / P1 companion: virtual-keyboard-unstable-v1 (server). The other
+# half of a grabbing IME — once input-method-v2 grabs the seat keyboard, the
+# IME re-injects the keys it does not compose through zwp_virtual_keyboard_v1
+# so they reach the focused app. Like input-method-v2 this is a wlr-protocols
+# extension (NOT wayland-protocols), so the xml is vendored under qdwin/qdwin/.
+# libweston-14 has no implementation. Bind is identity-gated EXACTLY like
+# input-method-v2 (allowed_ime_uid + sandbox/secctx deny) because it grants
+# arbitrary keystroke injection. See todo/open-followups.md +
+# todo/issues/qdwin/app-compat-protocol-gaps.md P1.
+virtual_keyboard_xml = files('qdwin/virtual-keyboard-unstable-v1.xml')
+virtual_keyboard_server_header = custom_target(
+  'virtual-keyboard-unstable-v1-server-header',
+  input: virtual_keyboard_xml,
+  output: 'virtual-keyboard-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+virtual_keyboard_protocol_code = custom_target(
+  'virtual-keyboard-unstable-v1-private-code',
+  input: virtual_keyboard_xml,
+  output: 'virtual-keyboard-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 # v24 workspaces: ext-workspace-v1 (server). qdwin implements the standard
 # workspace protocol so any taskbar (qdshell + others) can list/activate
 # workspaces. The window->workspace mapping the bar needs for occupancy is
@@ -500,6 +523,8 @@ qdwin_plugin = shared_library(
     text_input_protocol_code,
     input_method_server_header,
     input_method_protocol_code,
+    virtual_keyboard_server_header,
+    virtual_keyboard_protocol_code,
     ext_workspace_server_header,
     ext_workspace_protocol_code,
     wlr_output_mgmt_server_header,
@@ -862,6 +887,30 @@ executable('qdwin-imethod-probe',
   install: true,
 )
 
+# Client header for the virtual-keyboard probe (qdwin-vkbd-probe). Reuses
+# virtual_keyboard_protocol_code (private-code) for the wl_interface symbols.
+virtual_keyboard_client_header = custom_target(
+  'virtual-keyboard-unstable-v1-client-header',
+  input: virtual_keyboard_xml,
+  output: 'virtual-keyboard-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+# virtual-keyboard-unstable-v1 live probe. Binds zwp_virtual_keyboard_manager_v1
+# (proving the shared IME bind gate admits the session uid), asserts the seat
+# gate (exit 5 headless), then under a seat re-uploads the seat keymap and
+# injects key+modifiers with no protocol error; --nokeymap asserts the
+# fail-closed no_keymap contract. Driven by tests/host/25-virtual-keyboard.md.
+executable('qdwin-vkbd-probe',
+  sources: [
+    'test-client/qdwin-vkbd-probe.c',
+    virtual_keyboard_client_header,
+    virtual_keyboard_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 executable('qdistro-test-window',
   sources: [
     'test-client/qdistro-test-window.c',
@@ -934,6 +983,7 @@ install_data(
     'qdwin/wlr-layer-shell-unstable-v1.xml',
     'qdwin/wlr-output-management-unstable-v1.xml',
     'qdwin/input-method-unstable-v2.xml',
+    'qdwin/virtual-keyboard-unstable-v1.xml',
   ],
   install_dir: qdistro_protocols_dir,
 )
@@ -998,6 +1048,21 @@ test('input-method-gating',
   python3,
   args: [
     files('qdwin/test_input_method.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+# virtual-keyboard-unstable-v1 gating + injection + teardown invariants
+# (Bucket A / P1 companion): the manager is gated identically to input-method-v2
+# via the SHARED qdwin_ime_family_bind_allowed helper (secctx-deny + uid), the
+# global filter hides it from silos, the seat keymap is NOT swapped, key/
+# modifiers are no_keymap-guarded and inject via notify_key/notify_modifiers,
+# and teardown/seat-destroy detach cleanly. Headless source invariants; the live
+# inject path is seat/VM-gated (qdwin-vkbd-probe + tests/host/25).
+test('virtual-keyboard-gating',
+  python3,
+  args: [
+    files('qdwin/test_virtual_keyboard.py'),
     files('qdwin/qdwin.c'),
   ],
 )

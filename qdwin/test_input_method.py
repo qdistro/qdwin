@@ -101,28 +101,56 @@ def check_manager_global_created_gated_v1(source):
 
 
 def check_bind_rejects_sandbox_and_uid(source):
-    """The bind handler must reject secctx/sandboxed clients AND enforce a uid
-    check before creating the manager resource."""
+    """The bind handler must run the shared identity gate
+    (qdwin_ime_family_bind_allowed) and return on its failure BEFORE creating
+    the manager resource (fail-closed). The gate itself must reject
+    secctx/sandboxed clients AND enforce a uid check.
+
+    The gate is shared with the virtual-keyboard companion so the two
+    privileged protocols cannot drift apart; this check pins both the
+    delegation+ordering at the bind and the actual gate logic in the helper."""
     body, err = _function_body(
         source, r"static void\s+bind_qdwin_input_method_manager\s*\(",
         "bind_qdwin_input_method_manager")
     if err:
         return fail(err)
-    if "qdwin_secctx_client_find" not in body:
-        return fail("input-method bind does not consult "
-                    "qdwin_secctx_client_find (a sandboxed silo client could "
-                    "become the IME and keylog/inject across silos)")
-    if "post_implementation_error" not in body:
-        return fail("input-method bind never rejects (no "
-                    "post_implementation_error path)")
-    if "allowed_ime_uid" not in body and "allowed" not in body:
-        return fail("input-method bind has no uid gate (allowed_ime_uid)")
-    # The reject must come before wl_resource_create (fail-closed ordering).
-    rej = body.find("post_implementation_error")
-    crt = body.find("wl_resource_create")
-    if rej == -1 or crt == -1 or rej > crt:
+    code = _strip_comments(body)
+    if "qdwin_ime_family_bind_allowed" not in code:
+        return fail("input-method bind does not call the shared identity gate "
+                    "qdwin_ime_family_bind_allowed")
+    # Fail-closed ordering: the gate call (and its `return` on failure) must
+    # precede wl_resource_create.
+    gate = code.find("qdwin_ime_family_bind_allowed")
+    crt = code.find("wl_resource_create")
+    if gate == -1 or crt == -1 or gate > crt:
         return fail("input-method bind creates the manager resource before "
-                    "rejecting unauthorized clients (not fail-closed)")
+                    "running the identity gate (not fail-closed)")
+    if not re.search(r"if\s*\(\s*!\s*qdwin_ime_family_bind_allowed[^)]*\)[^;{]*"
+                     r"return", code, re.DOTALL):
+        return fail("input-method bind does not return on a failed identity "
+                    "gate (would create the resource for a rejected client)")
+
+    # The shared gate must reject sandboxed/secctx clients and enforce the uid.
+    gate_body, err = _function_body(
+        source, r"static bool\s+qdwin_ime_family_bind_allowed\s*\(",
+        "qdwin_ime_family_bind_allowed")
+    if err:
+        return fail(err)
+    if "qdwin_secctx_client_find" not in gate_body:
+        return fail("identity gate does not consult qdwin_secctx_client_find "
+                    "(a sandboxed silo client could become the IME and "
+                    "keylog/inject across silos)")
+    if "post_implementation_error" not in gate_body:
+        return fail("identity gate never rejects (no post_implementation_error "
+                    "path)")
+    if "allowed_ime_uid" not in gate_body and "allowed" not in gate_body:
+        return fail("identity gate has no uid gate (allowed_ime_uid)")
+    # The gate must reject (post_implementation_error + return false) before it
+    # ever returns true.
+    if not re.search(r"post_implementation_error.*return\s+false",
+                     gate_body, re.DOTALL):
+        return fail("identity gate does not return false after "
+                    "post_implementation_error (not fail-closed)")
     return 0
 
 
