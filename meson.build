@@ -960,3 +960,15 @@ test('input-config-policy',
     files('qdwin/qdwin.c'),
   ],
 )
+
+# Worktree-aware vm-exec / workspace lookup in the GUI agent test harness.
+# Builds throwaway normal + .worktrees/ layouts and sources the real helper
+# files to assert vm-exec resolves correctly from a worktree. Headless.
+test('vm-exec-lookup',
+  python3,
+  args: [
+    files('qdwin/test_vm_exec_lookup.py'),
+    files('tests/gui/qdwin-helpers.sh'),
+    files('tests/apps/qdwin-apps-helpers.sh'),
+  ],
+)

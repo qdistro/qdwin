@@ -16,11 +16,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 QDWIN_REPO=${QDWIN_REPO:-$ROOT}
-WORKSPACE=$(cd "$ROOT/.." && pwd)
 VMNAME=${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -n1)}
 
 export QDWIN_REPO
-export QDWIN_VM_EXEC=${QDWIN_VM_EXEC:-$WORKSPACE/qdistro/scripts/vm/vm-exec}
 export QDWIN_VIRSH=${QDWIN_VIRSH:-virsh -c qemu:///session}
 
 # shellcheck source=qdwin-helpers.sh

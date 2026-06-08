@@ -35,9 +35,39 @@
 # bleed into the caller's shell and break interactive use. Helpers
 # return nonzero on failure; callers can `set -e` themselves.
 
+# Resolve the workspace root — the directory that holds the sibling product
+# repos (qdistro, qdshell, ...). Walk upward from $1 until a checkout with
+# qdistro/scripts/vm/vm-exec is found. This works both in the normal layout
+# (qdwin a sibling of qdistro under the project root) AND from a git worktree
+# under .worktrees/<name>/, where $repo/.. is the worktrees dir — not the
+# project root — so the old "$ROOT/.." derivation pointed vm-exec at a path
+# that does not exist. Prints the workspace dir, or returns 1 if none found.
+qdwin_find_workspace() {
+    local d
+    d=$(cd "${1:-.}" 2>/dev/null && pwd -P) || return 1
+    while [ -n "$d" ] && [ "$d" != / ]; do
+        if [ -e "$d/qdistro/scripts/vm/vm-exec" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+        d=$(dirname "$d")
+    done
+    return 1
+}
+
 : "${VMNAME:=}"
 : "${QDWIN_VIRSH:=virsh -c qemu:///session}"
-: "${QDWIN_VM_EXEC:=$(dirname "${BASH_SOURCE[0]}")/../../../scripts/vm/vm-exec}"
+# Anchor the upward search at the qdwin checkout (QDWIN_REPO when the caller
+# set it, else this file's own repo root); fall back to the legacy two-up path
+# only when no qdistro sibling exists anywhere above (degraded, but no worse
+# than before).
+if [ -z "${QDWIN_WORKSPACE:-}" ]; then
+    QDWIN_WORKSPACE=$(qdwin_find_workspace "${QDWIN_REPO:-$(dirname "${BASH_SOURCE[0]}")/../..}") \
+        || QDWIN_WORKSPACE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)
+fi
+export QDWIN_WORKSPACE
+: "${QDWIN_VM_EXEC:=$QDWIN_WORKSPACE/qdistro/scripts/vm/vm-exec}"
+export QDWIN_VM_EXEC
 : "${QDWIN_HTTP_DIR:=${QDWIN_REPO}/extra}"
 : "${QDWIN_HTTP_URL:=http://10.0.2.2:8765/extra}"
 

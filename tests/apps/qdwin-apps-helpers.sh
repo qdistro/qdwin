@@ -12,9 +12,31 @@
 # - The active wayland socket name is auto-detected because weston
 #   restarts cycle through wayland-1 / wayland-2.
 
+# Worktree-aware workspace lookup — see qdwin-helpers.sh for the rationale.
+# Walk upward until a checkout with qdistro/scripts/vm/vm-exec is found so
+# vm-exec resolves correctly when this runs from a .worktrees/<name>/ checkout.
+qdwin_find_workspace() {
+    local d
+    d=$(cd "${1:-.}" 2>/dev/null && pwd -P) || return 1
+    while [ -n "$d" ] && [ "$d" != / ]; do
+        if [ -e "$d/qdistro/scripts/vm/vm-exec" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+        d=$(dirname "$d")
+    done
+    return 1
+}
+
 : "${VMNAME:=}"
 : "${QDWIN_VIRSH:=virsh -c qemu:///session}"
-: "${QDWIN_VM_EXEC:=$(dirname "${BASH_SOURCE[0]}")/../../../scripts/vm/vm-exec}"
+if [ -z "${QDWIN_WORKSPACE:-}" ]; then
+    QDWIN_WORKSPACE=$(qdwin_find_workspace "${QDWIN_REPO:-$(dirname "${BASH_SOURCE[0]}")/../..}") \
+        || QDWIN_WORKSPACE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)
+fi
+export QDWIN_WORKSPACE
+: "${QDWIN_VM_EXEC:=$QDWIN_WORKSPACE/qdistro/scripts/vm/vm-exec}"
+export QDWIN_VM_EXEC
 : "${QDWIN_HTTP_DIR:=${QDWIN_REPO}/extra}"
 : "${QDWIN_HTTP_URL:=http://10.0.2.2:8765/extra}"
 : "${QDWIN_BYSTANDER_FIFO:=/run/user/1000/qdwin-cmd.fifo}"

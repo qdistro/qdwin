@@ -11,11 +11,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 QDWIN_REPO=${QDWIN_REPO:-$ROOT}
-WORKSPACE=$(cd "$ROOT/.." && pwd)
 VMNAME=${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -n1)}
 
 export QDWIN_REPO
-export QDWIN_VM_EXEC=${QDWIN_VM_EXEC:-$WORKSPACE/qdistro/scripts/vm/vm-exec}
 export QDWIN_VIRSH=${QDWIN_VIRSH:-virsh -c qemu:///session}
 
 # shellcheck source=qdwin-helpers.sh
@@ -114,10 +112,10 @@ require_global "$globals_file" qdwin_shell_v1
 static_file="$tmpdir/qdshell-static-protocol-use.txt"
 {
     echo "== QML imports =="
-    rg -n '^import (Quickshell|QtWayland|Qdistro)' "$WORKSPACE/qdshell" || true
+    rg -n '^import (Quickshell|QtWayland|Qdistro)' "$QDWIN_WORKSPACE/qdshell" || true
     echo
     echo "== Layer-shell usage =="
-    rg -n 'WlrLayershell|WlrLayer|WlrKeyboardFocus|PanelWindow|PopupWindow|xdg|popup|get_popup' "$WORKSPACE/qdshell" || true
+    rg -n 'WlrLayershell|WlrLayer|WlrKeyboardFocus|PanelWindow|PopupWindow|xdg|popup|get_popup' "$QDWIN_WORKSPACE/qdshell" || true
 } > "$static_file"
 echo "INFO: static qdshell protocol scan: $static_file"
 
