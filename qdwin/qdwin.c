@@ -62,6 +62,7 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "cursor-shape-v1-server-protocol.h"
 #include "fractional-scale-v1-server-protocol.h"
 #include "text-input-unstable-v3-server-protocol.h"
+#include "input-method-unstable-v2-server-protocol.h"
 #include "ext-workspace-v1-server-protocol.h"
 #include "wlr-output-management-unstable-v1-server-protocol.h"
 #include "primary-selection-unstable-v1-server-protocol.h"
@@ -272,6 +273,10 @@ static void qdwin_secctx_destroy_all(struct qdwin *qdwin);
 struct qdwin_secctx_client;
 static struct qdwin_secctx_client *
 qdwin_secctx_client_lookup(struct qdwin *qdwin, struct wl_client *client);
+/* Used by the input-method bind gate (defined far below near the secctx
+ * code) to reject sandboxed clients from acting as the privileged IME. */
+static struct qdwin_secctx_client *
+qdwin_secctx_client_find(struct qdwin *qdwin, struct wl_client *client);
 static const char *qdwin_secctx_client_engine(struct qdwin_secctx_client *sc);
 static const char *qdwin_secctx_client_app_id(struct qdwin_secctx_client *sc);
 static const char *qdwin_secctx_client_instance_id(struct qdwin_secctx_client *sc);
@@ -911,6 +916,21 @@ struct qdwin {
 	struct wl_list text_inputs;          /* qdwin_text_input::link */
 	struct wl_list text_input_managers;  /* qdwin_text_input_manager::link */
 
+	/* Bucket A / P1: input-method-unstable-v2 (zwp_input_method_manager_v2).
+	 * The PRIVILEGED IME side that drives the open text-input-v3 plane:
+	 * a session-trusted input method (fcitx5/ibus) binds the manager, grabs
+	 * the seat keyboard, and pushes preedit/commit back into the focused
+	 * text_input. Because it grants keystroke capture + arbitrary text
+	 * injection it is identity-gated (allowed_ime_uid + secctx/sandbox deny
+	 * via the global filter + single-IME-per-seat), NOT open like
+	 * text-input-v3. See todo/issues/qdwin/app-compat-protocol-gaps.md P1. */
+	struct wl_global *input_method_manager_global;
+	struct wl_list input_methods;        /* qdwin_input_method::link */
+	struct wl_list input_method_managers; /* qdwin_input_method_manager::link */
+	uid_t allowed_ime_uid;               /* (uid_t)-1 => default to allowed_uid */
+	char *allowed_ime_exe;               /* optional resolved-exe pin (NULL=skip) */
+	char *allowed_ime_label;             /* optional SELinux-label pin (NULL=skip) */
+
 	/* §6.7 primary-selection-unstable-v1. One global for the
 	 * device-manager; per-seat selection state lives on
 	 * qdwin_primary_seat entries. */
@@ -1047,6 +1067,17 @@ static void qdwin_text_input_update_focus(struct qdwin *qdwin,
  * no-ops. */
 static void qdwin_text_inputs_destroy_all(struct qdwin *qdwin);
 static void qdwin_text_input_managers_destroy_all(struct qdwin *qdwin);
+/* Bucket A / P1: input-method-v2 reconcile. After a text-input enable/focus
+ * change, (re)activate or deactivate the seat's bound IME and push current
+ * text-input state to it. Defined with the input-method code far below;
+ * forward-declared so the text-input focus/commit paths can call it. A
+ * text_input going away calls it after detaching, so the IME deactivates. */
+struct qdwin_text_input;
+static void qdwin_im_sync_seat(struct qdwin *qdwin, struct weston_seat *seat);
+static void qdwin_im_text_input_gone(struct qdwin *qdwin,
+				     struct qdwin_text_input *ti);
+static void qdwin_input_methods_destroy_all(struct qdwin *qdwin);
+static void qdwin_input_method_managers_destroy_all(struct qdwin *qdwin);
 /* spec/10 v16 accessors — forward-declared so set_keyboard_focus_v2
  * (which lives near the rest of the request handlers, above the
  * seat_tracker struct definition) can read/write last_target_silo
@@ -11044,6 +11075,13 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 		wl_global_destroy(qdwin->fractional_scale_manager_global);
 	if (qdwin->primary_selection_manager_global)
 		wl_global_destroy(qdwin->primary_selection_manager_global);
+	/* Drain input methods before text_inputs: an IME may end an active
+	 * keyboard grab and references text_input objects via active_ti (cleared
+	 * without dereference in qdwin_im_detach). */
+	if (qdwin->input_method_manager_global)
+		wl_global_destroy(qdwin->input_method_manager_global);
+	qdwin_input_methods_destroy_all(qdwin);
+	qdwin_input_method_managers_destroy_all(qdwin);
 	if (qdwin->text_input_manager_global)
 		wl_global_destroy(qdwin->text_input_manager_global);
 	qdwin_text_inputs_destroy_all(qdwin);
@@ -11097,6 +11135,8 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	free(qdwin->allowed_locker_entrypoint);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
+	free(qdwin->allowed_ime_exe);
+	free(qdwin->allowed_ime_label);
 	free(qdwin->allowed_layershell_exe);
 	free(qdwin->allowed_layershell_label);
 	free(qdwin);
@@ -14377,7 +14417,19 @@ struct qdwin_text_input {
 	 * future input-method wiring a drop-in. */
 	int pending_enabled;
 	int current_enabled;
-	uint32_t commit_count;            /* serial echoed in done (future IME) */
+	uint32_t commit_count;            /* serial echoed in zwp_text_input_v3.done */
+	/* App-set, double-buffered content the IME needs (applied on commit,
+	 * forwarded to a bound input-method via activate/surrounding_text/
+	 * content_type). The *_set flags distinguish "field never supplied"
+	 * (don't forward — IME treats as unsupported) from "supplied as empty". */
+	char *pending_surrounding, *current_surrounding;
+	uint32_t pending_sur_cursor, pending_sur_anchor;
+	uint32_t current_sur_cursor, current_sur_anchor;
+	int pending_sur_set, current_sur_set;
+	uint32_t pending_hint, pending_purpose, current_hint, current_purpose;
+	int pending_ct_set, current_ct_set;
+	uint32_t pending_change_cause, current_change_cause;
+	int pending_cc_set, current_cc_set;
 	/* Surface this text_input currently holds enter on (NULL = none).
 	 * Tracked so we send exactly one leave per enter and never touch a
 	 * destroyed surface: the destroy listener clears it WITHOUT a leave
@@ -14457,6 +14509,10 @@ qdwin_text_input_update_focus(struct qdwin *qdwin, struct weston_seat *seat)
 			qdwin_text_input_set_entered(ti, want);
 		}
 	}
+
+	/* Focus moved → the seat's IME may need to (de)activate for the newly
+	 * focused, enabled text_input. */
+	qdwin_im_sync_seat(qdwin, seat);
 }
 
 /* ---- zwp_text_input_v3 requests ---- */
@@ -14492,8 +14548,19 @@ qdwin_text_input_set_surrounding_text(struct wl_client *client,
 				      const char *text,
 				      int32_t cursor, int32_t anchor)
 {
-	(void)client; (void)resource; (void)text; (void)cursor; (void)anchor;
-	/* No IME consumer yet — accepted and dropped. */
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!ti)
+		return;
+	/* Double-buffered: pending until the next zwp_text_input_v3.commit,
+	 * then forwarded to a bound IME as zwp_input_method_v2.surrounding_text.
+	 * strdup failure leaves the field unset (forwarded as unsupported)
+	 * rather than aborting the client. */
+	free(ti->pending_surrounding);
+	ti->pending_surrounding = text ? strdup(text) : NULL;
+	ti->pending_sur_cursor = (uint32_t)cursor;
+	ti->pending_sur_anchor = (uint32_t)anchor;
+	ti->pending_sur_set = 1;
 }
 
 static void
@@ -14501,7 +14568,12 @@ qdwin_text_input_set_text_change_cause(struct wl_client *client,
 				       struct wl_resource *resource,
 				       uint32_t cause)
 {
-	(void)client; (void)resource; (void)cause;
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!ti)
+		return;
+	ti->pending_change_cause = cause;
+	ti->pending_cc_set = 1;
 }
 
 static void
@@ -14509,7 +14581,13 @@ qdwin_text_input_set_content_type(struct wl_client *client,
 				  struct wl_resource *resource,
 				  uint32_t hint, uint32_t purpose)
 {
-	(void)client; (void)resource; (void)hint; (void)purpose;
+	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!ti)
+		return;
+	ti->pending_hint = hint;
+	ti->pending_purpose = purpose;
+	ti->pending_ct_set = 1;
 }
 
 static void
@@ -14520,23 +14598,55 @@ qdwin_text_input_set_cursor_rectangle(struct wl_client *client,
 {
 	(void)client; (void)resource; (void)x; (void)y;
 	(void)width; (void)height;
+	/* Stored for input-method popup placement once popup surfaces gain a
+	 * real position; the cursor rectangle carries no IME state that needs
+	 * forwarding for composition itself, so it is accepted as a no-op. */
 }
 
 static void
 qdwin_text_input_commit(struct wl_client *client, struct wl_resource *resource)
 {
 	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
+	int was_enabled;
 	(void)client;
 	if (!ti)
 		return;
-	/* Atomically apply the buffered enable state and bump the serial the
-	 * spec requires us to echo in `done`. With no IME there is no
-	 * preedit/commit/delete state to batch, so we deliberately send no
-	 * `done` — a text_input with no input-method behind it stays inert
-	 * after commit. The serial is maintained so input-method wiring later
-	 * is a drop-in. */
+	/* Atomically apply the buffered enable + content state and bump the
+	 * serial the spec requires us to echo in `done`. */
+	was_enabled = ti->current_enabled;
 	ti->current_enabled = ti->pending_enabled;
 	ti->commit_count++;
+
+	/* Apply the double-buffered content the IME consumes. surrounding_text
+	 * ownership transfers from pending to current. */
+	if (ti->pending_sur_set) {
+		free(ti->current_surrounding);
+		ti->current_surrounding = ti->pending_surrounding;
+		ti->pending_surrounding = NULL;
+		ti->current_sur_cursor = ti->pending_sur_cursor;
+		ti->current_sur_anchor = ti->pending_sur_anchor;
+		ti->current_sur_set = 1;
+		ti->pending_sur_set = 0;
+	}
+	if (ti->pending_ct_set) {
+		ti->current_hint = ti->pending_hint;
+		ti->current_purpose = ti->pending_purpose;
+		ti->current_ct_set = 1;
+		ti->pending_ct_set = 0;
+	}
+	if (ti->pending_cc_set) {
+		ti->current_change_cause = ti->pending_change_cause;
+		ti->current_cc_set = 1;
+		ti->pending_cc_set = 0;
+	}
+
+	/* Reconcile the seat's IME. An enable/disable edge changes which
+	 * text_input (if any) the IME serves; a commit while already enabled is
+	 * a content refresh. qdwin_im_sync_seat handles both: it (de)activates
+	 * on the edge and re-pushes current state to the active text_input. */
+	(void)was_enabled;
+	if (ti->qdwin && ti->seat)
+		qdwin_im_sync_seat(ti->qdwin, ti->seat);
 }
 
 /* v2-only requests (we advertise v1, but libwayland dispatches by opcode,
@@ -14584,8 +14694,14 @@ qdwin_text_input_resource_destroy(struct wl_resource *resource)
 	struct qdwin_text_input *ti = wl_resource_get_user_data(resource);
 	if (!ti)
 		return;
+	/* If a bound IME was serving this text_input, deactivate it before the
+	 * backing object disappears (clears the IME's active_ti back-pointer). */
+	if (ti->qdwin)
+		qdwin_im_text_input_gone(ti->qdwin, ti);
 	qdwin_text_input_clear_entered(ti);
 	wl_list_remove(&ti->link);
+	free(ti->pending_surrounding);
+	free(ti->current_surrounding);
 	free(ti);
 }
 
@@ -14604,6 +14720,8 @@ qdwin_text_inputs_destroy_all(struct qdwin *qdwin)
 		wl_resource_set_user_data(ti->resource, NULL);
 		qdwin_text_input_clear_entered(ti);
 		wl_list_remove(&ti->link);
+		free(ti->pending_surrounding);
+		free(ti->current_surrounding);
 		free(ti);
 	}
 }
@@ -14734,6 +14852,746 @@ bind_qdwin_text_input_manager(struct wl_client *client, void *data,
 	wl_resource_set_implementation(
 		resource, &qdwin_text_input_manager_impl, mgr,
 		qdwin_text_input_manager_resource_destroy);
+}
+
+/* ==================================================================
+ * Bucket A / P1: input-method-unstable-v2 (zwp_input_method_manager_v2).
+ *
+ * The privileged IME side of the text-input plane. A session-trusted input
+ * method (fcitx5/ibus) binds the manager, calls get_input_method(seat) to get
+ * one zwp_input_method_v2 per seat, optionally grab_keyboard()s the seat's
+ * hardware keyboard to receive raw keys, and pushes preedit/commit/delete back
+ * which the compositor forwards into the focused, enabled zwp_text_input_v3.
+ *
+ * Trust: unlike the OPEN text-input-v3 plane, this grants keystroke capture +
+ * arbitrary text injection across the focused client, so it is identity-gated
+ * exactly like the locker — hidden from sandboxed/secctx clients by the global
+ * filter, bind-gated to allowed_ime_uid (default allowed_uid) with optional
+ * exe/label pins, and limited to one ACTIVE input method per seat (a second
+ * get_input_method gets only `unavailable`, per the protocol). A grabbing IME
+ * also needs zwp_virtual_keyboard_manager_v1 to pass non-composed keys back to
+ * apps; that companion protocol is a documented follow-up (see
+ * todo/open-followups.md) — until it lands, only a deliberately-launched gated
+ * IME ever grabs, so the default (no IME bound) keeps text-input-v3 inert and
+ * the keyboard untouched.
+ * ================================================================== */
+
+struct qdwin_input_method;
+
+/* Per-seat keyboard grab held by an IME. weston_keyboard_grab MUST be the first
+ * member so the grab interface callbacks can recover us by pointer identity. */
+struct qdwin_im_keyboard_grab {
+	struct weston_keyboard_grab base;   /* must be first */
+	struct qdwin_input_method *im;      /* NULL once the IME detaches */
+	struct wl_resource *resource;       /* zwp_input_method_keyboard_grab_v2 */
+	struct weston_keyboard *keyboard;   /* NULL if grab was cancelled by wl */
+};
+
+struct qdwin_input_method {
+	struct qdwin *qdwin;
+	struct wl_resource *resource;       /* zwp_input_method_v2 */
+	struct weston_seat *seat;           /* NULL after seat destroy */
+	struct wl_client *client;
+	int inert;                          /* second-per-seat: only `unavailable` */
+	int active;                         /* currently activated for active_ti */
+	struct qdwin_text_input *active_ti; /* text_input being served (NULL=none) */
+	uint32_t done_count;                /* serial: # of zwp_input_method_v2.done */
+	/* Pending IME->app state, applied on zwp_input_method_v2.commit. */
+	char *pending_preedit;
+	int32_t pending_preedit_cb, pending_preedit_ce;
+	char *pending_commit;
+	uint32_t pending_del_before, pending_del_after;
+	struct qdwin_im_keyboard_grab *grab; /* active keyboard grab, or NULL */
+	struct wl_listener seat_destroy_listener;
+	struct wl_list link;                /* qdwin::input_methods */
+};
+
+/* Reset the per-commit buffered IME->app state to its protocol-initial values. */
+static void
+qdwin_im_reset_pending(struct qdwin_input_method *im)
+{
+	free(im->pending_preedit);
+	im->pending_preedit = NULL;
+	im->pending_preedit_cb = 0;
+	im->pending_preedit_ce = 0;
+	free(im->pending_commit);
+	im->pending_commit = NULL;
+	im->pending_del_before = 0;
+	im->pending_del_after = 0;
+}
+
+/* Find the non-inert IME bound for `seat` (at most one). */
+static struct qdwin_input_method *
+qdwin_im_for_seat(struct qdwin *qdwin, struct weston_seat *seat)
+{
+	struct qdwin_input_method *im;
+	if (!seat)
+		return NULL;
+	wl_list_for_each(im, &qdwin->input_methods, link) {
+		if (!im->inert && im->seat == seat)
+			return im;
+	}
+	return NULL;
+}
+
+/* The focused, enabled text_input on `seat` (the IME's activation target), or
+ * NULL. enter-tracking already singles out the focused client's text_input. */
+static struct qdwin_text_input *
+qdwin_im_active_candidate(struct qdwin *qdwin, struct weston_seat *seat)
+{
+	struct qdwin_text_input *ti;
+	wl_list_for_each(ti, &qdwin->text_inputs, link) {
+		if (ti->seat == seat && ti->entered && ti->current_enabled)
+			return ti;
+	}
+	return NULL;
+}
+
+/* Push the active text_input's current content to the IME, framed by a `done`.
+ * Caller guarantees im->active && im->active_ti. Per spec, surrounding_text /
+ * content_type are only sent if the text_input actually supplied them. */
+static void
+qdwin_im_send_state(struct qdwin_input_method *im)
+{
+	struct qdwin_text_input *ti = im->active_ti;
+	if (ti->current_sur_set)
+		zwp_input_method_v2_send_surrounding_text(
+			im->resource,
+			ti->current_surrounding ? ti->current_surrounding : "",
+			ti->current_sur_cursor, ti->current_sur_anchor);
+	if (ti->current_cc_set)
+		zwp_input_method_v2_send_text_change_cause(
+			im->resource, ti->current_change_cause);
+	if (ti->current_ct_set)
+		zwp_input_method_v2_send_content_type(
+			im->resource, ti->current_hint, ti->current_purpose);
+	zwp_input_method_v2_send_done(im->resource);
+	im->done_count++;
+}
+
+static void
+qdwin_im_deactivate(struct qdwin_input_method *im)
+{
+	if (!im->active)
+		return;
+	zwp_input_method_v2_send_deactivate(im->resource);
+	zwp_input_method_v2_send_done(im->resource);
+	im->done_count++;
+	im->active = 0;
+	im->active_ti = NULL;
+	/* A fresh activation must start from clean buffered state. */
+	qdwin_im_reset_pending(im);
+}
+
+static void
+qdwin_im_activate(struct qdwin_input_method *im, struct qdwin_text_input *ti)
+{
+	im->active = 1;
+	im->active_ti = ti;
+	qdwin_im_reset_pending(im);
+	zwp_input_method_v2_send_activate(im->resource);
+	qdwin_im_send_state(im);
+}
+
+/* Reconcile the seat's IME with the current focus/enable state. Called after a
+ * focus change or a text_input enable/disable/content commit. */
+static void
+qdwin_im_sync_seat(struct qdwin *qdwin, struct weston_seat *seat)
+{
+	struct qdwin_input_method *im = qdwin_im_for_seat(qdwin, seat);
+	struct qdwin_text_input *ti;
+	if (!im)
+		return;
+	ti = qdwin_im_active_candidate(qdwin, seat);
+	if (ti != im->active_ti) {
+		if (im->active)
+			qdwin_im_deactivate(im);
+		if (ti)
+			qdwin_im_activate(im, ti);
+	} else if (ti && im->active) {
+		/* Same target, still active → a content refresh (the app
+		 * committed new surrounding text / content type). */
+		qdwin_im_send_state(im);
+	}
+}
+
+/* A text_input is being destroyed; if it was an IME's active target, deactivate
+ * so no stale back-pointer survives. */
+static void
+qdwin_im_text_input_gone(struct qdwin *qdwin, struct qdwin_text_input *ti)
+{
+	struct qdwin_input_method *im;
+	wl_list_for_each(im, &qdwin->input_methods, link) {
+		if (im->active_ti == ti)
+			qdwin_im_deactivate(im);
+	}
+}
+
+/* Generic destructor handler shared by the input-method child objects whose
+ * only request is `destroy`/`release` (popup surface, keyboard grab). */
+static void
+qdwin_im_generic_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+/* ---- zwp_input_method_keyboard_grab_v2 ---- */
+
+static void
+qdwin_im_grab_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_im_keyboard_grab *g = wl_resource_get_user_data(resource);
+	if (!g)
+		return;
+	if (g->im)
+		g->im->grab = NULL;
+	/* Only end the grab if it is still the keyboard's active grab — weston
+	 * may already have swapped it out (cancel), in which case g->keyboard
+	 * was nulled and end_grab would corrupt a different grab. */
+	if (g->keyboard && g->keyboard->grab == &g->base)
+		weston_keyboard_end_grab(g->keyboard);
+	free(g);
+}
+
+static const struct zwp_input_method_keyboard_grab_v2_interface
+qdwin_im_keyboard_grab_impl = {
+	.release = qdwin_im_generic_destroy,
+};
+
+static const struct zwp_input_popup_surface_v2_interface
+qdwin_im_popup_impl = {
+	.destroy = qdwin_im_generic_destroy,
+};
+
+/* weston keyboard grab: forward raw keys/modifiers to the IME grab resource and
+ * SUPPRESS normal app delivery (spec: the compositor must not further process
+ * an event after forwarding it to the grab holder). */
+static void
+qdwin_im_grab_key(struct weston_keyboard_grab *grab,
+		  const struct timespec *time, uint32_t key, uint32_t state)
+{
+	struct qdwin_im_keyboard_grab *g =
+		wl_container_of(grab, g, base);
+	struct wl_display *display;
+	uint32_t serial, msecs;
+	qdwin_idle_note_activity(qdwin_singleton);
+	if (!g->resource)
+		return;
+	display = grab->keyboard->seat->compositor->wl_display;
+	serial = wl_display_next_serial(display);
+	msecs = (uint32_t)((time->tv_sec * 1000) + (time->tv_nsec / 1000000));
+	zwp_input_method_keyboard_grab_v2_send_key(g->resource, serial, msecs,
+						   key, state);
+}
+
+static void
+qdwin_im_grab_modifiers(struct weston_keyboard_grab *grab, uint32_t serial,
+			uint32_t mods_depressed, uint32_t mods_latched,
+			uint32_t mods_locked, uint32_t group)
+{
+	struct qdwin_im_keyboard_grab *g =
+		wl_container_of(grab, g, base);
+	if (!g->resource)
+		return;
+	zwp_input_method_keyboard_grab_v2_send_modifiers(
+		g->resource, serial, mods_depressed, mods_latched,
+		mods_locked, group);
+}
+
+static void
+qdwin_im_grab_cancel(struct weston_keyboard_grab *grab)
+{
+	struct qdwin_im_keyboard_grab *g =
+		wl_container_of(grab, g, base);
+	/* weston is tearing the grab down (e.g. seat/keyboard release). Detach
+	 * from the keyboard so the resource-destroy path does not call
+	 * weston_keyboard_end_grab() on an already-gone grab. */
+	g->keyboard = NULL;
+}
+
+static const struct weston_keyboard_grab_interface qdwin_im_grab_iface = {
+	.key       = qdwin_im_grab_key,
+	.modifiers = qdwin_im_grab_modifiers,
+	.cancel    = qdwin_im_grab_cancel,
+};
+
+/* ---- zwp_input_method_v2 requests ---- */
+
+static void
+qdwin_im_req_commit_string(struct wl_client *client,
+			   struct wl_resource *resource, const char *text)
+{
+	struct qdwin_input_method *im = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!im || im->inert)
+		return;
+	free(im->pending_commit);
+	im->pending_commit = text ? strdup(text) : NULL;
+}
+
+static void
+qdwin_im_req_set_preedit_string(struct wl_client *client,
+				struct wl_resource *resource, const char *text,
+				int32_t cursor_begin, int32_t cursor_end)
+{
+	struct qdwin_input_method *im = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!im || im->inert)
+		return;
+	free(im->pending_preedit);
+	im->pending_preedit = text ? strdup(text) : NULL;
+	im->pending_preedit_cb = cursor_begin;
+	im->pending_preedit_ce = cursor_end;
+}
+
+static void
+qdwin_im_req_delete_surrounding_text(struct wl_client *client,
+				     struct wl_resource *resource,
+				     uint32_t before_length,
+				     uint32_t after_length)
+{
+	struct qdwin_input_method *im = wl_resource_get_user_data(resource);
+	(void)client;
+	if (!im || im->inert)
+		return;
+	im->pending_del_before = before_length;
+	im->pending_del_after = after_length;
+}
+
+static void
+qdwin_im_req_commit(struct wl_client *client, struct wl_resource *resource,
+		    uint32_t serial)
+{
+	struct qdwin_input_method *im = wl_resource_get_user_data(resource);
+	struct qdwin_text_input *ti;
+	(void)client;
+	if (!im || im->inert)
+		return;
+	ti = im->active_ti;
+	/* Drop the buffered changes unless they target the current activation:
+	 * the IME must be active for a still-enabled text_input AND echo our
+	 * latest done serial (a stale serial means it is acting on superseded
+	 * state — spec says do not change current state). */
+	if (!im->active || !ti || !ti->current_enabled ||
+	    serial != im->done_count) {
+		qdwin_im_reset_pending(im);
+		return;
+	}
+	if (im->pending_del_before || im->pending_del_after)
+		zwp_text_input_v3_send_delete_surrounding_text(
+			ti->resource, im->pending_del_before,
+			im->pending_del_after);
+	if (im->pending_commit && im->pending_commit[0])
+		zwp_text_input_v3_send_commit_string(ti->resource,
+						     im->pending_commit);
+	/* Always send preedit (an empty string clears any existing preedit). */
+	zwp_text_input_v3_send_preedit_string(
+		ti->resource, im->pending_preedit ? im->pending_preedit : "",
+		im->pending_preedit_cb, im->pending_preedit_ce);
+	/* text-input-v3 done echoes the text_input's own commit serial. */
+	zwp_text_input_v3_send_done(ti->resource, ti->commit_count);
+	qdwin_im_reset_pending(im);
+}
+
+static void
+qdwin_im_req_get_input_popup_surface(struct wl_client *client,
+				     struct wl_resource *resource,
+				     uint32_t id,
+				     struct wl_resource *surface_resource)
+{
+	struct weston_surface *surface = surface_resource ?
+		wl_resource_get_user_data(surface_resource) : NULL;
+	struct wl_resource *popup;
+	/* Per the protocol the surface gets the input_popup role and a role
+	 * conflict must post a protocol error (set_role posts it itself). */
+	if (surface &&
+	    weston_surface_set_role(surface, "zwp_input_popup_surface_v2",
+				    resource, ZWP_INPUT_METHOD_V2_ERROR_ROLE) < 0)
+		return;
+	/* Minimal popup: the object is created so the IME's candidate window
+	 * does not error, but qdwin does not yet position it as an overlay
+	 * (text_input_rectangle is a hint only) — composition does not depend on
+	 * it. user_data is NULL: the only request is destroy (generic) and the
+	 * popup must never carry a back-pointer to an input_method that may be
+	 * destroyed first (its lifetime is client-managed). */
+	popup = wl_resource_create(client,
+				   &zwp_input_popup_surface_v2_interface,
+				   wl_resource_get_version(resource), id);
+	if (!popup) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(popup, &qdwin_im_popup_impl, NULL, NULL);
+}
+
+static void
+qdwin_im_req_grab_keyboard(struct wl_client *client,
+			   struct wl_resource *resource, uint32_t keyboard_id)
+{
+	struct qdwin_input_method *im = wl_resource_get_user_data(resource);
+	struct qdwin_im_keyboard_grab *g;
+	struct wl_resource *grab_res;
+	struct weston_keyboard *kbd;
+	int32_t rate, delay;
+
+	grab_res = wl_resource_create(
+		client, &zwp_input_method_keyboard_grab_v2_interface,
+		wl_resource_get_version(resource), keyboard_id);
+	if (!grab_res) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	if (!im || im->inert || !im->seat) {
+		/* Inert IME or no seat: hand back an object that holds no grab. */
+		wl_resource_set_implementation(grab_res,
+			&qdwin_im_keyboard_grab_impl, NULL, NULL);
+		return;
+	}
+	/* One grab per IME: drop a stale one first (ends its weston grab). */
+	if (im->grab && im->grab->resource)
+		wl_resource_destroy(im->grab->resource);
+
+	g = calloc(1, sizeof *g);
+	if (!g) {
+		wl_resource_set_implementation(grab_res,
+			&qdwin_im_keyboard_grab_impl, NULL, NULL);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	g->base.interface = &qdwin_im_grab_iface;
+	g->im = im;
+	g->resource = grab_res;
+	/* Track on the IME BEFORE anything can fail/return: otherwise an im
+	 * destroy would free `im` while the live grab resource still holds
+	 * g->im, and releasing the grab would deref freed `im`. With im->grab
+	 * set, qdwin_im_detach nulls g->im on teardown. */
+	im->grab = g;
+	wl_resource_set_implementation(grab_res, &qdwin_im_keyboard_grab_impl,
+				       g, qdwin_im_grab_resource_destroy);
+
+	kbd = weston_seat_get_keyboard(im->seat);
+	if (!kbd) {
+		/* Seat has no keyboard capability right now; the object is live
+		 * and tracked (im->grab) but holds no weston grab. */
+		return;
+	}
+	g->keyboard = kbd;
+	/* The grab interface is wire-compatible with wl_keyboard (the protocol
+	 * mirrors wl_keyboard v6), so weston's keymap sender targets it
+	 * correctly; key/modifiers/repeat_info use the generated senders. */
+	weston_keyboard_send_keymap(kbd, grab_res);
+	rate = im->qdwin->compositor->kb_repeat_rate;
+	delay = im->qdwin->compositor->kb_repeat_delay;
+	zwp_input_method_keyboard_grab_v2_send_repeat_info(grab_res, rate, delay);
+	weston_keyboard_start_grab(kbd, &g->base);
+}
+
+static void
+qdwin_im_req_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct zwp_input_method_v2_interface qdwin_input_method_impl = {
+	.commit_string          = qdwin_im_req_commit_string,
+	.set_preedit_string     = qdwin_im_req_set_preedit_string,
+	.delete_surrounding_text = qdwin_im_req_delete_surrounding_text,
+	.commit                 = qdwin_im_req_commit,
+	.get_input_popup_surface = qdwin_im_req_get_input_popup_surface,
+	.grab_keyboard          = qdwin_im_req_grab_keyboard,
+	.destroy                = qdwin_im_req_destroy,
+};
+
+/* Detach an IME from all live compositor state (grab, seat listener, active
+ * text_input). Idempotent; used by resource-destroy, seat-destroy and teardown. */
+static void
+qdwin_im_detach(struct qdwin_input_method *im)
+{
+	if (im->grab) {
+		struct qdwin_im_keyboard_grab *g = im->grab;
+		im->grab = NULL;
+		g->im = NULL;
+		if (g->keyboard && g->keyboard->grab == &g->base)
+			weston_keyboard_end_grab(g->keyboard);
+		g->keyboard = NULL;
+	}
+	if (im->seat) {
+		wl_list_remove(&im->seat_destroy_listener.link);
+		wl_list_init(&im->seat_destroy_listener.link);
+		im->seat = NULL;
+	}
+	im->active = 0;
+	im->active_ti = NULL;
+	qdwin_im_reset_pending(im);
+}
+
+static void
+qdwin_input_method_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_input_method *im = wl_resource_get_user_data(resource);
+	if (!im)
+		return;
+	/* Per the protocol, destroying the input_method destroys its child
+	 * keyboard grab. Destroy the grab resource first (its destroy callback
+	 * ends the weston grab, frees the grab struct, and nulls im->grab), so
+	 * detach below has nothing left to do for it and no orphaned grab
+	 * resource survives carrying a back-pointer to the freed im. */
+	if (im->grab && im->grab->resource)
+		wl_resource_destroy(im->grab->resource);
+	qdwin_im_detach(im);
+	wl_list_remove(&im->link);
+	free(im);
+}
+
+static void
+qdwin_im_seat_destroyed(struct wl_listener *l, void *data)
+{
+	struct qdwin_input_method *im =
+		wl_container_of(l, im, seat_destroy_listener);
+	(void)data;
+	/* The seat (hence its keyboard) is going away: tell the IME it is no
+	 * longer usable, then detach. The resource stays alive but inert. */
+	im->inert = 1;
+	zwp_input_method_v2_send_unavailable(im->resource);
+	/* The listener link is removed inside detach; clear active state too. */
+	qdwin_im_detach(im);
+}
+
+/* ---- zwp_input_method_manager_v2 ---- */
+
+/* One per live manager resource. The back-pointer to qdwin is neutralized to
+ * NULL at compositor teardown so a get_input_method on a manager that outlives
+ * the plugin returns an inert object instead of dereferencing freed qdwin.
+ * Mirrors qdwin_text_input_manager. */
+struct qdwin_input_method_manager {
+	struct qdwin *qdwin;          /* NULL after teardown neutralization */
+	struct wl_resource *resource;
+	struct wl_list link;          /* qdwin::input_method_managers */
+};
+
+static void
+qdwin_im_manager_resource_destroy(struct wl_resource *resource)
+{
+	struct qdwin_input_method_manager *mgr =
+		wl_resource_get_user_data(resource);
+	if (!mgr)
+		return;
+	wl_list_remove(&mgr->link);
+	free(mgr);
+}
+
+static void
+qdwin_input_method_managers_destroy_all(struct qdwin *qdwin)
+{
+	struct qdwin_input_method_manager *mgr, *tmp;
+	wl_list_for_each_safe(mgr, tmp, &qdwin->input_method_managers, link) {
+		wl_resource_set_user_data(mgr->resource, NULL);
+		wl_list_remove(&mgr->link);
+		free(mgr);
+	}
+}
+
+static void
+qdwin_im_manager_get_input_method(struct wl_client *client,
+				  struct wl_resource *resource,
+				  struct wl_resource *seat_resource,
+				  uint32_t id)
+{
+	struct qdwin_input_method_manager *mgr =
+		wl_resource_get_user_data(resource);
+	struct qdwin *qdwin = mgr ? mgr->qdwin : NULL;
+	struct weston_seat *seat =
+		seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
+	struct qdwin_input_method *im;
+	struct wl_resource *im_res;
+	struct qdwin_input_method *existing;
+
+	im_res = wl_resource_create(client, &zwp_input_method_v2_interface,
+				    wl_resource_get_version(resource), id);
+	if (!im_res) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	if (!qdwin) {
+		/* Manager outlived qdwin (teardown). Honour the new_id with an
+		 * inert object rather than dereferencing freed state. */
+		wl_resource_set_implementation(im_res, &qdwin_input_method_impl,
+					       NULL, NULL);
+		zwp_input_method_v2_send_unavailable(im_res);
+		return;
+	}
+	im = calloc(1, sizeof *im);
+	if (!im) {
+		wl_resource_set_implementation(im_res, &qdwin_input_method_impl,
+					       NULL, NULL);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	/* One input method per seat: probe for a pre-existing live IME BEFORE
+	 * inserting this one into the list — otherwise qdwin_im_for_seat would
+	 * just find `im` itself and the duplicate would never be made inert
+	 * (two concurrently-active privileged IMEs on a seat). */
+	existing = qdwin_im_for_seat(qdwin, seat);
+	im->qdwin = qdwin;
+	im->resource = im_res;
+	im->seat = seat;
+	im->client = client;
+	wl_list_init(&im->seat_destroy_listener.link);
+	wl_list_insert(&qdwin->input_methods, &im->link);
+	wl_resource_set_implementation(im_res, &qdwin_input_method_impl, im,
+				       qdwin_input_method_resource_destroy);
+
+	/* If this seat already has a live IME (or there is no seat), the new
+	 * object is inert and gets only `unavailable` (protocol-mandated),
+	 * never an implementation error. */
+	if (!seat || existing) {
+		im->inert = 1;
+		im->seat = NULL;
+		zwp_input_method_v2_send_unavailable(im_res);
+		return;
+	}
+	im->seat_destroy_listener.notify = qdwin_im_seat_destroyed;
+	wl_signal_add(&seat->destroy_signal, &im->seat_destroy_listener);
+	/* If a text_input is already focused+enabled on this seat, activate now. */
+	qdwin_im_sync_seat(qdwin, seat);
+}
+
+static void
+qdwin_im_manager_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct zwp_input_method_manager_v2_interface
+qdwin_im_manager_impl = {
+	.get_input_method = qdwin_im_manager_get_input_method,
+	.destroy          = qdwin_im_manager_destroy,
+};
+
+static void
+bind_qdwin_input_method_manager(struct wl_client *client, void *data,
+				uint32_t version, uint32_t id)
+{
+	struct qdwin *qdwin = data;
+	struct wl_resource *resource;
+	pid_t pid; uid_t uid; gid_t gid;
+	uid_t allowed = qdwin->allowed_ime_uid != (uid_t)-1 ?
+		qdwin->allowed_ime_uid : qdwin->allowed_uid;
+
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	weston_log("qdwin: input-method bind attempt pid=%d uid=%u "
+		   "(allowed_ime_uid=%u)\n",
+		   (int)pid, (unsigned)uid, (unsigned)allowed);
+
+	/* Sandboxed/secctx clients (silo apps) must never become the IME — that
+	 * would let one silo keylog/inject into another. The global filter
+	 * already hides this global from them; reject here too as defence in
+	 * depth in case a client obtained the global another way. */
+	if (qdwin_secctx_client_find(qdwin, client) != NULL) {
+		wl_client_post_implementation_error(client,
+			"zwp_input_method_manager_v2: sandboxed clients may not "
+			"act as an input method");
+		return;
+	}
+	if (uid != allowed) {
+		wl_client_post_implementation_error(client,
+			"zwp_input_method_manager_v2: uid %u not permitted "
+			"(allowed ime uid=%u)",
+			(unsigned)uid, (unsigned)allowed);
+		return;
+	}
+	/* Optional defence-in-depth peer pins (resolved exe / SELinux label),
+	 * bracketed by a starttime double-read so a recycled pid fails closed —
+	 * mirrors the locker bind. Unreadable /proc maps to "" so a configured
+	 * non-empty expectation always fails closed. */
+	if (qdwin->allowed_ime_exe || qdwin->allowed_ime_label) {
+		uint64_t st_before = qdwin_proc_starttime(pid);
+		uint64_t st_after;
+		if (qdwin->allowed_ime_exe) {
+			char *exe = qdwin_proc_exe(pid);
+			int ok = (exe &&
+				  strcmp(exe, qdwin->allowed_ime_exe) == 0);
+			free(exe);
+			if (!ok) {
+				weston_log("qdwin: input-method bind rejected "
+					   "pid=%d (exe mismatch)\n", (int)pid);
+				wl_client_post_implementation_error(client,
+					"zwp_input_method_manager_v2: peer exe "
+					"not permitted");
+				return;
+			}
+		}
+		if (qdwin->allowed_ime_label) {
+			char *label = qdwin_proc_selinux_label(pid);
+			int ok = (label &&
+				  strcmp(label, qdwin->allowed_ime_label) == 0);
+			free(label);
+			if (!ok) {
+				weston_log("qdwin: input-method bind rejected "
+					   "pid=%d (label mismatch)\n", (int)pid);
+				wl_client_post_implementation_error(client,
+					"zwp_input_method_manager_v2: peer "
+					"label not permitted");
+				return;
+			}
+		}
+		st_after = qdwin_proc_starttime(pid);
+		if (st_before == 0 || st_after == 0 || st_before != st_after) {
+			wl_client_post_implementation_error(client,
+				"zwp_input_method_manager_v2: peer identity "
+				"unstable");
+			return;
+		}
+	}
+
+	resource = wl_resource_create(
+		client, &zwp_input_method_manager_v2_interface, version, id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	{
+		struct qdwin_input_method_manager *mgr = calloc(1, sizeof *mgr);
+		if (!mgr) {
+			wl_resource_set_implementation(resource,
+				&qdwin_im_manager_impl, NULL, NULL);
+			wl_client_post_no_memory(client);
+			return;
+		}
+		mgr->qdwin = qdwin;
+		mgr->resource = resource;
+		wl_list_insert(&qdwin->input_method_managers, &mgr->link);
+		wl_resource_set_implementation(resource, &qdwin_im_manager_impl,
+					       mgr, qdwin_im_manager_resource_destroy);
+	}
+	weston_log("qdwin: input-method manager bound by uid=%u pid=%d\n",
+		   (unsigned)uid, (int)pid);
+}
+
+/* Compositor-teardown drain: neutralize every live input-method resource so a
+ * late destroy callback no-ops, and detach compositor state. Mirrors
+ * qdwin_text_inputs_destroy_all. */
+static void
+qdwin_input_methods_destroy_all(struct qdwin *qdwin)
+{
+	struct qdwin_input_method *im, *tmp;
+	wl_list_for_each_safe(im, tmp, &qdwin->input_methods, link) {
+		/* Neutralize the grab resource (so a late libwayland-driven
+		 * destroy no-ops) AND free the grab struct here: qdwin_im_detach
+		 * only ends the weston grab and nulls im->grab, it does not free
+		 * the struct, so without this the grab would leak at teardown. */
+		struct qdwin_im_keyboard_grab *g = im->grab;
+		if (g && g->resource)
+			wl_resource_set_user_data(g->resource, NULL);
+		qdwin_im_detach(im);
+		free(g);
+		wl_resource_set_user_data(im->resource, NULL);
+		wl_list_remove(&im->link);
+		free(im);
+	}
 }
 
 /* ------------------------------------------------------------------
@@ -18358,9 +19216,17 @@ qdwin_secctx_global_filter(const struct wl_client *client,
 			   const struct wl_global *global, void *data)
 {
 	struct qdwin *qdwin = data;
+	struct wl_client *cw = (struct wl_client *)client;
+	/* P1: hide the privileged input-method-v2 manager from sandboxed/silo
+	 * clients. It grants keystroke capture + text injection, so a secctx
+	 * (silo) client must not even see it — that would let one silo keylog or
+	 * inject into another. Unsandboxed clients see it; the bind handler then
+	 * enforces uid/exe identity and single-IME-per-seat. */
+	if (qdwin->input_method_manager_global &&
+	    global == qdwin->input_method_manager_global)
+		return qdwin_secctx_client_find(qdwin, cw) == NULL;
 	if (global != qdwin->security_context_manager_global)
 		return true;  /* only filter the secctx manager */
-	struct wl_client *cw = (struct wl_client *)client;
 	if (qdwin_secctx_client_find(qdwin, cw) != NULL)
 		return false;
 	{
@@ -18576,6 +19442,55 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 			}
 		}
 	}
+	/* P1: input-method-v2 bind policy. Default uid sentinel (-1) => the IME
+	 * is admitted at allowed_uid (the session uid); set
+	 * --qdwin-allowed-ime-uid=N for a dedicated IME uid. The real silo
+	 * boundary is the secctx deny in the global filter + bind handler
+	 * (sandboxed clients can never act as the IME regardless of uid); the
+	 * optional exe/label pins below are defence-in-depth, mirroring the
+	 * locker. Fail closed on a present-but-unallocatable string policy. */
+	qdwin->allowed_ime_uid = (uid_t)-1;
+	{
+		bool uid_set = false, exe_set = false, label_set = false;
+		if (!qdwin_parse_uid_opt(*argc, argv,
+					 "--qdwin-allowed-ime-uid=",
+					 "QDWIN_ALLOWED_IME_UID",
+					 &qdwin->allowed_ime_uid, &uid_set)) {
+			weston_log("qdwin: --qdwin-allowed-ime-uid / "
+				   "QDWIN_ALLOWED_IME_UID is malformed — "
+				   "refusing to start\n");
+			free(qdwin->allowed_locker_entrypoint);
+			free(qdwin->allowed_locker_exe);
+			free(qdwin->allowed_locker_label);
+			free(qdwin->allowed_layershell_exe);
+			free(qdwin->allowed_layershell_label);
+			free(qdwin);
+			return -1;
+		}
+		qdwin->allowed_ime_exe =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-ime-exe=",
+					    "QDWIN_ALLOWED_IME_EXE", &exe_set);
+		qdwin->allowed_ime_label =
+			qdwin_parse_str_opt(*argc, argv,
+					    "--qdwin-allowed-ime-label=",
+					    "QDWIN_ALLOWED_IME_LABEL", &label_set);
+		if ((exe_set && !qdwin->allowed_ime_exe) ||
+		    (label_set && !qdwin->allowed_ime_label)) {
+			weston_log("qdwin: failed to allocate input-method bind "
+				   "policy — refusing to start with a weaker "
+				   "policy than configured\n");
+			free(qdwin->allowed_ime_exe);
+			free(qdwin->allowed_ime_label);
+			free(qdwin->allowed_locker_entrypoint);
+			free(qdwin->allowed_locker_exe);
+			free(qdwin->allowed_locker_label);
+			free(qdwin->allowed_layershell_exe);
+			free(qdwin->allowed_layershell_label);
+			free(qdwin);
+			return -1;
+		}
+	}
 	/* §6.8 S3b: install our default-pointer-grab so nested-proxy
 	 * input forwarding lives even when no other grab is active.
 	 * Singleton hookup so the grab callbacks (which receive only a
@@ -18605,6 +19520,8 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_list_init(&qdwin->fractional_scales);
 	wl_list_init(&qdwin->text_inputs);
 	wl_list_init(&qdwin->text_input_managers);
+	wl_list_init(&qdwin->input_methods);
+	wl_list_init(&qdwin->input_method_managers);
 	wl_list_init(&qdwin->primary_seats);
 	wl_list_init(&qdwin->nested_toplevels);
 	qdwin->next_stream_port = 3401;  /* pool start for per-stream ports */
@@ -18876,6 +19793,17 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		goto fail;
 	}
 
+	/* P1: input-method-unstable-v2 (privileged IME side). v1 — the only
+	 * interface version. Hidden from sandboxed clients by the global filter
+	 * and bind-gated to allowed_ime_uid; see the section comment far above. */
+	qdwin->input_method_manager_global = wl_global_create(
+		ec->wl_display, &zwp_input_method_manager_v2_interface,
+		1, qdwin, bind_qdwin_input_method_manager);
+	if (!qdwin->input_method_manager_global) {
+		weston_log("qdwin: input-method wl_global_create failed\n");
+		goto fail;
+	}
+
 	/* §6.10: wp_security_context_v1. Hides itself from sandboxed
 	 * clients via the global filter so nesting is impossible. */
 	wl_list_init(&qdwin->secctxs);
@@ -19105,6 +20033,8 @@ fail:
 	free(qdwin->allowed_locker_entrypoint);
 	free(qdwin->allowed_locker_exe);
 	free(qdwin->allowed_locker_label);
+	free(qdwin->allowed_ime_exe);
+	free(qdwin->allowed_ime_label);
 	free(qdwin->allowed_layershell_exe);
 	free(qdwin->allowed_layershell_label);
 	free(qdwin);

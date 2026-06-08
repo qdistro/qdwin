@@ -165,11 +165,14 @@ def check_update_focus_is_client_scoped(source):
     return 0
 
 
-def check_inert_no_ime_events(source):
-    """Foundation-only contract: with no input-method wired in, qdwin must
-    NEVER send preedit_string / commit_string / delete_surrounding_text /
-    done. Their presence anywhere is a regression (a real IME is a separate,
-    gated increment)."""
+def check_ime_events_only_from_input_method(source):
+    """IME-driven contract (input-method-v2 now wired in): qdwin may send
+    preedit_string / commit_string / delete_surrounding_text / done to a
+    text_input, but ONLY from the input-method commit path
+    (qdwin_im_req_commit), never spontaneously from a text-input request or
+    focus path. A stray send elsewhere would mean the compositor fabricates
+    composed text with no IME behind it — exactly the regression the old
+    "inert" guard protected against, narrowed to allow the real IME bridge."""
     code = _strip_comments(source)
     forbidden = (
         "zwp_text_input_v3_send_preedit_string",
@@ -177,11 +180,20 @@ def check_inert_no_ime_events(source):
         "zwp_text_input_v3_send_delete_surrounding_text",
         "zwp_text_input_v3_send_done",
     )
-    seen = [name for name in forbidden if name in code]
-    if seen:
-        return fail("foundation-only contract broken — qdwin emits IME "
-                    f"event(s) with no input-method: {', '.join(seen)}. "
-                    "preedit/commit/done must wait for input-method-v2.")
+    commit_body, err = _function_body(
+        source, r"static void\s+qdwin_im_req_commit\s*\(",
+        "qdwin_im_req_commit")
+    if err:
+        return fail(err)
+    commit_body = _strip_comments(commit_body)
+    for name in forbidden:
+        total = code.count(name)
+        in_commit = commit_body.count(name)
+        if total != in_commit:
+            return fail("IME event "
+                        f"{name} is emitted outside qdwin_im_req_commit "
+                        f"({total - in_commit} stray use(s)) — composed text "
+                        "must only flow from an input-method commit.")
     return 0
 
 
@@ -307,7 +319,7 @@ def main():
         check_get_text_input_null_guards_manager,
         check_focus_listener_drives_text_input,
         check_update_focus_is_client_scoped,
-        check_inert_no_ime_events,
+        check_ime_events_only_from_input_method,
         check_entered_destroy_is_leave_free,
         check_resource_destroy_unlinks,
         check_teardown_drains_text_inputs,
@@ -319,10 +331,10 @@ def main():
             return rc
 
     print("PASS: text-input-v3 foundation (manager open at v1, get_text_input "
-          "+ focus_signal both drive client-scoped enter/leave, inert "
-          "no-IME-events contract holds, entered-destroy is leave-free, "
-          "resource destroy unlinks cleanly, teardown drains live objects "
-          "before free)")
+          "+ focus_signal both drive client-scoped enter/leave, IME events "
+          "flow only from the input-method commit path, entered-destroy is "
+          "leave-free, resource destroy unlinks cleanly, teardown drains live "
+          "objects before free)")
     return 0
 
 

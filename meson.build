@@ -241,6 +241,31 @@ text_input_protocol_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# Bucket A / P1: input-method-unstable-v2 (server). The privileged IME side
+# that pairs with the open text-input-v3 plane: a gated, session-trusted input
+# method (fcitx5/ibus) binds zwp_input_method_manager_v2 and drives
+# preedit/commit back into the focused text_input so CJK / complex-script
+# input works. Unlike text-input-v3 this is NOT in wayland-protocols — it is a
+# wlr-protocols extension, so the xml is vendored under qdwin/qdwin/ alongside
+# the other private protocol XMLs (single source of truth, installed via the
+# qdistro-protocols pkg-config package). Bind is identity-gated like the locker
+# (allowed_ime_uid + sandbox/secctx deny + single-claimant) because it grants
+# keystroke capture + text injection. See
+# todo/issues/qdwin/app-compat-protocol-gaps.md P1.
+input_method_xml = files('qdwin/input-method-unstable-v2.xml')
+input_method_server_header = custom_target(
+  'input-method-unstable-v2-server-header',
+  input: input_method_xml,
+  output: 'input-method-unstable-v2-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+input_method_protocol_code = custom_target(
+  'input-method-unstable-v2-private-code',
+  input: input_method_xml,
+  output: 'input-method-unstable-v2-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 # v24 workspaces: ext-workspace-v1 (server). qdwin implements the standard
 # workspace protocol so any taskbar (qdshell + others) can list/activate
 # workspaces. The window->workspace mapping the bar needs for occupancy is
@@ -473,6 +498,8 @@ qdwin_plugin = shared_library(
     fractional_scale_protocol_code,
     text_input_server_header,
     text_input_protocol_code,
+    input_method_server_header,
+    input_method_protocol_code,
     ext_workspace_server_header,
     ext_workspace_protocol_code,
     wlr_output_mgmt_server_header,
@@ -812,6 +839,29 @@ executable('qdwin-textinput-probe',
   install: true,
 )
 
+# Client header for the input-method-v2 probe (qdwin-imethod-probe). Reuses
+# input_method_protocol_code (private-code) for the wl_interface symbols.
+input_method_client_header = custom_target(
+  'input-method-unstable-v2-client-header',
+  input: input_method_xml,
+  output: 'input-method-unstable-v2-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+# input-method-unstable-v2 live probe. Binds zwp_input_method_manager_v2,
+# asserts the seat gate (exit 5 headless), one-IME-per-seat (`unavailable`),
+# and that grab_keyboard delivers keymap + repeat_info. Driven by
+# tests/host/24-input-method.md.
+executable('qdwin-imethod-probe',
+  sources: [
+    'test-client/qdwin-imethod-probe.c',
+    input_method_client_header,
+    input_method_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
 executable('qdistro-test-window',
   sources: [
     'test-client/qdistro-test-window.c',
@@ -883,6 +933,7 @@ install_data(
     'qdwin/qdwin-nested-v1.xml',
     'qdwin/wlr-layer-shell-unstable-v1.xml',
     'qdwin/wlr-output-management-unstable-v1.xml',
+    'qdwin/input-method-unstable-v2.xml',
   ],
   install_dir: qdistro_protocols_dir,
 )
@@ -934,6 +985,19 @@ test('text-input-foundation',
   python3,
   args: [
     files('qdwin/test_text_input.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
+# input-method-unstable-v2 gating + teardown invariants (Bucket A / P1): the
+# manager is gated (secctx-deny + uid + one-per-seat), the keyboard grab
+# suppresses app delivery, the IME->app commit is serial/activation-guarded,
+# and teardown/seat-destroy detach cleanly. Headless source invariants; the
+# live compose path is seat/VM-gated (no wl_seat on the headless backend).
+test('input-method-gating',
+  python3,
+  args: [
+    files('qdwin/test_input_method.py'),
     files('qdwin/qdwin.c'),
   ],
 )
