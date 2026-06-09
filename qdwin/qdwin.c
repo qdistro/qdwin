@@ -1902,6 +1902,44 @@ qdwin_client_is_bound_shell(struct qdwin *qdwin, struct wl_client *client)
 	       client == wl_resource_get_client(qdwin->shell_resource);
 }
 
+/* May this client MUTATE the display layout (zwlr_output_manager apply path)?
+ *
+ * Enumeration of heads/modes is advertised to every client (wlr-randr, kanshi,
+ * the qdshell Display tab all read it), but the apply/test mutation path —
+ * which can weston_output_disable() / move / rescale every display in every
+ * silo — must be restricted to the trusted shell. Mirrors the layer-shell gate
+ * (bind_qdwin_layer_shell): the bound shell client, or a second wl_client of
+ * the same (pid,uid) as the shell (qdshell opens a separate connection for some
+ * surfaces), or — before any shell has bound — the configured allowed_uid.
+ *
+ * Fail-closed: when allowed_uid is unset ((uid_t)-1, the open test posture) and
+ * no shell is bound yet, this returns true so the historical broad posture is
+ * unchanged; once a shell binds, only that shell (by client or pid/uid) passes.
+ */
+static bool
+qdwin_om_client_may_mutate(struct qdwin *qdwin, struct wl_client *client)
+{
+	pid_t pid; uid_t uid; gid_t gid;
+
+	if (qdwin_client_is_bound_shell(qdwin, client))
+		return true;
+
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+
+	if (qdwin->shell_bound && qdwin->shell_resource) {
+		/* A shell is bound: only it (or a same-process second
+		 * connection) may mutate. */
+		return pid > 0 && pid == qdwin->shell_pid &&
+		       uid == qdwin->shell_uid;
+	}
+
+	/* No shell bound yet: fall back to the allowed_uid gate. When
+	 * allowed_uid is unset the open posture is preserved. */
+	if (qdwin->allowed_uid == (uid_t)-1)
+		return true;
+	return uid == qdwin->allowed_uid;
+}
+
 static void
 qdwin_handle_bind_as_shell(struct wl_client *client,
 			   struct wl_resource *resource)
@@ -9681,6 +9719,10 @@ struct qdwin_om_manager {
 	struct wl_resource *resource;   /* zwlr_output_manager_v1 */
 	struct wl_list heads;           /* qdwin_om_head::link */
 	bool stopped;
+	/* Authorization snapshot taken at bind time: whether the binding client
+	 * is the trusted shell and may therefore drive the apply/test mutation
+	 * path. Enumeration stays open regardless. */
+	bool may_mutate;
 };
 
 struct qdwin_om_mode {
@@ -9735,6 +9777,7 @@ struct qdwin_om_config {
 	struct wl_resource *resource;   /* zwlr_output_configuration_v1 */
 	uint32_t serial;                /* serial passed at create time */
 	bool used;                      /* apply/test already issued */
+	bool may_mutate;                /* inherited from the binding manager */
 	struct wl_list cfg_heads;       /* qdwin_om_cfg_head::link */
 };
 
@@ -10504,9 +10547,21 @@ static void
 qdwin_om_config_apply(struct wl_client *client, struct wl_resource *res)
 {
 	struct qdwin_om_config *cfg = wl_resource_get_user_data(res);
-	(void)client;
 	if (!cfg)
 		return;
+	/* Authorization gate (security): only the trusted shell may mutate the
+	 * display layout. Enumeration is open, but an unauthorized client that
+	 * reaches apply is rejected with a protocol error (fatal to that
+	 * client), mirroring the layer-shell bind gate. Checked before `used`
+	 * so an unauthorized client can never even consume the one-shot. */
+	if (!cfg->may_mutate) {
+		weston_log("qdwin: zwlr_output_configuration apply REJECTED — "
+			   "client not authorized to mutate display layout\n");
+		wl_client_post_implementation_error(client,
+			"zwlr_output_configuration_v1: not authorized to apply "
+			"a display configuration");
+		return;
+	}
 	if (cfg->used) {
 		wl_resource_post_error(res,
 			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_USED,
@@ -10537,9 +10592,20 @@ static void
 qdwin_om_config_test(struct wl_client *client, struct wl_resource *res)
 {
 	struct qdwin_om_config *cfg = wl_resource_get_user_data(res);
-	(void)client;
 	if (!cfg)
 		return;
+	/* Same authorization gate as apply. `test` itself is side-effect-free
+	 * (qdwin_om_config_realize returns before touching any output when
+	 * test_only), but an unauthorized client has no business driving the
+	 * configuration machinery at all — reject uniformly, fail-closed. */
+	if (!cfg->may_mutate) {
+		weston_log("qdwin: zwlr_output_configuration test REJECTED — "
+			   "client not authorized to mutate display layout\n");
+		wl_client_post_implementation_error(client,
+			"zwlr_output_configuration_v1: not authorized to test "
+			"a display configuration");
+		return;
+	}
 	if (cfg->used) {
 		wl_resource_post_error(res,
 			ZWLR_OUTPUT_CONFIGURATION_V1_ERROR_ALREADY_USED,
@@ -10632,6 +10698,7 @@ qdwin_om_manager_create_configuration(struct wl_client *client,
 	cfg->qdwin = mgr->qdwin;
 	cfg->resource = cr;
 	cfg->serial = serial;
+	cfg->may_mutate = mgr->may_mutate;
 	wl_list_init(&cfg->cfg_heads);
 	wl_resource_set_implementation(cr, &qdwin_om_config_impl, cfg,
 				       qdwin_om_config_resource_destroy);
@@ -10688,6 +10755,11 @@ bind_output_manager(struct wl_client *client, void *data,
 	}
 	mgr->qdwin = qdwin;
 	wl_list_init(&mgr->heads);
+	/* Enumeration is open to every client; the apply/test mutation path is
+	 * gated to the trusted shell. Snapshot the decision now against the
+	 * binding client's credentials (consistent with qdwin's connect-time
+	 * peer-identity posture). */
+	mgr->may_mutate = qdwin_om_client_may_mutate(qdwin, client);
 	mgr->resource = wl_resource_create(client,
 		&zwlr_output_manager_v1_interface, version, id);
 	if (!mgr->resource) {

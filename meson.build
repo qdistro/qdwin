@@ -1101,3 +1101,16 @@ test('vm-exec-lookup',
     files('tests/apps/qdwin-apps-helpers.sh'),
   ],
 )
+
+# zwlr_output_manager_v1 mutation gate (security; cross-silo display
+# DoS/tamper): enumeration is open to every client but the apply/test path is
+# authorization-snapshotted at manager bind and rejected fail-closed for an
+# untrusted peer. Headless source invariant; the live two-uid half is
+# tests/host/12-output-protocol.md S6.
+test('output-manager-gate',
+  python3,
+  args: [
+    files('qdwin/test_output_manager_gate.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)

@@ -23,6 +23,10 @@
  *                    `done` (with a bumped serial) follows.
  *   --bad-serial     apply a config built against serial+1; asserts
  *                    `cancelled`.
+ *   --expect-denied  combine with --test/--apply: assert the compositor
+ *                    REJECTS the mutation with a protocol error (an
+ *                    unauthorized client must never reach succeeded/failed/
+ *                    cancelled). Enumeration must still have worked.
  *
  * Exit codes: 0 ok, 1 assertion/protocol failure, 2 setup error.
  *
@@ -193,7 +197,7 @@ static const struct wl_registry_listener registry_listener = {
 int main(int argc, char *argv[])
 {
 	int expect_heads = -1;
-	int do_test = 0, do_apply = 0, bad_serial = 0;
+	int do_test = 0, do_apply = 0, bad_serial = 0, expect_denied = 0;
 	for (int i = 1; i < argc; i++) {
 		if (strncmp(argv[i], "--expect-heads=", 15) == 0)
 			expect_heads = atoi(argv[i] + 15);
@@ -203,6 +207,8 @@ int main(int argc, char *argv[])
 			do_apply = 1;
 		else if (strcmp(argv[i], "--bad-serial") == 0)
 			bad_serial = 1;
+		else if (strcmp(argv[i], "--expect-denied") == 0)
+			expect_denied = 1;
 	}
 
 	struct probe p = {0};
@@ -263,6 +269,28 @@ int main(int argc, char *argv[])
 
 		printf("qdwin-output-probe: cfg succeeded=%d failed=%d cancelled=%d\n",
 		       p.cfg_succeeded, p.cfg_failed, p.cfg_cancelled);
+		if (expect_denied) {
+			/* The mutation gate posts a protocol error and never sends
+			 * succeeded/failed/cancelled. Assert: NO reply arrived AND
+			 * the display went into protocol-error state. */
+			int err = wl_display_get_error(p.display);
+			if (p.cfg_succeeded || p.cfg_failed || p.cfg_cancelled) {
+				fprintf(stderr, "qdwin-output-probe: FAIL unauthorized "
+					"mutation got a reply (s=%d f=%d c=%d) — gate "
+					"did not deny\n", p.cfg_succeeded,
+					p.cfg_failed, p.cfg_cancelled);
+				return 1;
+			}
+			if (err == 0) {
+				fprintf(stderr, "qdwin-output-probe: FAIL expected a "
+					"protocol error from the mutation gate, got "
+					"none\n");
+				return 1;
+			}
+			printf("qdwin-output-probe: denied (protocol error %d) — OK\n",
+			       err);
+			return 0;
+		}
 		if (bad_serial) {
 			if (p.cfg_cancelled != 1) {
 				fprintf(stderr, "qdwin-output-probe: FAIL expected cancelled\n");
