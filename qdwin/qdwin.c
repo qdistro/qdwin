@@ -6237,6 +6237,13 @@ qdwin_handle_clear_selection(struct wl_client *client,
 	(void)client;
 	if (!qdwin || !seat_name)
 		return;
+	/* Shell-role gate: clear_selection is "Sent by the shell" (after a
+	 * broker deny verdict) and wipes the seat clipboard / primary
+	 * selection. Same privileged class as set_keyboard_focus — gate it so
+	 * a pre-bind allowed_uid client holding a qdwin_shell_v1 resource can't
+	 * wipe selections before any shell binds. */
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 	seat = NULL;
 	struct weston_seat *s;
 	wl_list_for_each(s, &qdwin->compositor->seat_list, link) {
@@ -6324,6 +6331,14 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
 	if (!qdwin || !seat_name)
+		return;
+	/* Shell-role gate: only the bound shell may redirect keyboard focus
+	 * and clear seat/primary selections. Without this, before any client
+	 * claims the role via bind_as_shell, any allowed_uid client holding a
+	 * qdwin_shell_v1 resource could steer focus and wipe selections.
+	 * Matches the rest of the shell request surface (move_toplevel_to_
+	 * workspace, set_workspace_name, ...). */
+	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
 	struct weston_seat *seat = NULL;
 	struct weston_seat *s;
@@ -6419,6 +6434,10 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
 	if (!qdwin || !seat_name)
+		return;
+	/* Shell-role gate (see set_keyboard_focus v1 for rationale): only the
+	 * bound shell may inject silo-aware keyboard focus / clear selections. */
+	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
 	struct weston_seat *seat = NULL;
 	struct weston_seat *s;

@@ -276,6 +276,45 @@ def check_focus_requests_preserve_pending_gate(source):
     return 0
 
 
+def check_focus_requests_shell_role_gated(source):
+    """The set_keyboard_focus handlers (and clear_selection) redirect keyboard
+    focus and/or clear the seat/primary selections — privileged shell-only
+    operations ("Sent by the shell" in qdwin-shell-v1.xml). They must gate on
+    qdwin_shell_require_bound (fail-closed: rejects until a client claims the
+    shell role via bind_as_shell), like the rest of the shell request surface
+    (move_toplevel_to_workspace, set_workspace_name, ...). Without it a
+    non-shell allowed_uid client holding a qdwin_shell_v1 resource could steer
+    focus and wipe selections before any shell binds (second-bind rejection
+    only triggers once shell_bound is set)."""
+    # Privileged side effects that must never run before the shell-bound gate.
+    sinks = ("weston_seat_set_selection",
+             "weston_keyboard_set_focus",
+             "weston_seat_set_keyboard_focus",
+             "qdwin_primary_seat_clear_selection")
+    for fn in ("qdwin_handle_set_keyboard_focus",
+               "qdwin_handle_set_keyboard_focus_v2",
+               "qdwin_handle_clear_selection"):
+        body, err = _function_body(
+            source,
+            rf"static void\s+{fn}\s*\(",
+            fn,
+        )
+        if err:
+            return fail(err)
+        if "qdwin_shell_require_bound" not in body:
+            return fail(f"{fn} does not gate on the shell-bound check "
+                        "(qdwin_shell_require_bound)")
+        # The gate must guard the privileged side effects: it has to appear
+        # before the first selection-clearing / focus-setting call, not after.
+        gate = body.index("qdwin_shell_require_bound")
+        for sink in sinks:
+            at = body.find(sink)
+            if at != -1 and at < gate:
+                return fail(f"{fn} reaches {sink} before the shell-bound "
+                            "gate")
+    return 0
+
+
 def check_minimize_preserves_pending_gate(source):
     body, err = _function_body(
         source,
@@ -463,6 +502,7 @@ def main():
         check_geometry_resize_preserves_pending_gate,
         check_stale_decisions_are_idempotent,
         check_focus_requests_preserve_pending_gate,
+        check_focus_requests_shell_role_gated,
         check_minimize_preserves_pending_gate,
         check_view_stream_preserves_pending_gate,
         check_state_requests_preserve_pending_gate,
