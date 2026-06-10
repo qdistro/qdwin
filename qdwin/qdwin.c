@@ -15511,6 +15511,16 @@ qdwin_im_seat_destroyed(struct wl_listener *l, void *data)
 	 * longer usable, then detach. The resource stays alive but inert. */
 	im->inert = 1;
 	zwp_input_method_v2_send_unavailable(im->resource);
+	/* UAF guard: vendored weston_seat_release() destroys (frees) the seat's
+	 * weston_keyboard BEFORE emitting seat->destroy_signal, and
+	 * weston_keyboard_destroy() does NOT cancel an active grab. So by the time
+	 * this listener runs, a cached g->keyboard points at freed memory; reading
+	 * g->keyboard->grab or calling weston_keyboard_end_grab() on it would be a
+	 * use-after-free. The keyboard is already gone, so there is nothing left to
+	 * end — null the cached pointer up front so the shared detach path below
+	 * (and any later grab-resource destroy) never dereferences it. */
+	if (im->grab)
+		im->grab->keyboard = NULL;
 	/* The listener link is removed inside detach; clear active state too. */
 	qdwin_im_detach(im);
 }

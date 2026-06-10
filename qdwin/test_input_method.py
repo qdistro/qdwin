@@ -294,7 +294,16 @@ def check_manager_resource_is_neutralizable(source):
 
 def check_seat_destroy_sends_unavailable(source):
     """When the seat is destroyed, the IME must be told it is `unavailable`
-    and detached (no dangling weston_seat pointer / grab)."""
+    and detached (no dangling weston_seat pointer / grab).
+
+    UAF guard: vendored weston_seat_release() frees the seat's weston_keyboard
+    (weston_keyboard_destroy) BEFORE emitting seat->destroy_signal, and that
+    destroy does NOT cancel an active grab (so our .cancel never fires to null
+    g->keyboard). By the time this listener runs, a cached g->keyboard is a
+    dangling pointer; qdwin_im_detach then reads g->keyboard->grab and may call
+    weston_keyboard_end_grab(g->keyboard) — a use-after-free. The handler must
+    therefore null im->grab->keyboard up front, BEFORE qdwin_im_detach, so the
+    shared detach path never dereferences the freed keyboard."""
     body, err = _function_body(
         source, r"static void\s+qdwin_im_seat_destroyed\s*\(",
         "qdwin_im_seat_destroyed")
@@ -304,6 +313,18 @@ def check_seat_destroy_sends_unavailable(source):
         return fail("seat-destroy does not send `unavailable` to the IME")
     if "qdwin_im_detach" not in body:
         return fail("seat-destroy does not detach the IME (dangling seat/grab)")
+    code = _strip_comments(body)
+    if not re.search(r"im->grab\s*->\s*keyboard\s*=\s*NULL", code):
+        return fail("seat-destroy does not null im->grab->keyboard before "
+                    "detach — vendored weston_seat_release frees the keyboard "
+                    "before this signal, so qdwin_im_detach would deref a freed "
+                    "weston_keyboard (latent UAF)")
+    null_pos = code.find("im->grab")
+    detach_pos = code.find("qdwin_im_detach")
+    if null_pos == -1 or detach_pos == -1 or null_pos > detach_pos:
+        return fail("seat-destroy nulls im->grab->keyboard AFTER qdwin_im_detach "
+                    "(or not at all) — detach would already have dereferenced "
+                    "the freed keyboard")
     return 0
 
 
