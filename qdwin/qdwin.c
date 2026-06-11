@@ -14776,31 +14776,6 @@ qdwin_text_input_commit(struct wl_client *client, struct wl_resource *resource)
 		qdwin_im_sync_seat(ti->qdwin, ti->seat);
 }
 
-/* v2-only requests (we advertise v1, but libwayland dispatches by opcode,
- * not resource version — a misbehaving client could still send these, so
- * provide safe no-ops rather than NULL slots). */
-static void
-qdwin_text_input_set_available_actions(struct wl_client *client,
-				       struct wl_resource *resource,
-				       struct wl_array *available_actions)
-{
-	(void)client; (void)resource; (void)available_actions;
-}
-
-static void
-qdwin_text_input_show_input_panel(struct wl_client *client,
-				  struct wl_resource *resource)
-{
-	(void)client; (void)resource;
-}
-
-static void
-qdwin_text_input_hide_input_panel(struct wl_client *client,
-				  struct wl_resource *resource)
-{
-	(void)client; (void)resource;
-}
-
 static const struct zwp_text_input_v3_interface qdwin_text_input_impl = {
 	.destroy               = qdwin_text_input_destroy,
 	.enable                = qdwin_text_input_enable,
@@ -14810,9 +14785,6 @@ static const struct zwp_text_input_v3_interface qdwin_text_input_impl = {
 	.set_content_type      = qdwin_text_input_set_content_type,
 	.set_cursor_rectangle  = qdwin_text_input_set_cursor_rectangle,
 	.commit                = qdwin_text_input_commit,
-	.set_available_actions = qdwin_text_input_set_available_actions,
-	.show_input_panel      = qdwin_text_input_show_input_panel,
-	.hide_input_panel      = qdwin_text_input_hide_input_panel,
 };
 
 static void

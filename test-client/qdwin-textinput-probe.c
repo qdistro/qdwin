@@ -74,7 +74,6 @@ struct probe {
 	/* Event counters — the heart of the assertions. */
 	int n_enter, n_leave;
 	int n_preedit, n_commit_string, n_delete, n_done;
-	int n_v2;                       /* action/language/preedit_hint (must stay 0) */
 };
 
 /* ---- zwp_text_input_v3 listener ---- */
@@ -125,20 +124,6 @@ ti_done(void *data, struct zwp_text_input_v3 *ti, uint32_t serial)
 	(void)ti; (void)serial;
 	p->n_done++;
 }
-/* v2 events — never expected on a v1 binding; count to fail loudly if seen. */
-static void
-ti_action(void *data, struct zwp_text_input_v3 *ti, uint32_t action,
-	  uint32_t serial)
-{ struct probe *p = data; (void)ti; (void)action; (void)serial; p->n_v2++; }
-static void
-ti_language(void *data, struct zwp_text_input_v3 *ti, const char *lang)
-{ struct probe *p = data; (void)ti; (void)lang; p->n_v2++; }
-static void
-ti_preedit_hint(void *data, struct zwp_text_input_v3 *ti, uint32_t start,
-		uint32_t end, uint32_t hint)
-{ struct probe *p = data; (void)ti; (void)start; (void)end; (void)hint;
-  p->n_v2++; }
-
 static const struct zwp_text_input_v3_listener ti_listener = {
 	.enter                   = ti_enter,
 	.leave                   = ti_leave,
@@ -146,9 +131,6 @@ static const struct zwp_text_input_v3_listener ti_listener = {
 	.commit_string           = ti_commit_string,
 	.delete_surrounding_text = ti_delete_surrounding_text,
 	.done                    = ti_done,
-	.action                  = ti_action,
-	.language                = ti_language,
-	.preedit_hint            = ti_preedit_hint,
 };
 
 /* ---- xdg-shell plumbing (focus mode only) ---- */
@@ -237,7 +219,7 @@ static int
 no_ime_events(struct probe *p)
 {
 	return p->n_preedit == 0 && p->n_commit_string == 0 &&
-	       p->n_delete == 0 && p->n_done == 0 && p->n_v2 == 0;
+	       p->n_delete == 0 && p->n_done == 0;
 }
 
 /* A mapped xdg_toplevel that qdwin autofocuses (first-buffer map). */
@@ -416,10 +398,10 @@ int main(int argc, char *argv[])
 
 	if (!no_ime_events(&p)) {
 		fprintf(stderr, "textinput-probe: FAIL inert contract — "
-			"preedit=%d commit_string=%d delete=%d done=%d v2=%d "
+			"preedit=%d commit_string=%d delete=%d done=%d "
 			"(all must be 0; no IME is wired in)\n",
 			p.n_preedit, p.n_commit_string, p.n_delete,
-			p.n_done, p.n_v2);
+			p.n_done);
 		rc = 1;
 	}
 
