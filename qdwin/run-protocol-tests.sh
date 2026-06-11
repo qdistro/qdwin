@@ -6,6 +6,15 @@
 # weston. Single-test invocation (the test client itself iterates
 # through all sub-tests).
 #
+# This is the IN-VM full-session variant: it runs as `admin` against a
+# fixed wayland-77 socket under /run/user/1000 with a bootstrap-provided
+# /home/admin/weston.ini, and is the path to exercise all 12 sub-tests
+# against the qdistro-vendored libweston-14 (QDWIN_USE_VENDORED_LIBWESTON=1).
+# For headless host / CI use, prefer the self-contained meson harness
+# `tests/protocol/run-layer-shell-protocol-test.sh`, wired as
+# `meson test --suite protocol` — it stages the pywayland bindings and a
+# private weston itself and needs neither root nor a bootstrapped VM.
+#
 # Phase 1.6 of .
 
 set -u
@@ -68,6 +77,10 @@ runuser -u admin -- bash -c "
   export XDG_RUNTIME_DIR=/run/user/1000
   export QDWIN_USE_VENDORED_LIBWESTON=$QDWIN_USE_VENDORED_LIBWESTON
   export QDWIN_COMPOSITOR_LOG=/tmp/weston-proto-test.log
+  # QDWIN_WESTON_LOG is what test_v19_register_hotkey_live reads; without it
+  # that sub-test SKIPs. Point it at the same log so the in-VM run really
+  # does exercise all 12 sub-tests.
+  export QDWIN_WESTON_LOG=/tmp/weston-proto-test.log
   cd /home/admin/qdwin-test
   python3 test_zwlr_layer_shell.py wayland-77
 "

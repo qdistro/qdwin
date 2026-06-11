@@ -1003,6 +1003,7 @@ pkg.generate(
 
 test('xdg-activation-policy',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_xdg_activation_policy.py'),
     files('qdwin/qdwin.c'),
@@ -1011,6 +1012,7 @@ test('xdg-activation-policy',
 
 test('nested-identity-policy',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_nested_identity_policy.py'),
     files('qdwin/qdwin.c'),
@@ -1021,6 +1023,7 @@ test('nested-identity-policy',
 # tests/host/20-rdp-focus-rebind.md (live VM half is PENDING residue).
 test('rdp-focus-rebind',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_rdp_focus_rebind.py'),
     files('qdwin/qdwin.c'),
@@ -1033,6 +1036,7 @@ test('rdp-focus-rebind',
 # the live enter/leave half is seat/VM-gated (headless has no wl_seat).
 test('text-input-foundation',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_text_input.py'),
     files('qdwin/qdwin.c'),
@@ -1046,6 +1050,7 @@ test('text-input-foundation',
 # live compose path is seat/VM-gated (no wl_seat on the headless backend).
 test('input-method-gating',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_input_method.py'),
     files('qdwin/qdwin.c'),
@@ -1061,6 +1066,7 @@ test('input-method-gating',
 # inject path is seat/VM-gated (qdwin-vkbd-probe + tests/host/25).
 test('virtual-keyboard-gating',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_virtual_keyboard.py'),
     files('qdwin/qdwin.c'),
@@ -1073,6 +1079,7 @@ test('virtual-keyboard-gating',
 # third-party ext-workspace bar showing the user's names) is PENDING.
 test('workspace-name-policy',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_workspace_name_policy.py'),
     files('qdwin/qdwin.c'),
@@ -1084,6 +1091,7 @@ test('workspace-name-policy',
 # half (a real mouse/touchpad / physical keyboard reacting) is PENDING.
 test('input-config-policy',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_input_config_policy.py'),
     files('qdwin/qdwin.c'),
@@ -1095,6 +1103,7 @@ test('input-config-policy',
 # files to assert vm-exec resolves correctly from a worktree. Headless.
 test('vm-exec-lookup',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_vm_exec_lookup.py'),
     files('tests/gui/qdwin-helpers.sh'),
@@ -1109,8 +1118,39 @@ test('vm-exec-lookup',
 # tests/host/12-output-protocol.md S6.
 test('output-manager-gate',
   python3,
+  suite: 'source_invariant',
   args: [
     files('qdwin/test_output_manager_gate.py'),
     files('qdwin/qdwin.c'),
   ],
+)
+
+# zwlr_layer_shell_v1 BEHAVIOURAL protocol suite. Unlike the
+# source_invariant tests above (which grep qdwin.c as text), this EXECUTES
+# the compositor: a real pywayland client drives qdwin-shell.so under a
+# private headless weston and asserts wire-level outcomes — the
+# get_layer_surface configure handshake, every protocol-error path
+# (invalid_layer / anchor / keyboard_interactivity / exclusive_edge, role
+# conflict, NULL-parent popup), the stale-serial popup grab, and the v19
+# register_hotkey path. Closes the biggest automated-behaviour gap in
+# todo/fable-testing/p2-qdwin-compiled-tests.md item 2.
+#
+# Gated so a green `meson test` stays honest on a minimal image: the
+# harness exits 77 (SKIP) when weston / the headless backend / pywayland
+# are absent. The two vendored-libweston discriminators
+# (layer_popup_grab_handler_registered, layer_popup_reposition) SKIP unless
+# QDWIN_USE_VENDORED_LIBWESTON=1 points at an installed vendored
+# libweston-14 (stock lacks weston_desktop_xdg_popup_set_layer_grab_handler).
+# Run just this suite with:  meson test --suite protocol
+test('layer-shell-protocol',
+  find_program('tests/protocol/run-layer-shell-protocol-test.sh'),
+  args: [
+    qdwin_plugin,
+    files('qdwin/test_zwlr_layer_shell.py'),
+    files('qdwin/wlr-layer-shell-unstable-v1.xml'),
+    files('qdwin/qdwin-shell-v1.xml'),
+  ],
+  depends: qdwin_plugin,
+  suite: 'protocol',
+  timeout: 120,
 )

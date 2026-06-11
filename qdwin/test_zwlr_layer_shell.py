@@ -41,6 +41,23 @@ except Exception:
     QdwinShellV1 = None  # type: ignore
 
 
+def _vendored_libweston_active():
+    """True iff the compositor was launched against the qdistro-vendored
+    libweston-14 (the NULL-parent xdg_popup / layer-popup-grab patch).
+
+    The harness that boots weston (run-protocol-tests.sh in a VM, or
+    tests/protocol/run-layer-shell-protocol-test.sh headless) exports
+    QDWIN_USE_VENDORED_LIBWESTON=1 into BOTH the weston env and this
+    client's env when it LD_LIBRARY_PATH-prefixes the vendored .so, so
+    the two agree. The grab-handler and layer-popup-reposition tests are
+    discriminators that are only meaningful against the patched
+    libweston; against stock libweston-14 (which lacks
+    weston_desktop_xdg_popup_set_layer_grab_handler) they SKIP rather
+    than FAIL, so the protocol suite stays green on a stock host.
+    """
+    return os.environ.get("QDWIN_USE_VENDORED_LIBWESTON") == "1"
+
+
 # Stderr capture: libwayland's protocol-error printout lands here.
 _STDERR_LOG_FD = None
 _STDERR_LOG_PATH = None
@@ -568,6 +585,11 @@ def test_layer_popup_grab_handler_registered(display_name):
     serial); a follow-up VM GUI scenario exercises the live grab path.
     """
     label = "layer_popup_grab_handler_registered"
+    if not _vendored_libweston_active():
+        print(f"  SKIP [{label}] stock libweston-14 has no layer-popup grab "
+              f"handler symbol; set QDWIN_USE_VENDORED_LIBWESTON=1 against "
+              f"the vendored .so to exercise this")
+        return True
     log_path = os.environ.get("QDWIN_COMPOSITOR_LOG")
     if not log_path or not os.path.exists(log_path):
         print(f"  SKIP [{label}] QDWIN_COMPOSITOR_LOG not set; run via "
@@ -599,6 +621,11 @@ def test_layer_popup_reposition(display_name):
     xdg_surface.configure. Without either, fail.
     """
     label = "layer_popup_reposition"
+    if not _vendored_libweston_active():
+        print(f"  SKIP [{label}] layer-parented popup reposition only "
+              f"schedules a configure on the qdistro-patched libweston; "
+              f"set QDWIN_USE_VENDORED_LIBWESTON=1 against the vendored .so")
+        return True
     d, st = with_globals(display_name)
     if not (st["xdg"] and st["shell"] and st["compositor"]):
         print(f"  SKIP [{label}] missing globals")
