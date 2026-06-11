@@ -502,6 +502,7 @@ qdwin_plugin = shared_library(
   'qdwin-shell',
   sources: [
     'qdwin/qdwin.c',
+    'qdwin/qdwin-logic.c',
     'qdwin/qdwin-nested-client.c',
     qdwin_shell_server_header,
     qdwin_shell_protocol_code,
@@ -1153,4 +1154,23 @@ test('layer-shell-protocol',
   depends: qdwin_plugin,
   suite: 'protocol',
   timeout: 120,
+)
+
+# Compiled C unit test for the pure logic kernels extracted into
+# qdwin/qdwin-logic.c (enum mappers, layer-shell anchor/box geometry,
+# fractional-scale clamp). Unlike the source_invariant suite (which greps
+# qdwin.c as text) and the protocol suite (which drives a live
+# compositor), this COMPILES qdwin-logic.c against a custom CHECK/printf
+# harness (assert() is avoided since it compiles out under NDEBUG) and
+# exercises the kernels directly — the single source of truth for the
+# arithmetic the plugin uses. See todo/fable-testing/p2-qdwin-compiled-tests.md
+# item 3. Run just this suite with:  meson test --suite logic
+test('qdwin-logic-unit',
+  executable('test-qdwin-logic',
+    'tests/unit/test-qdwin-logic.c',
+    'qdwin/qdwin-logic.c',
+    include_directories: include_directories('qdwin'),
+    dependencies: [dep_libinput],
+  ),
+  suite: 'logic',
 )

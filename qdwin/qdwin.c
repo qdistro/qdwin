@@ -77,6 +77,12 @@ int screenshooter_create(struct weston_compositor *ec);
 #include "qdwin/qdwin-nested-client.h"
 #include <libweston/pipewire-plugin.h>
 
+/* Pure logic kernels (enum maps, layer-shell geometry, fractional-scale
+ * clamp) live in qdwin-logic.c so they can be unit-tested in isolation
+ * (tests/unit/test-qdwin-logic.c). The wrappers below read struct fields
+ * and delegate the actual arithmetic to these kernels. */
+#include "qdwin/qdwin-logic.h"
+
 /* §6.5 S5c: libweston-14 exports these from libweston-14.so but does not
  * declare them in the installed plugin header (they're backend-facing).
  * Declare locally so qdwin-shell can act as a virtual input backend for
@@ -7161,25 +7167,23 @@ qdwin_handle_set_display_power(struct wl_client *client,
  * subset per device and never errors on an unsupported field.
  * ------------------------------------------------------------------ */
 
-static enum libinput_config_accel_profile
-qdwin_accel_profile_to_libinput(uint32_t p)
-{
-	return (p == QDWIN_ACCEL_FLAT)
-		? LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT
-		: LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE;
-}
-
-static enum libinput_config_scroll_method
-qdwin_scroll_method_to_libinput(uint32_t m)
-{
-	switch (m) {
-	case QDWIN_SCROLL_NONE:           return LIBINPUT_CONFIG_SCROLL_NO_SCROLL;
-	case QDWIN_SCROLL_EDGE:           return LIBINPUT_CONFIG_SCROLL_EDGE;
-	case QDWIN_SCROLL_ON_BUTTON_DOWN: return LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN;
-	case QDWIN_SCROLL_TWO_FINGER:
-	default:                          return LIBINPUT_CONFIG_SCROLL_2FG;
-	}
-}
+/* The accel-profile / scroll-method enum mappers are pure kernels living
+ * in qdwin-logic.c (declared in qdwin-logic.h). The qdwin-side enum
+ * values (QDWIN_ACCEL_*, QDWIN_SCROLL_*) match the QDWIN_LOGIC_* mirrors,
+ * so the existing call sites pass the raw uint32_t straight through.
+ * Build-time guards keep the two enum value sets in lock-step. */
+_Static_assert(QDWIN_ACCEL_ADAPTIVE == QDWIN_LOGIC_ACCEL_ADAPTIVE,
+	       "accel-profile enum drift vs qdwin-logic.h");
+_Static_assert(QDWIN_ACCEL_FLAT == QDWIN_LOGIC_ACCEL_FLAT,
+	       "accel-profile enum drift vs qdwin-logic.h");
+_Static_assert(QDWIN_SCROLL_NONE == QDWIN_LOGIC_SCROLL_NONE,
+	       "scroll-method enum drift vs qdwin-logic.h");
+_Static_assert(QDWIN_SCROLL_TWO_FINGER == QDWIN_LOGIC_SCROLL_TWO_FINGER,
+	       "scroll-method enum drift vs qdwin-logic.h");
+_Static_assert(QDWIN_SCROLL_EDGE == QDWIN_LOGIC_SCROLL_EDGE,
+	       "scroll-method enum drift vs qdwin-logic.h");
+_Static_assert(QDWIN_SCROLL_ON_BUTTON_DOWN == QDWIN_LOGIC_SCROLL_ON_BUTTON_DOWN,
+	       "scroll-method enum drift vs qdwin-logic.h");
 
 /* Apply the stored snapshot to one libinput device, honouring each
  * capability guard. Safe to call on any device kind. */
@@ -11765,32 +11769,23 @@ qdwin_layer_surface_handle_on_demand_button(struct qdwin *qdwin,
  *   free edge.
  * - Otherwise: NONE (no zone reserved).
  * Encoded as the same bitfield as anchor: TOP/BOTTOM/LEFT/RIGHT. */
-#define QLS_T ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
-#define QLS_B ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
-#define QLS_L ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
-#define QLS_R ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT
 static uint32_t
 qdwin_layer_surface_get_exclusive_edge(const struct qdwin_layer_surface *ls)
 {
-	if (ls->current.exclusive_edge != 0)
-		return ls->current.exclusive_edge;
-
-	switch (ls->current.anchor) {
-	case QLS_T:                          return QLS_T;
-	case QLS_B:                          return QLS_B;
-	case QLS_L:                          return QLS_L;
-	case QLS_R:                          return QLS_R;
-	case (QLS_T | QLS_L | QLS_R):        return QLS_T;
-	case (QLS_B | QLS_L | QLS_R):        return QLS_B;
-	case (QLS_L | QLS_T | QLS_B):        return QLS_L;
-	case (QLS_R | QLS_T | QLS_B):        return QLS_R;
-	default:                             return 0;
-	}
+	/* Pure derivation lives in qdwin-logic.c; the original "edge unset"
+	 * sentinel is exclusive_edge == 0. */
+	return qdwin_layer_exclusive_edge(ls->current.anchor,
+					  ls->current.exclusive_edge != 0,
+					  ls->current.exclusive_edge);
 }
-#undef QLS_T
-#undef QLS_B
-#undef QLS_L
-#undef QLS_R
+_Static_assert(ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP == QDWIN_LOGIC_ANCHOR_TOP,
+	       "layer anchor bit drift vs qdwin-logic.h");
+_Static_assert(ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM == QDWIN_LOGIC_ANCHOR_BOTTOM,
+	       "layer anchor bit drift vs qdwin-logic.h");
+_Static_assert(ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT == QDWIN_LOGIC_ANCHOR_LEFT,
+	       "layer anchor bit drift vs qdwin-logic.h");
+_Static_assert(ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT == QDWIN_LOGIC_ANCHOR_RIGHT,
+	       "layer anchor bit drift vs qdwin-logic.h");
 
 /* Phase 1.3: forward-declared at top of file; called by
  * qdwin_output_work_area. Subtracts every mapped layer-shell surface's
@@ -11838,50 +11833,18 @@ qdwin_layer_surface_compute_box(struct qdwin_layer_surface *ls,
 				int32_t bx, int32_t by,
 				int32_t bw, int32_t bh)
 {
-	const uint32_t T = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP;
-	const uint32_t B = ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
-	const uint32_t L = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT;
-	const uint32_t R = ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
-	uint32_t a = ls->current.anchor;
-	int32_t w = (int32_t)ls->current.desired_w;
-	int32_t h = (int32_t)ls->current.desired_h;
-	int32_t x, y;
-
-	/* Horizontal */
-	if (w == 0) {
-		x = bx + ls->current.margin.left;
-		w = bw - (ls->current.margin.left + ls->current.margin.right);
-	} else if ((a & L) && (a & R)) {
-		x = bx + bw / 2 - w / 2;
-	} else if (a & L) {
-		x = bx + ls->current.margin.left;
-	} else if (a & R) {
-		x = bx + bw - w - ls->current.margin.right;
-	} else {
-		x = bx + bw / 2 - w / 2;
-	}
-
-	/* Vertical */
-	if (h == 0) {
-		y = by + ls->current.margin.top;
-		h = bh - (ls->current.margin.top + ls->current.margin.bottom);
-	} else if ((a & T) && (a & B)) {
-		y = by + bh / 2 - h / 2;
-	} else if (a & T) {
-		y = by + ls->current.margin.top;
-	} else if (a & B) {
-		y = by + bh - h - ls->current.margin.bottom;
-	} else {
-		y = by + bh / 2 - h / 2;
-	}
-
-	if (w < 0) w = 0;
-	if (h < 0) h = 0;
-
-	ls->box_x = x;
-	ls->box_y = y;
-	ls->box_w = (uint32_t)w;
-	ls->box_h = (uint32_t)h;
+	/* Pure layout math lives in qdwin-logic.c; we read the struct
+	 * inputs, run the kernel, and store the placed rect back. */
+	qdwin_layer_compute_box(ls->current.anchor,
+				(int32_t)ls->current.desired_w,
+				(int32_t)ls->current.desired_h,
+				ls->current.margin.top,
+				ls->current.margin.right,
+				ls->current.margin.bottom,
+				ls->current.margin.left,
+				bx, by, bw, bh,
+				&ls->box_x, &ls->box_y,
+				&ls->box_w, &ls->box_h);
 }
 
 static void
@@ -14350,7 +14313,8 @@ qdwin_compute_preferred_scale_for_surface(struct qdwin *qdwin,
 	const char *env = getenv("QDWIN_FRACTIONAL_SCALE");
 	if (env && *env) {
 		long n = strtol(env, NULL, 10);
-		if (n >= 30 && n <= 960)
+		/* Accept-or-fall-through gate (30..960) lives in qdwin-logic.c. */
+		if (qdwin_fractional_scale_env_valid(n))
 			return (uint32_t)n;
 	}
 	if (surface && surface->output && surface->output->current_scale > 0)
