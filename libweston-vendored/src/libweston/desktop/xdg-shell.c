@@ -38,6 +38,7 @@
 #include <libweston/desktop.h>
 #include "internal.h"
 #include "shared/helpers.h"
+#include "qdwin-xdg-constrain.h"	/* qdistro: popup constraint kernel */
 
 /************************************************************************************
  * WARNING: This file implements the stable xdg shell protocol.
@@ -135,6 +136,21 @@ struct weston_desktop_xdg_popup {
 
 	bool pending_reposition;
 	uint32_t pending_reposition_token;
+
+	/* qdistro security patch: snapshot of the positioner that produced
+	 * `geometry`, so the popup can be RE-constrained from scratch (no
+	 * accumulated drift) against the parent's output every time it is
+	 * positioned. See weston_desktop_xdg_popup_constrain_geometry and
+	 * qdwin-xdg-constrain.h. */
+	struct {
+		bool valid;
+		struct weston_geometry anchor_rect;
+		struct weston_size size;
+		struct weston_coord offset;
+		uint32_t anchor;
+		uint32_t gravity;
+		uint32_t constraint_adjustment;
+	} qd_positioner;
 };
 
 #define weston_desktop_surface_role_biggest_size \
@@ -215,12 +231,134 @@ weston_desktop_xdg_positioner_get_geometry(struct weston_desktop_xdg_positioner 
 		geometry.x -= geometry.width / 2;
 	}
 
-	if (positioner->constraint_adjustment == XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE)
-		return geometry;
-
-	/* TODO: add compositor policy configuration and the code here */
-
+	/* qdistro security patch: this returns the UNCONSTRAINED base
+	 * placement (anchor + gravity + offset). constraint_adjustment is
+	 * applied later, at popup placement time, by
+	 * weston_desktop_xdg_popup_constrain_geometry() — which has the
+	 * parent's mapped output and so can clamp the popup to it (see
+	 * qdwin-xdg-constrain.h). Constraining here is not possible: at
+	 * positioner-eval time the parent may not be mapped/positioned yet,
+	 * and the layer-shell popup path calls this with a NULL parent. The
+	 * upstream "TODO: add compositor policy configuration" is therefore
+	 * intentionally resolved out-of-band rather than inline. */
 	return geometry;
+}
+
+/* qdistro security patch: snapshot the protocol inputs of `positioner`
+ * onto the popup so its geometry can be recomputed from scratch (no
+ * accumulated drift) and re-clamped to the parent's output on every
+ * placement. */
+static void
+weston_desktop_xdg_popup_snapshot_positioner(struct weston_desktop_xdg_popup *popup,
+					     struct weston_desktop_xdg_positioner *positioner)
+{
+	popup->qd_positioner.valid = true;
+	popup->qd_positioner.anchor_rect = positioner->anchor_rect;
+	popup->qd_positioner.size = positioner->size;
+	popup->qd_positioner.offset = positioner->offset;
+	popup->qd_positioner.anchor = positioner->anchor;
+	popup->qd_positioner.gravity = positioner->gravity;
+	popup->qd_positioner.constraint_adjustment =
+		positioner->constraint_adjustment;
+}
+
+/* Round a double pixel coordinate to int32 without pulling in libm. */
+static inline int32_t
+weston_desktop_xdg_round_i32(double v)
+{
+	return (int32_t)(v < 0 ? v - 0.5 : v + 0.5);
+}
+
+/* qdistro security patch: recompute popup->geometry from the snapshotted
+ * positioner and clamp it so the popup cannot leave the parent toplevel's
+ * output. Runs at every placement (popup commit / reposition). Recomputes
+ * from the snapshot — never re-clamps the already-clamped geometry — so
+ * repeated calls as the parent moves do not accumulate drift.
+ *
+ * Bound = the output the parent is primarily on, translated into the
+ * parent window-geometry frame that popup->geometry lives in. Fail-closed:
+ * if the parent has no output/view yet we clamp to the parent's own window
+ * geometry rather than emit the unconstrained base geometry (which would
+ * reach the client via the next configure). */
+static void
+weston_desktop_xdg_popup_constrain_geometry(struct weston_desktop_xdg_popup *popup)
+{
+	struct weston_desktop_surface *parent_dsurface;
+	struct weston_surface *parent_wsurface;
+	struct weston_view *pview = NULL, *v;
+	struct weston_geometry parent_geom;
+	struct weston_output *output = NULL;
+	int32_t bx, by, bw, bh;
+	int32_t gx, gy, gw, gh;
+
+	if (!popup->qd_positioner.valid || popup->parent == NULL)
+		return;
+
+	parent_dsurface = popup->parent->desktop_surface;
+	parent_wsurface = popup->parent->surface;
+	if (parent_dsurface == NULL || parent_wsurface == NULL)
+		return;
+
+	/* Representative parent view. qdwin is single-seat/single-desktop, so
+	 * a desktop surface normally has exactly one view; if it is mirrored
+	 * across outputs we take the first — the security bound is "an output
+	 * the parent is actually on", and either is acceptable. */
+	wl_list_for_each(v, &parent_wsurface->views, surface_link) {
+		pview = v;
+		break;
+	}
+
+	parent_geom = weston_desktop_surface_get_geometry(parent_dsurface);
+
+	output = parent_wsurface->output;
+	if (output == NULL && parent_wsurface->compositor != NULL) {
+		struct weston_output *o;
+		wl_list_for_each(o, &parent_wsurface->compositor->output_list,
+				 link) {
+			output = o;
+			break;
+		}
+	}
+
+	if (output != NULL && pview != NULL) {
+		struct weston_coord_surface cs =
+			weston_coord_surface(parent_geom.x, parent_geom.y,
+					     parent_wsurface);
+		struct weston_coord_global porigin =
+			weston_coord_surface_to_global(pview, cs);
+
+		bx = weston_desktop_xdg_round_i32(output->pos.c.x - porigin.c.x);
+		by = weston_desktop_xdg_round_i32(output->pos.c.y - porigin.c.y);
+		bw = output->width;
+		bh = output->height;
+	} else {
+		/* Fail-closed: clamp to the parent window geometry itself. The
+		 * anchor rect is already in this frame, so its origin is 0,0. */
+		bx = 0;
+		by = 0;
+		bw = parent_geom.width > 0 ? parent_geom.width : 1;
+		bh = parent_geom.height > 0 ? parent_geom.height : 1;
+	}
+
+	qdwin_xdg_constrain_geometry(
+		popup->qd_positioner.anchor_rect.x,
+		popup->qd_positioner.anchor_rect.y,
+		popup->qd_positioner.anchor_rect.width,
+		popup->qd_positioner.anchor_rect.height,
+		popup->qd_positioner.size.width,
+		popup->qd_positioner.size.height,
+		weston_desktop_xdg_round_i32(popup->qd_positioner.offset.x),
+		weston_desktop_xdg_round_i32(popup->qd_positioner.offset.y),
+		popup->qd_positioner.anchor,
+		popup->qd_positioner.gravity,
+		popup->qd_positioner.constraint_adjustment,
+		bx, by, bw, bh,
+		&gx, &gy, &gw, &gh);
+
+	popup->geometry.x = gx;
+	popup->geometry.y = gy;
+	popup->geometry.width = gw;
+	popup->geometry.height = gh;
 }
 
 static void
@@ -1090,6 +1228,10 @@ weston_desktop_xdg_popup_protocol_reposition(struct wl_client *wl_client,
 		weston_desktop_xdg_positioner_get_geometry(positioner,
 							   dsurface,
 							   parent_dsurface);
+	/* qdistro security patch: clamp the repositioned popup to the
+	 * parent's output before the client is configured. */
+	weston_desktop_xdg_popup_snapshot_positioner(popup, positioner);
+	weston_desktop_xdg_popup_constrain_geometry(popup);
 	popup->pending_reposition = true;
 	popup->pending_reposition_token = token;
 	if (popup->committed)
@@ -1163,6 +1305,12 @@ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface
 	 * non-NULL parent). Guard for defence-in-depth. */
 	if (popup->parent == NULL)
 		return;
+	/* qdistro security patch: re-clamp to the parent's output now that
+	 * the parent is mapped/positioned. Recomputes from the snapshot, so
+	 * repeated commits (e.g. parent moved) do not accumulate drift. The
+	 * updated geometry is read by the idle configure scheduled in
+	 * weston_desktop_xdg_popup_committed before it is sent. */
+	weston_desktop_xdg_popup_constrain_geometry(popup);
 	parent_dsurface = popup->parent->desktop_surface;
 	offset = weston_coord_surface(popup->geometry.x,
 				      popup->geometry.y,
@@ -1550,6 +1698,12 @@ weston_desktop_xdg_surface_protocol_get_popup(struct wl_client *wl_client,
 								   dsurface,
 								   parent_surface);
 
+		/* qdistro security patch: snapshot the positioner and clamp to
+		 * the parent's output before the initial set_relative_to.
+		 * update_position re-clamps at commit from the same snapshot. */
+		weston_desktop_xdg_popup_snapshot_positioner(popup, positioner);
+		weston_desktop_xdg_popup_constrain_geometry(popup);
+
 		offset = weston_coord_surface(popup->geometry.x,
 					      popup->geometry.y,
 					      popup->parent->surface);
@@ -1564,7 +1718,18 @@ weston_desktop_xdg_surface_protocol_get_popup(struct wl_client *wl_client,
 		 * state, so we can still compute the anchored rect now —
 		 * qdwin's layer-popup commit listener reads it via
 		 * weston_desktop_xdg_popup_get_geometry to place the view
-		 * relative to its layer-shell parent. */
+		 * relative to its layer-shell parent.
+		 *
+		 * qdistro security note: a popup with a NULL desktop parent is
+		 * NOT run through the output clamp (constrain_geometry requires
+		 * popup->parent). This is safe ONLY because zwlr_layer_shell_v1
+		 * binding is restricted to privileged uids
+		 * (qdwin_layershell_pre_shell_uid_allowed) — a sandboxed silo
+		 * client cannot create a layer surface, so it cannot reach this
+		 * branch. A *child* xdg_popup of a layer popup has a non-NULL
+		 * desktop parent and IS clamped (the parented branch above). If
+		 * layer-shell is ever opened to silos, this branch must clamp
+		 * against the layer surface's output. */
 		popup->geometry =
 			weston_desktop_xdg_positioner_get_geometry(positioner,
 								   dsurface,

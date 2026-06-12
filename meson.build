@@ -923,6 +923,20 @@ executable('qdistro-test-window',
   install_dir: get_option('bindir'),
 )
 
+# Direct xdg_popup spoofing probe for the M1 libweston popup clamp: maps a
+# toplevel, creates an xdg_popup with an off-output positioner, and prints
+# the constrained geometry the compositor reports in xdg_popup.configure.
+executable('qdwin-popup-probe',
+  sources: [
+    'test-client/qdwin-popup-probe.c',
+    xdg_shell_client_header,
+    xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
 # Clipboard set_selection helper that bypasses wl-clipboard's
 # focus-wait. Used by spec/10 e2e bats; see the binary's leading
 # comment for why wl-copy doesn't work headlessly.
@@ -1189,7 +1203,13 @@ test('qdwin-logic-unit',
   executable('test-qdwin-logic',
     'tests/unit/test-qdwin-logic.c',
     'qdwin/qdwin-logic.c',
-    include_directories: include_directories('qdwin'),
+    include_directories: include_directories(
+      'qdwin',
+      # Pure popup-constraint kernel lives next to the vendored xdg-shell.c
+      # that includes it, so the unit test exercises the exact compositor
+      # code (single source of truth, header-only).
+      'libweston-vendored/src/libweston/desktop',
+    ),
     dependencies: [dep_libinput],
   ),
   suite: 'logic',

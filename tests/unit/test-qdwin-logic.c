@@ -11,6 +11,7 @@
 #include <libinput.h>
 
 #include "qdwin-logic.h"
+#include "qdwin-xdg-constrain.h"
 
 static int failures = 0;
 static int checks = 0;
@@ -418,6 +419,97 @@ static void test_s13_fail_open_pins(void)
 	      "S13 layer-shell: allowed_uid=-1 does not create an open bind");
 }
 
+/* ---- xdg_popup constraint kernel (M1 security fix) ----
+ *
+ * qdwin_xdg_constrain_geometry places + clamps an xdg_popup so it cannot
+ * leave the parent's output. Each case exercises one property; CHECK_GEOM
+ * asserts the full rect. */
+#define CHECK_GEOM(gx, gy, gw, gh, ex, ey, ew, eh, label)                  \
+	CHECK((gx) == (ex) && (gy) == (ey) && (gw) == (ew) && (gh) == (eh), \
+	      "%s: got (%d,%d %dx%d), want (%d,%d %dx%d)",                  \
+	      (label), (int)(gx), (int)(gy), (int)(gw), (int)(gh),         \
+	      (int)(ex), (int)(ey), (int)(ew), (int)(eh))
+
+static void test_popup_constrain(void)
+{
+	int32_t x, y, w, h;
+
+	/* A. Base placement, bounds large + NONE: equals the unconstrained
+	 *    anchor/gravity result (pins the kernel against get_geometry).
+	 *    anchor BOTTOM_LEFT + gravity BOTTOM_RIGHT = grow down-right from
+	 *    the anchor rect's bottom-left, the common menu case. */
+	qdwin_xdg_constrain_geometry(100, 50, 20, 10, 40, 30, 0, 0,
+				     QDWIN_PC_ANCHOR_BOTTOM_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     0, 0, 10000, 10000, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 100, 60, 40, 30, "base placement, no constraint");
+
+	/* B. Same popup well inside a real output: unchanged. */
+	qdwin_xdg_constrain_geometry(100, 50, 20, 10, 40, 30, 0, 0,
+				     QDWIN_PC_ANCHOR_BOTTOM_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     0, 0, 500, 500, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 100, 60, 40, 30, "inside output, unchanged");
+
+	/* C. Overflows the right edge, constraint_adjustment = NONE: the
+	 *    MANDATORY clamp slides it back so the right edge meets bounds.
+	 *    This is the core security property — NONE does not exempt. */
+	qdwin_xdg_constrain_geometry(100, 50, 20, 10, 40, 30, 0, 0,
+				     QDWIN_PC_ANCHOR_BOTTOM_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     0, 0, 120, 200, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 80, 60, 40, 30, "NONE overflow slid inside");
+
+	/* D. FLIP_X: a right-anchored menu overflowing the right edge flips
+	 *    to the left of the anchor and fits — legitimate edge submenu. */
+	qdwin_xdg_constrain_geometry(100, 50, 0, 0, 40, 30, 0, 0,
+				     QDWIN_PC_ANCHOR_TOP_RIGHT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_FLIP_X,
+				     0, 0, 120, 200, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 60, 50, 40, 30, "FLIP_X edge submenu flips left");
+
+	/* E. Attacker parks the popup far away via a huge offset, NONE: the
+	 *    clamp pulls it back inside the output. */
+	qdwin_xdg_constrain_geometry(0, 0, 10, 10, 50, 50, 100000, 0,
+				     QDWIN_PC_ANCHOR_TOP_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     0, 0, 800, 600, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 750, 0, 50, 50, "far offset clamped into output");
+
+	/* F. Extreme offset near INT32_MAX: int64 internals, no UB, still
+	 *    clamped into the output. */
+	qdwin_xdg_constrain_geometry(0, 0, 10, 10, 50, 50, INT32_MAX, 0,
+				     QDWIN_PC_ANCHOR_TOP_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     0, 0, 800, 600, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 750, 0, 50, 50, "INT32_MAX offset clamped, no overflow");
+
+	/* G. Popup larger than the output is shrunk to fit (literal "cannot
+	 *    escape"), even without RESIZE_*. */
+	qdwin_xdg_constrain_geometry(0, 0, 0, 0, 2000, 30, 0, 0,
+				     QDWIN_PC_ANCHOR_TOP_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     0, 0, 800, 600, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 0, 0, 800, 30, "oversize popup shrunk to bounds");
+
+	/* H. Non-zero bounds origin (output not at global 0,0): clamp uses
+	 *    the bounds frame, not absolute 0. Popup at x=900 over an output
+	 *    spanning [1000,1800) slides to its left edge. */
+	qdwin_xdg_constrain_geometry(900, 1100, 0, 0, 50, 50, 0, 0,
+				     QDWIN_PC_ANCHOR_TOP_LEFT,
+				     QDWIN_PC_GRAVITY_BOTTOM_RIGHT,
+				     QDWIN_PC_ADJUST_NONE,
+				     1000, 1000, 800, 600, &x, &y, &w, &h);
+	CHECK_GEOM(x, y, w, h, 1000, 1100, 50, 50, "clamp respects bounds origin");
+}
+
 int main(void)
 {
 	test_accel_profile();
@@ -427,6 +519,7 @@ int main(void)
 	test_fractional_scale();
 	test_global_visibility();
 	test_s13_fail_open_pins();
+	test_popup_constrain();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	if (failures) {
