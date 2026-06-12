@@ -78,7 +78,7 @@ def _function_body(source, signature_regex, name):
     return None, f"{name} not found (no definition)"
 
 
-def check_mutate_gate_is_trusted_shell(source):
+def check_mutate_gate_is_trusted_shell(source, logic_source):
     """qdwin_om_client_may_mutate must accept the bound shell (or its pid/uid,
     or pre-shell the allowed_uid) and otherwise deny — a real gate, not a stub
     that returns true unconditionally."""
@@ -99,13 +99,32 @@ def check_mutate_gate_is_trusted_shell(source):
     if "allowed_uid" not in code:
         return fail("qdwin_om_client_may_mutate has no allowed_uid fallback "
                     "for the pre-shell window")
+    if "qdwin_om_mutation_allowed" not in code:
+        return fail("qdwin_om_client_may_mutate does not delegate to the "
+                    "compiled pure policy helper")
+
+    helper_body, err = _function_body(
+        logic_source, r"bool\s+qdwin_om_mutation_allowed\s*\(",
+        "qdwin_om_mutation_allowed")
+    if err:
+        return fail(err)
+    helper = _strip_comments(helper_body)
+    if "client_is_bound_shell" not in helper:
+        return fail("qdwin_om_mutation_allowed does not accept the bound shell")
+    if "shell_bound" not in helper or "shell_pid" not in helper or \
+       "shell_uid" not in helper:
+        return fail("qdwin_om_mutation_allowed does not enforce the shell "
+                    "(pid,uid) second-connection rule")
+    if "allowed_uid" not in helper:
+        return fail("qdwin_om_mutation_allowed has no pre-shell allowed_uid "
+                    "fallback")
     # Must be capable of denying: a credential comparison drives a return (so it
     # is not a stub that authorizes every client). Accept either a literal
     # `return false` or a `return <expr with == uid>`.
-    denies = ("return false" in code or
-              re.search(r"return[^;]*uid\s*==", code) is not None)
+    denies = ("return false" in helper or
+              re.search(r"return[^;]*uid\s*==", helper) is not None)
     if not denies:
-        return fail("qdwin_om_client_may_mutate has no deny path — every client "
+        return fail("qdwin_om_mutation_allowed has no deny path — every client "
                     "would be authorized (not a gate)")
     return 0
 
@@ -188,18 +207,19 @@ def check_test_is_gated(source):
 
 
 def main():
-    if len(sys.argv) != 2:
-        return fail("usage: test_output_manager_gate.py <qdwin.c>")
+    if len(sys.argv) != 3:
+        return fail("usage: test_output_manager_gate.py <qdwin.c> <qdwin-logic.c>")
     source = Path(sys.argv[1]).read_text(encoding="utf-8")
+    logic_source = Path(sys.argv[2]).read_text(encoding="utf-8")
 
-    checks = (
-        check_mutate_gate_is_trusted_shell,
-        check_bind_snapshots_authorization,
-        check_config_inherits_authorization,
-        check_apply_is_gated,
-        check_test_is_gated,
-    )
-    for check in checks:
+    rc = check_mutate_gate_is_trusted_shell(source, logic_source)
+    if rc:
+        return rc
+    for check in (
+            check_bind_snapshots_authorization,
+            check_config_inherits_authorization,
+            check_apply_is_gated,
+            check_test_is_gated):
         rc = check(source)
         if rc:
             return rc

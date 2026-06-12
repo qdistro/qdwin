@@ -342,6 +342,61 @@ static void test_global_visibility(void)
 	      "unknown global kind denied to secctx (fail closed)");
 }
 
+/* ---- deliberate fail-open / broad-trust pins (02/S13) ----
+ *
+ * These tests pin explicit risk-register entries rather than asserting ideal
+ * policy. If any row changes, the implementation must be deliberately closed
+ * or the documented residual risk must be updated.
+ */
+static void test_s13_fail_open_pins(void)
+{
+	const uid_t admin = (uid_t)1000;
+	const uid_t other = (uid_t)1001;
+	const pid_t shell_pid = (pid_t)4242;
+	const pid_t other_pid = (pid_t)5252;
+
+	CHECK(qdwin_om_mutation_allowed(true, true, other_pid, other,
+					shell_pid, admin, admin),
+	      "S13 output-manager: bound shell may mutate");
+	CHECK(qdwin_om_mutation_allowed(false, true, shell_pid, admin,
+					shell_pid, admin, admin),
+	      "S13 output-manager: same shell pid+uid second connection may mutate");
+	CHECK(!qdwin_om_mutation_allowed(false, true, shell_pid, other,
+					 shell_pid, admin, admin),
+	      "S13 output-manager: shell-bound pid with wrong uid denied");
+	CHECK(qdwin_om_mutation_allowed(false, false, other_pid, admin,
+					0, (uid_t)-1, admin),
+	      "S13 output-manager: pre-shell allowed_uid may mutate");
+	CHECK(!qdwin_om_mutation_allowed(false, false, other_pid, other,
+					 0, (uid_t)-1, admin),
+	      "S13 output-manager: pre-shell non-allowed uid denied");
+	CHECK(qdwin_om_mutation_allowed(false, false, other_pid, other,
+					0, (uid_t)-1, (uid_t)-1),
+	      "S13 output-manager: allowed_uid=-1 preserves open test posture");
+
+	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, "runuser"),
+	      "S13 secctx: known root launcher basename accepted");
+	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, ""),
+	      "S13 secctx: unreadable root launcher basename accepted with stable root parent");
+	CHECK(!qdwin_secctx_root_launcher_attested(other, 111, 111, ""),
+	      "S13 secctx: unreadable non-root parent denied");
+	CHECK(!qdwin_secctx_root_launcher_attested(0, 0, 111, ""),
+	      "S13 secctx: unreadable parent with missing starttime denied");
+	CHECK(!qdwin_secctx_root_launcher_attested(0, 111, 222, ""),
+	      "S13 secctx: unreadable parent with changed starttime denied");
+	CHECK(!qdwin_secctx_root_launcher_attested(0, 111, 111, "sh"),
+	      "S13 secctx: readable non-launcher basename denied");
+	CHECK(!qdwin_secctx_root_launcher_attested(0, 111, 111, NULL),
+	      "S13 secctx: NULL basename denied");
+
+	CHECK(qdwin_layershell_pre_shell_uid_allowed(admin, admin),
+	      "S13 layer-shell: pre-shell allowed_uid may bind");
+	CHECK(!qdwin_layershell_pre_shell_uid_allowed(other, admin),
+	      "S13 layer-shell: pre-shell non-allowed uid denied");
+	CHECK(!qdwin_layershell_pre_shell_uid_allowed(admin, (uid_t)-1),
+	      "S13 layer-shell: allowed_uid=-1 does not create an open bind");
+}
+
 int main(void)
 {
 	test_accel_profile();
@@ -350,6 +405,7 @@ int main(void)
 	test_compute_box();
 	test_fractional_scale();
 	test_global_visibility();
+	test_s13_fail_open_pins();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	if (failures) {

@@ -5,6 +5,8 @@
  */
 #include "qdwin-logic.h"
 
+#include <string.h>
+
 enum libinput_config_accel_profile
 qdwin_accel_profile_to_libinput(uint32_t p)
 {
@@ -163,4 +165,55 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 	/* Unknown kind: fail closed (deny). A new privileged global added
 	 * without a policy row must not default to visible. */
 	return false;
+}
+
+bool
+qdwin_om_mutation_allowed(bool client_is_bound_shell,
+			  bool shell_bound,
+			  pid_t client_pid, uid_t client_uid,
+			  pid_t shell_pid, uid_t shell_uid,
+			  uid_t allowed_uid)
+{
+	if (client_is_bound_shell)
+		return true;
+	if (shell_bound) {
+		return client_pid > 0 && client_pid == shell_pid &&
+		       client_uid == shell_uid;
+	}
+	if (allowed_uid == (uid_t)-1)
+		return true;
+	return client_uid == allowed_uid;
+}
+
+bool
+qdwin_secctx_root_launcher_attested(uid_t parent_uid,
+				    uint64_t parent_start_before,
+				    uint64_t parent_start_after,
+				    const char *parent_exe_basename)
+{
+	bool stable_parent = parent_uid == 0 &&
+			     parent_start_before != 0 &&
+			     parent_start_after != 0 &&
+			     parent_start_before == parent_start_after;
+
+	if (!stable_parent)
+		return false;
+	if (!parent_exe_basename)
+		return false;
+	if (strcmp(parent_exe_basename, "runuser") == 0 ||
+	    strcmp(parent_exe_basename, "su") == 0 ||
+	    strcmp(parent_exe_basename, "sudo") == 0 ||
+	    strcmp(parent_exe_basename, "pkexec") == 0)
+		return true;
+	/* Deliberate fail-open: a more-privileged root parent can make
+	 * /proc/<pid>/exe unreadable to the unprivileged compositor. The
+	 * direct-root-parent + stable-starttime checks above are the pinned
+	 * precondition for accepting the structurally unreadable basename. */
+	return parent_exe_basename[0] == '\0';
+}
+
+bool
+qdwin_layershell_pre_shell_uid_allowed(uid_t client_uid, uid_t allowed_uid)
+{
+	return client_uid == allowed_uid;
 }

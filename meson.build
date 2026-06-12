@@ -1055,6 +1055,7 @@ test('input-method-gating',
   args: [
     files('qdwin/test_input_method.py'),
     files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-logic.c'),
   ],
 )
 
@@ -1071,6 +1072,7 @@ test('virtual-keyboard-gating',
   args: [
     files('qdwin/test_virtual_keyboard.py'),
     files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-logic.c'),
   ],
 )
 
@@ -1123,6 +1125,7 @@ test('output-manager-gate',
   args: [
     files('qdwin/test_output_manager_gate.py'),
     files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-logic.c'),
   ],
 )
 

@@ -154,21 +154,40 @@ def check_bind_rejects_sandbox_and_uid(source):
     return 0
 
 
-def check_global_filter_hides_ime_from_sandbox(source):
+def check_global_filter_hides_ime_from_sandbox(source, logic_source):
     """The wl_global filter must hide the input-method manager global from
     sandboxed (secctx) clients."""
+    classify, err = _function_body(
+        source, r"static enum qdwin_global_kind\s+qdwin_classify_global\s*\(",
+        "qdwin_classify_global")
+    if err:
+        return fail(err)
+    if "input_method_manager_global" not in classify or \
+       "QDWIN_GLOBAL_INPUT_METHOD" not in classify:
+        return fail("global classifier does not map "
+                    "input_method_manager_global to QDWIN_GLOBAL_INPUT_METHOD")
+
     body, err = _function_body(
         source, r"static bool\s+qdwin_secctx_global_filter\s*\(",
         "qdwin_secctx_global_filter")
     if err:
         return fail(err)
-    if "input_method_manager_global" not in body:
-        return fail("global filter does not special-case "
-                    "input_method_manager_global (sandboxed clients could see "
-                    "the privileged IME global)")
     if "qdwin_secctx_client_find" not in body:
-        return fail("global filter does not gate the IME global on "
+        return fail("global filter does not classify silo clients with "
                     "qdwin_secctx_client_find")
+    if "qdwin_global_visible" not in body:
+        return fail("global filter does not consult the qdwin_global_visible "
+                    "policy matrix")
+
+    policy, err = _function_body(
+        logic_source, r"bool\s+qdwin_global_visible\s*\(",
+        "qdwin_global_visible")
+    if err:
+        return fail(err)
+    if "QDWIN_GLOBAL_INPUT_METHOD" not in policy:
+        return fail("policy matrix has no input-method global row")
+    if "cred != QDWIN_CRED_SECCTX" not in _strip_comments(policy):
+        return fail("policy matrix does not hide IME/VK from secctx clients")
     return 0
 
 
@@ -363,14 +382,14 @@ def check_teardown_drains_input_methods_first(source):
 
 
 def main():
-    if len(sys.argv) != 2:
-        return fail("usage: test_input_method.py <qdwin.c>")
+    if len(sys.argv) != 3:
+        return fail("usage: test_input_method.py <qdwin.c> <qdwin-logic.c>")
     source = Path(sys.argv[1]).read_text(encoding="utf-8")
+    logic_source = Path(sys.argv[2]).read_text(encoding="utf-8")
 
-    checks = (
+    for check in (
         check_manager_global_created_gated_v1,
         check_bind_rejects_sandbox_and_uid,
-        check_global_filter_hides_ime_from_sandbox,
         check_one_ime_per_seat_unavailable,
         check_grab_suppresses_app_delivery,
         check_grab_release_only_ends_own_grab,
@@ -378,11 +397,13 @@ def main():
         check_manager_resource_is_neutralizable,
         check_seat_destroy_sends_unavailable,
         check_teardown_drains_input_methods_first,
-    )
-    for check in checks:
+    ):
         rc = check(source)
         if rc:
             return rc
+    rc = check_global_filter_hides_ime_from_sandbox(source, logic_source)
+    if rc:
+        return rc
 
     print("PASS: input-method-v2 (manager gated at v1, bind rejects "
           "sandboxed/uid-mismatched clients fail-closed, global filter hides "

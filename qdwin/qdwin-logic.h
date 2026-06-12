@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>
 #include <libinput.h>
 
 #ifdef __cplusplus
@@ -146,6 +147,34 @@ enum qdwin_global_kind {
  * this matrix is the per-class VISIBILITY gate that runs first. */
 bool qdwin_global_visible(enum qdwin_cred_class cred,
 			  enum qdwin_global_kind kind);
+
+/* ------------------------------------------------------------------
+ * Deliberate fail-open / broad-trust pins (02/S13).
+ *
+ * These helpers model three explicit production compromises in qdwin.c. They
+ * keep the current preconditions executable so future hardening is conscious
+ * and tested:
+ *
+ * 1. Output-management mutation falls back to allowed_uid before qdshell binds,
+ *    and preserves the open test posture when allowed_uid == (uid_t)-1.
+ * 2. The secctx helper's direct root launcher parent is accepted when the
+ *    launcher's /proc/<pid>/exe basename is structurally unreadable, provided
+ *    the root-parent and stable-starttime checks already passed.
+ * 3. Layer-shell bind falls back to allowed_uid before qdshell binds.
+ * ------------------------------------------------------------------ */
+bool qdwin_om_mutation_allowed(bool client_is_bound_shell,
+			       bool shell_bound,
+			       pid_t client_pid, uid_t client_uid,
+			       pid_t shell_pid, uid_t shell_uid,
+			       uid_t allowed_uid);
+
+bool qdwin_secctx_root_launcher_attested(uid_t parent_uid,
+					 uint64_t parent_start_before,
+					 uint64_t parent_start_after,
+					 const char *parent_exe_basename);
+
+bool qdwin_layershell_pre_shell_uid_allowed(uid_t client_uid,
+					    uid_t allowed_uid);
 
 #ifdef __cplusplus
 }

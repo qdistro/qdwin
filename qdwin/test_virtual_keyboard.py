@@ -128,22 +128,41 @@ def check_bind_uses_shared_gate_fail_closed(source):
     return 0
 
 
-def check_global_filter_hides_vk_from_sandbox(source):
+def check_global_filter_hides_vk_from_sandbox(source, logic_source):
     """The wl_global filter must hide the virtual-keyboard manager global from
     sandboxed (secctx) clients."""
+    classify, err = _function_body(
+        source, r"static enum qdwin_global_kind\s+qdwin_classify_global\s*\(",
+        "qdwin_classify_global")
+    if err:
+        return fail(err)
+    if "virtual_keyboard_manager_global" not in classify or \
+       "QDWIN_GLOBAL_VIRTUAL_KEYBOARD" not in classify:
+        return fail("global classifier does not map "
+                    "virtual_keyboard_manager_global to "
+                    "QDWIN_GLOBAL_VIRTUAL_KEYBOARD")
+
     body, err = _function_body(
         source, r"static bool\s+qdwin_secctx_global_filter\s*\(",
         "qdwin_secctx_global_filter")
     if err:
         return fail(err)
-    if "virtual_keyboard_manager_global" not in body:
-        return fail("global filter does not special-case "
-                    "virtual_keyboard_manager_global (sandboxed clients could "
-                    "see the privileged key-injection global)")
-    # The vk branch must gate on qdwin_secctx_client_find like the IME branch.
     if "qdwin_secctx_client_find" not in body:
-        return fail("global filter does not gate the virtual-keyboard global on "
+        return fail("global filter does not classify silo clients with "
                     "qdwin_secctx_client_find")
+    if "qdwin_global_visible" not in body:
+        return fail("global filter does not consult the qdwin_global_visible "
+                    "policy matrix")
+
+    policy, err = _function_body(
+        logic_source, r"bool\s+qdwin_global_visible\s*\(",
+        "qdwin_global_visible")
+    if err:
+        return fail(err)
+    if "QDWIN_GLOBAL_VIRTUAL_KEYBOARD" not in policy:
+        return fail("policy matrix has no virtual-keyboard global row")
+    if "cred != QDWIN_CRED_SECCTX" not in _strip_comments(policy):
+        return fail("policy matrix does not hide IME/VK from secctx clients")
     return 0
 
 
@@ -327,24 +346,26 @@ def check_seat_destroy_and_teardown_detach(source):
 
 
 def main():
-    if len(sys.argv) != 2:
-        return fail("usage: test_virtual_keyboard.py <qdwin.c>")
+    if len(sys.argv) != 3:
+        return fail("usage: test_virtual_keyboard.py <qdwin.c> <qdwin-logic.c>")
     source = Path(sys.argv[1]).read_text(encoding="utf-8")
+    logic_source = Path(sys.argv[2]).read_text(encoding="utf-8")
 
-    checks = (
+    for check in (
         check_manager_global_created_gated_v1,
         check_bind_uses_shared_gate_fail_closed,
-        check_global_filter_hides_vk_from_sandbox,
         check_key_and_modifiers_no_keymap_guarded,
         check_injection_goes_through_the_seat,
         check_same_client_passthrough,
         check_manager_resource_is_neutralizable,
         check_seat_destroy_and_teardown_detach,
-    )
-    for check in checks:
+    ):
         rc = check(source)
         if rc:
             return rc
+    rc = check_global_filter_hides_vk_from_sandbox(source, logic_source)
+    if rc:
+        return rc
 
     print("PASS: virtual-keyboard-v1 (manager gated at v1 via the shared IME "
           "bind gate fail-closed, global filter hides it from silos, "

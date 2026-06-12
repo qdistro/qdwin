@@ -1918,8 +1918,8 @@ qdwin_client_is_bound_shell(struct qdwin *qdwin, struct wl_client *client)
  * the same (pid,uid) as the shell (qdshell opens a separate connection for some
  * surfaces), or — before any shell has bound — the configured allowed_uid.
  *
- * Fail-closed: when allowed_uid is unset ((uid_t)-1, the open test posture) and
- * no shell is bound yet, this returns true so the historical broad posture is
+ * Deliberate test fail-open: when allowed_uid is unset ((uid_t)-1) and no
+ * shell is bound yet, this returns true so the historical broad posture is
  * unchanged; once a shell binds, only that shell (by client or pid/uid) passes.
  */
 static bool
@@ -1927,23 +1927,12 @@ qdwin_om_client_may_mutate(struct qdwin *qdwin, struct wl_client *client)
 {
 	pid_t pid; uid_t uid; gid_t gid;
 
-	if (qdwin_client_is_bound_shell(qdwin, client))
-		return true;
-
 	wl_client_get_credentials(client, &pid, &uid, &gid);
-
-	if (qdwin->shell_bound && qdwin->shell_resource) {
-		/* A shell is bound: only it (or a same-process second
-		 * connection) may mutate. */
-		return pid > 0 && pid == qdwin->shell_pid &&
-		       uid == qdwin->shell_uid;
-	}
-
-	/* No shell bound yet: fall back to the allowed_uid gate. When
-	 * allowed_uid is unset the open posture is preserved. */
-	if (qdwin->allowed_uid == (uid_t)-1)
-		return true;
-	return uid == qdwin->allowed_uid;
+	return qdwin_om_mutation_allowed(
+		qdwin_client_is_bound_shell(qdwin, client),
+		qdwin->shell_bound && qdwin->shell_resource,
+		pid, uid, qdwin->shell_pid, qdwin->shell_uid,
+		qdwin->allowed_uid);
 }
 
 static void
@@ -13019,7 +13008,8 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 		}
 	} else {
 		/* No shell bound yet; fall back to allowed_uid check. */
-		if (uid != qdwin->allowed_uid) {
+		if (!qdwin_layershell_pre_shell_uid_allowed(uid,
+							    qdwin->allowed_uid)) {
 			weston_log("qdwin: layer-shell bind REJECTED — "
 				   "uid=%u not permitted (allowed_uid=%u, "
 				   "no shell bound)\n",
@@ -19597,10 +19587,9 @@ qdwin_secctx_helper_has_root_launcher_parent(pid_t pid)
 		return false;
 	base = strrchr(parent_exe, '/');
 	base = base ? base + 1 : parent_exe;
-	ok = strcmp(base, "runuser") == 0 ||
-	     strcmp(base, "su") == 0 ||
-	     strcmp(base, "sudo") == 0 ||
-	     strcmp(base, "pkexec") == 0;
+	st_after = qdwin_proc_starttime(parent_pid);
+	ok = qdwin_secctx_root_launcher_attested(parent_uid, st_before, st_after,
+						 base);
 	/* The launcher parent here is root (parent_uid==0, verified above),
 	 * while this compositor runs unprivileged (admin uid, no
 	 * CAP_SYS_PTRACE). The kernel therefore denies readlink(/proc/
@@ -19612,16 +19601,14 @@ qdwin_secctx_helper_has_root_launcher_parent(pid_t pid)
 	 * — is already established from /proc/<pid>/status (readable). Accept
 	 * on the verified root parent + stable starttime when the launcher
 	 * basename is structurally unreadable, rather than fail closed. */
-	if (!ok && (!*base)) {
-		ok = true;
+	if (ok && (!*base)) {
 		weston_log("qdwin/secctx: helper pid=%d launcher parent "
 			   "pid=%d exe unreadable; falling back to verified "
 			   "root-parent + stable-starttime attestation\n",
 			   (int)pid, (int)parent_pid);
 	}
 	free(parent_exe);
-	st_after = qdwin_proc_starttime(parent_pid);
-	return ok && st_before != 0 && st_after != 0 && st_before == st_after;
+	return ok;
 }
 
 static bool
