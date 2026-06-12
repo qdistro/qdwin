@@ -329,6 +329,19 @@ static void test_global_visibility(void)
 				    QDWIN_GLOBAL_SECCTX_MANAGER),
 	      "secctx manager hidden from secctx/silo client");
 
+	/* ext_idle_notifier_v1 exposes whole-session idle/resume, which is a
+	 * presence/activity side-channel across silo boundaries. It remains
+	 * visible to trusted session components but hidden from secctx clients. */
+	CHECK(qdwin_global_visible(QDWIN_CRED_SHELL,
+				   QDWIN_GLOBAL_IDLE_NOTIFIER),
+	      "ext_idle_notifier_v1 visible to shell");
+	CHECK(qdwin_global_visible(QDWIN_CRED_ORDINARY,
+				   QDWIN_GLOBAL_IDLE_NOTIFIER),
+	      "ext_idle_notifier_v1 visible to ordinary session clients");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_SECCTX,
+				    QDWIN_GLOBAL_IDLE_NOTIFIER),
+	      "ext_idle_notifier_v1 hidden from secctx/silo clients");
+
 	/* Matrix-level fail-closed default: a kind enum value with no policy row
 	 * must be DENIED to every credential class. NOTE this is the MATRIX
 	 * default only — it does NOT mean a brand-new privileged libweston global

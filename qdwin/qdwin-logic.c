@@ -161,6 +161,11 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 		 * authorized secctx-exec helper, both QDWIN_CRED_SHELL) may
 		 * even see it. Ordinary and silo clients get nothing. */
 		return cred == QDWIN_CRED_SHELL;
+	case QDWIN_GLOBAL_IDLE_NOTIFIER:
+		/* Session idle/resume is a cross-silo presence/activity signal.
+		 * Keep it available to trusted session components, but hide it
+		 * from sandboxed security-context clients. */
+		return cred != QDWIN_CRED_SECCTX;
 	}
 	/* Unknown kind: fail closed (deny). A new privileged global added
 	 * without a policy row must not default to visible. */

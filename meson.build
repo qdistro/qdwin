@@ -1091,12 +1091,12 @@ test('virtual-keyboard-gating',
 )
 
 # advertised-global visibility filter (02/S1, the §4b finding): pins the
-# capture + secctx-manager wiring whose ONLY headless protection is the filter
-# itself — the filter is installed via wl_display_set_global_filter,
-# qdwin_classify_global maps weston_capture_v1 + the secctx manager to their
-# privileged kinds, and qdwin_global_visible gates both shell-only. The IME/VK
-# rows are covered by their own gating tests; the live silo-registry negative is
-# VM/B1-gated.
+# capture, secctx-manager, and ext-idle-notifier wiring whose ONLY headless
+# protection is the filter itself — the filter is installed via
+# wl_display_set_global_filter, qdwin_classify_global maps the globals to their
+# privileged kinds, qdwin_global_visible gates capture/secctx shell-only, and
+# hides ext-idle from secctx/silo clients. The IME/VK rows are covered by their
+# own gating tests; the live silo-registry negative is VM/B1-gated.
 test('global-filter-gate',
   python3,
   suite: 'source_invariant',

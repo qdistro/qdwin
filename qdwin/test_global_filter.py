@@ -5,12 +5,15 @@ manager reach).
 
 The IME / virtual-keyboard manager globals carry their own bind-time uid/exe
 pins, so the IME and VK source-invariant tests already cover their classify
-rows. The two globals whose ONLY headless protection is the filter wiring are:
+rows. The globals whose ONLY headless protection is the filter wiring are:
 
   * weston_capture_v1 — libweston binds it with NO bind-time uid/exe pin, so
     the filter is the sole gate. It must be shell-only (denied to ordinary AND
     silo clients).
   * wp_security_context_manager_v1 — minting security contexts; shell-only.
+  * ext_idle_notifier_v1 — whole-session idle/resume leaks presence/activity
+    across silos. It stays visible to trusted session components but is hidden
+    from secctx/silo clients.
 
 The live half (a silo client's wl_registry actually lacks the globals) is
 VM/B1-gated. The load-bearing pieces a headless source-invariant test CAN pin,
@@ -21,11 +24,13 @@ regression:
    qdwin_secctx_global_filter. Without this call the whole matrix is dead code.
 2. qdwin_classify_global maps the capture global
    (compositor->output_capture.weston_capture_v1) to QDWIN_GLOBAL_WESTON_CAPTURE
-   and the secctx manager global to QDWIN_GLOBAL_SECCTX_MANAGER. Misclassifying
-   either as ORDINARY makes it silo-visible again.
+   the secctx manager global to QDWIN_GLOBAL_SECCTX_MANAGER, and qdwin's
+   ext-idle global to QDWIN_GLOBAL_IDLE_NOTIFIER. Misclassifying any as
+   ORDINARY makes it silo-visible again.
 3. The filter delegates the per-class decision to qdwin_global_visible.
 4. The pure policy gates BOTH capture and the secctx manager shell-only
    (cred == QDWIN_CRED_SHELL), i.e. denied to ordinary and silo clients.
+   The idle notifier is denied to secctx/silo clients.
 """
 
 from pathlib import Path
@@ -100,9 +105,9 @@ def check_filter_is_installed(source):
     return 0
 
 
-def check_capture_and_secctx_classified(source):
-    """qdwin_classify_global must map the capture + secctx-manager globals to
-    their privileged kinds — misclassifying either as ORDINARY re-opens it.
+def check_privileged_globals_classified(source):
+    """qdwin_classify_global must map the gated globals to their privileged
+    kinds — misclassifying any as ORDINARY re-opens it.
     Co-occurrence is not enough: require the branch that compares against the
     privileged pointer to RETURN the matching kind (so the pointer cannot be
     matched but routed to QDWIN_GLOBAL_ORDINARY or the wrong enum)."""
@@ -127,6 +132,13 @@ def check_capture_and_secctx_classified(source):
         return fail("qdwin_classify_global does not return "
                     "QDWIN_GLOBAL_SECCTX_MANAGER for the "
                     "security_context_manager_global pointer")
+    if not re.search(
+            r"global\s*==\s*[^;]*idle_notifier_global\s*\)\s*"
+            r"return\s+QDWIN_GLOBAL_IDLE_NOTIFIER\s*;", code):
+        return fail("qdwin_classify_global does not return "
+                    "QDWIN_GLOBAL_IDLE_NOTIFIER for the "
+                    "idle_notifier_global pointer (ext-idle could classify "
+                    "ORDINARY = visible to silos)")
     return 0
 
 
@@ -178,6 +190,32 @@ def check_capture_and_secctx_are_shell_only(logic_source):
     return 0
 
 
+def check_idle_notifier_hidden_from_secctx(logic_source):
+    """ext_idle_notifier_v1 must be denied to secctx/silo clients while
+    remaining visible to session components."""
+    policy, err = _function_body(
+        logic_source, r"bool\s+qdwin_global_visible\s*\(",
+        "qdwin_global_visible")
+    if err:
+        return fail(err)
+    code = _norm(policy)
+    m = re.search(
+        r"case\s+QDWIN_GLOBAL_IDLE_NOTIFIER\s*:\s*(?:/\*.*?\*/\s*)?"
+        r"(return[^;]*;)",
+        code)
+    if not m:
+        return fail("qdwin_global_visible has no QDWIN_GLOBAL_IDLE_NOTIFIER "
+                    "row with a direct return")
+    ret = re.sub(r"\s+", " ", m.group(1)).strip()
+    if ret != "return cred != QDWIN_CRED_SECCTX ;" and \
+       ret != "return cred != QDWIN_CRED_SECCTX;":
+        return fail("ext_idle_notifier_v1 is not gated as hidden from "
+                    "secctx/silo clients (expected "
+                    "`return cred != QDWIN_CRED_SECCTX;`, got "
+                    f"`{ret}`)")
+    return 0
+
+
 def main():
     if len(sys.argv) != 3:
         return fail("usage: test_global_filter.py <qdwin.c> <qdwin-logic.c>")
@@ -185,7 +223,7 @@ def main():
     logic_source = Path(sys.argv[2]).read_text(encoding="utf-8")
 
     for check in (check_filter_is_installed,
-                  check_capture_and_secctx_classified,
+                  check_privileged_globals_classified,
                   check_filter_consults_policy):
         rc = check(source)
         if rc:
@@ -193,10 +231,14 @@ def main():
     rc = check_capture_and_secctx_are_shell_only(logic_source)
     if rc:
         return rc
+    rc = check_idle_notifier_hidden_from_secctx(logic_source)
+    if rc:
+        return rc
 
     print("PASS: advertised-global filter (installed via "
           "wl_display_set_global_filter; weston_capture_v1 + secctx manager "
-          "classified and gated shell-only via qdwin_global_visible)")
+          "classified and gated shell-only; ext_idle_notifier_v1 classified "
+          "and hidden from secctx/silo clients via qdwin_global_visible)")
     return 0
 
 

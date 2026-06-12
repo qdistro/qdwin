@@ -19681,16 +19681,20 @@ qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
 	if (qdwin->security_context_manager_global &&
 	    global == qdwin->security_context_manager_global)
 		return QDWIN_GLOBAL_SECCTX_MANAGER;
+	if (qdwin->idle_notifier_global &&
+	    global == qdwin->idle_notifier_global)
+		return QDWIN_GLOBAL_IDLE_NOTIFIER;
 	return QDWIN_GLOBAL_ORDINARY;
 }
 
 /* Hide privileged globals (keystroke capture/injection, screen-pixel theft,
- * secctx minting) from the credential classes the policy matrix denies, and
- * block sandboxed clients from the secctx manager (per the protocol's nesting
- * prohibition). Installed as a wl_global_filter; returns true to allow this
- * client to see/bind the global. The per-class visibility decision lives in
- * the pure, unit-tested qdwin_global_visible() (qdwin-logic.c, 02/S1); the
- * bind handlers apply the further runtime identity pins on top. */
+ * secctx minting, and idle presence/activity) from the credential classes the
+ * policy matrix denies, and block sandboxed clients from the secctx manager
+ * (per the protocol's nesting prohibition). Installed as a wl_global_filter;
+ * returns true to allow this client to see/bind the global. The per-class
+ * visibility decision lives in the pure, unit-tested qdwin_global_visible()
+ * (qdwin-logic.c, 02/S1); the bind handlers apply the further runtime
+ * identity pins on top. */
 static bool
 qdwin_secctx_global_filter(const struct wl_client *client,
 			   const struct wl_global *global, void *data)
@@ -20197,8 +20201,11 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 		goto fail;
 	}
 
-	/* §6.7: ext-idle-notify-v1 + idle-inhibit-unstable-v1. Both
-	 * public. idle_signal/wake_signal drive notification fan-out. */
+	/* §6.7: ext-idle-notify-v1 + idle-inhibit-unstable-v1.
+	 * ext-idle-notify is hidden from secctx/silo clients by the global
+	 * filter because whole-session idle/resume is a cross-silo
+	 * presence/activity signal. idle-inhibit remains public.
+	 * idle_signal/wake_signal drive notification fan-out. */
 	qdwin->idle_notifier_global = wl_global_create(
 		ec->wl_display, &ext_idle_notifier_v1_interface,
 		2, qdwin, bind_qdwin_idle_notifier);
