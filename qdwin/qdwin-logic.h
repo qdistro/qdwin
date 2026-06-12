@@ -103,6 +103,50 @@ uint32_t qdwin_clamp_fractional_scale_120(uint32_t raw_120);
  * original `n >= 30 && n <= 960` accept-or-fall-through gate. */
 bool qdwin_fractional_scale_env_valid(long n);
 
+/* ------------------------------------------------------------------
+ * Advertised-global visibility policy (02/S1, the §4b finding).
+ *
+ * The compositor advertises a few PRIVILEGED globals that must not be
+ * reachable by sandboxed silo clients (each grants a cross-silo attack:
+ * keystroke capture, keystroke injection, screen-pixel theft, or minting
+ * security contexts). The wl_global_filter installed in qdwin.c classifies
+ * the binding CLIENT into a credential class and the GLOBAL into a kind,
+ * then consults this pure matrix. Keeping the matrix here (a) makes the
+ * per-credential-class policy a single source of truth and (b) lets a
+ * compiled test enumerate every (class × kind) cell so a regression — a
+ * silo client gaining a privileged global — is a mechanical test failure,
+ * not a silent compositor change. See tests/unit/test-qdwin-logic.c.
+ *
+ * Credential classes (computed in qdwin.c from the wl_client):
+ * ------------------------------------------------------------------ */
+enum qdwin_cred_class {
+	/* The bound privileged shell, or the authorized secctx-exec helper —
+	 * the only client trusted to mint security contexts. */
+	QDWIN_CRED_SHELL = 0,
+	/* A plain-uid client that is neither the shell nor a secctx (silo)
+	 * client (e.g. a tier-0/1 session-level tool). */
+	QDWIN_CRED_ORDINARY = 1,
+	/* A sandboxed client running under a wp_security_context (a silo). */
+	QDWIN_CRED_SECCTX = 2,
+};
+
+/* Global kinds the filter distinguishes. ORDINARY = any inherited libweston
+ * global that is NOT one of the gated privileged ones (always visible). */
+enum qdwin_global_kind {
+	QDWIN_GLOBAL_ORDINARY = 0,
+	QDWIN_GLOBAL_INPUT_METHOD = 1,      /* zwp_input_method_manager_v2 */
+	QDWIN_GLOBAL_VIRTUAL_KEYBOARD = 2,  /* zwp_virtual_keyboard_manager_v1 */
+	QDWIN_GLOBAL_WESTON_CAPTURE = 3,    /* weston_capture_v1 (screen capture) */
+	QDWIN_GLOBAL_SECCTX_MANAGER = 4,    /* wp_security_context_manager_v1 */
+};
+
+/* Pure policy: may a client of credential class `cred` SEE/BIND a global of
+ * kind `kind`? The filter still applies its runtime identity checks on top
+ * (e.g. the secctx manager's bind handler, the IME's allowed_ime_uid pin);
+ * this matrix is the per-class VISIBILITY gate that runs first. */
+bool qdwin_global_visible(enum qdwin_cred_class cred,
+			  enum qdwin_global_kind kind);
+
 #ifdef __cplusplus
 }
 #endif

@@ -19674,39 +19674,65 @@ qdwin_secctx_client_is_authorized(struct qdwin *qdwin,
 	return ok && st_before != 0 && st_after != 0 && st_before == st_after;
 }
 
-/* Block sandboxed clients from binding the manager (per protocol's
- * nesting prohibition), and hide the global from unauthorized clients.
- * Installed as a wl_global_filter; returns true to allow this client to
- * see/bind the global. */
+/* Map an advertised wl_global to its policy kind (02/S1). Pointer identity
+ * against the privileged globals we own a handle to; the screen-capture global
+ * is created by libweston core and exposed via
+ * compositor->output_capture.weston_capture_v1. Anything else is ORDINARY. */
+static enum qdwin_global_kind
+qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
+{
+	if (qdwin->input_method_manager_global &&
+	    global == qdwin->input_method_manager_global)
+		return QDWIN_GLOBAL_INPUT_METHOD;
+	if (qdwin->virtual_keyboard_manager_global &&
+	    global == qdwin->virtual_keyboard_manager_global)
+		return QDWIN_GLOBAL_VIRTUAL_KEYBOARD;
+	if (qdwin->compositor &&
+	    qdwin->compositor->output_capture.weston_capture_v1 &&
+	    global == qdwin->compositor->output_capture.weston_capture_v1)
+		return QDWIN_GLOBAL_WESTON_CAPTURE;
+	if (qdwin->security_context_manager_global &&
+	    global == qdwin->security_context_manager_global)
+		return QDWIN_GLOBAL_SECCTX_MANAGER;
+	return QDWIN_GLOBAL_ORDINARY;
+}
+
+/* Hide privileged globals (keystroke capture/injection, screen-pixel theft,
+ * secctx minting) from the credential classes the policy matrix denies, and
+ * block sandboxed clients from the secctx manager (per the protocol's nesting
+ * prohibition). Installed as a wl_global_filter; returns true to allow this
+ * client to see/bind the global. The per-class visibility decision lives in
+ * the pure, unit-tested qdwin_global_visible() (qdwin-logic.c, 02/S1); the
+ * bind handlers apply the further runtime identity pins on top. */
 static bool
 qdwin_secctx_global_filter(const struct wl_client *client,
 			   const struct wl_global *global, void *data)
 {
 	struct qdwin *qdwin = data;
 	struct wl_client *cw = (struct wl_client *)client;
-	/* P1: hide the privileged input-method-v2 manager from sandboxed/silo
-	 * clients. It grants keystroke capture + text injection, so a secctx
-	 * (silo) client must not even see it — that would let one silo keylog or
-	 * inject into another. Unsandboxed clients see it; the bind handler then
-	 * enforces uid/exe identity and single-IME-per-seat. */
-	if (qdwin->input_method_manager_global &&
-	    global == qdwin->input_method_manager_global)
-		return qdwin_secctx_client_find(qdwin, cw) == NULL;
-	/* P1 companion: the virtual-keyboard manager is equally privileged
-	 * (arbitrary keystroke injection) — hide it from sandboxed/silo clients
-	 * for the same reason, so one silo cannot inject into another. */
-	if (qdwin->virtual_keyboard_manager_global &&
-	    global == qdwin->virtual_keyboard_manager_global)
-		return qdwin_secctx_client_find(qdwin, cw) == NULL;
-	if (global != qdwin->security_context_manager_global)
-		return true;  /* only filter the secctx manager */
-	if (qdwin_secctx_client_find(qdwin, cw) != NULL)
-		return false;
-	{
+	enum qdwin_global_kind kind = qdwin_classify_global(qdwin, global);
+	if (kind == QDWIN_GLOBAL_ORDINARY)
+		return true;  /* fast path: not a gated global */
+
+	/* Credential class. SECCTX (a silo client) is the cheap common case.
+	 * The SHELL/ORDINARY split only matters for the shell-only globals
+	 * (secctx manager + weston_capture) and needs the runtime identity check
+	 * (bound shell or authorized secctx-exec helper) — resolve it ONLY for
+	 * those, so we don't read pid/exe for every IME/VK filter call (whose row
+	 * folds SHELL and ORDINARY together anyway). */
+	enum qdwin_cred_class cred;
+	if (qdwin_secctx_client_find(qdwin, cw) != NULL) {
+		cred = QDWIN_CRED_SECCTX;
+	} else if (kind == QDWIN_GLOBAL_SECCTX_MANAGER ||
+		   kind == QDWIN_GLOBAL_WESTON_CAPTURE) {
 		pid_t pid; uid_t uid; gid_t gid;
 		wl_client_get_credentials(cw, &pid, &uid, &gid);
-		return qdwin_secctx_client_is_authorized(qdwin, cw, pid, uid);
+		cred = qdwin_secctx_client_is_authorized(qdwin, cw, pid, uid)
+			? QDWIN_CRED_SHELL : QDWIN_CRED_ORDINARY;
+	} else {
+		cred = QDWIN_CRED_ORDINARY;
 	}
+	return qdwin_global_visible(cred, kind);
 }
 
 static void

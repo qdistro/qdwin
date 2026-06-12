@@ -271,6 +271,77 @@ static void test_fractional_scale(void)
 	CHECK(!qdwin_fractional_scale_env_valid(-5), "env -5 invalid");
 }
 
+/* ---- advertised-global visibility matrix (02/S1, the §4b finding) ----
+ *
+ * Enumerate every (credential class × global kind) cell so a regression —
+ * most importantly a silo (SECCTX) client gaining a keystroke/capture global,
+ * or an ordinary client gaining the secctx manager — is a mechanical failure.
+ */
+static void test_global_visibility(void)
+{
+	/* Ordinary (non-privileged) globals: visible to everyone. */
+	CHECK(qdwin_global_visible(QDWIN_CRED_SHELL, QDWIN_GLOBAL_ORDINARY),
+	      "ordinary global visible to shell");
+	CHECK(qdwin_global_visible(QDWIN_CRED_ORDINARY, QDWIN_GLOBAL_ORDINARY),
+	      "ordinary global visible to ordinary");
+	CHECK(qdwin_global_visible(QDWIN_CRED_SECCTX, QDWIN_GLOBAL_ORDINARY),
+	      "ordinary global visible to secctx/silo");
+
+	/* The two keystroke-privileged globals (IME + virtual keyboard): visible
+	 * to shell + ordinary, HIDDEN from a sandboxed silo client (the bind
+	 * handlers apply the further allowed_ime_uid pin on top). */
+	const enum qdwin_global_kind kbd[] = {
+		QDWIN_GLOBAL_INPUT_METHOD,
+		QDWIN_GLOBAL_VIRTUAL_KEYBOARD,
+	};
+	for (size_t i = 0; i < sizeof(kbd) / sizeof(kbd[0]); i++) {
+		CHECK(qdwin_global_visible(QDWIN_CRED_SHELL, kbd[i]),
+		      "kbd kind %u visible to shell", (unsigned)kbd[i]);
+		CHECK(qdwin_global_visible(QDWIN_CRED_ORDINARY, kbd[i]),
+		      "kbd kind %u visible to ordinary", (unsigned)kbd[i]);
+		/* THE security invariant: a silo client must never see it. */
+		CHECK(!qdwin_global_visible(QDWIN_CRED_SECCTX, kbd[i]),
+		      "kbd kind %u HIDDEN from secctx/silo", (unsigned)kbd[i]);
+	}
+
+	/* weston_capture_v1 — the §4b screen-capture path. Gated TIGHTEST
+	 * (shell-only): libweston binds it with no uid/exe pin, so it must be
+	 * denied to ordinary AND silo clients, not just silos. */
+	CHECK(qdwin_global_visible(QDWIN_CRED_SHELL,
+				   QDWIN_GLOBAL_WESTON_CAPTURE),
+	      "weston_capture_v1 visible to shell");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_ORDINARY,
+				    QDWIN_GLOBAL_WESTON_CAPTURE),
+	      "weston_capture_v1 denied to an ordinary uid client (no bind pin)");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_SECCTX,
+				    QDWIN_GLOBAL_WESTON_CAPTURE),
+	      "weston_capture_v1 denied to a silo client (the §4b gate)");
+
+	/* secctx manager: only the shell/authorized helper may even see it. */
+	CHECK(qdwin_global_visible(QDWIN_CRED_SHELL,
+				   QDWIN_GLOBAL_SECCTX_MANAGER),
+	      "secctx manager visible to shell");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_ORDINARY,
+				    QDWIN_GLOBAL_SECCTX_MANAGER),
+	      "secctx manager hidden from ordinary uid client");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_SECCTX,
+				    QDWIN_GLOBAL_SECCTX_MANAGER),
+	      "secctx manager hidden from secctx/silo client");
+
+	/* Fail-closed default: an unknown/out-of-range global kind (e.g. a new
+	 * privileged libweston global not yet given a policy row) must be DENIED
+	 * to every credential class, never default-visible. */
+	CHECK(!qdwin_global_visible(QDWIN_CRED_SHELL,
+				    (enum qdwin_global_kind)99),
+	      "unknown global kind denied even to shell (fail closed)");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_ORDINARY,
+				    (enum qdwin_global_kind)99),
+	      "unknown global kind denied to ordinary (fail closed)");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_SECCTX,
+				    (enum qdwin_global_kind)99),
+	      "unknown global kind denied to secctx (fail closed)");
+}
+
 int main(void)
 {
 	test_accel_profile();
@@ -278,6 +349,7 @@ int main(void)
 	test_exclusive_edge();
 	test_compute_box();
 	test_fractional_scale();
+	test_global_visibility();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	if (failures) {

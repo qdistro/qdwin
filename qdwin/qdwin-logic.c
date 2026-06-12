@@ -123,3 +123,44 @@ qdwin_fractional_scale_env_valid(long n)
 	return n >= (long)QDWIN_LOGIC_FRACTIONAL_MIN &&
 	       n <= (long)QDWIN_LOGIC_FRACTIONAL_MAX;
 }
+
+bool
+qdwin_global_visible(enum qdwin_cred_class cred,
+		     enum qdwin_global_kind kind)
+{
+	switch (kind) {
+	case QDWIN_GLOBAL_ORDINARY:
+		/* Non-privileged inherited globals are visible to everyone. */
+		return true;
+	case QDWIN_GLOBAL_INPUT_METHOD:
+	case QDWIN_GLOBAL_VIRTUAL_KEYBOARD:
+		/* Keystroke capture / injection: hidden from sandboxed silo
+		 * clients (so one silo cannot keylog or inject into another),
+		 * but available to the shell and ordinary session clients. The
+		 * IME/VK bind handlers apply the further allowed_ime_uid + exe
+		 * pins, so an ordinary client still can't actually grab. */
+		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_WESTON_CAPTURE:
+		/* Screen-pixel capture (whole-output). UNLIKE the IME/VK
+		 * managers, libweston binds weston_capture_v1 unconditionally
+		 * (no bind-time uid/exe pin — access is deferred to a
+		 * screenshot-authority callback, which qdwin does not register,
+		 * so capture requests default-deny today). A visible-but-
+		 * unbound posture is therefore a LATENT hole: the day any
+		 * authority is registered, every client that can see the global
+		 * regains capture with no pin. So gate it tightest — shell-only
+		 * (02/S1, D7) — denying ordinary AND silo clients, not just
+		 * silos. qdshell (the bound shell) is the only legitimate
+		 * capturer; an ordinary-uid screenshot product, if ever added,
+		 * must register an authority that re-checks identity. */
+		return cred == QDWIN_CRED_SHELL;
+	case QDWIN_GLOBAL_SECCTX_MANAGER:
+		/* Minting security contexts: only the bound shell (or the
+		 * authorized secctx-exec helper, both QDWIN_CRED_SHELL) may
+		 * even see it. Ordinary and silo clients get nothing. */
+		return cred == QDWIN_CRED_SHELL;
+	}
+	/* Unknown kind: fail closed (deny). A new privileged global added
+	 * without a policy row must not default to visible. */
+	return false;
+}
