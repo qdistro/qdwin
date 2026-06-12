@@ -1160,6 +1160,21 @@ test('output-manager-gate',
   ],
 )
 
+# S13 deliberate fail-open call-site pins: assert the LIVE layer-shell
+# pre-shell bind gate and the secctx root-launcher attestation delegate to
+# their compiled pure helpers (qdwin-logic-unit pins the helpers themselves;
+# this stops a neutered call site — `if (0 && ...)` / inline re-impl — from
+# regressing silently, the gap the M3 fable review surfaced). Headless; the
+# behavioural negatives are VM/B1-gated.
+test('s13-failopen-pins',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_s13_failopen_pins.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # zwlr_layer_shell_v1 BEHAVIOURAL protocol suite. Unlike the
 # source_invariant tests above (which grep qdwin.c as text), this EXECUTES
 # the compositor: a real pywayland client drives qdwin-shell.so under a

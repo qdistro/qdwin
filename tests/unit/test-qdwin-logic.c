@@ -329,9 +329,14 @@ static void test_global_visibility(void)
 				    QDWIN_GLOBAL_SECCTX_MANAGER),
 	      "secctx manager hidden from secctx/silo client");
 
-	/* Fail-closed default: an unknown/out-of-range global kind (e.g. a new
-	 * privileged libweston global not yet given a policy row) must be DENIED
-	 * to every credential class, never default-visible. */
+	/* Matrix-level fail-closed default: a kind enum value with no policy row
+	 * must be DENIED to every credential class. NOTE this is the MATRIX
+	 * default only — it does NOT mean a brand-new privileged libweston global
+	 * fails closed at the live filter: qdwin_classify_global returns
+	 * QDWIN_GLOBAL_ORDINARY (visible to all) for any global it does not
+	 * recognise by pointer identity, so an unrecognised new global is visible
+	 * until given a classify row. See todo/fable-release 02-security-gate.md
+	 * S1 (classify-ORDINARY default) + the threat-model residual register. */
 	CHECK(!qdwin_global_visible(QDWIN_CRED_SHELL,
 				    (enum qdwin_global_kind)99),
 	      "unknown global kind denied even to shell (fail closed)");
@@ -406,6 +411,12 @@ static void test_s13_fail_open_pins(void)
 	      "S13 secctx: unreadable parent with missing starttime denied");
 	CHECK(!qdwin_secctx_root_launcher_attested(0, 111, 222, ""),
 	      "S13 secctx: unreadable parent with changed starttime denied");
+	/* Both starttime reads failing (0/0) must deny: before==after is true for
+	 * 0/0, so this cell is what discriminates the `start_before != 0 &&
+	 * start_after != 0` conjuncts from the stability check — without it,
+	 * deleting both !=0 guards passes the suite (fable M3 mutation M5). */
+	CHECK(!qdwin_secctx_root_launcher_attested(0, 0, 0, ""),
+	      "S13 secctx: double starttime-read failure (0/0) denied");
 	CHECK(!qdwin_secctx_root_launcher_attested(0, 111, 111, "sh"),
 	      "S13 secctx: readable non-launcher basename denied");
 	CHECK(!qdwin_secctx_root_launcher_attested(0, 111, 111, NULL),
