@@ -14928,15 +14928,18 @@ bind_qdwin_text_input_manager(struct wl_client *client, void *data,
  *
  * Trust: unlike the OPEN text-input-v3 plane, this grants keystroke capture +
  * arbitrary text injection across the focused client, so it is identity-gated
- * exactly like the locker — hidden from sandboxed/secctx clients by the global
- * filter, bind-gated to allowed_ime_uid (default allowed_uid) with optional
+ * on two layers: (1) hidden from sandboxed/secctx clients by the global filter
+ * (qdwin_secctx_global_filter) so a silo client cannot even see it — this is
+ * STRONGER than the locker global, which is bind-gated only (visible to all
+ * clients, bind rejected unless authorized; it is NOT in the global filter);
+ * and (2) bind-gated to allowed_ime_uid (default allowed_uid) with optional
  * exe/label pins, and limited to one ACTIVE input method per seat (a second
  * get_input_method gets only `unavailable`, per the protocol). A grabbing IME
  * also needs zwp_virtual_keyboard_manager_v1 to pass non-composed keys back to
- * apps; that companion protocol is a documented follow-up (see
- * todo/open-followups.md) — until it lands, only a deliberately-launched gated
- * IME ever grabs, so the default (no IME bound) keeps text-input-v3 inert and
- * the keyboard untouched.
+ * apps; that companion protocol IS implemented (registered in wet_shell_init)
+ * and gated IDENTICALLY — hidden by the same global filter and bind-gated via
+ * the shared qdwin_ime_family_bind_allowed() helper. The default (no IME bound)
+ * still keeps text-input-v3 inert and the keyboard untouched.
  * ================================================================== */
 
 struct qdwin_input_method;
