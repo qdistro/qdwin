@@ -245,13 +245,13 @@ def check_layershell_pre_shell_delegates(source):
         cond, close = _paren_group(code, open_idx)
         if cond is not None and \
                 "qdwin_layershell_pre_shell_uid_allowed" in cond:
-            gate = (cond, close)
+            gate = (m.start(), cond, close)
             break
     if gate is None:
         return fail("bind_qdwin_layer_shell has no `if (...)` gating on "
                     "qdwin_layershell_pre_shell_uid_allowed — the live "
                     "pre-shell uid check is not wired to the pinned helper")
-    cond, close = gate
+    gate_start, cond, close = gate
     norm = re.sub(r"\s+", "", cond)
     if norm != _LAYERSHELL_EXPECTED_COND:
         return fail(
@@ -269,6 +269,17 @@ def check_layershell_pre_shell_delegates(source):
     if not re.search(r"\breturn\s*;", block):
         return fail("bind_qdwin_layer_shell deny block does not `return;` — "
                     "would fall through and bind an unpermitted client")
+    # Ordering: the gate must run BEFORE the resource is created — a reorder
+    # that binds first fails open even with a perfect gate downstream. (Same
+    # property output-manager-gate pins via gate-before-`cfg->used`.) The first
+    # wl_resource_create / wl_resource_set_implementation must come AFTER the
+    # gate's `if`.
+    bind_m = re.search(
+        r"\bwl_resource_(?:create|set_implementation)\s*\(", code)
+    if bind_m and bind_m.start() < gate_start:
+        return fail("bind_qdwin_layer_shell creates/implements the layer-shell "
+                    "resource BEFORE the pre-shell uid gate — the gate must be "
+                    "able to deny+return before any bind happens")
     return 0
 
 
