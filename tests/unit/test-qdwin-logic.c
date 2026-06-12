@@ -364,6 +364,19 @@ static void test_s13_fail_open_pins(void)
 	CHECK(!qdwin_om_mutation_allowed(false, true, shell_pid, other,
 					 shell_pid, admin, admin),
 	      "S13 output-manager: shell-bound pid with wrong uid denied");
+	/* The security-critical post-shell tightening: once a shell is bound,
+	 * a client carrying the right uid but a DIFFERENT pid is denied. This is
+	 * the only cell that discriminates the shell_bound branch from the
+	 * pre-shell allowed_uid fallback (deleting that branch would let this
+	 * client through via the uid==allowed_uid path). */
+	CHECK(!qdwin_om_mutation_allowed(false, true, other_pid, admin,
+					 shell_pid, admin, admin),
+	      "S13 output-manager: shell-bound, allowed uid but wrong pid denied");
+	/* And shell-bound must close the allowed_uid==-1 open posture, not
+	 * inherit it: a non-shell client is denied even when allowed_uid is -1. */
+	CHECK(!qdwin_om_mutation_allowed(false, true, other_pid, other,
+					 shell_pid, admin, (uid_t)-1),
+	      "S13 output-manager: shell-bound closes the -1 open posture");
 	CHECK(qdwin_om_mutation_allowed(false, false, other_pid, admin,
 					0, (uid_t)-1, admin),
 	      "S13 output-manager: pre-shell allowed_uid may mutate");
@@ -376,6 +389,14 @@ static void test_s13_fail_open_pins(void)
 
 	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, "runuser"),
 	      "S13 secctx: known root launcher basename accepted");
+	/* Pin the full accept-list, not just runuser — widening it (e.g. adding
+	 * "bash") must be a deliberate, test-visible change. */
+	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, "su"),
+	      "S13 secctx: su accepted");
+	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, "sudo"),
+	      "S13 secctx: sudo accepted");
+	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, "pkexec"),
+	      "S13 secctx: pkexec accepted");
 	CHECK(qdwin_secctx_root_launcher_attested(0, 111, 111, ""),
 	      "S13 secctx: unreadable root launcher basename accepted with stable root parent");
 	CHECK(!qdwin_secctx_root_launcher_attested(other, 111, 111, ""),
