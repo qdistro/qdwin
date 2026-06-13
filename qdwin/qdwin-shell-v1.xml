@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="28">
+  <interface name="qdwin_shell_v1" version="29">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -189,6 +189,8 @@
              summary="compositor is in locked state; request refused"/>
       <entry name="stream_unavailable" value="4"
              summary="pipewire backend not loaded; per-view forwarding disabled"/>
+      <entry name="invalid_grab" value="5"
+             summary="show_popup serial did not match a live input grab serial"/>
     </enum>
 
     <request name="bind_as_shell">
@@ -333,11 +335,23 @@
         show_popup with the same parent dismisses the prior popup
         (the `dismissed` event fires on the old object before the
         new one becomes visible).
+
+        Version 29: `serial` must be the serial of the input event
+        (pointer button, key, or touch-down) that triggered the popup,
+        exactly as for an xdg_popup grab. The compositor starts a
+        pointer grab for the popup (so an outside-click dismisses it),
+        and like xdg-shell it validates the serial against a live grab
+        serial on the seat it grabs. A stale or fabricated serial
+        raises the `invalid_grab` error and no popup is created. This
+        keeps show_popup symmetric with the layer-popup grab path; the
+        request remains shell-only (require bound shell).
       </description>
       <arg name="popup" type="new_id" interface="qdwin_popup_v1"/>
       <arg name="parent" type="uint"
            summary="toplevel handle from toplevel_added"/>
       <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="serial" type="uint"
+           summary="input event serial that triggered the popup (v29)"/>
       <arg name="x" type="int"/>
       <arg name="y" type="int"/>
     </request>
@@ -1419,6 +1433,8 @@
            summary="surface-local y in chrome buffer space"/>
       <arg name="button" type="uint" summary="linux BTN_* code"/>
       <arg name="state" type="uint" summary="1=pressed, 0=released"/>
+      <arg name="serial" type="uint"
+           summary="input event serial of this button (v29) — pass to show_popup to open a context menu"/>
     </event>
 
     <event name="popup_button" since="21">
@@ -1454,6 +1470,8 @@
            summary="popup-local y in popup buffer space"/>
       <arg name="button" type="uint" summary="linux BTN_xxx code"/>
       <arg name="state" type="uint" summary="1=pressed, 0=released"/>
+      <arg name="serial" type="uint"
+           summary="input event serial of this button (v29) — pass to show_popup to open a submenu"/>
     </event>
 
     <request name="move_toplevel_to_workspace" since="24">

@@ -368,6 +368,9 @@ struct qdwin_wm_policy {
 #define QDWIN_KB_RATE_MAX      255u    /* wl_keyboard repeat rate (Hz), 0=off */
 #define QDWIN_KB_DELAY_MIN     1u
 #define QDWIN_KB_DELAY_MAX     10000u
+/* D5: per-source primary-selection MIME-list cap (DoS guard). Far above any
+ * legitimate target set (real sources advertise a handful to a few dozen). */
+#define QDWIN_PRIMARY_MIME_MAX 256u
 
 enum qdwin_accel_profile {
 	QDWIN_ACCEL_ADAPTIVE = 0,
@@ -3223,7 +3226,14 @@ qdwin_popup_grab_button(struct weston_pointer_grab *grab,
 			wl_fixed_from_double(sx),
 			wl_fixed_from_double(sy),
 			button,
-			state);
+			state,
+			/* v29: the grab serial for this button (see
+			 * chrome_button: wl_display_get_serial == what
+			 * notify_button stores into grab_serial after this
+			 * callback returns, NOT the stale pointer->grab_serial).
+			 * Echo to show_popup to open a submenu. */
+			wl_display_get_serial(
+				pointer->seat->compositor->wl_display));
 	}
 }
 
@@ -3627,7 +3637,19 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				wl_fixed_from_double(sx),
 				wl_fixed_from_double(sy),
 				button,
-				state);
+				state,
+				/* v29: the grab serial for this button. NOT
+				 * pointer->grab_serial — that is still the
+				 * PREVIOUS press here, because notify_button()
+				 * assigns grab_serial only AFTER this grab
+				 * callback returns (input.c). wl_display_get_serial
+				 * is the serial just used for the wl_pointer.button
+				 * send above, and is exactly what notify_button
+				 * will store into grab_serial (nothing between
+				 * allocates a serial), so the shell can echo it to
+				 * show_popup. Meaningful on press. */
+				wl_display_get_serial(
+					pointer->seat->compositor->wl_display));
 		}
 	}
 
@@ -3809,6 +3831,24 @@ static const struct weston_pointer_grab_interface qdwin_popup_grab_iface = {
 	qdwin_popup_grab_cancel,
 };
 
+/* D7: shared input grab-serial check. A popup grab request must carry the
+ * serial of the input event (pointer button / key / touch-down) that triggered
+ * it; accept only if it matches a live grab serial on the seat. Used by both
+ * qdwin_handle_show_popup and the layer-popup grab handler so the two popup
+ * grab paths stay symmetric. Mirrors weston_desktop_seat_popup_grab_start. */
+static bool
+qdwin_seat_grab_serial_matches(struct weston_seat *wseat, uint32_t serial)
+{
+	if (!wseat)
+		return false;
+	struct weston_pointer *pointer = weston_seat_get_pointer(wseat);
+	struct weston_keyboard *keyboard = weston_seat_get_keyboard(wseat);
+	struct weston_touch *touch = weston_seat_get_touch(wseat);
+	return (pointer && pointer->grab_serial == serial) ||
+	       (keyboard && keyboard->grab_serial == serial) ||
+	       (touch && touch->grab_serial == serial);
+}
+
 static void
 qdwin_popup_start_grab(struct qdwin_popup *p, struct weston_compositor *ec)
 {
@@ -3890,12 +3930,47 @@ qdwin_handle_show_popup(struct wl_client *client,
 			uint32_t popup_id,
 			uint32_t parent,
 			struct wl_resource *surface_res,
+			uint32_t serial,
 			int32_t x, int32_t y)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+
+	/* D6: uniform locked gate. Like request_fullscreen/tile/maximize, a
+	 * popup must not be created while the compositor is locked (the lock
+	 * screen owns the display). Reject BEFORE creating the qdwin_popup_v1
+	 * new_id object below. set_display_power is the documented exception. */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+
+	/* D7 (v29): require a valid input grab serial, matching the layer-popup
+	 * grab path. show_popup starts a pointer grab; the serial ties that grab
+	 * to the real interaction that opened the menu, so a stale or fabricated
+	 * serial cannot silently install a compositor-wide pointer grab. Find the
+	 * seat show_popup will grab (first with a pointer — same selection as
+	 * qdwin_popup_start_grab) and validate against its live grab serial,
+	 * BEFORE creating the new_id object. */
+	struct weston_seat *grab_seat = NULL, *gs;
+	wl_list_for_each(gs, &qdwin->compositor->seat_list, link) {
+		if (weston_seat_get_pointer(gs)) {
+			grab_seat = gs;
+			break;
+		}
+	}
+	if (!qdwin_seat_grab_serial_matches(grab_seat, serial)) {
+		weston_log("qdwin: show_popup refused: stale/invalid "
+			   "serial=%u\n", serial);
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_INVALID_GRAB,
+				       "show_popup: invalid grab serial %u",
+				       serial);
+		return;
+	}
 
 	struct qdwin_toplevel *tl = qdwin_toplevel_from_handle(qdwin, parent);
 	if (!tl) {
@@ -6299,6 +6374,14 @@ qdwin_handle_clear_selection(struct wl_client *client,
 	 * wipe selections before any shell binds. */
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* D6: uniform locked gate (same class as fullscreen/tile). A deny
+	 * verdict that arrives while locked is deferred until unlock rather
+	 * than mutating the seat selection behind the lock screen. */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
 	seat = NULL;
 	struct weston_seat *s;
 	wl_list_for_each(s, &qdwin->compositor->seat_list, link) {
@@ -7422,6 +7505,13 @@ qdwin_handle_set_pointer_config(struct wl_client *client,
 	(void)client;
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* D6: uniform locked gate. Input-device config is not part of unlock
+	 * (qdshell pushes settings at session start, before any lock). */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
 
 	struct qdwin_pointer_config *pc = &qdwin->pointer_config;
 	if (accel_speed < QDWIN_ACCEL_SPEED_MIN)
@@ -7496,6 +7586,12 @@ qdwin_handle_set_key_repeat(struct wl_client *client,
 	(void)client;
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* D6: uniform locked gate (see set_pointer_config). */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
 
 	if (rate > QDWIN_KB_RATE_MAX)
 		rate = QDWIN_KB_RATE_MAX;
@@ -12450,21 +12546,22 @@ qdwin_layer_popup_bbox_contains(struct qdwin_layer_popup *lp,
 	       pos.c.y >= vp.c.y && pos.c.y < vp.c.y + lp->surface->height;
 }
 
-/* deep-review-2 H2: shared client-gated focus filter. Returns the
- * grab's popup wl_client, or NULL when the popup_resource is gone
- * (cancelled / outside-click-dismissed). */
-static struct wl_client *
-qdwin_layer_popup_grab_client(struct qdwin_layer_popup *lp)
+/* D9: is this surface an xdg_popup (the role libweston stamps on
+ * weston_desktop popups)? Used to keep a same-client *nested* submenu popup
+ * inside the grab while still excluding unrelated same-client surfaces
+ * (hidden toplevels, other panels). Role is matched by name. */
+static bool
+qdwin_surface_is_xdg_popup(struct weston_surface *s)
 {
-	if (!lp || !lp->popup_resource)
-		return NULL;
-	return wl_resource_get_client(lp->popup_resource);
+	const char *role = s ? weston_surface_get_role(s) : NULL;
+	return role && strcmp(role, "xdg_popup") == 0;
 }
 
-/* deep-review-2 H2: repick the topmost view at the pointer and clamp
- * pointer->focus to "popup or same-client view"; clear focus
- * otherwise. Called by every grab event hook before sending events so
- * stale pre-grab focus cannot receive button/axis/frame.
+/* deep-review-2 H2 / D9: repick the topmost view at the pointer and clamp
+ * pointer->focus to the popup surface, its layer parent, a subsurface of
+ * either, or a same-client nested submenu popup; clear focus otherwise.
+ * Called by every grab event hook before sending events so stale pre-grab
+ * focus cannot receive button/axis/frame.
  *
  * Side effect: pointer->focus reflects the filter result on return.
  * Callers can compare against NULL to decide whether to forward the
@@ -12477,15 +12574,33 @@ qdwin_layer_popup_grab_refilter_focus(struct qdwin_layer_popup *lp,
 		return;
 	struct weston_view *view = weston_compositor_pick_view(
 		pointer->seat->compositor, pointer->pos);
-	struct wl_client *grab_client = qdwin_layer_popup_grab_client(lp);
 	int deliver = 0;
 	if (view && view->surface) {
-		if (view->surface == lp->surface) {
+		/* D9 (deeper-review): confine grabbed input to the popup family,
+		 * NOT to every surface owned by the popup's wl_client. Legitimate
+		 * targets are the popup surface, its layer parent (the anchor), a
+		 * subsurface of either (weston_surface_get_main_surface folds
+		 * subsurfaces onto their root), and a same-client *nested* submenu
+		 * popup (a separate xdg_popup, not a subsurface). Everything else
+		 * the old code reached via "any same-client surface" — a hidden
+		 * sibling toplevel, an unrelated panel — is excluded. All derefs
+		 * guarded (teardown/destroy paths null these). */
+		struct weston_surface *parent_s =
+			lp->parent ? lp->parent->surface : NULL;
+		struct weston_surface *main_s =
+			weston_surface_get_main_surface(view->surface);
+		struct wl_client *grab_client = lp->popup_resource ?
+			wl_resource_get_client(lp->popup_resource) : NULL;
+		if (view->surface == lp->surface ||
+		    view->surface == parent_s ||
+		    main_s == lp->surface ||
+		    main_s == parent_s) {
 			deliver = 1;
-		} else if (view->surface->resource && grab_client &&
+		} else if (grab_client && view->surface->resource &&
 			   wl_resource_get_client(view->surface->resource) ==
-			       grab_client) {
-			deliver = 1;
+			       grab_client &&
+			   qdwin_surface_is_xdg_popup(view->surface)) {
+			deliver = 1;   /* same-client nested submenu popup */
 		}
 	}
 	if (deliver) {
@@ -12649,15 +12764,12 @@ qdwin_layer_popup_layer_grab_handler(struct wl_resource *popup_resource,
 
 	/* Validate that one of the input devices on this seat has a grab
 	 * serial matching the request. Mirrors libweston's serial check
-	 * in weston_desktop_seat_popup_grab_start. */
+	 * in weston_desktop_seat_popup_grab_start. Shares the serial-match
+	 * predicate with qdwin_handle_show_popup (D7). */
 	struct weston_pointer *pointer = weston_seat_get_pointer(wseat);
-	struct weston_keyboard *keyboard = weston_seat_get_keyboard(wseat);
-	struct weston_touch *touch = weston_seat_get_touch(wseat);
-	int serial_ok =
-		(pointer && pointer->grab_serial == serial) ||
-		(keyboard && keyboard->grab_serial == serial) ||
-		(touch && touch->grab_serial == serial);
-	if (!serial_ok) {
+	if (!qdwin_seat_grab_serial_matches(wseat, serial)) {
+		struct weston_keyboard *keyboard = weston_seat_get_keyboard(wseat);
+		struct weston_touch *touch = weston_seat_get_touch(wseat);
 		weston_log("qdwin: layer-popup grab refused: stale serial=%u "
 			   "(p=%u k=%u t=%u)\n", serial,
 			   pointer ? pointer->grab_serial : 0,
@@ -16425,9 +16537,28 @@ qdwin_primary_source_offer(struct wl_client *client,
 {
 	struct qdwin_primary_source *source = wl_resource_get_user_data(resource);
 	struct qdwin_primary_mime *m;
+	unsigned n = 0;
 	(void)client;
 	if (!mime_type)
 		return;
+	/* D5 (deeper-review): bound the per-source MIME list. A source client
+	 * may call offer() unboundedly; each entry is a calloc+strdup that is
+	 * re-broadcast to every primary-selection device, so an unbounded list
+	 * is a heap + event-queue DoS (the same family as the F7 length caps).
+	 * Real sources advertise a handful to a few dozen target names;
+	 * QDWIN_PRIMARY_MIME_MAX is far above any legitimate set. Over the cap
+	 * we SILENTLY drop further offers — posting a protocol error here would
+	 * kill an otherwise-legitimate but noisy client, which is the wrong
+	 * trade for a DoS guard. (The regular clipboard source is owned by
+	 * vendored libweston and capped separately/upstream.) */
+	wl_list_for_each(m, &source->mime_types, link) {
+		if (++n >= QDWIN_PRIMARY_MIME_MAX) {
+			weston_log("qdwin: primary-selection offer dropped: "
+				   "MIME cap %u reached\n",
+				   QDWIN_PRIMARY_MIME_MAX);
+			return;
+		}
+	}
 	m = calloc(1, sizeof *m);
 	if (!m)
 		return;
@@ -20384,12 +20515,12 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request up to v28 (set_pointer_config / set_key_repeat). This also
-	 * fixes v27 (set_workspace_name) being unreachable when the global was
-	 * pinned at 26. */
+	 * request up to v29 (show_popup grab serial; v28 set_pointer_config /
+	 * set_key_repeat). This also fixes v27 (set_workspace_name) being
+	 * unreachable when the global was pinned at 26. */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       28, qdwin, bind_qdwin_shell);
+					       29, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

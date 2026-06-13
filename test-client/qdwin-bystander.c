@@ -423,13 +423,14 @@ static void l_hotkey_pressed(void *d, struct qdwin_shell_v1 *s, uint32_t id)
 }
 static void l_chrome_button(void *d, struct qdwin_shell_v1 *s, uint32_t h,
 			    uint32_t side, wl_fixed_t sx, wl_fixed_t sy,
-			    uint32_t button, uint32_t state)
+			    uint32_t button, uint32_t state, uint32_t serial)
 { (void)d; (void)s; (void)h; (void)side; (void)sx; (void)sy; (void)button;
-  (void)state; }
+  (void)state; (void)serial; }
 static void l_popup_button(void *d, struct qdwin_shell_v1 *s, uint32_t h,
 			   wl_fixed_t sx, wl_fixed_t sy, uint32_t button,
-			   uint32_t state)
-{ (void)d; (void)s; (void)h; (void)sx; (void)sy; (void)button; (void)state; }
+			   uint32_t state, uint32_t serial)
+{ (void)d; (void)s; (void)h; (void)sx; (void)sy; (void)button; (void)state;
+  (void)serial; }
 static void l_toplevel_workspace(void *d, struct qdwin_shell_v1 *s,
 				 uint32_t h, uint32_t index)
 { (void)d; (void)s; (void)h; (void)index; }

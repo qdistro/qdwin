@@ -1201,6 +1201,19 @@ test('lock-fail-secure',
   ],
 )
 
+# Round-2 popup / selection defense-in-depth (D5 primary-MIME cap, D6 locked
+# gate on mutating shell requests, D7 show_popup grab-serial @v29, D9 layer-
+# popup grab scope). Source + protocol invariants; behavioural lanes are VM.
+test('popup-grab-hardening',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_popup_grab_hardening.py'),
+    files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-shell-v1.xml'),
+  ],
+)
+
 # S13 deliberate fail-open call-site pins: assert the LIVE layer-shell
 # pre-shell bind gate and the secctx root-launcher attestation delegate to
 # their compiled pure helpers (qdwin-logic-unit pins the helpers themselves;
