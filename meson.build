@@ -1190,6 +1190,17 @@ test('primary-selection-lifetime',
   ],
 )
 
+# F9 fail-secure: lock teardown holds the lock (no auto-unlock on locker crash)
+# and the default keyboard grab drops keys while locked.
+test('lock-fail-secure',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_lock_fail_secure.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # S13 deliberate fail-open call-site pins: assert the LIVE layer-shell
 # pre-shell bind gate and the secctx root-launcher attestation delegate to
 # their compiled pure helpers (qdwin-logic-unit pins the helpers themselves;

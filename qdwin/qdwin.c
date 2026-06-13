@@ -300,6 +300,26 @@ static void
 bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 			  uint32_t version, uint32_t id);
 
+/* findings F7: strdup that logs (once, rate-naive) on OOM instead of failing
+ * silently. Returns NULL on a NULL input OR on allocation failure — callers in
+ * qdwin are uniformly NULL-tolerant (the accessors fall back to ""), so a NULL
+ * here fails closed (an OOM'd identity string cannot match a silo gate) rather
+ * than crashing. Use this for internally-snapshotted strings where visibility
+ * of an OOM matters; for externally-set protocol strings, prefer
+ * wl_resource_post_no_memory() so the client learns the request was dropped. */
+static char *
+qdwin_xstrdup_or_null(const char *s)
+{
+	char *d;
+	if (!s)
+		return NULL;
+	d = strdup(s);
+	if (!d)
+		weston_log("qdwin: strdup OOM (len=%zu) — field left unset\n",
+			   strlen(s));
+	return d;
+}
+
 /* toplevel_state bits — must match qdwin-shell-v1.xml's event docs. */
 #define QDWIN_TS_MAXIMIZED  (1u << 0)
 #define QDWIN_TS_FULLSCREEN (1u << 1)
@@ -3700,6 +3720,20 @@ qdwin_proxy_default_grab_key(struct weston_keyboard_grab *grab,
 			     uint32_t key, uint32_t state)
 {
 	struct weston_keyboard *kb = grab->keyboard;
+	/* Fail-secure: while the compositor is locked, no key may reach a
+	 * client through the default grab. During a normal lock the role=2
+	 * overlay grab is the active keyboard grab and routes keys to the
+	 * locker as overlay_key events, so this path is not hit. It IS hit in
+	 * the window between a locker crash and the fresh locker reattaching:
+	 * qdwin holds the lock (see qdwin_lock_surface_destroyed_cb /
+	 * qdwin_locker_resource_destroy) but the overlay grab has been torn
+	 * down, leaving the default grab active. Delivering keys here would
+	 * leak keystrokes to the focused desktop client behind the black lock
+	 * screen. Drop them instead. (Pointer input is already contained by
+	 * qdwin_proxy_default_grab_{focus,motion,button} forcing focus to the
+	 * lock view while locked.) */
+	if (qdwin_singleton && qdwin_singleton->locked)
+		return;
 	qdwin_idle_note_activity(qdwin_singleton);
 	weston_keyboard_send_key(kb, time, key, state);
 
@@ -3719,6 +3753,13 @@ qdwin_proxy_default_grab_modifiers(struct weston_keyboard_grab *grab,
 				   uint32_t mods_locked,
 				   uint32_t group)
 {
+	/* Fail-secure: like the key path above, drop modifier updates to the
+	 * focused client while locked. During a normal lock the overlay grab is
+	 * active so this default grab isn't hit; this guards the post-crash
+	 * lock-held window so Shift/Ctrl/Alt state does not leak to the hidden
+	 * desktop client. */
+	if (qdwin_singleton && qdwin_singleton->locked)
+		return;
 	weston_keyboard_send_modifiers(grab->keyboard, serial,
 				       mods_depressed, mods_latched,
 				       mods_locked, group);
@@ -5893,15 +5934,22 @@ qdwin_lock_surface_destroyed_cb(struct wl_listener *l, void *data)
 		}
 	}
 	if (qdwin->locked && !qdwin->lock_resource_reattach_in_progress) {
-		qdwin->locked = 0;
-		qdwin_show_non_lock_layers(qdwin);
-		weston_log("qdwin: locked_changed=0 cause=lock-surface-destroy\n");
-		if (qdwin->shell_resource)
-			qdwin_shell_v1_send_locked_changed(
-				qdwin->shell_resource, 0);
-		if (qdwin->locker_resource)
-			qdwin_locker_v1_send_locked_changed(
-				qdwin->locker_resource, 0);
+		/* F9 fail-secure: the lock surface was destroyed while the
+		 * compositor is still locked and no reattach is in flight —
+		 * i.e. the locker crashed/was killed, NOT an explicit
+		 * set_locked(0) (which clears `locked` first, so we would not
+		 * reach this branch). Do NOT auto-unlock: hold the lock so the
+		 * desktop stays hidden behind the black lock screen until a
+		 * fresh locker (systemd Restart=always) rebinds and reattaches.
+		 * This mirrors qdwin_locker_resource_destroy(). Demote any
+		 * promoted lock toplevel and force a repaint so the now-empty
+		 * lock layer is composited to black (demote only repaints when
+		 * a toplevel exists; the legacy shell lock path uses a raw
+		 * view, so repaint explicitly). */
+		qdwin_demote_lock_toplevel(qdwin, "lock-surface-destroy");
+		weston_compositor_schedule_repaint(qdwin->compositor);
+		weston_log("qdwin: lock held (fail-secure) "
+			   "cause=lock-surface-destroy — awaiting fresh locker\n");
 	}
 	/* B4: drop overlay keyboard grab when locker goes away. */
 	if (qdwin->overlay_grab_active && qdwin->overlay_grab_role == 2)
@@ -5959,15 +6007,16 @@ qdwin_lock_surface_resource_destroyed(struct wl_resource *resource)
 		qdwin->lock_surface = NULL;
 	}
 	if (qdwin->locked && !qdwin->lock_resource_reattach_in_progress) {
-		qdwin->locked = 0;
-		qdwin_show_non_lock_layers(qdwin);
-		weston_log("qdwin: locked_changed=0 cause=lock-resource-destroy\n");
-		if (qdwin->shell_resource)
-			qdwin_shell_v1_send_locked_changed(
-				qdwin->shell_resource, 0);
-		if (qdwin->locker_resource)
-			qdwin_locker_v1_send_locked_changed(
-				qdwin->locker_resource, 0);
+		/* F9 fail-secure: lock resource destroyed while still locked
+		 * and no reattach in flight (locker crash, not an explicit
+		 * unlock — set_locked(0) clears `locked` first). Hold the lock
+		 * rather than auto-unlock; mirror qdwin_locker_resource_destroy()
+		 * and qdwin_lock_surface_destroyed_cb(). Demote any promoted
+		 * toplevel and repaint so the empty lock layer goes black. */
+		qdwin_demote_lock_toplevel(qdwin, "lock-resource-destroy");
+		weston_compositor_schedule_repaint(qdwin->compositor);
+		weston_log("qdwin: lock held (fail-secure) "
+			   "cause=lock-resource-destroy — awaiting fresh locker\n");
 	}
 	/* Suppress the analogous flap on the surface-destroy callback
 	 * by leaving `locked` untouched when a reattach is in flight;
@@ -19306,9 +19355,12 @@ qdwin_secctx_listen_cb(int fd, uint32_t mask, void *data)
 	/* Snapshot tag metadata into the client so introspection (the v13
 	 * toplevel_security_context fanout) stays valid even after the
 	 * listener (and its qdwin_secctx) is torn down. */
-	sc->sandbox_engine = sec->sandbox_engine ? strdup(sec->sandbox_engine) : NULL;
-	sc->app_id         = sec->app_id         ? strdup(sec->app_id)         : NULL;
-	sc->instance_id    = sec->instance_id    ? strdup(sec->instance_id)    : NULL;
+	/* F7: log on OOM. A NULL leaves the accessor falling back to "" — the
+	 * client fails closed (an empty identity matches no silo gate) rather
+	 * than crashing; visibility lets us spot the rare OOM truncation. */
+	sc->sandbox_engine = qdwin_xstrdup_or_null(sec->sandbox_engine);
+	sc->app_id         = qdwin_xstrdup_or_null(sec->app_id);
+	sc->instance_id    = qdwin_xstrdup_or_null(sec->instance_id);
 	/* Option-B identity capture: SO_PEERCRED on the accepted socket
 	 * gives us the (pid, uid) the kernel pinned at connect-time, which
 	 * the broker re-verifies against /proc at decision time. We snapshot
@@ -19452,7 +19504,16 @@ qdwin_secctx_set_sandbox_engine(struct wl_client *client,
 				       "sandbox_engine too long");
 		return;
 	}
-	sec->sandbox_engine = name ? strdup(name) : NULL;
+	/* F7: on OOM after a non-NULL value, tell the client rather than
+	 * silently storing NULL ("unset"), which would misrepresent a tagged
+	 * client as untagged. */
+	if (name) {
+		sec->sandbox_engine = strdup(name);
+		if (!sec->sandbox_engine) {
+			wl_resource_post_no_memory(resource);
+			return;
+		}
+	}
 }
 
 static void
@@ -19481,7 +19542,14 @@ qdwin_secctx_set_app_id(struct wl_client *client,
 				       "app_id too long");
 		return;
 	}
-	sec->app_id = app_id ? strdup(app_id) : NULL;
+	/* F7: signal OOM instead of silently storing NULL — see set_sandbox_engine. */
+	if (app_id) {
+		sec->app_id = strdup(app_id);
+		if (!sec->app_id) {
+			wl_resource_post_no_memory(resource);
+			return;
+		}
+	}
 }
 
 static void
@@ -19511,7 +19579,14 @@ qdwin_secctx_set_instance_id(struct wl_client *client,
 				       "instance_id too long");
 		return;
 	}
-	sec->instance_id = instance_id ? strdup(instance_id) : NULL;
+	/* F7: signal OOM instead of silently storing NULL — see set_sandbox_engine. */
+	if (instance_id) {
+		sec->instance_id = strdup(instance_id);
+		if (!sec->instance_id) {
+			wl_resource_post_no_memory(resource);
+			return;
+		}
+	}
 }
 
 static void
