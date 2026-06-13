@@ -16168,6 +16168,7 @@ struct qdwin_primary_source {
 	struct wl_resource *resource;
 	struct qdwin_primary_seat *pseat;  /* NULL until set_selection wins */
 	struct wl_list mime_types;          /* qdwin_primary_mime::link */
+	struct wl_list offers;              /* qdwin_primary_offer::link */
 };
 
 struct qdwin_primary_device {
@@ -16180,6 +16181,7 @@ struct qdwin_primary_device {
 struct qdwin_primary_offer {
 	struct qdwin_primary_source *source;  /* NULL after source destroyed */
 	struct wl_resource *resource;
+	struct wl_list link;                  /* qdwin_primary_source::offers */
 };
 
 struct qdwin_primary_seat {
@@ -16303,6 +16305,10 @@ static void
 qdwin_primary_offer_resource_destroy(struct wl_resource *resource)
 {
 	struct qdwin_primary_offer *offer = wl_resource_get_user_data(resource);
+	if (offer && offer->source) {
+		wl_list_remove(&offer->link);
+		offer->source = NULL;
+	}
 	free(offer);
 }
 
@@ -16328,6 +16334,7 @@ qdwin_primary_build_offer_for_device(struct qdwin_primary_device *device,
 	}
 	offer->source = source;
 	offer->resource = res;
+	wl_list_insert(&source->offers, &offer->link);
 	wl_resource_set_implementation(res, &qdwin_primary_offer_impl, offer,
 				       qdwin_primary_offer_resource_destroy);
 	zwp_primary_selection_device_v1_send_data_offer(device->resource, res);
@@ -16343,7 +16350,12 @@ qdwin_primary_source_clear_offers(struct qdwin_primary_source *source)
 {
 	/* Offers keep a pointer back to source; mark them stale so their
 	 * receive() becomes a no-op after source goes away. */
-	(void)source;
+	struct qdwin_primary_offer *offer, *tmp;
+	wl_list_for_each_safe(offer, tmp, &source->offers, link) {
+		wl_list_remove(&offer->link);
+		wl_list_init(&offer->link);
+		offer->source = NULL;
+	}
 }
 
 static void
@@ -16540,6 +16552,7 @@ qdwin_primary_manager_create_source(struct wl_client *client,
 	source->qdwin = qdwin;
 	source->resource = res;
 	wl_list_init(&source->mime_types);
+	wl_list_init(&source->offers);
 	wl_resource_set_implementation(res, &qdwin_primary_source_impl,
 				       source,
 				       qdwin_primary_source_resource_destroy);

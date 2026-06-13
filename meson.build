@@ -1178,6 +1178,18 @@ test('output-manager-gate',
   ],
 )
 
+# Primary-selection D1 lifetime invariant: stale offer resources must be made
+# inert before their source is freed, otherwise a later receive() can deref a
+# destroyed source before the cross-silo gate runs.
+test('primary-selection-lifetime',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_primary_selection_lifetime.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # S13 deliberate fail-open call-site pins: assert the LIVE layer-shell
 # pre-shell bind gate and the secctx root-launcher attestation delegate to
 # their compiled pure helpers (qdwin-logic-unit pins the helpers themselves;
