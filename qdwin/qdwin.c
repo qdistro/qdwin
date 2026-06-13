@@ -1927,6 +1927,17 @@ qdwin_om_client_may_mutate(struct qdwin *qdwin, struct wl_client *client)
 {
 	pid_t pid; uid_t uid; gid_t gid;
 
+	/* findings F8: a sandboxed silo client must never drive output-layout
+	 * mutation (resolution / enable-disable / mode changes — a DoS and
+	 * display-spoofing lever), regardless of uid or the pre-shell window.
+	 * uid == allowed_uid is satisfied by every tier-0..3 silo client
+	 * (isolation-tiers.md), so deny secctx clients outright here, before the
+	 * uid-based pre-shell fallback in qdwin_om_mutation_allowed can grant it.
+	 * Enumeration stays open (intentional, threat-model.md); only mutation
+	 * is gated. */
+	if (qdwin_secctx_client_find(qdwin, client))
+		return false;
+
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 	return qdwin_om_mutation_allowed(
 		qdwin_client_is_bound_shell(qdwin, client),
@@ -6335,6 +6346,18 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 	 * workspace, set_workspace_name, ...). */
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* findings F1: refuse focus redirection while locked, matching
+	 * request_fullscreen/tile/maximize/etc. which already post ERROR_LOCKED.
+	 * The locker routes input via its overlay keyboard grab
+	 * (qdwin_overlay_grab_start, role=2), NOT through set_keyboard_focus, so
+	 * gating here cannot break unlock; it removes the inconsistency whereby
+	 * the shell could steer focus to a background app while the screen is
+	 * locked (a latent lock-bypass if grab handling ever changes). */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource, QDWIN_SHELL_V1_ERROR_LOCKED,
+				       "locked");
+		return;
+	}
 	struct weston_seat *seat = NULL;
 	struct weston_seat *s;
 	wl_list_for_each(s, &qdwin->compositor->seat_list, link) {
@@ -6434,6 +6457,12 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 	 * bound shell may inject silo-aware keyboard focus / clear selections. */
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* findings F1: refuse focus redirection while locked (see v1). */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource, QDWIN_SHELL_V1_ERROR_LOCKED,
+				       "locked");
+		return;
+	}
 	struct weston_seat *seat = NULL;
 	struct weston_seat *s;
 	wl_list_for_each(s, &qdwin->compositor->seat_list, link) {
@@ -7508,6 +7537,14 @@ qdwin_handle_register_hotkey(struct wl_client *client,
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
 	if (!qdwin || key == 0) return;
+	/* Shell-role gate (deeper-review D2): every other state-mutating
+	 * qdwin_shell_v1 request requires the bound shell. A registered hotkey
+	 * installs a compositor-wide key binding (intercepts the chord before
+	 * normal delivery), so an unbound allowed_uid client holding a shell
+	 * resource could hijack chords / unregister the real shell's hotkeys.
+	 * Match the rest of the request table. */
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 
 	/* Idempotent re-register: drop any existing entry under this id. */
 	struct qdwin_hotkey *existing = qdwin_hotkey_find(qdwin, id);
@@ -7541,6 +7578,10 @@ qdwin_handle_unregister_hotkey(struct wl_client *client,
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
 	if (!qdwin) return;
+	/* Shell-role gate (deeper-review D2): mirror register_hotkey so an
+	 * unbound client cannot unregister the bound shell's hotkeys. */
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 	struct qdwin_hotkey *h = qdwin_hotkey_find(qdwin, id);
 	if (h) {
 		qdwin_hotkey_destroy(h);
@@ -7757,6 +7798,20 @@ bind_qdwin_shell(struct wl_client *client, void *data,
 			client,
 			"qdwin_shell_v1: uid %u not permitted (allowed uid=%u)",
 			(unsigned)uid, (unsigned)qdwin->allowed_uid);
+		return;
+	}
+
+	/* Defense-in-depth (findings F0): reject sandboxed silo clients
+	 * outright. The global filter already hides qdwin_shell_v1 from secctx
+	 * clients (QDWIN_GLOBAL_SHELL), but uid == allowed_uid is satisfied by
+	 * every tier-0..3 silo client (isolation-tiers.md), so a filter bug
+	 * must not be the only thing standing between a silo and the shell
+	 * role. A silo client is never the legitimate shell. */
+	if (qdwin_secctx_client_find(qdwin, client)) {
+		wl_client_post_implementation_error(
+			client,
+			"qdwin_shell_v1: sandboxed (security-context) clients "
+			"may not claim the shell role");
 		return;
 	}
 
@@ -8422,8 +8477,24 @@ qdwin_toplevel_for_secctx_app_id(struct qdwin *qdwin,
 		return NULL;
 	struct qdwin_secctx_client *src_sc =
 		qdwin_secctx_client_lookup(qdwin, client);
+	/* deeper-review D3: match on the (engine, app_id) silo identity, not
+	 * app_id alone. app_id alone collides across engines — e.g.
+	 * engine=qdistro.tier2/app_id=firefox vs engine=qdistro.tier3/app_id=
+	 * firefox are *different* silos — which would conflate them and feed the
+	 * broker a false "same silo" verdict → cross-silo paste. Adding the
+	 * engine closes that collision precisely.
+	 *
+	 * instance_id is deliberately NOT required: this resolver exists to
+	 * bridge a selection *source* to a *toplevel* that are separate launches
+	 * within the SAME silo (each app launch is a fresh waypipe-client
+	 * wl_client with its own instance_id — see the header comment), so
+	 * requiring instance equality would defeat the resolver's whole purpose.
+	 * The (engine, app_id) pair is the silo identity; instance distinguishes
+	 * launches within it. NULL on any missing component → caller default-
+	 * denies and the broker's authoritative VerifyClientIdentity decides. */
+	const char *src_engine = qdwin_secctx_client_engine(src_sc);
 	const char *src_app_id = qdwin_secctx_client_app_id(src_sc);
-	if (!src_app_id || !*src_app_id)
+	if (!src_engine || !*src_engine || !src_app_id || !*src_app_id)
 		return NULL;
 	struct qdwin_toplevel *tl;
 	wl_list_for_each(tl, &qdwin->toplevels, link) {
@@ -8436,8 +8507,10 @@ qdwin_toplevel_for_secctx_app_id(struct qdwin *qdwin,
 		struct wl_client *tlc = wl_resource_get_client(ws->resource);
 		struct qdwin_secctx_client *tl_sc =
 			qdwin_secctx_client_lookup(qdwin, tlc);
+		const char *tl_engine = qdwin_secctx_client_engine(tl_sc);
 		const char *tl_app_id = qdwin_secctx_client_app_id(tl_sc);
-		if (tl_app_id && *tl_app_id &&
+		if (tl_engine && *tl_engine && tl_app_id && *tl_app_id &&
+		    strcmp(tl_engine, src_engine) == 0 &&
 		    strcmp(tl_app_id, src_app_id) == 0)
 			return tl;
 	}
@@ -12892,6 +12965,15 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 	 * Layer-shell surfaces can take exclusive keyboard focus and occupy
 	 * overlay layers — untrusted clients must not have this capability.
 	 * See codex-review Finding 1 (HIGH). */
+	/* findings F4 (defense in depth): reject sandboxed silo clients outright
+	 * so the bind gate holds even if the global filter ever regresses or the
+	 * global name leaks; layer-shell is never a silo capability. */
+	if (qdwin_secctx_client_find(qdwin, client)) {
+		wl_client_post_implementation_error(
+			client,
+			"zwlr_layer_shell_v1: sandboxed clients may not bind");
+		return;
+	}
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 
 	/* Optional admin allowlist (security review Finding #4). When any of
@@ -16142,16 +16224,63 @@ qdwin_primary_seat_ensure(struct qdwin *qdwin, struct weston_seat *seat)
 
 /* --- primary_selection_offer -------------------------------------- */
 
+/* deeper-review D1: are two clients in the same silo, for primary-selection
+ * receive gating? Same silo == matching security-context (engine, app_id);
+ * two untagged clients (trusted admin-uid session tools) are also same-silo.
+ * A tagged client paired with an untagged one, or differing (engine, app_id),
+ * is CROSS-silo. instance_id is excluded on purpose — different launches of
+ * one silo are still the same silo (mirrors qdwin_toplevel_for_secctx_app_id,
+ * D3). Fails closed (returns false) on any incomplete identity. */
+static bool
+qdwin_primary_same_silo(struct qdwin *qdwin,
+			struct wl_client *a, struct wl_client *b)
+{
+	if (a == b)
+		return true;
+	struct qdwin_secctx_client *sa = qdwin_secctx_client_lookup(qdwin, a);
+	struct qdwin_secctx_client *sb = qdwin_secctx_client_lookup(qdwin, b);
+	if (!sa && !sb)
+		return true;   /* both untagged (admin / ordinary) */
+	if (!sa || !sb)
+		return false;  /* one tagged, one not → cross-boundary */
+	const char *ea = qdwin_secctx_client_engine(sa);
+	const char *eb = qdwin_secctx_client_engine(sb);
+	const char *aa = qdwin_secctx_client_app_id(sa);
+	const char *ab = qdwin_secctx_client_app_id(sb);
+	if (!ea || !*ea || !eb || !*eb || !aa || !*aa || !ab || !*ab)
+		return false;  /* incomplete identity → fail closed */
+	return strcmp(ea, eb) == 0 && strcmp(aa, ab) == 0;
+}
+
 static void
 qdwin_primary_offer_receive(struct wl_client *client,
 			    struct wl_resource *resource,
 			    const char *mime_type, int32_t fd)
 {
 	struct qdwin_primary_offer *offer = wl_resource_get_user_data(resource);
-	(void)client;
-	if (offer && offer->source && offer->source->resource) {
-		zwp_primary_selection_source_v1_send_send(
-			offer->source->resource, mime_type, fd);
+	struct qdwin *qdwin = qdwin_singleton;
+	if (offer && offer->source && offer->source->resource && qdwin) {
+		struct wl_client *src_client =
+			wl_resource_get_client(offer->source->resource);
+		/* deeper-review D1: the primary selection (middle-click clipboard)
+		 * had NO cross-silo receive gate — unlike wl_data_device, whose
+		 * v15 send-shim routes every receive through a per-MIME, fail-
+		 * closed broker decision — so one silo could read another silo's
+		 * primary selection by calling receive() on the broadcast offer.
+		 * Gate it: forward a same-silo paste; default-DENY a cross-silo
+		 * receive (fail closed — fd is closed below so the receiver sees
+		 * EOF / empty paste). A broker-rule allow path for cross-silo
+		 * primary paste (mirroring the clipboard ClipboardGate) can be
+		 * layered on later if it becomes a product requirement; default-
+		 * deny is the secure baseline and matches the clipboard posture. */
+		if (qdwin_primary_same_silo(qdwin, src_client, client)) {
+			zwp_primary_selection_source_v1_send_send(
+				offer->source->resource, mime_type, fd);
+		} else {
+			weston_log("qdwin: primary-selection receive DENIED "
+				   "(cross-silo) mime='%s'\n",
+				   mime_type ? mime_type : "");
+		}
 	}
 	close(fd);
 }
@@ -17638,6 +17767,31 @@ qdwin_nested_init(struct qdwin *qdwin)
 	const char *outer = getenv("QDWIN_OUTER_DISPLAY");
 	if (!outer || !*outer)
 		outer = "wayland-0";
+
+	/* findings F6: QDWIN_OUTER_DISPLAY selects which Wayland server the
+	 * nested qdwin connects out to. It is owned by the trusted launcher, but
+	 * constrain it defensively so a compromised environment cannot redirect
+	 * the outer connection to an attacker-controlled socket (MITM of
+	 * advertise_toplevel etc.). Accept a runtime-dir-relative display name
+	 * (no '/', libwayland resolves it under XDG_RUNTIME_DIR); accept an
+	 * absolute path only if it lives under $XDG_RUNTIME_DIR. Reject anything
+	 * else and refuse to enter nested mode (fail secure). */
+	if (strchr(outer, '/')) {
+		const char *xrd = getenv("XDG_RUNTIME_DIR");
+		size_t xl = xrd ? strlen(xrd) : 0;
+		/* Reject any ".." component so a runtime-dir-prefixed path cannot
+		 * traverse out (e.g. $XDG_RUNTIME_DIR/../1001/wayland-0). */
+		if (outer[0] != '/' || !xrd || !xl ||
+		    strncmp(outer, xrd, xl) != 0 || outer[xl] != '/' ||
+		    strstr(outer, "/../") != NULL ||
+		    (strlen(outer) >= 3 &&
+		     strcmp(outer + strlen(outer) - 3, "/..") == 0)) {
+			weston_log("qdwin: NESTED_MODE refused — QDWIN_OUTER_DISPLAY="
+				   "%s is neither a display name nor a path under "
+				   "XDG_RUNTIME_DIR\n", outer);
+			return;
+		}
+	}
 
 	weston_log("qdwin: NESTED_MODE on; pid=%d outer=%s\n",
 		   (int)getpid(), outer);
@@ -19247,6 +19401,13 @@ qdwin_secctx_destroy_req(struct wl_client *client,
 	wl_resource_destroy(resource);
 }
 
+/* findings F7: cap externally-settable secctx identity strings. These are
+ * later strdup'd, logged, forwarded to the shell, and compared (incl. the D1/D3
+ * (engine, app_id) silo matching), so an unbounded value is a needless DoS
+ * amplifier. Legitimate engine/app_id/instance values are short (tens of
+ * bytes); reject anything absurd with a protocol error. */
+#define QDWIN_SECCTX_STR_MAX 4096
+
 /* secctx tags are advisory routing metadata — qdwin forwards them to the
  * shell but broker verifies identity via starttime + uid (always) and
  * exe + SELinux label (when available).  See doc/protocol.md
@@ -19272,6 +19433,12 @@ qdwin_secctx_set_sandbox_engine(struct wl_client *client,
 				       "sandbox_engine already set");
 		return;
 	}
+	if (name && strlen(name) > QDWIN_SECCTX_STR_MAX) {
+		wl_resource_post_error(resource,
+				       WP_SECURITY_CONTEXT_V1_ERROR_INVALID_METADATA,
+				       "sandbox_engine too long");
+		return;
+	}
 	sec->sandbox_engine = name ? strdup(name) : NULL;
 }
 
@@ -19293,6 +19460,12 @@ qdwin_secctx_set_app_id(struct wl_client *client,
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_SET,
 				       "app_id already set");
+		return;
+	}
+	if (app_id && strlen(app_id) > QDWIN_SECCTX_STR_MAX) {
+		wl_resource_post_error(resource,
+				       WP_SECURITY_CONTEXT_V1_ERROR_INVALID_METADATA,
+				       "app_id too long");
 		return;
 	}
 	sec->app_id = app_id ? strdup(app_id) : NULL;
@@ -19317,6 +19490,12 @@ qdwin_secctx_set_instance_id(struct wl_client *client,
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_SET,
 				       "instance_id already set");
+		return;
+	}
+	if (instance_id && strlen(instance_id) > QDWIN_SECCTX_STR_MAX) {
+		wl_resource_post_error(resource,
+				       WP_SECURITY_CONTEXT_V1_ERROR_INVALID_METADATA,
+				       "instance_id too long");
 		return;
 	}
 	sec->instance_id = instance_id ? strdup(instance_id) : NULL;
@@ -19684,6 +19863,12 @@ qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
 	if (qdwin->idle_notifier_global &&
 	    global == qdwin->idle_notifier_global)
 		return QDWIN_GLOBAL_IDLE_NOTIFIER;
+	if (qdwin->shell_global &&
+	    global == qdwin->shell_global)
+		return QDWIN_GLOBAL_SHELL;
+	if (qdwin->layer_shell_global &&
+	    global == qdwin->layer_shell_global)
+		return QDWIN_GLOBAL_LAYER_SHELL;
 	return QDWIN_GLOBAL_ORDINARY;
 }
 
@@ -20352,10 +20537,12 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * (waybar, Quickshell/noctalia, eww, fuzzel, mako, swaylock).
 	 * Stub stage — accepts the protocol and completes configure/ack
 	 * but does not lay out or render yet. See impl block above. */
-	/* Global is advertised publicly but bind_qdwin_layer_shell gates to
-	 * shell-client or allowed_uid.  See doc/protocol.md "Security posture:
-	 * layer-shell".  Production TODO: add a wl_global filter to hide it
-	 * from non-shell clients entirely. */
+	/* bind_qdwin_layer_shell gates to shell-client or allowed_uid. See
+	 * doc/protocol.md "Security posture: layer-shell". findings F4: the
+	 * global is now ALSO classified QDWIN_GLOBAL_LAYER_SHELL and hidden from
+	 * secctx/silo clients by qdwin_secctx_global_filter (the prior
+	 * "advertised publicly" Production TODO), so the bind gate is a redundant
+	 * second layer rather than the sole defense. */
 	wl_list_init(&qdwin->layer_surfaces);
 	qdwin->layer_shell_global = wl_global_create(
 		ec->wl_display, &zwlr_layer_shell_v1_interface,

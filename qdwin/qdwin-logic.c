@@ -166,6 +166,32 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 		 * Keep it available to trusted session components, but hide it
 		 * from sandboxed security-context clients. */
 		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_SHELL:
+		/* The trusted shell interface (qdwin_shell_v1) — the ultimate
+		 * cross-silo escalation surface (focus steal, selection clear,
+		 * hotkeys, lock state). Hide it from sandboxed silo clients so a
+		 * compromised silo app cannot see or race the shell role
+		 * (findings F0). It must stay visible to the shell itself and to
+		 * ordinary admin-uid session tools: qdshell is a plain admin
+		 * client (ORDINARY) until it actually calls bind_as_shell, so a
+		 * shell-only (CRED_SHELL) policy would hide the global from the
+		 * very client that needs to bind it and break session startup.
+		 * Same posture as IME/VK/idle: not-SECCTX. The bind handler
+		 * (bind_qdwin_shell) applies the allowed_uid + singleton +
+		 * secctx-deny pins on top. A fully-adversarial same-uid ORDINARY
+		 * session is explicitly out of scope (threat-model.md); the
+		 * in-scope threat is the secctx-tagged silo, which this denies. */
+		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_LAYER_SHELL:
+		/* zwlr_layer_shell_v1 — keyboard-focusable overlays / lock-screen
+		 * surfaces. Legitimately used only by the shell and the locker
+		 * (both non-secctx, admin-uid); no sandboxed silo app needs it.
+		 * Hide it from secctx clients (findings F4, closing qdwin's own
+		 * "Production TODO" to filter it) so the bind-time gate
+		 * (bind_qdwin_layer_shell) becomes a redundant second layer
+		 * instead of the sole defense. not-SECCTX, same rationale as the
+		 * shell global re: ordinary clients and startup. */
+		return cred != QDWIN_CRED_SECCTX;
 	}
 	/* Unknown kind: fail closed (deny). A new privileged global added
 	 * without a policy row must not default to visible. */

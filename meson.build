@@ -395,6 +395,13 @@ primary_selection_protocol_code = custom_target(
   output: 'primary-selection-unstable-v1-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
+# Client header for the P-D1 primary-selection cross-silo probe.
+primary_selection_client_header = custom_target(
+  'primary-selection-unstable-v1-client-header',
+  input: primary_selection_xml,
+  output: 'primary-selection-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
 
 # Layer-shell (zwlr_layer_shell_v1 v5): vendored from
 # Quickshell's repo because wayland-protocols never accepted it
@@ -744,6 +751,17 @@ executable('qdwin-hotkey-probe',
     'test-client/qdwin-hotkey-probe.c',
     qdwin_shell_client_header,
     qdwin_shell_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+)
+
+# Research probe P-D1: primary-selection cross-silo receive gate (finding D1).
+executable('qdwin-primary-selection-probe',
+  sources: [
+    'test-client/qdwin-primary-selection-probe.c',
+    primary_selection_client_header,
+    primary_selection_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,
