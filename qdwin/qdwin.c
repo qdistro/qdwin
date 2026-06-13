@@ -6346,6 +6346,18 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 	 * workspace, set_workspace_name, ...). */
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* findings F1: refuse focus redirection while locked, matching
+	 * request_fullscreen/tile/maximize/etc. which already post ERROR_LOCKED.
+	 * The locker routes input via its overlay keyboard grab
+	 * (qdwin_overlay_grab_start, role=2), NOT through set_keyboard_focus, so
+	 * gating here cannot break unlock; it removes the inconsistency whereby
+	 * the shell could steer focus to a background app while the screen is
+	 * locked (a latent lock-bypass if grab handling ever changes). */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource, QDWIN_SHELL_V1_ERROR_LOCKED,
+				       "locked");
+		return;
+	}
 	struct weston_seat *seat = NULL;
 	struct weston_seat *s;
 	wl_list_for_each(s, &qdwin->compositor->seat_list, link) {
@@ -6445,6 +6457,12 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 	 * bound shell may inject silo-aware keyboard focus / clear selections. */
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
+	/* findings F1: refuse focus redirection while locked (see v1). */
+	if (qdwin->locked) {
+		wl_resource_post_error(resource, QDWIN_SHELL_V1_ERROR_LOCKED,
+				       "locked");
+		return;
+	}
 	struct weston_seat *seat = NULL;
 	struct weston_seat *s;
 	wl_list_for_each(s, &qdwin->compositor->seat_list, link) {
