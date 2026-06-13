@@ -1201,6 +1201,22 @@ test('lock-fail-secure',
   ],
 )
 
+# F7 identity-gate OOM fail-closed pin: assert every privileged-protocol
+# identity gate (locker / layer-shell / IME exe+label allowlist compare)
+# NULL-short-circuits its strcmp, denies on `!ok` with a posted error + a
+# fail-closed return, and (for the bind handlers) gates BEFORE the protocol
+# resource is created — so an OOM'd `strdup` of a /proc identity can never
+# bypass the gate. Closes the F7 strdup-OOM audit; behavioural negative (a
+# real impostor failing to bind) is VM/seat-gated.
+test('identity-gate-oom-failclosed',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_identity_gate_oom_failclosed.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # Round-2 popup / selection defense-in-depth (D5 primary-MIME cap, D6 locked
 # gate on mutating shell requests, D7 show_popup grab-serial @v29, D9 layer-
 # popup grab scope). Source + protocol invariants; behavioural lanes are VM.
