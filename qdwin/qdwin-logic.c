@@ -182,6 +182,16 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 		 * session is explicitly out of scope (threat-model.md); the
 		 * in-scope threat is the secctx-tagged silo, which this denies. */
 		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_LAYER_SHELL:
+		/* zwlr_layer_shell_v1 — keyboard-focusable overlays / lock-screen
+		 * surfaces. Legitimately used only by the shell and the locker
+		 * (both non-secctx, admin-uid); no sandboxed silo app needs it.
+		 * Hide it from secctx clients (findings F4, closing qdwin's own
+		 * "Production TODO" to filter it) so the bind-time gate
+		 * (bind_qdwin_layer_shell) becomes a redundant second layer
+		 * instead of the sole defense. not-SECCTX, same rationale as the
+		 * shell global re: ordinary clients and startup. */
+		return cred != QDWIN_CRED_SECCTX;
 	}
 	/* Unknown kind: fail closed (deny). A new privileged global added
 	 * without a policy row must not default to visible. */

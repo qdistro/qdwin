@@ -1927,6 +1927,17 @@ qdwin_om_client_may_mutate(struct qdwin *qdwin, struct wl_client *client)
 {
 	pid_t pid; uid_t uid; gid_t gid;
 
+	/* findings F8: a sandboxed silo client must never drive output-layout
+	 * mutation (resolution / enable-disable / mode changes — a DoS and
+	 * display-spoofing lever), regardless of uid or the pre-shell window.
+	 * uid == allowed_uid is satisfied by every tier-0..3 silo client
+	 * (isolation-tiers.md), so deny secctx clients outright here, before the
+	 * uid-based pre-shell fallback in qdwin_om_mutation_allowed can grant it.
+	 * Enumeration stays open (intentional, threat-model.md); only mutation
+	 * is gated. */
+	if (qdwin_secctx_client_find(qdwin, client))
+		return false;
+
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 	return qdwin_om_mutation_allowed(
 		qdwin_client_is_bound_shell(qdwin, client),
@@ -19778,6 +19789,9 @@ qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
 	if (qdwin->shell_global &&
 	    global == qdwin->shell_global)
 		return QDWIN_GLOBAL_SHELL;
+	if (qdwin->layer_shell_global &&
+	    global == qdwin->layer_shell_global)
+		return QDWIN_GLOBAL_LAYER_SHELL;
 	return QDWIN_GLOBAL_ORDINARY;
 }
 
@@ -20446,10 +20460,12 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * (waybar, Quickshell/noctalia, eww, fuzzel, mako, swaylock).
 	 * Stub stage — accepts the protocol and completes configure/ack
 	 * but does not lay out or render yet. See impl block above. */
-	/* Global is advertised publicly but bind_qdwin_layer_shell gates to
-	 * shell-client or allowed_uid.  See doc/protocol.md "Security posture:
-	 * layer-shell".  Production TODO: add a wl_global filter to hide it
-	 * from non-shell clients entirely. */
+	/* bind_qdwin_layer_shell gates to shell-client or allowed_uid. See
+	 * doc/protocol.md "Security posture: layer-shell". findings F4: the
+	 * global is now ALSO classified QDWIN_GLOBAL_LAYER_SHELL and hidden from
+	 * secctx/silo clients by qdwin_secctx_global_filter (the prior
+	 * "advertised publicly" Production TODO), so the bind gate is a redundant
+	 * second layer rather than the sole defense. */
 	wl_list_init(&qdwin->layer_surfaces);
 	qdwin->layer_shell_global = wl_global_create(
 		ec->wl_display, &zwlr_layer_shell_v1_interface,
