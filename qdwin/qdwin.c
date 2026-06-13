@@ -17741,6 +17741,26 @@ qdwin_nested_init(struct qdwin *qdwin)
 	if (!outer || !*outer)
 		outer = "wayland-0";
 
+	/* findings F6: QDWIN_OUTER_DISPLAY selects which Wayland server the
+	 * nested qdwin connects out to. It is owned by the trusted launcher, but
+	 * constrain it defensively so a compromised environment cannot redirect
+	 * the outer connection to an attacker-controlled socket (MITM of
+	 * advertise_toplevel etc.). Accept a runtime-dir-relative display name
+	 * (no '/', libwayland resolves it under XDG_RUNTIME_DIR); accept an
+	 * absolute path only if it lives under $XDG_RUNTIME_DIR. Reject anything
+	 * else and refuse to enter nested mode (fail secure). */
+	if (strchr(outer, '/')) {
+		const char *xrd = getenv("XDG_RUNTIME_DIR");
+		size_t xl = xrd ? strlen(xrd) : 0;
+		if (outer[0] != '/' || !xrd || !xl ||
+		    strncmp(outer, xrd, xl) != 0 || outer[xl] != '/') {
+			weston_log("qdwin: NESTED_MODE refused — QDWIN_OUTER_DISPLAY="
+				   "%s is neither a display name nor a path under "
+				   "XDG_RUNTIME_DIR\n", outer);
+			return;
+		}
+	}
+
 	weston_log("qdwin: NESTED_MODE on; pid=%d outer=%s\n",
 		   (int)getpid(), outer);
 
@@ -19349,6 +19369,13 @@ qdwin_secctx_destroy_req(struct wl_client *client,
 	wl_resource_destroy(resource);
 }
 
+/* findings F7: cap externally-settable secctx identity strings. These are
+ * later strdup'd, logged, forwarded to the shell, and compared (incl. the D1/D3
+ * (engine, app_id) silo matching), so an unbounded value is a needless DoS
+ * amplifier. Legitimate engine/app_id/instance values are short (tens of
+ * bytes); reject anything absurd with a protocol error. */
+#define QDWIN_SECCTX_STR_MAX 4096
+
 /* secctx tags are advisory routing metadata — qdwin forwards them to the
  * shell but broker verifies identity via starttime + uid (always) and
  * exe + SELinux label (when available).  See doc/protocol.md
@@ -19374,6 +19401,12 @@ qdwin_secctx_set_sandbox_engine(struct wl_client *client,
 				       "sandbox_engine already set");
 		return;
 	}
+	if (name && strlen(name) > QDWIN_SECCTX_STR_MAX) {
+		wl_resource_post_error(resource,
+				       WP_SECURITY_CONTEXT_V1_ERROR_INVALID_METADATA,
+				       "sandbox_engine too long");
+		return;
+	}
 	sec->sandbox_engine = name ? strdup(name) : NULL;
 }
 
@@ -19395,6 +19428,12 @@ qdwin_secctx_set_app_id(struct wl_client *client,
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_SET,
 				       "app_id already set");
+		return;
+	}
+	if (app_id && strlen(app_id) > QDWIN_SECCTX_STR_MAX) {
+		wl_resource_post_error(resource,
+				       WP_SECURITY_CONTEXT_V1_ERROR_INVALID_METADATA,
+				       "app_id too long");
 		return;
 	}
 	sec->app_id = app_id ? strdup(app_id) : NULL;
@@ -19419,6 +19458,12 @@ qdwin_secctx_set_instance_id(struct wl_client *client,
 		wl_resource_post_error(resource,
 				       WP_SECURITY_CONTEXT_V1_ERROR_ALREADY_SET,
 				       "instance_id already set");
+		return;
+	}
+	if (instance_id && strlen(instance_id) > QDWIN_SECCTX_STR_MAX) {
+		wl_resource_post_error(resource,
+				       WP_SECURITY_CONTEXT_V1_ERROR_INVALID_METADATA,
+				       "instance_id too long");
 		return;
 	}
 	sec->instance_id = instance_id ? strdup(instance_id) : NULL;
