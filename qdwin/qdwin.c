@@ -300,13 +300,20 @@ static void
 bind_qdwin_secctx_manager(struct wl_client *client, void *data,
 			  uint32_t version, uint32_t id);
 
-/* findings F7: strdup that logs (once, rate-naive) on OOM instead of failing
- * silently. Returns NULL on a NULL input OR on allocation failure — callers in
- * qdwin are uniformly NULL-tolerant (the accessors fall back to ""), so a NULL
- * here fails closed (an OOM'd identity string cannot match a silo gate) rather
- * than crashing. Use this for internally-snapshotted strings where visibility
- * of an OOM matters; for externally-set protocol strings, prefer
- * wl_resource_post_no_memory() so the client learns the request was dropped. */
+/* findings F7: the standard fail-closed snapshot dup for qdwin. Returns NULL on
+ * a NULL input OR on allocation failure, logging (once, rate-naive) on OOM
+ * instead of failing silently. Behaviourally identical to the
+ * `s ? strdup(s) : NULL` idiom it replaces — both yield NULL for a NULL input
+ * AND for an OOM'd non-NULL input — but it makes the OOM visible and self-
+ * documents that the site is deliberately NULL-tolerant: every qdwin consumer of
+ * these snapshot fields guards the read (accessors fall back to ""), so a NULL
+ * here fails closed (an OOM'd identity cannot match a silo gate) rather than
+ * crashing. Use this for INTERNALLY-snapshotted strings (cached titles/app_ids,
+ * proxied/text-input/IME state, identity captures). For an EXTERNALLY-set
+ * protocol string in a request handler prefer wl_resource_post_no_memory() so
+ * the client learns the request was dropped (e.g. the secctx set-path); for a
+ * security identity the caller must additionally treat NULL as "no match" — see
+ * the bind gates and test_identity_gate_oom_failclosed.py. */
 static char *
 qdwin_xstrdup_or_null(const char *s)
 {
@@ -1470,9 +1477,9 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 	 * the surface_committed diff path uses these to suppress spurious
 	 * "title/app_id changed" log spam on every initial commit. */
 	free(tl->cached_title);
-	tl->cached_title = strdup(title ? title : "");
+	tl->cached_title = qdwin_xstrdup_or_null(title ? title : "");
 	free(tl->cached_app_id);
-	tl->cached_app_id = strdup(app_id ? app_id : "");
+	tl->cached_app_id = qdwin_xstrdup_or_null(app_id ? app_id : "");
 	if (!qdwin->shell_bound || !qdwin->shell_resource)
 		return;
 	qdwin_shell_v1_send_toplevel_added(qdwin->shell_resource,
@@ -1718,7 +1725,7 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 		const char *cur_safe = cur ? cur : "";
 		if (!tl->cached_title || strcmp(tl->cached_title, cur_safe) != 0) {
 			free(tl->cached_title);
-			tl->cached_title = strdup(cur_safe);
+			tl->cached_title = qdwin_xstrdup_or_null(cur_safe);
 			weston_log("qdwin: toplevel_title handle=%u title=\"%s\"\n",
 				   tl->handle, cur_safe);
 			if (qdwin->shell_bound && qdwin->shell_resource)
@@ -1736,7 +1743,7 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 		const char *cur_safe = cur ? cur : "";
 		if (!tl->cached_app_id || strcmp(tl->cached_app_id, cur_safe) != 0) {
 			free(tl->cached_app_id);
-			tl->cached_app_id = strdup(cur_safe);
+			tl->cached_app_id = qdwin_xstrdup_or_null(cur_safe);
 			weston_log("qdwin: toplevel_app_id handle=%u app_id=\"%s\" (log-only — no protocol event yet)\n",
 				   tl->handle, cur_safe);
 		}
@@ -11072,7 +11079,7 @@ qdwin_seat_tracker_set_silo(struct qdwin_seat_tracker *tr, const char *silo)
 	if (!tr)
 		return;
 	free(tr->last_target_silo);
-	tr->last_target_silo = (silo && *silo) ? strdup(silo) : NULL;
+	tr->last_target_silo = (silo && *silo) ? qdwin_xstrdup_or_null(silo) : NULL;
 }
 
 static void
@@ -13056,7 +13063,7 @@ qdwin_layer_shell_get_layer_surface(struct wl_client *client,
 	ls->qdwin     = qdwin;
 	ls->surface   = surface;
 	ls->layer     = layer;
-	ls->namespace = namespace_str ? strdup(namespace_str) : NULL;
+	ls->namespace = qdwin_xstrdup_or_null(namespace_str);
 	ls->pending.exclusive_zone = 0;
 	ls->pending.kbd_interactivity =
 		ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
@@ -13654,7 +13661,7 @@ qdwin_cursor_theme_load(struct qdwin *qdwin)
 	if (size <= 0)
 		size = 24;
 	qdwin->cursor_size = size;
-	qdwin->cursor_theme_name = env_theme ? strdup(env_theme) : NULL;
+	qdwin->cursor_theme_name = qdwin_xstrdup_or_null(env_theme);
 
 	unsigned loaded = 0;
 	for (uint32_t s = 1; s <= WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE; s++) {
@@ -14881,7 +14888,7 @@ qdwin_text_input_set_surrounding_text(struct wl_client *client,
 	 * strdup failure leaves the field unset (forwarded as unsupported)
 	 * rather than aborting the client. */
 	free(ti->pending_surrounding);
-	ti->pending_surrounding = text ? strdup(text) : NULL;
+	ti->pending_surrounding = qdwin_xstrdup_or_null(text);
 	ti->pending_sur_cursor = (uint32_t)cursor;
 	ti->pending_sur_anchor = (uint32_t)anchor;
 	ti->pending_sur_set = 1;
@@ -15455,7 +15462,7 @@ qdwin_im_req_commit_string(struct wl_client *client,
 	if (!im || im->inert)
 		return;
 	free(im->pending_commit);
-	im->pending_commit = text ? strdup(text) : NULL;
+	im->pending_commit = qdwin_xstrdup_or_null(text);
 }
 
 static void
@@ -15468,7 +15475,7 @@ qdwin_im_req_set_preedit_string(struct wl_client *client,
 	if (!im || im->inert)
 		return;
 	free(im->pending_preedit);
-	im->pending_preedit = text ? strdup(text) : NULL;
+	im->pending_preedit = qdwin_xstrdup_or_null(text);
 	im->pending_preedit_cb = cursor_begin;
 	im->pending_preedit_ce = cursor_end;
 }
@@ -16905,7 +16912,7 @@ qdwin_nested_toplevel_set_title(struct wl_client *client,
 	if (!t)
 		return;
 	free(t->title);
-	t->title = title ? strdup(title) : NULL;
+	t->title = qdwin_xstrdup_or_null(title);
 	weston_log("qdwin: nested-toplevel set_title app_id=%s title=%s\n",
 		   t->app_id ? t->app_id : "",
 		   t->title ? t->title : "");
@@ -16924,7 +16931,7 @@ qdwin_nested_toplevel_set_app_id(struct wl_client *client,
 	if (!t)
 		return;
 	free(t->app_id);
-	t->app_id = app_id ? strdup(app_id) : NULL;
+	t->app_id = qdwin_xstrdup_or_null(app_id);
 	weston_log("qdwin: nested-toplevel set_app_id=%s\n",
 		   t->app_id ? t->app_id : "");
 	if (t->proxy_tl)
@@ -17032,10 +17039,10 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 	}
 	t->qdwin       = qdwin;
 	t->resource    = tl_res;
-	t->pw_node     = pw_node    ? strdup(pw_node)    : NULL;
-	t->input_sink  = input_sink ? strdup(input_sink) : NULL;
-	t->app_id      = app_id     ? strdup(app_id)     : NULL;
-	t->title       = title      ? strdup(title)      : NULL;
+	t->pw_node     = qdwin_xstrdup_or_null(pw_node);
+	t->input_sink  = qdwin_xstrdup_or_null(input_sink);
+	t->app_id      = qdwin_xstrdup_or_null(app_id);
+	t->title       = qdwin_xstrdup_or_null(title);
 	/* origin_uid here is the verified peer uid (see above), not the raw
 	 * client assertion. */
 	t->origin_uid  = origin_uid;
@@ -17390,7 +17397,7 @@ qdwin_activation_token_set_app_id(struct wl_client *client,
 	if (!t || t->committed)
 		return;
 	free(t->app_id);
-	t->app_id = app_id ? strdup(app_id) : NULL;
+	t->app_id = qdwin_xstrdup_or_null(app_id);
 }
 
 static void
@@ -18518,8 +18525,8 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 	tl->desktop_surface    = NULL;
 	tl->handle             = ++qdwin->next_handle;
 	tl->is_nested_proxy    = true;
-	tl->proxy_app_id       = app_id ? strdup(app_id) : NULL;
-	tl->proxy_title        = title  ? strdup(title)  : NULL;
+	tl->proxy_app_id       = qdwin_xstrdup_or_null(app_id);
+	tl->proxy_title        = qdwin_xstrdup_or_null(title);
 	tl->proxy_origin_uid   = origin_uid;
 	tl->proxy_nested_owner = owner;
 	tl->mapped             = 1;
@@ -18909,7 +18916,7 @@ qdwin_nested_proxy_set_title(struct qdwin_toplevel *tl, const char *title)
 	if (!tl || !tl->is_nested_proxy)
 		return;
 	free(tl->proxy_title);
-	tl->proxy_title = title ? strdup(title) : NULL;
+	tl->proxy_title = qdwin_xstrdup_or_null(title);
 	struct qdwin *qdwin = tl->qdwin;
 	if (qdwin->shell_bound && qdwin->shell_resource) {
 		qdwin_shell_v1_send_toplevel_title(
@@ -18924,7 +18931,7 @@ qdwin_nested_proxy_set_app_id(struct qdwin_toplevel *tl, const char *app_id)
 	if (!tl || !tl->is_nested_proxy)
 		return;
 	free(tl->proxy_app_id);
-	tl->proxy_app_id = app_id ? strdup(app_id) : NULL;
+	tl->proxy_app_id = qdwin_xstrdup_or_null(app_id);
 	/* qdwin_shell_v1 has no app_id-changed event today (app_id is
 	 * sent once at toplevel_added). Cached value still affects
 	 * subsequent re-emissions / debug output. */
