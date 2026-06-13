@@ -12965,6 +12965,15 @@ bind_qdwin_layer_shell(struct wl_client *client, void *data,
 	 * Layer-shell surfaces can take exclusive keyboard focus and occupy
 	 * overlay layers — untrusted clients must not have this capability.
 	 * See codex-review Finding 1 (HIGH). */
+	/* findings F4 (defense in depth): reject sandboxed silo clients outright
+	 * so the bind gate holds even if the global filter ever regresses or the
+	 * global name leaks; layer-shell is never a silo capability. */
+	if (qdwin_secctx_client_find(qdwin, client)) {
+		wl_client_post_implementation_error(
+			client,
+			"zwlr_layer_shell_v1: sandboxed clients may not bind");
+		return;
+	}
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 
 	/* Optional admin allowlist (security review Finding #4). When any of
@@ -17770,8 +17779,13 @@ qdwin_nested_init(struct qdwin *qdwin)
 	if (strchr(outer, '/')) {
 		const char *xrd = getenv("XDG_RUNTIME_DIR");
 		size_t xl = xrd ? strlen(xrd) : 0;
+		/* Reject any ".." component so a runtime-dir-prefixed path cannot
+		 * traverse out (e.g. $XDG_RUNTIME_DIR/../1001/wayland-0). */
 		if (outer[0] != '/' || !xrd || !xl ||
-		    strncmp(outer, xrd, xl) != 0 || outer[xl] != '/') {
+		    strncmp(outer, xrd, xl) != 0 || outer[xl] != '/' ||
+		    strstr(outer, "/../") != NULL ||
+		    (strlen(outer) >= 3 &&
+		     strcmp(outer + strlen(outer) - 3, "/..") == 0)) {
 			weston_log("qdwin: NESTED_MODE refused — QDWIN_OUTER_DISPLAY="
 				   "%s is neither a display name nor a path under "
 				   "XDG_RUNTIME_DIR\n", outer);
