@@ -67,7 +67,17 @@ reason=manual`.
 ### Step 3 — type the password (B4 — overlay grab forwards keys)
 
 ```bash
-for c in k r u g e r; do
+qdwin_qmp_key shift down; sleep 0.03
+qdwin_qmp_key p down; sleep 0.05
+qdwin_qmp_key p up; sleep 0.05
+qdwin_qmp_key shift up; sleep 0.03
+qdwin_qmp_key a down; sleep 0.05
+qdwin_qmp_key a up; sleep 0.05
+qdwin_qmp_key shift down; sleep 0.03
+qdwin_qmp_key minus down; sleep 0.05
+qdwin_qmp_key minus up; sleep 0.05
+qdwin_qmp_key shift up; sleep 0.03
+for c in s s w 0 r d 4 5; do
     qdwin_qmp_key "$c" down; sleep 0.05
     qdwin_qmp_key "$c" up; sleep 0.05
 done
@@ -76,8 +86,8 @@ qdwin_screenshot /tmp/03-step3-typed.png
 qdwin_ctrl "locker"
 ```
 
-**Assert (3.1):** ctrl-socket reports `prompt-len=6`.
-**Assert (3.2):** screenshot shows 6 password dots (`••••••`) in the
+**Assert (3.1):** ctrl-socket reports `prompt-len=11`.
+**Assert (3.2):** screenshot shows 11 password dots in the
 password field — confirms the overlay_key event delivered each
 character into the locker prompt buffer.
 

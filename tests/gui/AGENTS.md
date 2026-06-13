@@ -17,7 +17,7 @@ and observation primitives are different.
 - Host: openSUSE Tumbleweed with `libvirt` + `virsh`.
 - Target: a running libvirt domain on `qemu:///session` running the
   qdwin compositor (greetd-qdwin.service active on tty3 with autologin
-  as `admin`). Standard test password `$QDISTRO_VM_PASSWORD`.
+  as `admin`). Standard test password: `Pa_ssw0rd45`.
 - VM name: `$VMNAME` if set, else `virsh list --name --state-running | head -1`.
 - The qdshell ctrl-socket at `/run/user/1000/qdshell.sock` is the
   legacy driver for the launcher / switcher / locker and is still
