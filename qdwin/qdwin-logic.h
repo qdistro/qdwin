@@ -140,6 +140,7 @@ enum qdwin_global_kind {
 	QDWIN_GLOBAL_WESTON_CAPTURE = 3,    /* weston_capture_v1 (screen capture) */
 	QDWIN_GLOBAL_SECCTX_MANAGER = 4,    /* wp_security_context_manager_v1 */
 	QDWIN_GLOBAL_IDLE_NOTIFIER = 5,     /* ext_idle_notifier_v1 */
+	QDWIN_GLOBAL_SHELL = 6,             /* qdwin_shell_v1 (trusted shell role) */
 };
 
 /* Pure policy: may a client of credential class `cred` SEE/BIND a global of

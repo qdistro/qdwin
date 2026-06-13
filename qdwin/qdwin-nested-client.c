@@ -317,7 +317,16 @@ qdwin_nested_input_sink_open(uint32_t handle)
 	if (fd < 0)
 		return NULL;
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	/* findings F3: reject an over-long path rather than silently truncating
+	 * (a truncated sun_path could resolve to a different, attacker-influenced
+	 * socket), and NUL-terminate explicitly rather than relying on the
+	 * designated initializer having zeroed the reserved last byte. */
+	if (strlen(path) >= sizeof addr.sun_path) {
+		close(fd);
+		return NULL;
+	}
 	strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+	addr.sun_path[sizeof addr.sun_path - 1] = '\0';
 	unlink(path);  /* in case of stale socket from a previous run */
 	if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
 		close(fd);
@@ -441,7 +450,14 @@ qdwin_nested_input_sink_connect_one(const char *path)
 	if (fd < 0)
 		return -1;
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	/* findings F3: reject an over-long path rather than silently truncating,
+	 * and NUL-terminate explicitly (see the bind site for rationale). */
+	if (strlen(path) >= sizeof addr.sun_path) {
+		close(fd);
+		return -1;
+	}
 	strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+	addr.sun_path[sizeof addr.sun_path - 1] = '\0';
 	if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
 		close(fd);
 		return -1;
@@ -474,6 +490,17 @@ qdwin_nested_input_sink_connect(const char *socket_path)
 	if (!slash)
 		return -1;
 	const char *basename = slash + 1;
+	/* findings F2: the basename comes from an advertised path controlled by
+	 * the (sandboxed) inner publisher. It is spliced UNESCAPED into the glob
+	 * pattern below, so glob metacharacters (* ? [ ] \) in it would broaden
+	 * matching and let a malicious inner connect to a *different* same-uid
+	 * container's input-sink than the one it named, defeating the uniqueness
+	 * assumption. Legitimate names are qdwin-nested-input-<pid>-<n>.sock with
+	 * no metacharacters, so reject any basename that carries one (and an
+	 * empty basename). Only `basename` is sanitized; the `*` container-dir
+	 * wildcard in the pattern is ours and intended. */
+	if (!*basename || basename[strcspn(basename, "*?[]\\")] != '\0')
+		return -1;
 	if (strncmp(socket_path, "/run/user/", 10) != 0)
 		return -1;
 	const char *uid_start = socket_path + 10;

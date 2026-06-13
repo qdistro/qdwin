@@ -7508,6 +7508,14 @@ qdwin_handle_register_hotkey(struct wl_client *client,
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
 	if (!qdwin || key == 0) return;
+	/* Shell-role gate (deeper-review D2): every other state-mutating
+	 * qdwin_shell_v1 request requires the bound shell. A registered hotkey
+	 * installs a compositor-wide key binding (intercepts the chord before
+	 * normal delivery), so an unbound allowed_uid client holding a shell
+	 * resource could hijack chords / unregister the real shell's hotkeys.
+	 * Match the rest of the request table. */
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 
 	/* Idempotent re-register: drop any existing entry under this id. */
 	struct qdwin_hotkey *existing = qdwin_hotkey_find(qdwin, id);
@@ -7541,6 +7549,10 @@ qdwin_handle_unregister_hotkey(struct wl_client *client,
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
 	if (!qdwin) return;
+	/* Shell-role gate (deeper-review D2): mirror register_hotkey so an
+	 * unbound client cannot unregister the bound shell's hotkeys. */
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 	struct qdwin_hotkey *h = qdwin_hotkey_find(qdwin, id);
 	if (h) {
 		qdwin_hotkey_destroy(h);
@@ -7757,6 +7769,20 @@ bind_qdwin_shell(struct wl_client *client, void *data,
 			client,
 			"qdwin_shell_v1: uid %u not permitted (allowed uid=%u)",
 			(unsigned)uid, (unsigned)qdwin->allowed_uid);
+		return;
+	}
+
+	/* Defense-in-depth (findings F0): reject sandboxed silo clients
+	 * outright. The global filter already hides qdwin_shell_v1 from secctx
+	 * clients (QDWIN_GLOBAL_SHELL), but uid == allowed_uid is satisfied by
+	 * every tier-0..3 silo client (isolation-tiers.md), so a filter bug
+	 * must not be the only thing standing between a silo and the shell
+	 * role. A silo client is never the legitimate shell. */
+	if (qdwin_secctx_client_find(qdwin, client)) {
+		wl_client_post_implementation_error(
+			client,
+			"qdwin_shell_v1: sandboxed (security-context) clients "
+			"may not claim the shell role");
 		return;
 	}
 
@@ -8422,8 +8448,24 @@ qdwin_toplevel_for_secctx_app_id(struct qdwin *qdwin,
 		return NULL;
 	struct qdwin_secctx_client *src_sc =
 		qdwin_secctx_client_lookup(qdwin, client);
+	/* deeper-review D3: match on the (engine, app_id) silo identity, not
+	 * app_id alone. app_id alone collides across engines — e.g.
+	 * engine=qdistro.tier2/app_id=firefox vs engine=qdistro.tier3/app_id=
+	 * firefox are *different* silos — which would conflate them and feed the
+	 * broker a false "same silo" verdict → cross-silo paste. Adding the
+	 * engine closes that collision precisely.
+	 *
+	 * instance_id is deliberately NOT required: this resolver exists to
+	 * bridge a selection *source* to a *toplevel* that are separate launches
+	 * within the SAME silo (each app launch is a fresh waypipe-client
+	 * wl_client with its own instance_id — see the header comment), so
+	 * requiring instance equality would defeat the resolver's whole purpose.
+	 * The (engine, app_id) pair is the silo identity; instance distinguishes
+	 * launches within it. NULL on any missing component → caller default-
+	 * denies and the broker's authoritative VerifyClientIdentity decides. */
+	const char *src_engine = qdwin_secctx_client_engine(src_sc);
 	const char *src_app_id = qdwin_secctx_client_app_id(src_sc);
-	if (!src_app_id || !*src_app_id)
+	if (!src_engine || !*src_engine || !src_app_id || !*src_app_id)
 		return NULL;
 	struct qdwin_toplevel *tl;
 	wl_list_for_each(tl, &qdwin->toplevels, link) {
@@ -8436,8 +8478,10 @@ qdwin_toplevel_for_secctx_app_id(struct qdwin *qdwin,
 		struct wl_client *tlc = wl_resource_get_client(ws->resource);
 		struct qdwin_secctx_client *tl_sc =
 			qdwin_secctx_client_lookup(qdwin, tlc);
+		const char *tl_engine = qdwin_secctx_client_engine(tl_sc);
 		const char *tl_app_id = qdwin_secctx_client_app_id(tl_sc);
-		if (tl_app_id && *tl_app_id &&
+		if (tl_engine && *tl_engine && tl_app_id && *tl_app_id &&
+		    strcmp(tl_engine, src_engine) == 0 &&
 		    strcmp(tl_app_id, src_app_id) == 0)
 			return tl;
 	}
@@ -16142,16 +16186,63 @@ qdwin_primary_seat_ensure(struct qdwin *qdwin, struct weston_seat *seat)
 
 /* --- primary_selection_offer -------------------------------------- */
 
+/* deeper-review D1: are two clients in the same silo, for primary-selection
+ * receive gating? Same silo == matching security-context (engine, app_id);
+ * two untagged clients (trusted admin-uid session tools) are also same-silo.
+ * A tagged client paired with an untagged one, or differing (engine, app_id),
+ * is CROSS-silo. instance_id is excluded on purpose — different launches of
+ * one silo are still the same silo (mirrors qdwin_toplevel_for_secctx_app_id,
+ * D3). Fails closed (returns false) on any incomplete identity. */
+static bool
+qdwin_primary_same_silo(struct qdwin *qdwin,
+			struct wl_client *a, struct wl_client *b)
+{
+	if (a == b)
+		return true;
+	struct qdwin_secctx_client *sa = qdwin_secctx_client_lookup(qdwin, a);
+	struct qdwin_secctx_client *sb = qdwin_secctx_client_lookup(qdwin, b);
+	if (!sa && !sb)
+		return true;   /* both untagged (admin / ordinary) */
+	if (!sa || !sb)
+		return false;  /* one tagged, one not → cross-boundary */
+	const char *ea = qdwin_secctx_client_engine(sa);
+	const char *eb = qdwin_secctx_client_engine(sb);
+	const char *aa = qdwin_secctx_client_app_id(sa);
+	const char *ab = qdwin_secctx_client_app_id(sb);
+	if (!ea || !*ea || !eb || !*eb || !aa || !*aa || !ab || !*ab)
+		return false;  /* incomplete identity → fail closed */
+	return strcmp(ea, eb) == 0 && strcmp(aa, ab) == 0;
+}
+
 static void
 qdwin_primary_offer_receive(struct wl_client *client,
 			    struct wl_resource *resource,
 			    const char *mime_type, int32_t fd)
 {
 	struct qdwin_primary_offer *offer = wl_resource_get_user_data(resource);
-	(void)client;
-	if (offer && offer->source && offer->source->resource) {
-		zwp_primary_selection_source_v1_send_send(
-			offer->source->resource, mime_type, fd);
+	struct qdwin *qdwin = qdwin_singleton;
+	if (offer && offer->source && offer->source->resource && qdwin) {
+		struct wl_client *src_client =
+			wl_resource_get_client(offer->source->resource);
+		/* deeper-review D1: the primary selection (middle-click clipboard)
+		 * had NO cross-silo receive gate — unlike wl_data_device, whose
+		 * v15 send-shim routes every receive through a per-MIME, fail-
+		 * closed broker decision — so one silo could read another silo's
+		 * primary selection by calling receive() on the broadcast offer.
+		 * Gate it: forward a same-silo paste; default-DENY a cross-silo
+		 * receive (fail closed — fd is closed below so the receiver sees
+		 * EOF / empty paste). A broker-rule allow path for cross-silo
+		 * primary paste (mirroring the clipboard ClipboardGate) can be
+		 * layered on later if it becomes a product requirement; default-
+		 * deny is the secure baseline and matches the clipboard posture. */
+		if (qdwin_primary_same_silo(qdwin, src_client, client)) {
+			zwp_primary_selection_source_v1_send_send(
+				offer->source->resource, mime_type, fd);
+		} else {
+			weston_log("qdwin: primary-selection receive DENIED "
+				   "(cross-silo) mime='%s'\n",
+				   mime_type ? mime_type : "");
+		}
 	}
 	close(fd);
 }
@@ -19684,6 +19775,9 @@ qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
 	if (qdwin->idle_notifier_global &&
 	    global == qdwin->idle_notifier_global)
 		return QDWIN_GLOBAL_IDLE_NOTIFIER;
+	if (qdwin->shell_global &&
+	    global == qdwin->shell_global)
+		return QDWIN_GLOBAL_SHELL;
 	return QDWIN_GLOBAL_ORDINARY;
 }
 

@@ -437,6 +437,12 @@ def check_capture_and_secctx_are_shell_only(logic_source):
         frozenset(["QDWIN_GLOBAL_WESTON_CAPTURE"]): "cred==QDWIN_CRED_SHELL",
         frozenset(["QDWIN_GLOBAL_SECCTX_MANAGER"]): "cred==QDWIN_CRED_SHELL",
         frozenset(["QDWIN_GLOBAL_IDLE_NOTIFIER"]): "cred!=QDWIN_CRED_SECCTX",
+        # findings F0: the trusted shell interface, hidden from secctx/silo
+        # clients (the in-scope cross-silo threat). Not shell-only (CRED_SHELL):
+        # qdshell is an ORDINARY admin client until it calls bind_as_shell, so a
+        # CRED_SHELL policy would hide the global from the client that must bind
+        # it. bind_qdwin_shell applies allowed_uid + singleton + secctx-deny.
+        frozenset(["QDWIN_GLOBAL_SHELL"]): "cred!=QDWIN_CRED_SECCTX",
     }
     if parsed != expected_arms:
         return fail(
@@ -508,6 +514,11 @@ FILTER_GATED_KIND = {
     "virtual_keyboard_manager_global": "QDWIN_GLOBAL_VIRTUAL_KEYBOARD",
     "security_context_manager_global": "QDWIN_GLOBAL_SECCTX_MANAGER",
     "idle_notifier_global": "QDWIN_GLOBAL_IDLE_NOTIFIER",
+    # findings F0: the trusted shell interface is the ultimate cross-silo
+    # escalation surface; hidden from secctx/silo clients by the filter
+    # (cred != SECCTX), with bind_qdwin_shell applying allowed_uid + singleton
+    # + secctx-deny on top.
+    "shell_global": "QDWIN_GLOBAL_SHELL",
 }
 FILTER_GATED_GLOBALS = set(FILTER_GATED_KIND)
 
@@ -520,7 +531,8 @@ FILTER_GATED_GLOBALS = set(FILTER_GATED_KIND)
 INTENTIONALLY_VISIBLE_GLOBALS = {
     # identity-gated at bind or request time (covered by their own host/source
     # tests), so filter-visibility is acceptable:
-    "shell_global",            # qdwin shell: shell-auth bind gate
+    # NOTE: shell_global moved to FILTER_GATED_KIND (QDWIN_GLOBAL_SHELL) —
+    # findings F0; it is now hidden from secctx clients by the filter.
     "output_mgmt_global",      # output-management: S13 om_mutation_allowed gate
     "locker_global",           # session locker: locker bind gate (host 07)
     "xdg_activation_global",   # xdg-activation: activation gating (host 09)
