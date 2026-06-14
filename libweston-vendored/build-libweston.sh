@@ -104,6 +104,12 @@ cd "$SRC"
 # thereafter; delete the build dir to force a profile/option change.
 if [[ ! -f "$BUILD/build.ninja" ]]; then
     rm -rf "$BUILD"
+    # The trailing -D flags disable optional weston features qdwin does not use
+    # so the production tree builds without their devel deps. backend-drm's
+    # VA-API screencast recorder (-Dbackend-drm-screencast-vaapi) defaults ON and
+    # hard-requires libva (`ERROR: VA-API recorder requires libva >= 0.34.0`);
+    # qdwin records nothing through it (view streaming goes via pipewire), so
+    # disable it rather than pull libva-devel into every bake.
     meson setup "$BUILD" \
         --prefix="$PREFIX" \
         "${MESON_OPTS[@]}" \
@@ -120,7 +126,8 @@ if [[ ! -f "$BUILD/build.ninja" ]]; then
         -Ddemo-clients=false \
         -Dsimple-clients= \
         -Ddoc=false \
-        -Dwcap-decode=false
+        -Dwcap-decode=false \
+        -Dbackend-drm-screencast-vaapi=false
 fi
 
 if [[ ${#NINJA_TARGETS[@]} -gt 0 ]]; then
