@@ -192,6 +192,19 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 		 * instead of the sole defense. not-SECCTX, same rationale as the
 		 * shell global re: ordinary clients and startup. */
 		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_TOUCH_CALIBRATION:
+		/* weston_touch_calibration drives global touch-input calibration
+		 * and grabs touch during a calibration session — a cross-silo
+		 * input-integrity surface (a silo could remap or capture touch for
+		 * the whole seat). libweston creates it at
+		 * compositor->touch_calibration with NO bind-time peer pin, so the
+		 * visibility filter is the gate. Hide it from sandboxed silo
+		 * clients; ordinary admin-session tools (a calibrator) keep it.
+		 * Same posture as IME/VK/idle: not-SECCTX. (02/S1 inherited-global
+		 * sweep — the one privileged inherited global with a stable
+		 * qdwin-reachable global pointer, unlike direct-display /
+		 * content-protection whose create result libweston discards.) */
+		return cred != QDWIN_CRED_SECCTX;
 	}
 	/* Unknown kind: fail closed (deny). A new privileged global added
 	 * without a policy row must not default to visible. */

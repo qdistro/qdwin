@@ -20170,6 +20170,10 @@ qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
 	    qdwin->compositor->output_capture.weston_capture_v1 &&
 	    global == qdwin->compositor->output_capture.weston_capture_v1)
 		return QDWIN_GLOBAL_WESTON_CAPTURE;
+	if (qdwin->compositor &&
+	    qdwin->compositor->touch_calibration &&
+	    global == qdwin->compositor->touch_calibration)
+		return QDWIN_GLOBAL_TOUCH_CALIBRATION;
 	if (qdwin->security_context_manager_global &&
 	    global == qdwin->security_context_manager_global)
 		return QDWIN_GLOBAL_SECCTX_MANAGER;

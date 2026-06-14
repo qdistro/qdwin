@@ -342,6 +342,19 @@ static void test_global_visibility(void)
 				    QDWIN_GLOBAL_IDLE_NOTIFIER),
 	      "ext_idle_notifier_v1 hidden from secctx/silo clients");
 
+	/* weston_touch_calibration drives global touch-input calibration / touch
+	 * grab — a cross-silo input-integrity surface. Hidden from sandboxed silo
+	 * clients; visible to the shell and ordinary admin-session tools (02/S1). */
+	CHECK(qdwin_global_visible(QDWIN_CRED_SHELL,
+				   QDWIN_GLOBAL_TOUCH_CALIBRATION),
+	      "weston_touch_calibration visible to shell");
+	CHECK(qdwin_global_visible(QDWIN_CRED_ORDINARY,
+				   QDWIN_GLOBAL_TOUCH_CALIBRATION),
+	      "weston_touch_calibration visible to ordinary session clients");
+	CHECK(!qdwin_global_visible(QDWIN_CRED_SECCTX,
+				    QDWIN_GLOBAL_TOUCH_CALIBRATION),
+	      "weston_touch_calibration hidden from secctx/silo clients");
+
 	/* Matrix-level fail-closed default: a kind enum value with no policy row
 	 * must be DENIED to every credential class. NOTE this is the MATRIX
 	 * default only — it does NOT mean a brand-new privileged libweston global

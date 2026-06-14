@@ -41,10 +41,20 @@ regression:
    in qdwin_classify_global, or listed on the reviewed INTENTIONALLY_VISIBLE
    inventory below (filter-visible by design; protected — if at all — by a
    bind-time identity handler, not the visibility filter). Adding a global to
-   neither set fails this test until it is categorized. (The ~25 globals
-   INHERITED from libweston core are not created in qdwin.c and cannot be
-   enumerated from this source; that residual fail-open is recorded in
-   threat-model.md's risk register.)
+   neither set fails this test until it is categorized.
+6. INHERITED INVENTORY (02/S1 libweston-bump fail-open closure): the globals
+   created by the vendored libweston core stack are NOT created in qdwin.c, so
+   check #5 cannot see them — a libweston bump that added a new core global
+   would silently classify ORDINARY (visible to silos) with no signal. This
+   test enumerates every `wl_global_create(...)` site in libweston-vendored and
+   requires each advertised interface to be categorized in
+   LIBWESTON_INHERITED_GLOBALS (GATED — pulled into qdwin_classify_global by
+   pointer identity, today weston_capture_v1 + weston_touch_calibration; or
+   VISIBLE — classifies ORDINARY by design or as a tracked residual in
+   threat-model.md). A new upstream interface (or a new create site reusing a
+   known interface) fails the test until reviewed. The live silo-registry
+   negative (a silo client's wl_registry actually lacks the gated globals) stays
+   VM/B1-gated.
 """
 
 from pathlib import Path
@@ -312,6 +322,13 @@ def check_privileged_globals_classified(source):
                     "QDWIN_GLOBAL_IDLE_NOTIFIER for the "
                     "idle_notifier_global pointer (ext-idle could classify "
                     "ORDINARY = visible to silos)")
+    if not re.search(
+            r"global\s*==\s*[^;]*compositor->touch_calibration\s*\)\s*"
+            r"return\s+QDWIN_GLOBAL_TOUCH_CALIBRATION\s*;", code):
+        return fail("qdwin_classify_global does not return "
+                    "QDWIN_GLOBAL_TOUCH_CALIBRATION for the "
+                    "compositor->touch_calibration pointer (touch calibration "
+                    "could classify ORDINARY = visible to silos)")
     return 0
 
 
@@ -446,6 +463,10 @@ def check_capture_and_secctx_are_shell_only(logic_source):
         # findings F4: layer-shell hidden from secctx clients (overlays / lock
         # surfaces are shell/locker-only); bind gate remains as second layer.
         frozenset(["QDWIN_GLOBAL_LAYER_SHELL"]): "cred!=QDWIN_CRED_SECCTX",
+        # 02/S1 inherited sweep: weston_touch_calibration (global touch remap /
+        # touch grab) hidden from secctx/silo clients; ordinary admin tools keep
+        # it. libweston applies no bind-time pin, so the filter is the gate.
+        frozenset(["QDWIN_GLOBAL_TOUCH_CALIBRATION"]): "cred!=QDWIN_CRED_SECCTX",
     }
     if parsed != expected_arms:
         return fail(
@@ -479,7 +500,8 @@ def check_capture_and_secctx_are_shell_only(logic_source):
 
 
 def check_idle_notifier_hidden_from_secctx(logic_source):
-    """ext_idle_notifier_v1 must be denied to secctx/silo clients while
+    """The hidden-from-secctx inherited globals (ext_idle_notifier_v1 and
+    weston_touch_calibration) must be denied to secctx/silo clients while
     remaining visible to session components."""
     policy, err = _function_body(
         logic_source, r"bool\s+qdwin_global_visible\s*\(",
@@ -487,20 +509,21 @@ def check_idle_notifier_hidden_from_secctx(logic_source):
     if err:
         return fail(err)
     code = _norm(policy)
-    m = re.search(
-        r"case\s+QDWIN_GLOBAL_IDLE_NOTIFIER\s*:\s*(?:/\*.*?\*/\s*)?"
-        r"(return[^;]*;)",
-        code)
-    if not m:
-        return fail("qdwin_global_visible has no QDWIN_GLOBAL_IDLE_NOTIFIER "
-                    "row with a direct return")
-    ret = re.sub(r"\s+", " ", m.group(1)).strip()
-    if ret != "return cred != QDWIN_CRED_SECCTX ;" and \
-       ret != "return cred != QDWIN_CRED_SECCTX;":
-        return fail("ext_idle_notifier_v1 is not gated as hidden from "
-                    "secctx/silo clients (expected "
-                    "`return cred != QDWIN_CRED_SECCTX;`, got "
-                    f"`{ret}`)")
+    for kind, label in (
+            ("QDWIN_GLOBAL_IDLE_NOTIFIER", "ext_idle_notifier_v1"),
+            ("QDWIN_GLOBAL_TOUCH_CALIBRATION", "weston_touch_calibration")):
+        m = re.search(
+            re.escape("case " + kind) + r"\s*:\s*(?:/\*.*?\*/\s*)?(return[^;]*;)",
+            code)
+        if not m:
+            return fail(f"qdwin_global_visible has no {kind} row with a "
+                        "direct return")
+        ret = re.sub(r"\s+", " ", m.group(1)).strip()
+        if ret != "return cred != QDWIN_CRED_SECCTX ;" and \
+           ret != "return cred != QDWIN_CRED_SECCTX;":
+            return fail(f"{label} is not gated as hidden from secctx/silo "
+                        "clients (expected `return cred != QDWIN_CRED_SECCTX;`, "
+                        f"got `{ret}`)")
     return 0
 
 
@@ -865,6 +888,12 @@ def check_created_global_inventory(source):
     cap = "qdwin->compositor->output_capture.weston_capture_v1"
     canonical_cond[f"qdwin->compositor&&{cap}&&global=={cap}"] = \
         "QDWIN_GLOBAL_WESTON_CAPTURE"
+    # weston_touch_calibration: a second libweston-inherited global gated by
+    # pointer identity (compositor->touch_calibration, not a qdwin->*_global
+    # site), so — like capture — it is pinned here, not via FILTER_GATED_KIND.
+    tcal = "qdwin->compositor->touch_calibration"
+    canonical_cond[f"qdwin->compositor&&{tcal}&&global=={tcal}"] = \
+        "QDWIN_GLOBAL_TOUCH_CALIBRATION"
 
     full_branch_re = (r"if\s*\(\s*([^()]*?)\s*\)\s*\{?\s*"
                       r"return\s+(QDWIN_GLOBAL_\w+)\s*;")
@@ -895,9 +924,275 @@ def check_created_global_inventory(source):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 02/S1 — libweston-INHERITED global inventory (the documented libweston-bump
+# fail-open). qdwin_classify_global only recognizes globals created in qdwin.c
+# by POINTER identity; everything else returns ORDINARY (visible to silos). The
+# globals created by the vendored libweston core stack qdwin links against are
+# NOT created in qdwin.c, so each classifies ORDINARY unless explicitly pulled
+# into the classifier. Today only weston_capture_v1 is (gated shell-only); every
+# other inherited global is visible to silo clients — accepted by design for the
+# unprivileged session protocols, and an explicitly tracked residual for the few
+# privileged ones (recorded in threat-model.md's residual-risk register), whose
+# runtime gating is a behaviour change blocked on the live silo-registry
+# negative (VM/B1).
+#
+# This inventory makes a libweston BUMP that adds a new core global a mechanical
+# failure instead of a silent fail-open: check_inherited_global_inventory
+# enumerates every `wl_global_create(...)` site in the vendored tree, recovers
+# the advertised interface, and requires each to be categorized here. A new
+# upstream interface fails the test until consciously reviewed.
+#
+#   GATED   — pulled into qdwin_classify_global to a non-ORDINARY kind; the
+#             classification itself is pinned by
+#             check_privileged_globals_classified. Today: weston_capture_v1.
+#   VISIBLE — classifies ORDINARY (visible to every session client incl. silos):
+#             an unprivileged session protocol advertised by design, OR a
+#             privileged libweston feature accepted as a tracked residual
+#             ("RESIDUAL:" prefix) pending the VM/B1 gating decision.
+LIBWESTON_INHERITED_GLOBALS = {
+    # --- GATED (classified non-ORDINARY in qdwin_classify_global) -----------
+    "weston_capture_v1": ("GATED",
+        "output-capture screen capture (§4b) — classified "
+        "QDWIN_GLOBAL_WESTON_CAPTURE, gated shell-only; pinned by "
+        "check_privileged_globals_classified + check_created_global_inventory"),
+    "weston_touch_calibration": ("GATED",
+        "global touch-input calibration / touch grab — classified "
+        "QDWIN_GLOBAL_TOUCH_CALIBRATION via the public compositor->touch_calibration "
+        "pointer, hidden from secctx/silo clients; pinned by "
+        "check_privileged_globals_classified + the qdwin_global_visible arm"),
+
+    # --- VISIBLE: core / unprivileged session protocols (visible by design) --
+    "wl_compositor": ("VISIBLE", "core surface/region factory"),
+    "wl_subcompositor": ("VISIBLE", "core subsurfaces"),
+    "wl_seat": ("VISIBLE", "core input seat"),
+    "wl_output": ("VISIBLE", "core output advertisement (per head)"),
+    "xdg_wm_base": ("VISIBLE", "xdg-shell window roles"),
+    "zxdg_shell_v6": ("VISIBLE", "deprecated xdg-shell v6 (toolkit fallback)"),
+    "wp_viewporter": ("VISIBLE", "surface viewport crop/scale"),
+    "wp_presentation": ("VISIBLE", "presentation-time feedback"),
+    "zxdg_output_manager_v1": ("VISIBLE", "logical output geometry/names"),
+    "wp_single_pixel_buffer_manager_v1": ("VISIBLE", "1x1 solid-colour buffers"),
+    "wp_tearing_control_manager_v1": ("VISIBLE", "per-surface tearing hint"),
+    "zwp_linux_dmabuf_v1": ("VISIBLE", "GPU dmabuf import (hardware clients)"),
+    "zwp_linux_explicit_synchronization_v1": ("VISIBLE", "explicit GPU fencing"),
+    "zwp_relative_pointer_manager_v1": ("VISIBLE", "relative pointer motion"),
+    "zwp_pointer_constraints_v1": ("VISIBLE", "pointer lock/confine (games)"),
+    "zwp_input_timestamps_manager_v1": ("VISIBLE", "high-res input timestamps"),
+    "zwp_tablet_manager_v2": ("VISIBLE", "drawing-tablet input"),
+    "wl_data_device_manager": ("VISIBLE",
+        "core clipboard/DnD — cross-silo transfer is mediated by the shell's "
+        "ClipboardGate paste broker, not by the visibility filter"),
+
+    # --- VISIBLE but TRACKED RESIDUAL: privileged libweston features that
+    #     classify ORDINARY today and which qdwin canNOT gate by pointer identity
+    #     because libweston does not store the created global in a stable
+    #     qdwin-reachable field (direct-display / content-protection / color-mgr
+    #     discard the wl_global_create result; weston-debug stashes it behind the
+    #     opaque weston_log_context). A silo client's wl_registry can see them;
+    #     gating each needs an upstream API to recover the global pointer AND the
+    #     live silo-registry negative (VM/B1). Recorded in threat-model.md's
+    #     residual-risk register. (weston_touch_calibration was the one such
+    #     global with a reachable pointer — compositor->touch_calibration — so it
+    #     is now GATED above rather than deferred here.) -----------------------
+    "weston_direct_display_v1": ("VISIBLE",
+        "RESIDUAL: dmabuf direct-scanout hint — created on the DRM backend "
+        "(backend-drm/drm.c weston_direct_display_setup); create result is not "
+        "stored, no reachable pointer to gate; pending VM/B1"),
+    "weston_content_protection": ("VISIBLE",
+        "RESIDUAL: HDCP query/request — enabled on the DRM backend "
+        "(weston_compositor_enable_content_protection); create result is not "
+        "stored, no reachable pointer to gate; pending VM/B1"),
+    "weston_debug_v1": ("VISIBLE",
+        "RESIDUAL: weston debug-scope dump — advertised only when the compositor "
+        "enables the debug protocol; global lives behind the opaque "
+        "weston_log_context, no reachable pointer to gate; pending VM/B1"),
+    "xx_color_manager_v4": ("VISIBLE",
+        "RESIDUAL: experimental colour-management — advertised only when "
+        "colour management is enabled; create result is not stored, no reachable "
+        "pointer to gate; pending VM/B1"),
+}
+
+
+def _libweston_src_dir(qdwin_c_path):
+    """Vendored libweston core lives at <root>/libweston-vendored/src/libweston;
+    qdwin.c lives at <root>/qdwin/qdwin.c."""
+    return Path(qdwin_c_path).resolve().parents[1] / "libweston-vendored" / \
+        "src" / "libweston"
+
+
+def _wl_global_create_interfaces(code):
+    """Recover the advertised interface token of every `wl_global_create(...)`
+    call in already-comment-stripped, line-spliced `code`. Returns
+    (interfaces, unparsable) where interfaces maps the bare interface name
+    (interface-suffix stripped) to a count, and unparsable is a list of raw
+    arg-2 strings whose interface could not be recovered (fail-closed: an
+    unparsable site must trip review, not pass silently)."""
+    interfaces, unparsable = {}, []
+    for m in re.finditer(r"\bwl_global_create\s*\(", code):
+        paren = code.index("(", m.start())
+        depth, close = 0, None
+        for i in range(paren, len(code)):
+            if code[i] == "(":
+                depth += 1
+            elif code[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        if close is None:
+            unparsable.append("<unbalanced parens>")
+            continue
+        parts = _split_top_level_commas(code[paren + 1:close])
+        if len(parts) != 5:
+            unparsable.append(code[paren + 1:close].strip()[:80])
+            continue
+        arg2 = parts[1].lstrip("&").strip()
+        mi = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)_interface", arg2)
+        if not mi:
+            unparsable.append(arg2[:80])
+            continue
+        iface = mi.group(1)
+        interfaces[iface] = interfaces.get(iface, 0) + 1
+    return interfaces, unparsable
+
+
+def check_inherited_global_inventory(qdwin_c_path, override_dir=None):
+    """Every `wl_global_create(...)` site in the vendored libweston tree must
+    advertise an interface categorized in LIBWESTON_INHERITED_GLOBALS, so a
+    libweston bump that adds a new core global cannot silently classify ORDINARY
+    (visible to silo clients) — the inherited-global analogue of
+    check_created_global_inventory (which covers the qdwin.c sites)."""
+    src_dir = Path(override_dir) if override_dir else _libweston_src_dir(qdwin_c_path)
+    if not src_dir.is_dir():
+        return fail(
+            f"vendored libweston source not found at {src_dir} — the "
+            "inherited-global inventory cannot enumerate upstream core globals "
+            "(02/S1 libweston-bump fail-open guard). Pass the libweston "
+            "src/libweston dir as argv[3] if the tree layout differs.")
+
+    # iface -> total create-site count; iface -> sorted list of source files.
+    counts, sites, unparsable, all_code = {}, {}, [], []
+    for cfile in sorted(src_dir.rglob("*.c")):
+        text = _strip_comments(
+            re.sub(r"\\\r?\n", "", cfile.read_text(encoding="utf-8", errors="replace")))
+        all_code.append(text)
+        ifaces, bad = _wl_global_create_interfaces(text)
+        rel = str(cfile.relative_to(src_dir))
+        for iface, n in ifaces.items():
+            counts[iface] = counts.get(iface, 0) + n
+            sites.setdefault(iface, []).append(rel)
+        unparsable.extend(f"{rel}: {b}" for b in bad)
+    advertised = {i: sites[i][0] for i in sites}  # first file, for messages
+
+    # Category sanity (typo guard): every inventory entry must be exactly GATED
+    # or VISIBLE — a typo'd category ("VISIBLEE", "GATED ") would otherwise be
+    # treated as a known/categorized entry and slip past the checks below.
+    for iface, entry in LIBWESTON_INHERITED_GLOBALS.items():
+        if entry[0] not in ("GATED", "VISIBLE"):
+            return fail(
+                f"LIBWESTON_INHERITED_GLOBALS[{iface!r}] has invalid category "
+                f"{entry[0]!r} — must be exactly 'GATED' or 'VISIBLE'.")
+
+    # Indirection guard (mirrors check_created_global_inventory's stray-token
+    # scan for qdwin.c): every `wl_global_create` TOKEN in the vendored tree must
+    # be a direct call (`wl_global_create(`) — the failed-log word
+    # (`wl_global_create failed`) is the one benign non-call form. A token in any
+    # other position is a function-pointer capture (`mk = wl_global_create;`) or a
+    # `#define WGC wl_global_create` synonym whose renamed call site this
+    # enumeration would never see, so the global could be created and escape
+    # categorization. Reject it. (Today all 24 tokens are direct calls.)
+    code = "\n".join(all_code)
+    stray = re.findall(r"\bwl_global_create\b(?!\s*\()(?!\s+failed\b)", code)
+    if stray:
+        return fail(
+            f"{len(stray)} `wl_global_create` token(s) in vendored libweston are "
+            "neither a direct call nor the failed-log word — a function-pointer "
+            "capture or macro synonym could create an uncategorized core global "
+            "this enumeration cannot see (02/S1 fail-open). Globals must be created "
+            "via a direct `wl_global_create(...)` call.")
+
+    if unparsable:
+        return fail(
+            "wl_global_create(...) site(s) in vendored libweston whose advertised "
+            "interface could not be recovered (so they escape categorization): " +
+            "; ".join(sorted(unparsable)[:8]) +
+            " — the interface arg must be a literal `&<iface>_interface`; extend "
+            "_wl_global_create_interfaces if libweston introduced a new form.")
+
+    if not advertised:
+        return fail(
+            f"no wl_global_create(...) sites found under {src_dir} — the "
+            "inherited-global enumeration is stale (vendored tree moved or the "
+            "scan regex broke). This guard must see the core globals to pin them.")
+
+    known = set(LIBWESTON_INHERITED_GLOBALS)
+    uncategorized = sorted(set(advertised) - known)
+    if uncategorized:
+        return fail(
+            "vendored libweston advertises core global(s) " +
+            ", ".join(f"{i} ({advertised[i]})" for i in uncategorized) +
+            " not categorized in LIBWESTON_INHERITED_GLOBALS. qdwin_classify_global "
+            "returns ORDINARY for any global not created in qdwin.c, so each "
+            "inherited global is visible to silo clients until reviewed. Add it as "
+            "GATED (pull it into qdwin_classify_global + check_privileged_globals_"
+            "classified) or VISIBLE (with rationale; add a threat-model residual "
+            "line + a 'RESIDUAL:' note if it is privileged). This is the S1 "
+            "libweston-bump fail-open guard.")
+
+    stale = sorted(known - set(advertised))
+    if stale:
+        return fail(
+            "LIBWESTON_INHERITED_GLOBALS lists interface(s) " + ", ".join(stale) +
+            " no longer created by a wl_global_create site in vendored libweston — "
+            "remove the stale entries so the inventory stays truthful.")
+
+    # Per-SITE invariant: each known interface is created at EXACTLY ONE site
+    # today (24 sites / 24 distinct interfaces). Comparing interface SETS alone
+    # would miss a NEW create site that reuses an already-known interface — and a
+    # second instance of a GATED interface (e.g. a 2nd weston_capture_v1 global
+    # at a different pointer) would NOT be the pointer qdwin_classify_global pins,
+    # so it would classify ORDINARY (visible to silos). Flag any interface whose
+    # site count grew so the new site is consciously reviewed (and, for a gated
+    # interface, its new pointer wired into the classifier).
+    multi = sorted(f"{i} ({counts[i]} sites: {', '.join(sorted(set(sites[i])))})"
+                   for i in counts if counts[i] != 1)
+    if multi:
+        return fail(
+            "vendored libweston has interface(s) created at more than one "
+            "wl_global_create site: " + "; ".join(multi) + ". A new create site "
+            "reusing a known interface escapes the set-membership check above; for "
+            "a GATED interface the second instance is a different global pointer "
+            "that qdwin_classify_global does not pin (so it classifies ORDINARY = "
+            "visible to silos). Review the new site (wire its pointer into the "
+            "classifier if gated), then update this expected per-interface count.")
+
+    # A GATED inherited global must actually be wired into qdwin_classify_global +
+    # cross-checked by check_privileged_globals_classified. The recognized GATED
+    # set is hard-pinned here: each member below has both a classifier pin (in
+    # check_privileged_globals_classified) and a policy-arm pin (capture is
+    # shell-only in check_capture_and_secctx_are_shell_only; touch-calibration is
+    # hidden-from-secctx in check_idle_notifier_hidden_from_secctx). Labelling
+    # another inherited global GATED without that wiring would be a paper gate, so
+    # adding one must also extend those checks AND this set under review.
+    gated = {i for i, entry in LIBWESTON_INHERITED_GLOBALS.items()
+             if entry[0] == "GATED"}
+    if gated != {"weston_capture_v1", "weston_touch_calibration"}:
+        return fail(
+            "LIBWESTON_INHERITED_GLOBALS marks {" + ", ".join(sorted(gated)) +
+            "} as GATED, but the wired-and-pinned set is {weston_capture_v1, "
+            "weston_touch_calibration}. A new GATED inherited global must be "
+            "classified in qdwin_classify_global + pinned in "
+            "check_privileged_globals_classified + given a qdwin_global_visible "
+            "policy-arm pin, then this guard extended — otherwise GATED is a paper "
+            "label and the global still classifies ORDINARY (visible to silos).")
+    return 0
+
+
 def main():
-    if len(sys.argv) != 3:
-        return fail("usage: test_global_filter.py <qdwin.c> <qdwin-logic.c>")
+    if len(sys.argv) not in (3, 4):
+        return fail("usage: test_global_filter.py <qdwin.c> <qdwin-logic.c> "
+                    "[libweston-src-dir]")
     source = Path(sys.argv[1]).read_text(encoding="utf-8")
     logic_source = Path(sys.argv[2]).read_text(encoding="utf-8")
 
@@ -925,14 +1220,20 @@ def main():
     rc = check_idle_notifier_hidden_from_secctx(logic_source)
     if rc:
         return rc
+    rc = check_inherited_global_inventory(
+        sys.argv[1], sys.argv[3] if len(sys.argv) == 4 else None)
+    if rc:
+        return rc
 
     print("PASS: advertised-global filter (installed via "
           "wl_display_set_global_filter; weston_capture_v1 + secctx manager "
           "classified and gated shell-only; ext_idle_notifier_v1 classified "
           "and hidden from secctx/silo clients via qdwin_global_visible; "
           "every wl_global_create site is a direct qdwin->*_global assignment "
-          "and categorized filter-gated [exact kind] or reviewed-visible, so a "
-          "new uncategorized qdwin-created global fails closed here)")
+          "and categorized filter-gated [exact kind] or reviewed-visible; and "
+          "every vendored-libweston-inherited global is categorized "
+          "GATED/VISIBLE — so a new uncategorized qdwin-created OR libweston-"
+          "inherited global fails closed here)")
     return 0
 
 
