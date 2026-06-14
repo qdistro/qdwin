@@ -345,7 +345,16 @@ qdwin_nested_input_sink_open(uint32_t handle)
 	}
 	s->listen_fd = fd;
 	s->peer_fd = -1;
+	/* F7: on OOM, fail the whole setup rather than return a sink whose
+	 * socket_path is NULL — close() skips the unlink() of the bound socket
+	 * pathname, leaking a stale socket file on disk. */
 	s->socket_path = strdup(path);
+	if (!s->socket_path) {
+		close(fd);
+		unlink(path);
+		free(s);
+		return NULL;
+	}
 	return s;
 }
 

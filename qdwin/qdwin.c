@@ -379,6 +379,12 @@ struct qdwin_wm_policy {
  * legitimate target set (real sources advertise a handful to a few dozen). */
 #define QDWIN_PRIMARY_MIME_MAX 256u
 
+/* F7: per-MIME-type length cap (DoS guard) for externally-supplied mime
+ * strings that we duplicate and re-broadcast (the data_offer.receive shim
+ * forwards it to the shell). Real mime types are short (RFC 6838); 4096
+ * matches QDWIN_SECCTX_STR_MAX and is far above any legitimate name. */
+#define QDWIN_MIME_TYPE_MAX 4096u
+
 enum qdwin_accel_profile {
 	QDWIN_ACCEL_ADAPTIVE = 0,
 	QDWIN_ACCEL_FLAT     = 1,
@@ -9002,6 +9008,17 @@ qdwin_data_source_send_shim(struct weston_data_source *source,
 		return;
 	}
 
+	/* F7: bound the externally-supplied mime before we dup + re-broadcast
+	 * it to the shell. An absurdly long type is a heap/event DoS; there is
+	 * no client wl_resource to post an error on in this send-shim, so fail
+	 * closed by dropping the receive (close fd — the requester sees EOF). */
+	if (mime && strnlen(mime, QDWIN_MIME_TYPE_MAX + 1u) > QDWIN_MIME_TYPE_MAX) {
+		weston_log("qdwin: data_offer.receive dropped — mime too long "
+			   "(cap %u)\n", QDWIN_MIME_TYPE_MAX);
+		close(fd);
+		return;
+	}
+
 	struct qdwin_data_offer_pending *p = calloc(1, sizeof(*p));
 	if (!p) {
 		close(fd);
@@ -16548,6 +16565,15 @@ qdwin_primary_source_offer(struct wl_client *client,
 	(void)client;
 	if (!mime_type)
 		return;
+	/* F7: bound the per-MIME-type length (DoS guard) — these are stored and
+	 * re-broadcast to every primary-selection device. Silently drop an
+	 * over-long type (same fail-closed-drop posture as the count cap below;
+	 * a protocol error would kill an otherwise-legitimate noisy client). */
+	if (strnlen(mime_type, QDWIN_MIME_TYPE_MAX + 1u) > QDWIN_MIME_TYPE_MAX) {
+		weston_log("qdwin: primary-selection offer dropped: "
+			   "mime too long (cap %u)\n", QDWIN_MIME_TYPE_MAX);
+		return;
+	}
 	/* D5 (deeper-review): bound the per-source MIME list. A source client
 	 * may call offer() unboundedly; each entry is a calloc+strdup that is
 	 * re-broadcast to every primary-selection device, so an unbounded list
@@ -19039,7 +19065,9 @@ qdwin_parse_str_opt(int argc, char *argv[], const char *argprefix,
 		return NULL;
 	}
 	*was_set = true;
-	return strdup(val);
+	/* F7: log on OOM. A NULL return with *was_set==true is the documented
+	 * "configured but strdup() OOM'd" state the callers fail closed on. */
+	return qdwin_xstrdup_or_null(val);
 }
 
 /* Parse a boolean opt-in flag from a bare `--<flag>` argv switch or a
@@ -19294,7 +19322,9 @@ qdwin_proc_exe(pid_t pid)
 	if ((size_t)n >= sizeof(buf) - 1)
 		return strdup("");
 	buf[n] = '\0';
-	return strdup(buf);
+	/* F7: log on OOM. Consumers treat a NULL exe as "OOM → unverifiable →
+	 * reject (fail closed)" — see the locker/layer-shell/IME bind gates. */
+	return qdwin_xstrdup_or_null(buf);
 }
 
 static char *
@@ -19324,7 +19354,9 @@ qdwin_proc_selinux_label(pid_t pid)
 			 buf[n - 1] == ' ' || buf[n - 1] == '\r')) {
 		buf[--n] = '\0';
 	}
-	return strdup(buf);
+	/* F7: log on OOM. A NULL label is treated as "unverifiable → fail
+	 * closed" by every bind gate that compares it. */
+	return qdwin_xstrdup_or_null(buf);
 }
 
 /* Read argv[1] (the launcher's first argument) from /proc/<pid>/cmdline.
@@ -19376,7 +19408,9 @@ qdwin_proc_argv1(pid_t pid)
 	size_t a1max = off - (a0 + 1);
 	if (strnlen(a1, a1max) >= a1max)
 		return strdup("");
-	return strdup(a1);
+	/* F7: log on OOM. A NULL argv1 makes qdwin_path_is_trusted_entrypoint
+	 * fail (entrypoint policy rejects), i.e. fail closed. */
+	return qdwin_xstrdup_or_null(a1);
 }
 
 /* Is `exe` (a resolved /proc/<pid>/exe path) a system script interpreter
