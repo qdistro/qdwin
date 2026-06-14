@@ -5725,8 +5725,28 @@ qdwin_overlay_grab_modifiers(struct weston_keyboard_grab *grab,
 			     uint32_t mods_locked,
 			     uint32_t group)
 {
-	/* Forward modifier state to clients so e.g. Shift on the locker
-	 * password field follows the right xkb path. */
+	struct qdwin *qdwin = wl_container_of(grab, qdwin, overlay_grab);
+	/* Locker containment (role=2): the locker receives keystrokes as
+	 * qdwin_locker_v1.overlay_key with the *already shifted* utf8 resolved
+	 * from the compositor's own xkb_state (see qdwin_overlay_grab_key), so
+	 * it never needs wl_keyboard.modifiers — and the grab steals key events
+	 * from normal focus delivery, so wl_keyboard.key is not delivered to any
+	 * client either. But weston_keyboard_send_modifiers() goes to the
+	 * keyboard-/pointer-focus client, which during the locker crash→rebind
+	 * window can still be a hidden desktop client (the old lock toplevel was
+	 * demoted, the fresh one not yet promoted/focused). Forwarding modifier
+	 * transitions (Shift/Ctrl/Alt) there would leak input state to a desktop
+	 * client while the screen is locked — exactly what the default-grab
+	 * locked guard (qdwin_proxy_default_grab_modifiers) drops. So suppress
+	 * modifier delivery entirely for the locker role; keep forwarding it for
+	 * the launcher/switcher overlays (roles 0/1), which qdshell owns and are
+	 * not lock-screen security boundaries. The compositor's xkb_state is
+	 * updated by weston core before this callback regardless, so suppressing
+	 * delivery does NOT change the shifted utf8 the locker receives. */
+	if (qdwin->overlay_grab_role == 2 /* locker */)
+		return;
+	/* Forward modifier state to clients so e.g. Shift on a launcher
+	 * field follows the right xkb path. */
 	weston_keyboard_send_modifiers(grab->keyboard, serial,
 				       mods_depressed, mods_latched,
 				       mods_locked, group);
@@ -8069,11 +8089,25 @@ qdwin_locker_resource_destroy(struct wl_resource *resource)
 		weston_log("qdwin: locker unbound\n");
 		if (qdwin->overlay_grab_active && qdwin->overlay_grab_role == 2)
 			qdwin_overlay_grab_end(qdwin);
-		/* Fail-safe: if the locker disappears while the compositor
-		 * is locked, keep the LOCK layer composited — the screen
-		 * stays black until a fresh locker binds and maps its Qt
-		 * toplevel. We do NOT auto-unlock on locker death — see
-		 * doc/locker.md §Lifecycle. */
+		/* Fail-secure: if the locker disappears while the compositor is
+		 * locked, keep the LOCK layer composited — the screen stays
+		 * black until a fresh locker binds and maps its Qt toplevel. We
+		 * do NOT auto-unlock on locker death — see doc/locker.md
+		 * §Lifecycle. The two surface-teardown callbacks
+		 * (qdwin_lock_surface_destroyed_cb /
+		 * qdwin_lock_surface_resource_destroyed) log this same audit line
+		 * when they hold; emit it here too so the PRIMARY locker-death
+		 * path (wl_client disconnect) leaves a journal record whenever it
+		 * holds the lock — including the surfaceless case (locker died
+		 * after set_locked(1) but with no promoted toplevel to demote
+		 * above), which would otherwise hold completely silently. The
+		 * explicit repaint forces the now-empty lock layer to recomposite
+		 * to black (demote only repaints when a toplevel existed). */
+		if (qdwin->locked) {
+			weston_compositor_schedule_repaint(qdwin->compositor);
+			weston_log("qdwin: lock held (fail-secure) "
+				   "cause=locker_disconnect — awaiting fresh locker\n");
+		}
 	}
 }
 
@@ -8130,6 +8164,25 @@ qdwin_handle_bind_as_locker(struct wl_client *client,
 	weston_log("qdwin: locker bound pid=%d uid=%u (initially_locked=%d)\n",
 		   (int)pid, (unsigned)uid, qdwin->locked);
 	qdwin_locker_v1_send_ready(resource, qdwin->locked ? 1u : 0u);
+	/* If the session is ALREADY locked when this locker binds, it is a
+	 * fresh locker inheriting the lock after the previous one died
+	 * (systemd Restart=always; the old role=2 overlay grab was torn down
+	 * in qdwin_locker_resource_destroy). The inherited-lock path does NOT
+	 * re-issue set_locked(1) — qdlocker suppresses it as a duplicate — so
+	 * the overlay keyboard grab that routes keystrokes to the locker would
+	 * otherwise never be re-armed: the lock screen would reappear (toplevel
+	 * re-promoted on map) but silently swallow every keystroke, locking the
+	 * user out with no way to type the unlock password. Re-arm it here.
+	 * This does NOT widen the input-leak surface: role=2 overlay key events
+	 * go only to qdwin->locker_resource (qdwin_overlay_grab_key), and role=2
+	 * modifier events are suppressed (qdwin_overlay_grab_modifiers) so they
+	 * cannot reach a still-focused desktop client during the crash→rebind
+	 * window. Before this grab is armed the default keyboard grab drops keys
+	 * and modifiers while locked (qdwin_proxy_default_grab_{key,modifiers}),
+	 * so input is contained throughout — this only restores delivery to the
+	 * legitimately re-bound locker, which is exactly the secure path. */
+	if (qdwin->locked)
+		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 }
 
 static void
