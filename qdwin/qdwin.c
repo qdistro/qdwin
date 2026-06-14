@@ -1618,9 +1618,22 @@ qdwin_surface_added(struct weston_desktop_surface *dsurf, void *data)
 	/* Land on the held layer until S3 ships: no pixels visible. */
 	weston_view_move_to_layer(view, &qdwin->held_layer.view_list);
 
-	weston_log("qdwin: toplevel_added handle=%u uid=%u app_id=%s\n",
-		   tl->handle, (unsigned)qdwin_client_uid(dsurf),
-		   weston_desktop_surface_get_app_id(dsurf) ?: "(null)");
+	{
+		/* Log the peer pid alongside uid/app_id. The tier-2 "no phantom
+		 * host-output window" regression assertion (F6#2) keys on this:
+		 * once the inner nested weston runs with a pipewire-only backend
+		 * (no wayland-backend host-output window), NO regular
+		 * toplevel_added line should ever carry the nested-publisher's
+		 * pid. With a wayland-backend that pid WOULD appear here. */
+		pid_t peer_pid = 0; uid_t peer_uid = (uid_t)-1;
+		qdwin_desktop_surface_peer(dsurf, &peer_pid, &peer_uid);
+		(void)peer_uid;
+		weston_log("qdwin: toplevel_added handle=%u uid=%u pid=%d "
+			   "app_id=%s\n",
+			   tl->handle, (unsigned)qdwin_client_uid(dsurf),
+			   (int)peer_pid,
+			   weston_desktop_surface_get_app_id(dsurf) ?: "(null)");
+	}
 
 	qdwin_send_toplevel_added(qdwin, tl);
 
@@ -17070,6 +17083,114 @@ qdwin_nested_manager_destroy_req(struct wl_client *client,
 	wl_resource_destroy(resource);
 }
 
+/* §6.8 S3d route-test (env-gated QDWIN_NESTED_S3D_TEST) — DEFERRED.
+ *
+ * The deterministic, ydotool-independent F6#2 routing oracle. It must run
+ * AFTER a repaint: weston_compositor_pick_view() walks compositor->view_list,
+ * which is rebuilt lazily at repaint — running synchronously inside
+ * advertise_toplevel would read a stale list that does not yet include the
+ * just-created proxy curtain (observed: pick_matched=0). So advertise schedules
+ * a repaint + a one-shot timer; this fires once the list is current.
+ *
+ * Unlike S3b/S3c (which set active_input_proxy DIRECTLY), this drives the REAL
+ * path: it aims at the proxy view's centre, lets the actual picker resolve it
+ * (pick_matched proves the phantom is truly gone AND the placeholder is
+ * input-pickable), focuses the picker's result, runs the same
+ * qdwin_proxy_pointer_track_focus the default grab uses, then injects a button
+ * via notify_button so the default-grab button handler encodes a QDNI button to
+ * the inner sink. Pre-test focus + active proxy are restored afterwards. */
+struct qdwin_s3d_ctx {
+	struct qdwin *qdwin;
+	uint32_t handle;
+	struct wl_event_source *timer;
+};
+
+static int
+qdwin_s3d_route_test_fire(void *data)
+{
+	struct qdwin_s3d_ctx *ctx = data;
+	struct qdwin *qdwin = ctx->qdwin;
+	struct qdwin_toplevel *tl = qdwin_toplevel_from_handle(qdwin, ctx->handle);
+	int routed = 0, pick_matched = 0, matched = 0;
+
+	if (tl && tl->is_nested_proxy && tl->view) {
+		/* Ask the REAL picker what is at the proxy view's centre. */
+		weston_view_update_transform(tl->view);
+		struct weston_coord_global vpos =
+			weston_view_get_pos_offset_global(tl->view);
+		struct weston_coord_global center = { .c = weston_coord(
+			vpos.c.x + tl->last_width  / 2.0,
+			vpos.c.y + tl->last_height / 2.0) };
+		struct weston_view *picked =
+			weston_compositor_pick_view(qdwin->compositor, center);
+		/* Diagnostic: describe what pick_view returned (proxy / null /
+		 * cursor sprite / other-role) so a failure is one-shot debuggable. */
+		const char *picked_desc;
+		if (!picked)
+			picked_desc = "(null)";
+		else if (picked == tl->view)
+			picked_desc = "proxy";
+		else {
+			const char *r = picked->surface ?
+				weston_surface_get_role(picked->surface) : NULL;
+			picked_desc = r ? r : "(other,no-role)";
+		}
+
+		if (tl->nested_proxy_pending_decision) {
+			/* Security invariant (mechanism A): a PENDING/unapproved
+			 * proxy must NOT be input-pickable — even if a pixel feed
+			 * was bound while pending (it is stashed; the active view
+			 * stays the empty-input curtain). pick_view must NOT return
+			 * the proxy view. */
+			int pending_unpickable = (picked != tl->view);
+			weston_log("qdwin/nested-proxy: S3d pending-check handle=%u "
+				   "picked=%s center=(%.0f,%.0f) "
+				   "pending_unpickable=%d\n",
+				   ctx->handle, picked_desc,
+				   center.c.x, center.c.y, pending_unpickable);
+		} else {
+			/* Visible/approved: drive the real routing path. */
+			pick_matched = (picked == tl->view);
+			struct weston_seat *seat;
+			struct timespec ts = {0, 0};
+			wl_list_for_each(seat, &qdwin->compositor->seat_list,
+					 link) {
+				struct weston_pointer *ptr =
+					weston_seat_get_pointer(seat);
+				if (!ptr)
+					continue;
+				struct weston_view *saved_focus = ptr->focus;
+				struct qdwin_toplevel *saved_proxy =
+					qdwin->active_input_proxy;
+				weston_pointer_set_focus(ptr, picked);
+				qdwin_proxy_pointer_track_focus(qdwin, ptr);
+				matched = (qdwin->active_input_proxy == tl);
+				notify_button(seat, &ts, 0x110 /*BTN_LEFT*/,
+					      WL_POINTER_BUTTON_STATE_PRESSED);
+				notify_button(seat, &ts, 0x110,
+					      WL_POINTER_BUTTON_STATE_RELEASED);
+				qdwin->active_input_proxy = saved_proxy;
+				weston_pointer_set_focus(ptr, saved_focus);
+				routed = 1;
+				break;
+			}
+			weston_log("qdwin/nested-proxy: S3d route-test handle=%u "
+				   "routed=%d picked=%s center=(%.0f,%.0f) "
+				   "pick_matched=%d "
+				   "active_input_proxy_matched=%d\n",
+				   ctx->handle, routed, picked_desc,
+				   center.c.x, center.c.y,
+				   pick_matched, matched);
+		}
+	} else {
+		weston_log("qdwin/nested-proxy: S3d route-test handle=%u "
+			   "proxy gone before fire\n", ctx->handle);
+	}
+	wl_event_source_remove(ctx->timer);
+	free(ctx);
+	return 0;
+}
+
 static void
 qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 					struct wl_resource *resource,
@@ -17267,6 +17388,35 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 						   "handle=%u dispatched=%d\n",
 						   t->proxy_tl->handle,
 						   dispatched);
+				}
+				/* §6.8 S3d route-test (env-gated) — DEFERRED to a
+				 * one-shot timer (see qdwin_s3d_route_test_fire
+				 * above). pick_view must run AFTER the view_list
+				 * rebuilds at the next repaint; a synchronous pick
+				 * here reads a stale list missing the just-created
+				 * proxy curtain. schedule_repaint forces that repaint
+				 * promptly so the timer fires against a current list. */
+				if (getenv("QDWIN_NESTED_S3D_TEST") &&
+				    t->proxy_tl && t->proxy_tl->view) {
+					struct qdwin_s3d_ctx *s3d =
+						calloc(1, sizeof *s3d);
+					if (s3d) {
+						s3d->qdwin = qdwin;
+						s3d->handle = t->proxy_tl->handle;
+						s3d->timer = wl_event_loop_add_timer(
+							wl_display_get_event_loop(
+							  qdwin->compositor->wl_display),
+							qdwin_s3d_route_test_fire,
+							s3d);
+						if (s3d->timer) {
+							weston_compositor_schedule_repaint(
+								qdwin->compositor);
+							wl_event_source_timer_update(
+								s3d->timer, 500);
+						} else {
+							free(s3d);
+						}
+					}
 				}
 			} else {
 				weston_log("qdwin/nested-proxy: input-sink "
@@ -17980,17 +18130,20 @@ bind_qdwin_xdg_decoration_manager(struct wl_client *client, void *data,
  * §6.8 S1 — nested-mode publisher.
  *
  * When QDWIN_NESTED_MODE=1 is set in the environment, qdwin-shell.so
- * is being loaded by a *nested* weston (one whose backend is
- * `wayland-backend.so` talking to the *outer* qdwin). Instead of
- * acting as the admin shell with chrome / panel / launcher, this
- * shell acts as a publisher:
+ * is being loaded by a *nested* weston whose toplevels should be
+ * hosted by the *outer* qdwin. Instead of acting as the admin shell
+ * with chrome / panel / launcher, this shell acts as a publisher:
  *
  *   1. Opens a separate wl_display connection to the outer qdwin
  *      (env QDWIN_OUTER_DISPLAY, default "wayland-0"). Reuses the
- *      shell's allowed_uid for peer-uid filtering on the outer.
+ *      shell's allowed_uid for peer-uid filtering on the outer. This
+ *      connection — NOT a wayland-backend — is how the publisher
+ *      reaches the outer, so the nested weston needs no
+ *      wayland-backend (and must not load one: its host-output window
+ *      would shadow the proxy in the outer's pick_view; F6#2).
  *   2. Loads the pipewire-output API; expects backend-pipewire to
  *      be present in the nested compositor (configure via
- *      `[core] backend=wayland-backend.so,pipewire-backend.so`).
+ *      `[core] backend=pipewire-backend.so`).
  *   3. On each new desktop surface (= inner xdg_toplevel of an
  *      inner wayland client), allocates a dedicated pipewire output
  *      and pins the toplevel onto it. The pipewire output's frames
@@ -18618,6 +18771,11 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 		wl_list_init(&tl->chrome[s].surface_destroy.link);
 		wl_list_init(&tl->chrome[s].surface_commit.link);
 	}
+	/* F6#2 mechanism A: the pixel-feed destroy listener may be added without
+	 * a view (pending stash), and teardown paths key on the link being empty,
+	 * so initialise it to a valid empty list (calloc zeroes are not a valid
+	 * wl_list). */
+	wl_list_init(&tl->proxy_pixel_destroy_listener.link);
 
 	struct weston_output *out = qdwin_primary_output(qdwin);
 	int cx = 0, cy = 0;
@@ -18629,11 +18787,39 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 		if (cx < 0) cx = 0;
 		if (cy < 0) cy = 0;
 	}
+	/* §6.8 S4: gate visibility behind admin-broker decision when a
+	 * v8+ shell is bound. Pre-v8 shells (or no shell) auto-allow
+	 * unless QDWIN_NESTED_BROKER_REQUIRED=1, in which case we hold
+	 * indefinitely (fail-closed). The proxy starts on held layer
+	 * (invisible) and releases on `allow`, destroys on `deny`.
+	 *
+	 * Decide pending BEFORE building the curtain so its input region
+	 * matches the broker boundary (F6#2): a PENDING proxy keeps an
+	 * EMPTY input region (capture_input=false) so weston_compositor_
+	 * pick_view never routes pointer input to an unapproved proxy —
+	 * the held_layer is at WESTON_LAYER_POSITION_HIDDEN (below the
+	 * input-transparent background), so a non-empty input region there
+	 * could still be picked. A VISIBLE proxy (normal_layer) captures
+	 * input (capture_input=true) so it is pickable immediately, even
+	 * before the pixel feed binds (otherwise early clicks fall through
+	 * and active_input_proxy never arms). The pixel-bound surface, when
+	 * it later replaces the curtain, carries its own (default-full)
+	 * input region. Invariant: pending => empty input; visible => full;
+	 * pixel-bound => the consumer surface's own input. */
+	bool gate_required = false;
+	const char *req_env = getenv("QDWIN_NESTED_BROKER_REQUIRED");
+	if (req_env && strcmp(req_env, "1") == 0)
+		gate_required = true;
+	bool shell_can_gate = (qdwin->shell_bound && qdwin->shell_resource &&
+		wl_resource_get_version(qdwin->shell_resource) >= 8);
+	bool pending = (shell_can_gate || gate_required);
+
 	struct weston_curtain_params params = {
 		.r = 0.20f, .g = 0.22f, .b = 0.28f, .a = 1.0f,
 		.pos = { .c = weston_coord(cx, cy) },
 		.width = w,
 		.height = h,
+		.capture_input = !pending,
 	};
 	tl->proxy_curtain =
 		weston_shell_utils_curtain_create(qdwin->compositor, &params);
@@ -18645,19 +18831,7 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 	}
 	tl->view = tl->proxy_curtain->view;
 
-	/* §6.8 S4: gate visibility behind admin-broker decision when a
-	 * v8+ shell is bound. Pre-v8 shells (or no shell) auto-allow
-	 * unless QDWIN_NESTED_BROKER_REQUIRED=1, in which case we hold
-	 * indefinitely (fail-closed). The proxy starts on held layer
-	 * (invisible) and releases on `allow`, destroys on `deny`. */
-	bool gate_required = false;
-	const char *req_env = getenv("QDWIN_NESTED_BROKER_REQUIRED");
-	if (req_env && strcmp(req_env, "1") == 0)
-		gate_required = true;
-	bool shell_can_gate = (qdwin->shell_bound && qdwin->shell_resource &&
-		wl_resource_get_version(qdwin->shell_resource) >= 8);
-
-	if (shell_can_gate || gate_required) {
+	if (pending) {
 		weston_view_move_to_layer(tl->view,
 					  &qdwin->held_layer.view_list);
 		tl->decorated = 0;
@@ -18703,6 +18877,36 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 	return tl;
 }
 
+/* F6#2 mechanism A: defined after bind_proxy_pixels; forward-declared for the
+ * allow path (qdwin_handle_nested_proxy_decision) which performs the deferred
+ * curtain->pixel swap for a surface stashed while the proxy was pending. */
+static bool
+qdwin_nested_proxy_activate_pixel_surface(struct qdwin_toplevel *tl);
+
+/* F6#2: set the proxy placeholder curtain's input region to full
+ * (capture=true) or empty (capture=false). A solid-colour curtain surface
+ * has no client to recompute its input region on commit, so we replace
+ * surface->input directly; weston_compositor_pick_view reads
+ * view->surface->input live (via weston_view_takes_input_at_point), so no
+ * damage / geometry-dirty step is needed. Used to make an approved proxy
+ * pickable while keeping a pending one input-transparent. */
+static void
+qdwin_nested_proxy_curtain_set_capture(struct qdwin_toplevel *tl, bool capture)
+{
+	if (!tl || !tl->proxy_curtain || !tl->proxy_curtain->view)
+		return;
+	struct weston_surface *surface = tl->proxy_curtain->view->surface;
+	if (!surface)
+		return;
+	int w = tl->last_width  > 0 ? tl->last_width  : surface->width;
+	int h = tl->last_height > 0 ? tl->last_height : surface->height;
+	pixman_region32_fini(&surface->input);
+	if (capture)
+		pixman_region32_init_rect(&surface->input, 0, 0, w, h);
+	else
+		pixman_region32_init(&surface->input);
+}
+
 /* §6.8 S4: shell's verdict on a pending nested proxy.
  *
  * decision values per qdwin-shell-v1.xml:
@@ -18743,6 +18947,14 @@ qdwin_handle_nested_proxy_decision(struct wl_client *client,
 			return;
 		}
 		tl->nested_proxy_pending_decision = false;
+		/* F6#2: now-approved proxy becomes input-pickable. If a pixel
+		 * surface was STASHED by bind_proxy_pixels while pending
+		 * (mechanism A), perform the deferred curtain->pixel swap now;
+		 * otherwise make the placeholder curtain capturing. Either way
+		 * tl->view ends non-NULL and pickable before the layer move.
+		 * Synchronous in the compositor thread — no input interleaves. */
+		if (!qdwin_nested_proxy_activate_pixel_surface(tl))
+			qdwin_nested_proxy_curtain_set_capture(tl, true);
 		qdwin_toplevel_release_holding(tl, "nested_proxy_decision/allow");
 		weston_log("qdwin: nested_proxy_decision handle=%u ALLOW "
 			   "reason='%s'\n", handle, reason ? reason : "");
@@ -18810,17 +19022,36 @@ qdwin_proxy_pixel_surface_destroyed(struct wl_listener *listener, void *data)
 	struct qdwin_toplevel *tl =
 		wl_container_of(listener, tl, proxy_pixel_destroy_listener);
 	struct qdwin *qdwin = tl->qdwin;
-	struct weston_coord_global pos = weston_view_get_pos_offset_global(
-		tl->view);
-	weston_log("qdwin/nested-proxy: pixel surface destroyed handle=%u "
-	   "(reverting to placeholder curtain)\n", tl->handle);
+	/* F6#2 mechanism A: was the pixel surface the ACTIVE view, or only a
+	 * pending stash (curtain still tl->view)? */
+	bool was_active_pixel = (tl->proxy_pixel_view != NULL);
+	struct weston_coord_global pos = tl->view
+		? weston_view_get_pos_offset_global(tl->view)
+		: (struct weston_coord_global){ .c = weston_coord(0, 0) };
+
 	if (tl->proxy_pixel_view) {
+		if (tl->view == tl->proxy_pixel_view)
+			tl->view = NULL;
 		weston_view_destroy(tl->proxy_pixel_view);
 		tl->proxy_pixel_view = NULL;
 	}
 	tl->proxy_pixel_surface = NULL;
-	wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
-	wl_list_init(&tl->proxy_pixel_destroy_listener.link);
+	if (!wl_list_empty(&tl->proxy_pixel_destroy_listener.link)) {
+		wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
+		wl_list_init(&tl->proxy_pixel_destroy_listener.link);
+	}
+
+	/* Pending stash died and the curtain was never swapped out — it is still
+	 * the active view (empty-input, held). Nothing to revert; leave it. */
+	if (!was_active_pixel) {
+		weston_log("qdwin/nested-proxy: stashed pixel surface destroyed "
+			   "handle=%u (proxy pending; curtain still active)\n",
+			   tl->handle);
+		return;
+	}
+
+	weston_log("qdwin/nested-proxy: pixel surface destroyed handle=%u "
+	   "(reverting to placeholder curtain)\n", tl->handle);
 
 	/* Re-create a placeholder curtain at the current pixel-feed position +
 	 * size so the user still sees something. */
@@ -18831,6 +19062,10 @@ qdwin_proxy_pixel_surface_destroyed(struct wl_listener *listener, void *data)
 		.pos = pos,
 		.width = w,
 		.height = h,
+		/* F6#2: preserve the input policy on recreation — an approved
+		 * (non-pending) proxy whose pixel feed died must stay pickable;
+		 * a still-pending one stays input-transparent. */
+		.capture_input = !tl->nested_proxy_pending_decision,
 	};
 	tl->proxy_curtain = weston_shell_utils_curtain_create(
 		qdwin->compositor, &params);
@@ -18899,22 +19134,64 @@ qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 		return;
 	}
 
-	/* If we already had a bound pixel surface, drop it (consumer
-	 * respawn case; new wins). */
-	if (tl->proxy_pixel_view) {
-		wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
-		wl_list_init(&tl->proxy_pixel_destroy_listener.link);
-		weston_view_destroy(tl->proxy_pixel_view);
-		tl->proxy_pixel_view = NULL;
+	/* Capture the current on-screen position up front — before dropping any
+	 * old view — so the swap is seamless and we never read a freed view (the
+	 * respawn case below destroys the previous pixel view). */
+	struct weston_coord_global pos = tl->view
+		? weston_view_get_pos_offset_global(tl->view)
+		: (struct weston_coord_global){ .c = weston_coord(0, 0) };
+
+	/* If we already had a bound pixel surface OR a pending stash, drop it
+	 * (consumer respawn; new wins). Under mechanism A a PENDING proxy holds
+	 * proxy_pixel_surface != NULL with proxy_pixel_view == NULL, so key the
+	 * listener teardown on the listener link, not only the view. */
+	if (tl->proxy_pixel_surface || tl->proxy_pixel_view) {
+		if (!wl_list_empty(&tl->proxy_pixel_destroy_listener.link)) {
+			wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
+			wl_list_init(&tl->proxy_pixel_destroy_listener.link);
+		}
+		if (tl->proxy_pixel_view) {
+			if (tl->view == tl->proxy_pixel_view)
+				tl->view = NULL;
+			weston_view_destroy(tl->proxy_pixel_view);
+			tl->proxy_pixel_view = NULL;
+		}
 		tl->proxy_pixel_surface = NULL;
 	}
 
-	/* Capture position from current view (curtain) so the swap is
-	 * imperceptible. */
-	struct weston_coord_global pos = weston_view_get_pos_offset_global(
-		tl->view);
+	/* F6#2 mechanism A: do NOT swap the curtain for the pixel surface while
+	 * the proxy is still PENDING the admin broker decision. v9 shells get
+	 * nested_proxy_pixel_source at create (before `allow`), so the pixelfeed
+	 * can bind early; a client pixel surface has a default-FULL input region,
+	 * so making it the active view (even on held_layer, which sits below the
+	 * input-transparent background) would let weston_compositor_pick_view
+	 * route pointer input to an UNAPPROVED proxy. Stash the surface (+ its
+	 * destroy listener) and keep the empty-input curtain as tl->view; the
+	 * deferred swap runs on allow (qdwin_nested_proxy_activate_pixel_surface).
+	 * Clearing the client surface->input is not viable — the client recomputes
+	 * it on every frame commit. */
+	if (tl->nested_proxy_pending_decision) {
+		tl->proxy_pixel_surface = ws;
+		tl->proxy_pixel_destroy_listener.notify =
+			qdwin_proxy_pixel_surface_destroyed;
+		wl_signal_add(&ws->destroy_signal,
+			      &tl->proxy_pixel_destroy_listener);
+		weston_log("qdwin/nested-proxy: bind_proxy_pixels handle=%u "
+			   "surface=%p (pixel feed STASHED — proxy pending; "
+			   "swap deferred to allow)\n", handle, (void *)ws);
+		return;
+	}
 
-	/* Tear down the placeholder curtain — pixel feed takes over. */
+	/* Approved/visible: swap the curtain for the live pixel feed. Create the
+	 * pixel view BEFORE destroying the curtain so a view-create failure leaves
+	 * the curtain intact (never a NULL tl->view) — same robustness as the
+	 * deferred allow path. */
+	struct weston_view *pv = weston_view_create(ws);
+	if (!pv) {
+		weston_log("qdwin/nested-proxy: bind_proxy_pixels handle=%u "
+			   "weston_view_create failed — keeping curtain\n", handle);
+		return;
+	}
 	if (tl->proxy_curtain) {
 		weston_shell_utils_curtain_destroy(tl->proxy_curtain);
 		tl->proxy_curtain = NULL;
@@ -18922,13 +19199,7 @@ qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 	}
 
 	tl->proxy_pixel_surface = ws;
-	tl->proxy_pixel_view = weston_view_create(ws);
-	if (!tl->proxy_pixel_view) {
-		weston_log("qdwin/nested-proxy: bind_proxy_pixels handle=%u "
-			   "weston_view_create failed\n", handle);
-		tl->proxy_pixel_surface = NULL;
-		return;
-	}
+	tl->proxy_pixel_view = pv;
 	tl->view = tl->proxy_pixel_view;
 
 	tl->proxy_pixel_destroy_listener.notify =
@@ -18936,19 +19207,60 @@ qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 	wl_signal_add(&ws->destroy_signal, &tl->proxy_pixel_destroy_listener);
 
 	weston_view_set_position(tl->view, pos);
-	weston_view_move_to_layer(
-		tl->view,
-		tl->nested_proxy_pending_decision
-			? &qdwin->held_layer.view_list
-			: &qdwin->normal_layer.view_list);
+	weston_view_move_to_layer(tl->view, &qdwin->normal_layer.view_list);
 	if (!weston_surface_is_mapped(ws))
 		weston_surface_map(ws);
 	weston_view_update_transform(tl->view);
 
 	weston_log("qdwin/nested-proxy: bind_proxy_pixels handle=%u "
-		   "surface=%p (curtain swapped for live feed, pending=%d)\n",
-		   handle, (void *)ws,
-		   tl->nested_proxy_pending_decision ? 1 : 0);
+		   "surface=%p (curtain swapped for live feed)\n",
+		   handle, (void *)ws);
+}
+
+/* F6#2 mechanism A: on `allow`, perform the deferred curtain->pixel swap for a
+ * surface that was stashed by bind_proxy_pixels while the proxy was pending.
+ * Returns true if a stashed surface was activated. Caller has already cleared
+ * nested_proxy_pending_decision. */
+static bool
+qdwin_nested_proxy_activate_pixel_surface(struct qdwin_toplevel *tl)
+{
+	if (!tl || !tl->proxy_pixel_surface || tl->proxy_pixel_view)
+		return false;
+	struct qdwin *qdwin = tl->qdwin;
+	struct weston_surface *ws = tl->proxy_pixel_surface;
+	struct weston_coord_global pos = tl->view
+		? weston_view_get_pos_offset_global(tl->view)
+		: (struct weston_coord_global){ .c = weston_coord(0, 0) };
+
+	tl->proxy_pixel_view = weston_view_create(ws);
+	if (!tl->proxy_pixel_view) {
+		/* Keep the (now-approved) curtain as a capturing fallback so we
+		 * never leave tl->view NULL; drop the stash + listener. */
+		weston_log("qdwin/nested-proxy: activate pixel surface handle=%u "
+			   "weston_view_create failed — keeping curtain\n",
+			   tl->handle);
+		if (!wl_list_empty(&tl->proxy_pixel_destroy_listener.link)) {
+			wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
+			wl_list_init(&tl->proxy_pixel_destroy_listener.link);
+		}
+		tl->proxy_pixel_surface = NULL;
+		qdwin_nested_proxy_curtain_set_capture(tl, true);
+		return false;
+	}
+	/* Tear down the placeholder curtain — pixel feed takes over now. */
+	if (tl->proxy_curtain) {
+		weston_shell_utils_curtain_destroy(tl->proxy_curtain);
+		tl->proxy_curtain = NULL;
+	}
+	tl->view = tl->proxy_pixel_view;
+	weston_view_set_position(tl->view, pos);
+	weston_view_move_to_layer(tl->view, &qdwin->normal_layer.view_list);
+	if (!weston_surface_is_mapped(ws))
+		weston_surface_map(ws);
+	weston_view_update_transform(tl->view);
+	weston_log("qdwin/nested-proxy: activate pixel surface handle=%u "
+		   "(deferred swap on allow)\n", tl->handle);
+	return true;
 }
 
 static void
@@ -18972,13 +19284,18 @@ qdwin_nested_proxy_destroy(struct qdwin_toplevel *tl)
 	}
 	/* §6.8 S2b: drop the pixel-feed view + listener (the underlying
 	 * weston_surface is owned by the consumer wl_client; we only
-	 * release our view + listener). */
-	if (tl->proxy_pixel_view) {
+	 * release our view + listener). F6#2 mechanism A: a PENDING proxy can
+	 * hold a stashed surface + listener with NO view, so tear the listener
+	 * down based on the link, not only on proxy_pixel_view. */
+	if (!wl_list_empty(&tl->proxy_pixel_destroy_listener.link)) {
 		wl_list_remove(&tl->proxy_pixel_destroy_listener.link);
+		wl_list_init(&tl->proxy_pixel_destroy_listener.link);
+	}
+	if (tl->proxy_pixel_view) {
 		weston_view_destroy(tl->proxy_pixel_view);
 		tl->proxy_pixel_view = NULL;
-		tl->proxy_pixel_surface = NULL;
 	}
+	tl->proxy_pixel_surface = NULL;
 	if (tl->proxy_input_sink_fd >= 0) {
 		close(tl->proxy_input_sink_fd);
 		tl->proxy_input_sink_fd = -1;
@@ -19043,6 +19360,10 @@ qdwin_nested_proxy_set_geometry(struct qdwin_toplevel *tl, int w, int h)
 		.pos = pos,
 		.width = w,
 		.height = h,
+		/* F6#2: preserve the input policy across resize (curtain is
+		 * destroyed+recreated): approved => pickable, pending =>
+		 * input-transparent. */
+		.capture_input = !tl->nested_proxy_pending_decision,
 	};
 	tl->proxy_curtain =
 		weston_shell_utils_curtain_create(qdwin->compositor, &params);
