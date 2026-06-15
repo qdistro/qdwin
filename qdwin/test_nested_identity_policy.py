@@ -161,6 +161,24 @@ def check_bind_proxy_pixels_ownership(source):
 
 
 def check_bind_proxy_pixels_preserves_pending_gate(source):
+    """F6#2 mechanism A (stash-and-defer): while a nested proxy is still
+    PENDING the admin broker decision, bind_proxy_pixels must NOT make the
+    client pixel surface input-routable. A client pixel surface has a
+    default-FULL input region, so creating ANY view for it (even below the
+    input-transparent background curtain) would let weston_compositor_pick_view
+    route pointer input to an UNAPPROVED proxy. The current (commit 55620bc)
+    design therefore stashes the surface with NO view created — it sets
+    tl->proxy_pixel_surface = ws and returns early — and defers the real
+    curtain->pixel swap to qdwin_nested_proxy_activate_pixel_surface() on allow.
+
+    This used to be enforced by parking a pending view on held_layer via a
+    `pending ? &held_layer.view_list : &normal_layer.view_list` ternary; that
+    older shape was *input-routable* and was replaced by the strictly safer
+    stash-and-defer. We re-lock the CURRENT invariant: the pending branch
+    consults the broker gate, stashes the surface, returns early, and creates
+    NO view / does no layer placement while pending. A regression that
+    reintroduced a view-on-any-layer (held or normal) for a pending proxy would
+    fail this check."""
     body, err = _function_body(
         source,
         r"qdwin_handle_bind_proxy_pixels\s*\(\s*struct wl_client",
@@ -170,15 +188,82 @@ def check_bind_proxy_pixels_preserves_pending_gate(source):
         return fail(err)
     if "tl->nested_proxy_pending_decision" not in body:
         return fail("bind_proxy_pixels does not consult pending broker gate")
-    if "&qdwin->held_layer.view_list" not in body:
-        return fail("bind_proxy_pixels never keeps pending pixels on held layer")
-    if not re.search(
-            r"tl->nested_proxy_pending_decision\s*\?\s*"
-            r"&qdwin->held_layer\.view_list\s*:\s*"
-            r"&qdwin->normal_layer\.view_list",
-            body, re.DOTALL):
-        return fail("bind_proxy_pixels does not choose held vs normal layer "
-                    "from nested_proxy_pending_decision")
+
+    # Extract the brace-balanced body of the pending-decision branch:
+    #   if (tl->nested_proxy_pending_decision) { ... }
+    m = re.search(r"if\s*\(\s*tl->nested_proxy_pending_decision\s*\)\s*\{",
+                  body)
+    if not m:
+        return fail("bind_proxy_pixels has no pending-decision branch "
+                    "(if (tl->nested_proxy_pending_decision) { ... })")
+    open_brace = body.index("{", m.start())
+    depth = 0
+    pending_block = None
+    for i in range(open_brace, len(body)):
+        c = body[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                pending_block = body[open_brace:i + 1]
+                break
+    if pending_block is None:
+        return fail("bind_proxy_pixels pending-decision branch has "
+                    "unbalanced braces")
+
+    # (a) It must STASH the pixel surface (mechanism A) ...
+    if not re.search(r"tl->proxy_pixel_surface\s*=\s*ws\s*;", pending_block):
+        return fail("bind_proxy_pixels does not stash the pixel surface "
+                    "(tl->proxy_pixel_surface = ws) while pending")
+    # (b) ... and defer the curtain swap by returning early, before any
+    #     view is created/placed.
+    if not re.search(r"\breturn\s*;", pending_block):
+        return fail("bind_proxy_pixels does not defer the curtain swap "
+                    "(early return) while pending")
+    # (c) Teeth: the pending branch must NOT make the proxy input-routable.
+    #     No view may be created or moved onto ANY layer while pending — that
+    #     is precisely the regression (an input-routable view on held_layer or
+    #     normal_layer) this invariant guards against.
+    if "weston_view_create" in pending_block:
+        return fail("bind_proxy_pixels CREATES a view for a pending proxy "
+                    "(weston_view_create) — pending pixels would become "
+                    "input-routable; must stash-and-defer instead")
+    if "weston_view_move_to_layer" in pending_block:
+        return fail("bind_proxy_pixels places a pending proxy view on a "
+                    "layer (weston_view_move_to_layer) — pending pixels "
+                    "would become input-routable; must stash-and-defer")
+    if "view_list" in pending_block:
+        return fail("bind_proxy_pixels references a view_list while pending "
+                    "— a pending proxy must hold NO view on any layer "
+                    "(held or normal); must stash-and-defer")
+    # (d) Close the static-grep bypass: a helper call whose name does not
+    #     contain the forbidden tokens above (e.g. a future
+    #     qdwin_make_pending_proxy_pickable()) could still create/place a
+    #     view from inside the pending branch. The deferral contract is that
+    #     while pending we ONLY stash the surface + register its destroy
+    #     listener + log, then return — so allowlist exactly those calls and
+    #     reject any other function call in the pending block.
+    allowed_calls = {"wl_signal_add", "wl_list_remove", "wl_list_init",
+                     "wl_list_empty", "weston_log"}
+    # Scan for calls on CODE only: strip C string/char literals and comments
+    # first so that e.g. a "%p (" inside a weston_log format string is not
+    # mistaken for a call to "p(...)".
+    code = re.sub(r"/\*.*?\*/", " ", pending_block, flags=re.DOTALL)
+    code = re.sub(r"//[^\n]*", " ", code)
+    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
+    code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
+    for call in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", code):
+        name = call.group(1)
+        # Skip the control-flow keywords that the tokenizer also matches.
+        if name in {"if", "for", "while", "switch", "return", "sizeof"}:
+            continue
+        if name not in allowed_calls:
+            return fail("bind_proxy_pixels pending branch calls "
+                        f"'{name}' — while pending it may only stash the "
+                        "surface, register its destroy listener and log "
+                        "before returning; any other call risks creating an "
+                        "input-routable view (must stash-and-defer)")
     return 0
 
 
