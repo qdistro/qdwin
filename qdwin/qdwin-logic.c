@@ -109,6 +109,15 @@ qdwin_layer_compute_box(uint32_t anchor,
 	*out_h = (uint32_t)h;
 }
 
+int32_t
+qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead, int32_t inset_trail)
+{
+	int32_t inner = outer - inset_lead - inset_trail;
+	if (inner < 1)
+		inner = 1;
+	return inner;
+}
+
 uint32_t
 qdwin_clamp_fractional_scale_120(uint32_t raw_120)
 {

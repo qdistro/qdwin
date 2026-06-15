@@ -272,6 +272,48 @@ static void test_fractional_scale(void)
 	CHECK(!qdwin_fractional_scale_env_valid(-5), "env -5 invalid");
 }
 
+/* ---- decorated-toplevel inset inner-extent clamp ---- */
+static void test_inset_inner_extent(void)
+{
+	/* Typical case: insets fit comfortably inside the outer extent. */
+	CHECK(qdwin_inset_inner_extent(800, 4, 4) == 792,
+	      "800 - 4 - 4 -> 792: got %d",
+	      qdwin_inset_inner_extent(800, 4, 4));
+	CHECK(qdwin_inset_inner_extent(600, 28, 4) == 568,
+	      "600 - 28 - 4 -> 568 (top chrome + thin border): got %d",
+	      qdwin_inset_inner_extent(600, 28, 4));
+
+	/* Zero insets pass the outer extent through unchanged. */
+	CHECK(qdwin_inset_inner_extent(1024, 0, 0) == 1024,
+	      "1024 - 0 - 0 -> 1024: got %d",
+	      qdwin_inset_inner_extent(1024, 0, 0));
+
+	/* Boundary: insets sum to exactly outer-1 -> inner is the minimum
+	 * positive size of 1, not 0. */
+	CHECK(qdwin_inset_inner_extent(32, 16, 15) == 1,
+	      "32 - 16 - 15 -> 1 (boundary): got %d",
+	      qdwin_inset_inner_extent(32, 16, 15));
+
+	/* The maximized panel-reflow regression: insets EQUAL the work-area
+	 * extent. Without the clamp this shipped a degenerate 0 to the
+	 * client (qdwin.c qdwin_panels_on_output_change); it must floor to 1. */
+	CHECK(qdwin_inset_inner_extent(32, 16, 16) == 1,
+	      "32 - 16 - 16 -> 1 (insets == outer, was 0): got %d",
+	      qdwin_inset_inner_extent(32, 16, 16));
+
+	/* Insets EXCEED the available extent (panels reflowed below the
+	 * chrome height) — would have been negative; clamps up to 1. */
+	CHECK(qdwin_inset_inner_extent(20, 30, 10) == 1,
+	      "20 - 30 - 10 -> 1 (insets exceed outer, was -20): got %d",
+	      qdwin_inset_inner_extent(20, 30, 10));
+
+	/* Degenerate outer extent of 0 (work area collapsed) still floors
+	 * to 1 rather than going negative on any positive inset. */
+	CHECK(qdwin_inset_inner_extent(0, 0, 0) == 1,
+	      "0 - 0 - 0 -> 1 (collapsed outer): got %d",
+	      qdwin_inset_inner_extent(0, 0, 0));
+}
+
 /* ---- advertised-global visibility matrix (02/S1, the §4b finding) ----
  *
  * Enumerate every (credential class × global kind) cell so a regression —
@@ -554,6 +596,7 @@ int main(void)
 	test_exclusive_edge();
 	test_compute_box();
 	test_fractional_scale();
+	test_inset_inner_extent();
 	test_global_visibility();
 	test_s13_fail_open_pins();
 	test_popup_constrain();

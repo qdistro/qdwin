@@ -78,6 +78,24 @@ void qdwin_layer_compute_box(uint32_t anchor,
 			     uint32_t *out_w, uint32_t *out_h);
 
 /* ------------------------------------------------------------------
+ * Decorated-toplevel inset geometry.
+ *
+ * A toplevel's inner content extent on one axis is the outer extent
+ * minus the two server-side decoration insets on that axis (e.g.
+ * width = outer_w - inset_w - inset_e). The result is clamped to a
+ * minimum of 1: a <=0 inner size would ship a degenerate configure to
+ * the client (locking it to an unusable 0/negative surface) when the
+ * insets meet or exceed the available outer extent — the very thing
+ * that happens to a maximized toplevel when panel-reflow shrinks the
+ * work area below the chrome insets. Single source of truth for the
+ * clamp applied at every weston_desktop_surface_set_size inset site in
+ * qdwin.c (qdwin_toplevel_apply_inset and the maximized panel-reflow
+ * in qdwin_panels_on_output_change).
+ * ------------------------------------------------------------------ */
+int32_t qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead,
+				 int32_t inset_trail);
+
+/* ------------------------------------------------------------------
  * wp_fractional_scale: clamp / env-override arithmetic.
  *
  * Scale unit is 120 (120 = 1.0x, 180 = 1.5x, 240 = 2.0x). The valid

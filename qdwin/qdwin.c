@@ -2389,10 +2389,8 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 	if (tl->is_nested_proxy) {
 		outer_w = tl->last_width  > 0 ? tl->last_width  : 800;
 		outer_h = tl->last_height > 0 ? tl->last_height : 600;
-		inner_w = outer_w - tl->inset_w - tl->inset_e;
-		inner_h = outer_h - tl->inset_n - tl->inset_s;
-		if (inner_w < 1) inner_w = 1;
-		if (inner_h < 1) inner_h = 1;
+		inner_w = qdwin_inset_inner_extent(outer_w, tl->inset_w, tl->inset_e);
+		inner_h = qdwin_inset_inner_extent(outer_h, tl->inset_n, tl->inset_s);
 		weston_log("qdwin: apply_inset handle=%u (nested-proxy) "
 			   "outer=%dx%d inset=N%d E%d S%d W%d -> inner=%dx%d "
 			   "(curtain stays at outer; inner client resize "
@@ -2430,10 +2428,8 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 	outer_w = tl->outer_width;
 	outer_h = tl->outer_height;
 
-	inner_w = outer_w - tl->inset_w - tl->inset_e;
-	inner_h = outer_h - tl->inset_n - tl->inset_s;
-	if (inner_w < 1) inner_w = 1;
-	if (inner_h < 1) inner_h = 1;
+	inner_w = qdwin_inset_inner_extent(outer_w, tl->inset_w, tl->inset_e);
+	inner_h = qdwin_inset_inner_extent(outer_h, tl->inset_n, tl->inset_s);
 
 	weston_log("qdwin: apply_inset handle=%u outer=%dx%d inset=N%d E%d S%d W%d -> inner=%dx%d\n",
 		   tl->handle, outer_w, outer_h,
@@ -5266,8 +5262,8 @@ qdwin_panels_on_output_change(struct qdwin *qdwin)
 		};
 		weston_view_set_position(tl->view, pos);
 		weston_desktop_surface_set_size(tl->desktop_surface,
-						ww - tl->inset_w - tl->inset_e,
-						wh - tl->inset_n - tl->inset_s);
+			qdwin_inset_inner_extent(ww, tl->inset_w, tl->inset_e),
+			qdwin_inset_inner_extent(wh, tl->inset_n, tl->inset_s));
 		qdwin_toplevel_position_chrome(tl);
 	}
 	weston_compositor_schedule_repaint(qdwin->compositor);
