@@ -178,7 +178,41 @@ def check_bind_proxy_pixels_preserves_pending_gate(source):
     consults the broker gate, stashes the surface, returns early, and creates
     NO view / does no layer placement while pending. A regression that
     reintroduced a view-on-any-layer (held or normal) for a pending proxy would
-    fail this check."""
+    fail this check.
+
+    Two ordering clauses strengthen this against a "pickable before/after the
+    gate" regression that leaves the pending *block* itself clean:
+      - clause (b) requires the pending block to END with an unconditional
+        `return;` (and forbids `goto`), so the pending path PROVABLY exits at
+        the gate and can never fall through (conditional return) or jump (goto)
+        to the view-creating swap that follows the block. This is also why a
+        SECOND `if (tl->nested_proxy_pending_decision) { ...create... }` placed
+        after the first block is not a hole: the first block has already
+        returned for the pending case, so that later branch is dead code for a
+        pending proxy (only reached on the !pending fall-through).
+      - clause (e) scans the function PREFIX up to and including the pending
+        block and rejects the libweston view create/place/map *primitives*
+        (weston_view_create / _move_to_layer / _set_position[_with_offset] /
+        weston_surface_map[_with_input]) before the gate, excepting the
+        teardown/read ops that can never make a NEW surface pickable
+        (weston_view_destroy, weston_view_get_pos_offset_global).
+
+    Residual, by design: this is a source-SHAPE invariant, not an
+    interprocedural C analyzer. It catches the direct libweston create/place/
+    map primitives before or inside the pending gate, and (via clause (b))
+    proves the pending path cannot reach the post-gate direct primitives. It
+    does NOT catch a pre-gate helper or object/function-like macro whose BODY
+    hides such a primitive (e.g. `qdwin_prepare_pixels(tl, ws);` before the
+    gate, or a `QDWIN_CREATE(ws)` alias) — such a wrapper runs before the gate
+    and CAN create/place the pending pixel view. That limitation is accepted
+    for consistency with the rest of this token-lock test suite (every check
+    here locks a source shape, not the absence of behaviour hidden behind an
+    arbitrary wrapper in another function); growing this into a whole-file
+    macro scanner + blanket prefix call-allowlist would worsen false positives
+    on safe refactors (helperized validation, an `if (!pending) {create;return;}`
+    approved-first shape) while still only approximating C semantics. The load-
+    bearing signals are the positive shape (stash + unconditional return + no
+    view/list in the block) plus the direct-primitive bans."""
     body, err = _function_body(
         source,
         r"qdwin_handle_bind_proxy_pixels\s*\(\s*struct wl_client",
@@ -216,11 +250,57 @@ def check_bind_proxy_pixels_preserves_pending_gate(source):
     if not re.search(r"tl->proxy_pixel_surface\s*=\s*ws\s*;", pending_block):
         return fail("bind_proxy_pixels does not stash the pixel surface "
                     "(tl->proxy_pixel_surface = ws) while pending")
-    # (b) ... and defer the curtain swap by returning early, before any
-    #     view is created/placed.
+    # (b) ... and defer the curtain swap by UNCONDITIONALLY returning, so the
+    #     pending path can never fall through to the view-creating swap below.
+    #     A mere `return;` *token* is not enough: a conditional return
+    #         if (tl->nested_proxy_pending_decision) {
+    #             ...stash...; if (rare) return;       /* token present */
+    #         }                                         /* pending FALLS THROUGH */
+    #         struct weston_view *pv = weston_view_create(ws);  /* now pickable */
+    #     would satisfy a token check while letting the pending case reach the
+    #     create after the block. Likewise a `goto` out of the block could jump
+    #     past the gate into the create. So require the pending block's LAST
+    #     statement to be a bare unconditional `return;`, and forbid `goto`
+    #     inside the block. With an unconditional terminal return, the pending
+    #     path provably exits at the gate, so the prefix-only scan in clause (e)
+    #     covers every direct primitive the pending path can reach (before OR
+    #     after the block; a pre-gate helper/macro hiding a primitive is the
+    #     accepted residual documented in the function docstring).
     if not re.search(r"\breturn\s*;", pending_block):
         return fail("bind_proxy_pixels does not defer the curtain swap "
                     "(early return) while pending")
+    if re.search(r"\bgoto\b", pending_block):
+        return fail("bind_proxy_pixels pending branch uses goto — the pending "
+                    "path must exit via an unconditional terminal return, not "
+                    "jump past the gate; a goto could reach the view-creating "
+                    "swap (must stash-and-defer)")
+    # The last statement of the pending block must be a bare `return;`. Strip
+    # comments + literals, drop the block's own outer braces, and check the
+    # final non-empty token sequence is exactly `return ;`.
+    inner = pending_block[pending_block.index("{") + 1:
+                          pending_block.rindex("}")]
+    inner = re.sub(r"/\*.*?\*/", " ", inner, flags=re.DOTALL)
+    inner = re.sub(r"//[^\n]*", " ", inner)
+    inner = re.sub(r'"(?:\\.|[^"\\])*"', '""', inner)
+    inner = re.sub(r"'(?:\\.|[^'\\])*'", "''", inner)
+    inner = inner.strip()
+    # The block must END with a bare `return;` ...
+    if not re.search(r"return\s*;$", inner):
+        return fail("bind_proxy_pixels pending branch does not END with a "
+                    "`return;` — a missing terminal return lets the pending "
+                    "case fall through to the view-creating swap below (must "
+                    "stash-and-defer)")
+    # ... and that terminal return must be UNCONDITIONAL: the statement before
+    # it must be complete (end in ';' or '}'), so the return is not the
+    # consequent of an inline `if (...) return;` / loop. A conditional return
+    # would let the pending case fall through when the condition is false.
+    before_return = inner[:inner.rfind("return")].rstrip()
+    if before_return and before_return[-1] not in ";}":
+        return fail("bind_proxy_pixels pending branch's terminal `return;` is "
+                    "CONDITIONAL (e.g. `if (...) return;`) — the pending case "
+                    "can fall through to the view-creating swap when the "
+                    "condition is false; the gate must unconditionally return "
+                    "(must stash-and-defer)")
     # (c) Teeth: the pending branch must NOT make the proxy input-routable.
     #     No view may be created or moved onto ANY layer while pending — that
     #     is precisely the regression (an input-routable view on held_layer or
@@ -264,6 +344,61 @@ def check_bind_proxy_pixels_preserves_pending_gate(source):
                         "surface, register its destroy listener and log "
                         "before returning; any other call risks creating an "
                         "input-routable view (must stash-and-defer)")
+    # (e) Ordering teeth: clauses (a)-(d) only inspect the *pending block*, so
+    #     they cannot see a view created on the code path BEFORE the gate. A
+    #     regression could make the proxy pickable up front and THEN stash +
+    #     return inside the pending branch (the pending block is clean, yet the
+    #     pending proxy already holds an input-routable view):
+    #         struct weston_view *pv = weston_view_create(ws);
+    #         weston_view_move_to_layer(pv, &qdwin->normal_layer.view_list);
+    #         if (tl->nested_proxy_pending_decision) { ...stash...; return; }
+    #     So assert the pending gate runs BEFORE any view is created/placed/
+    #     mapped: the function PREFIX up to and including the pending block must
+    #     not create, place, position or map a view. The legitimate pre-gate
+    #     work is credential/handle/surface validation plus tearing down a
+    #     prior pixel view/stash (consumer respawn) and reading the current
+    #     position for a seamless swap — none of which makes a *new* surface
+    #     pickable — so allowlist exactly the view ops that only DESTROY or READ
+    #     (never create/place/map) and reject the concrete libweston create/
+    #     place/map primitives before the gate. (A pre-gate helper/macro that
+    #     hides such a primitive in another function is the accepted text-grep
+    #     residual documented above, not covered here.)
+    prefix = body[:body.index(pending_block) + len(pending_block)]
+    pcode = re.sub(r"/\*.*?\*/", " ", prefix, flags=re.DOTALL)
+    pcode = re.sub(r"//[^\n]*", " ", pcode)
+    pcode = re.sub(r'"(?:\\.|[^"\\])*"', '""', pcode)
+    pcode = re.sub(r"'(?:\\.|[^'\\])*'", "''", pcode)
+    # View ops that only destroy a prior view or read its geometry — they can
+    # never turn an unapproved surface into a pickable view, so they are safe
+    # before the gate.
+    prefix_view_allow = {"weston_view_destroy",
+                         "weston_view_get_pos_offset_global"}
+    for call in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", pcode):
+        name = call.group(1)
+        if name in prefix_view_allow:
+            continue
+        # Reject the concrete libweston primitives that create/place/position
+        # or map a view — these are the only ways a surface becomes pickable,
+        # and (with the allowlisted destroy/read ops excepted) none of them has
+        # any business running before the pending gate. We key on the weston_*
+        # TCB names (not a generic `*_show`/`*_map` suffix, which would wrongly
+        # reject benign project getters like qdwin_should_show() /
+        # qdwin_input_remap()): any qdwin wrapper that creates a view does so by
+        # itself calling one of these weston_view_* / weston_surface_map
+        # primitives, so the primitive — not the wrapper name — is the real
+        # signal. (A wrapper *called* before the gate that hides the primitive
+        # in another function is the deliberate residual noted in the docstring;
+        # the unconditional-terminal-return proof in clause (b) means the
+        # pending path still cannot REACH any post-gate create regardless.)
+        if (re.match(r"weston_view_(?:create|move_to_layer|set_position|"
+                     r"set_position_with_offset)$", name)
+                or name in ("weston_surface_map",
+                            "weston_surface_map_with_input")):
+            return fail("bind_proxy_pixels reaches a view create/place/map "
+                        f"call '{name}' BEFORE the pending-decision gate — a "
+                        "pending proxy would become input-routable before the "
+                        "stash-and-defer; the gate must run before any view is "
+                        "created, placed or mapped")
     return 0
 
 
