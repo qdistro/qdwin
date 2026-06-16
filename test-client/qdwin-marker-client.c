@@ -24,8 +24,10 @@
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -561,11 +563,25 @@ int main(int argc, char **argv)
 	if (animate_ms <= 0) {
 		while (running && wl_display_dispatch(display) != -1) { }
 	} else {
-		struct timespec ts = {animate_ms / 1000,
-				      (long)(animate_ms % 1000) * 1000000L};
+		/* Animate AND read the socket: poll the wl fd with the frame interval
+		 * as the timeout, dispatching when readable. The old loop used only
+		 * wl_display_dispatch_pending() which NEVER reads the fd, so any global
+		 * or event arriving AFTER startup was missed — fatal for input
+		 * telemetry, since the per-stream seat (and its injected pointer/key
+		 * events) appears only once the forward claims the input channel
+		 * (session-4 finding). */
+		int wlfd = wl_display_get_fd(display);
 		while (running) {
-			if (wl_display_dispatch_pending(display) < 0) break;
-			nanosleep(&ts, NULL);
+			wl_display_flush(display);
+			struct pollfd pfd = { .fd = wlfd, .events = POLLIN };
+			int pr = poll(&pfd, 1, animate_ms);
+			if (pr > 0 && (pfd.revents & POLLIN)) {
+				if (wl_display_dispatch(display) < 0) break;
+			} else if (pr < 0 && errno != EINTR) {
+				break;
+			} else if (wl_display_dispatch_pending(display) < 0) {
+				break;
+			}
 			frame++;
 			pack_payload(payload, (uint8_t)output_id,
 				     (uint16_t)generation, (uint32_t)frame, 0, 0,
