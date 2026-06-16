@@ -580,6 +580,9 @@ struct qdwin_view_stream {
 
 	/* S5: input-injection channel claimed by qdistro-forward */
 	int input_claimed;                /* 1 once claim() succeeded */
+	int allow_input;                  /* server-side permission bit: 0 => read-only
+	                                   * export, injected events are DROPPED at the
+	                                   * inject_* boundary (subscribe allow_input) */
 	struct wl_resource *input_handle; /* qdwin_stream_input_handle_v1, if claimed */
 
 	/* S5c: virtual input device for this view, fed by whichever wl_client
@@ -4317,6 +4320,23 @@ qdwin_forward_bin_path(void)
 	return "/usr/bin/qdistro-forward";
 }
 
+/* The wayland socket qdistro-forward must connect back to in order to claim the
+ * per-stream input-injection channel (qdwin_stream_input_v1). This is qdwin's OWN
+ * compositor socket — weston exports it as WAYLAND_DISPLAY in our process env when
+ * it adds the socket (`--socket=NAME`), so the forward lands on whatever socket
+ * this qdwin actually listens on, not a hardcoded "wayland-0". Was hardcoded
+ * "wayland-0", which forced any input-capable export to run qdwin on exactly that
+ * socket (session-4 input-confinement foot-gun); reading the env removes that
+ * coupling. Falls back to "wayland-0" only if the env is somehow unset. */
+static const char *
+qdwin_forward_wayland_display(void)
+{
+	const char *disp = getenv("WAYLAND_DISPLAY");
+	if (disp && *disp)
+		return disp;
+	return "wayland-0";
+}
+
 static int
 qdwin_forward_write_secret(int fd, const char *secret)
 {
@@ -4343,6 +4363,17 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 {
 	int token_pipe[2] = { -1, -1 };
 	int password_pipe[2] = { -1, -1 };
+	/* Resolve qdwin's real wayland socket in the PARENT (getenv is not
+	 * async-signal-safe to call in the post-fork child); the child references
+	 * this pointer into environ, valid across fork. Log the choice + its source:
+	 * a fallback to "wayland-0" in a real session means WAYLAND_DISPLAY was
+	 * unset/wrong, which would be an input-routing bug worth surfacing (not a
+	 * silent default). */
+	const char *wl_env = getenv("WAYLAND_DISPLAY");
+	const char *wl_display = qdwin_forward_wayland_display();
+	weston_log("qdwin: qdistro-forward will use wayland display %s (%s)\n",
+		   wl_display,
+		   (wl_env && *wl_env) ? "from WAYLAND_DISPLAY" : "FALLBACK wayland-0");
 	if (pipe(token_pipe) != 0) {
 		weston_log("qdwin: pipe failed for qdistro-forward token: %m\n");
 		return -1;
@@ -4398,7 +4429,7 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 		      "--access-token-fd", token_fd_arg,
 		      "--rdp-port", port_arg,
 		      "--rdp-password-fd", password_fd_arg,
-		      "--wayland-display", "wayland-0",
+		      "--wayland-display", wl_display,
 		      "--width", width_arg,
 		      "--height", height_arg,
 		      (char *)NULL);
@@ -4499,7 +4530,6 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 				   uint32_t allow_input)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(shell_resource);
-	(void)allow_input;
 
 	if (!qdwin_shell_require_bound(qdwin, shell_resource))
 		return;
@@ -4560,6 +4590,11 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 	s->qdwin = qdwin;
 	s->tl = tl;
 	s->pw_output = pw;
+	/* The subscriber's allow_input is now ENFORCED (was ignored): a read-only
+	 * export (allow_input=0) keeps its pixel stream + per-stream seat (for focus
+	 * locking) but DROPS every injected event at the inject_* boundary below, so a
+	 * read-only export cannot be driven by the remote subscriber's forward. */
+	s->allow_input = allow_input ? 1 : 0;
 	wl_list_insert(&qdwin->view_streams, &s->link);
 
 	wl_resource_set_implementation(stream_resource, &qdwin_stream_impl,
@@ -4767,9 +4802,9 @@ qdwin_stream_input_inject_pointer_motion(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited ||
+	if (!s || !s->allow_input || !s->seat_inited ||
 	    !s->tl || !s->tl->view || !s->tl->view->surface)
-		return;
+		return;                  /* allow_input=0 => read-only: drop the event */
 
 	qdwin_stream_seat_assert_focus(s);
 
@@ -4805,8 +4840,8 @@ qdwin_stream_input_inject_pointer_button(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited)
-		return;
+	if (!s || !s->allow_input || !s->seat_inited)
+		return;                  /* allow_input=0 => read-only: drop the event */
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
 	notify_button(&s->stream_seat, &ts, (int32_t)button,
 		      state ? WL_POINTER_BUTTON_STATE_PRESSED
@@ -4823,8 +4858,8 @@ qdwin_stream_input_inject_pointer_axis(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited)
-		return;
+	if (!s || !s->allow_input || !s->seat_inited)
+		return;                  /* allow_input=0 => read-only: drop the event */
 	struct weston_pointer_axis_event ev = {
 		.axis = axis,  /* 0=vertical, 1=horizontal (wl_pointer.axis) */
 		.value = wl_fixed_to_double(value),
@@ -4842,8 +4877,8 @@ qdwin_stream_input_inject_key(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited)
-		return;
+	if (!s || !s->allow_input || !s->seat_inited)
+		return;                  /* allow_input=0 => read-only: drop the event */
 
 	qdwin_stream_seat_assert_focus(s);
 
@@ -4872,6 +4907,8 @@ qdwin_stream_input_inject_modifiers(
 	 * future claimant needs explicit modifier overrides, the right
 	 * route is to add a new request that takes evdev codes, not masks. */
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
+	if (!s || !s->allow_input)
+		return;                  /* allow_input=0 => read-only: drop (completeness) */
 	weston_log("qdwin: inject modifiers (advisory) stream=%u "
 		   "dep=0x%x lat=0x%x lock=0x%x grp=%u\n",
 		   s ? s->rdp_port : 0, depressed, latched, locked, group);

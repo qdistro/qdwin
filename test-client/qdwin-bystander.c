@@ -169,10 +169,12 @@ struct app {
 	struct pending_subscribe pending;
 	char peer_label[64];
 	/* --allow-input: request an input-capable subscription (allow_input=1)
-	 * instead of the read-only default. A HINT — the server's admin approval
-	 * still decides. Used by the step-8 input-confinement gate (codex impl-10)
-	 * so the spawned qdistro-forward gets the qdwin_stream_input_v1 channel and
-	 * injects the remote RDP subscriber's input into the per-stream seat. */
+	 * instead of the read-only default. SERVER-ENFORCED (codex impl-14): with
+	 * allow_input=0 the compositor DROPS every injected event for the stream, so
+	 * a read-only export cannot be driven by the subscriber's qdistro-forward.
+	 * Used by the step-8 input-confinement gate + its read-only negative control
+	 * (codex impl-10/13): allow_input=1 lets the forward inject into the per-stream
+	 * seat; allow_input=0 must yield zero injected presses. */
 	int allow_input;
 	/* §P10 --forward-session: when set, every toplevel_added emits a
 	 * "FORWARD toplevel ..." stdout line so a wrapping waypipe-server
