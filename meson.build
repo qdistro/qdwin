@@ -941,6 +941,22 @@ executable('qdistro-test-window',
   install_dir: get_option('bindir'),
 )
 
+# Deterministic marker client for the multi-machine two-VM display harness
+# (todo/multi-machine/09). Paints the marker contract from
+# qdistro/multimachine/harness/marker.py (colour bands + 8x8 fiducials +
+# machine-readable corner barcode) so the Python pixel oracle can decode
+# output/generation/frame/scale from a capture. KEEP IN SYNC with marker.py.
+executable('qdwin-marker-client',
+  sources: [
+    'test-client/qdwin-marker-client.c',
+    xdg_shell_client_header,
+    xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
 # Direct xdg_popup spoofing probe for the M1 libweston popup clamp: maps a
 # toplevel, creates an xdg_popup with an off-output positioner, and prints
 # the constrained geometry the compositor reports in xdg_popup.configure.
