@@ -244,6 +244,21 @@ static struct seat_track *tel_by_kbd(struct wl_keyboard *k)
 	return NULL;
 }
 
+/* Minimal JSON string escaper for the (CLI-provided) label, so a quote/backslash/
+ * control char can't produce invalid JSON the harness then reads as {}. */
+static void json_escape(char *dst, size_t cap, const char *src)
+{
+	size_t j = 0;
+	for (size_t i = 0; src && src[i] && j + 7 < cap; i++) {
+		unsigned char ch = (unsigned char)src[i];
+		if (ch == '"' || ch == '\\') { dst[j++] = '\\'; dst[j++] = ch; }
+		else if (ch < 0x20) { j += (size_t)snprintf(dst + j, cap - j,
+							     "\\u%04x", ch); }
+		else dst[j++] = (char)ch;
+	}
+	dst[j] = '\0';
+}
+
 static void tel_write(void)
 {
 	if (!g_tel.path) return;
@@ -251,11 +266,12 @@ static void tel_write(void)
 	snprintf(tmp, sizeof tmp, "%s.tmp", g_tel.path);
 	FILE *f = fopen(tmp, "wb");
 	if (!f) return;
+	char lbl[256];
+	json_escape(lbl, sizeof lbl, g_tel.label ? g_tel.label : "");
 	int tpe = 0, tpm = 0, tbp = 0, tke = 0, tkp = 0;
 	fprintf(f, "{\"label\":\"%s\",\"output_id\":%ld,\"generation\":%ld,"
 		   "\"seats_seen\":%d,\"seats\":[",
-		g_tel.label ? g_tel.label : "", g_tel.output_id,
-		g_tel.generation, g_tel.nseats);
+		lbl, g_tel.output_id, g_tel.generation, g_tel.nseats);
 	for (int i = 0; i < g_tel.nseats; i++) {
 		struct seat_track *s = &g_tel.seats[i];
 		tpe += s->ptr_enter; tpm += s->ptr_motion; tbp += s->btn_press;
@@ -575,6 +591,8 @@ int main(int argc, char **argv)
 			wl_display_flush(display);
 			struct pollfd pfd = { .fd = wlfd, .events = POLLIN };
 			int pr = poll(&pfd, 1, animate_ms);
+			if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+				break;                 /* display hung up — stop */
 			if (pr > 0 && (pfd.revents & POLLIN)) {
 				if (wl_display_dispatch(display) < 0) break;
 			} else if (pr < 0 && errno != EINTR) {
