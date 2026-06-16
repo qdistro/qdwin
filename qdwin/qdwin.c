@@ -239,6 +239,11 @@ qdwin_primary_seat_find(struct qdwin *qdwin, struct weston_seat *seat);
 static void
 qdwin_primary_seat_clear_selection(struct qdwin_primary_seat *pseat,
 				   int notify_source);
+/* True when the primary seat currently owns a selection source. Defined with
+ * the struct far below; declared here so the (idempotent) clear_selection
+ * handler can test emptiness without the opaque type in scope. */
+static bool
+qdwin_primary_seat_has_source(struct qdwin_primary_seat *pseat);
 /* spec/09 activation_decision forward decl — defined in the
  * xdg-activation-v1 block far below. */
 static void
@@ -6436,14 +6441,26 @@ qdwin_handle_clear_selection(struct wl_client *client,
 		weston_log("qdwin: clear_selection unknown seat=%s\n", seat_name);
 		return;
 	}
+	/* Idempotent (defense-in-depth — clipboard.md "deny-storm robustness").
+	 * Clearing an already-empty seat/kind selection is a no-op: skip the
+	 * weston_seat_set_selection / primary clear AND its broadcast of
+	 * selection(NULL) to every device. The producer-side storm is bounded by
+	 * qdshell's deny-clear coalescer; this just makes the redundant tail
+	 * cost nothing on the compositor. The no-op path is intentionally SILENT
+	 * — emitting a log line per suppressed clear would reintroduce exactly
+	 * the journal flood the coalescer exists to prevent (qdwin has no
+	 * debug-level log channel separate from weston_log). */
 	if (is_primary) {
 		struct qdwin_primary_seat *pseat =
 			qdwin_primary_seat_find(qdwin, seat);
-		if (pseat)
-			qdwin_primary_seat_clear_selection(pseat, 1);
+		if (!pseat || !qdwin_primary_seat_has_source(pseat))
+			return;
+		qdwin_primary_seat_clear_selection(pseat, 1);
 		weston_log("qdwin: clear_selection seat=%s primary cleared\n",
 			   seat_name);
 	} else {
+		if (!seat->selection_data_source)
+			return;
 		weston_seat_set_selection(seat, NULL,
 					  wl_display_next_serial(
 						  qdwin->compositor->wl_display));
@@ -16701,6 +16718,15 @@ qdwin_primary_source_resource_destroy(struct wl_resource *resource)
 }
 
 /* --- primary_selection_device ------------------------------------ */
+
+/* True when the primary seat currently owns a selection source. Lets the
+ * clear_selection handler (far above, where the struct is opaque) test
+ * emptiness for its idempotent fast-path. */
+static bool
+qdwin_primary_seat_has_source(struct qdwin_primary_seat *pseat)
+{
+	return pseat && pseat->current_source != NULL;
+}
 
 static void
 qdwin_primary_seat_clear_selection(struct qdwin_primary_seat *pseat,
