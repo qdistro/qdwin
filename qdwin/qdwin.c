@@ -1566,6 +1566,40 @@ qdwin_primary_output(struct qdwin *qdwin)
 	return NULL;
 }
 
+/* A1-min TEST-ONLY placement hook (codex impl-5). When env
+ * QDWIN_TEST_PLACE_APPID matches a toplevel's app-id, place it at the explicit
+ * GLOBAL coordinate (QDWIN_TEST_PLACE_X, QDWIN_TEST_PLACE_Y), bypassing qdwin's
+ * one-output placement policy so the view's rect can overlap two outputs and
+ * libweston composites it onto both (output_mask). This is a deliberately
+ * narrow probe for the two-output straddle render gate — it sets ONLY the
+ * initial position for one targeted app, and does NOT alter maximize, tiling,
+ * fullscreen, chrome, snapping, or output-change reflow. NOT a user feature;
+ * delete/replace when real multi-output WM policy (§6.5) lands. Returns 1 if it
+ * placed the view (caller skips normal placement), else 0. */
+static int
+qdwin_test_place(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
+	const char *want = getenv("QDWIN_TEST_PLACE_APPID");
+	if (!want || !*want || !tl || !tl->view || !tl->cached_app_id)
+		return 0;
+	if (strcmp(want, tl->cached_app_id) != 0)
+		return 0;
+	const char *xs = getenv("QDWIN_TEST_PLACE_X");
+	const char *ys = getenv("QDWIN_TEST_PLACE_Y");
+	if (!xs || !ys)
+		return 0;
+	struct weston_coord_global p = {
+		.c = weston_coord(atoi(xs), atoi(ys)),
+	};
+	weston_view_set_position(tl->view, p);
+	weston_view_update_transform(tl->view);
+	weston_log("qdwin: TEST placement app_id=%s at (%s,%s) "
+		   "[QDWIN_TEST_PLACE_* — straddle probe, NOT WM policy]\n",
+		   tl->cached_app_id, xs, ys);
+	(void)qdwin;
+	return 1;
+}
+
 /* ------------------------------------------------------------------
  * weston_desktop_api callbacks.
  * ------------------------------------------------------------------ */
@@ -1785,6 +1819,10 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 			 * lock UI or any early-fullscreen client down/right and
 			 * expose whatever is behind it. */
 			qdwin_toplevel_apply_fullscreen_geometry(qdwin, tl, NULL);
+		} else if (qdwin_test_place(qdwin, tl)) {
+			/* A1-min test hook placed this toplevel at an explicit
+			 * global position straddling outputs (see qdwin_test_place):
+			 * skip the normal one-output placement policy entirely. */
 		} else {
 			/* Centre content on the primary output so chrome fits
 			 * within visible bounds. Without this the view defaults
