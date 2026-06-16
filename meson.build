@@ -40,6 +40,13 @@ else
   add_project_arguments('-DQDWIN_ROLE_HOST=1', language: 'c')
 endif
 
+# A1-min straddle test hook (codex impl-5/impl-6 M7): compiled in ONLY for
+# dedicated test builds. Production packaging leaves this off so the compositor
+# contains no ambient-env placement-bypass code path.
+if get_option('enable_test_place')
+  add_project_arguments('-DQDWIN_ENABLE_TEST_PLACE=1', language: 'c')
+endif
+
 dep_libweston = dependency('libweston-14', required: false)
 if not dep_libweston.found()
   dep_libweston = dependency('libweston-13')

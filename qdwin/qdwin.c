@@ -1579,6 +1579,11 @@ qdwin_primary_output(struct qdwin *qdwin)
 static int
 qdwin_test_place(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
+#ifdef QDWIN_ENABLE_TEST_PLACE
+	/* Compiled in ONLY for dedicated test builds (meson -Denable_test_place=true,
+	 * codex impl-6 M7) — production qdwin does not contain this code path, so it
+	 * cannot be driven by ambient env there. */
+	(void)qdwin;
 	const char *want = getenv("QDWIN_TEST_PLACE_APPID");
 	if (!want || !*want || !tl || !tl->view || !tl->cached_app_id)
 		return 0;
@@ -1588,16 +1593,31 @@ qdwin_test_place(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 	const char *ys = getenv("QDWIN_TEST_PLACE_Y");
 	if (!xs || !ys)
 		return 0;
+	/* strtol with validation (not atoi): reject malformed/overflowing config
+	 * and bound to a sane test range instead of silently placing at garbage. */
+	char *ex = NULL, *ey = NULL;
+	long lx = strtol(xs, &ex, 10);
+	long ly = strtol(ys, &ey, 10);
+	if (ex == xs || ey == ys || *ex || *ey ||
+	    lx < -32768 || lx > 32767 || ly < -32768 || ly > 32767) {
+		weston_log("qdwin: TEST placement IGNORED — bad QDWIN_TEST_PLACE_X/Y "
+			   "(\"%s\",\"%s\")\n", xs, ys);
+		return 0;
+	}
 	struct weston_coord_global p = {
-		.c = weston_coord(atoi(xs), atoi(ys)),
+		.c = weston_coord((int)lx, (int)ly),
 	};
 	weston_view_set_position(tl->view, p);
 	weston_view_update_transform(tl->view);
-	weston_log("qdwin: TEST placement app_id=%s at (%s,%s) "
+	weston_log("qdwin: TEST placement app_id=%s at (%ld,%ld) "
 		   "[QDWIN_TEST_PLACE_* — straddle probe, NOT WM policy]\n",
-		   tl->cached_app_id, xs, ys);
-	(void)qdwin;
+		   tl->cached_app_id, lx, ly);
 	return 1;
+#else
+	(void)qdwin;
+	(void)tl;
+	return 0;     /* production build: no test hook, dead branch at call site */
+#endif
 }
 
 /* ------------------------------------------------------------------

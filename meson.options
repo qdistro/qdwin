@@ -30,3 +30,9 @@ option('role',
   value: 'host',
   description: 'qdwin build target: host (default, full) or guest (stripped, for in-VM nested compositor)',
 )
+
+option('enable_test_place',
+  type: 'boolean',
+  value: false,
+  description: 'Compile the A1-min QDWIN_TEST_PLACE_* straddle test hook (test builds only; never enable in production packaging)',
+)
