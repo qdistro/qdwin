@@ -203,6 +203,163 @@ static void xdg_wm_base_ping(void *d, struct xdg_wm_base *b, uint32_t s)
 { (void)d; xdg_wm_base_pong(b, s); }
 static const struct xdg_wm_base_listener xdg_wm_base_impl = { .ping = xdg_wm_base_ping };
 
+/* ---- input telemetry (step-8 confinement gate, codex impl-10) ----------
+ * Runtime-only: bind EVERY wl_seat (including the per-stream seat the compositor
+ * spins up for an active forward, which appears AFTER the export starts), count
+ * injected pointer/keyboard events per seat, and write an atomic JSON telemetry
+ * file. This NEVER touches rendering state — the barcode/oracle contract stays
+ * pixel-identical. Enabled only when --telemetry PATH is given (otherwise the
+ * marker binds no seats and behaves exactly as before). --label names this
+ * client (exported vs sentinel) in the telemetry. PRESS deltas are the proof;
+ * enter counts are supporting diagnostics. */
+#define MAX_SEATS 8
+struct seat_track {
+	struct wl_seat *seat;
+	uint32_t gname;            /* registry global name (seat identity) */
+	struct wl_pointer *ptr;
+	struct wl_keyboard *kbd;
+	int ptr_enter, ptr_motion, btn_press, kbd_enter, key_press;
+	int last_x, last_y;
+};
+static struct {
+	const char *path;
+	const char *label;
+	long output_id, generation;
+	struct seat_track seats[MAX_SEATS];
+	int nseats;
+} g_tel;
+
+static struct seat_track *tel_by_ptr(struct wl_pointer *p)
+{
+	for (int i = 0; i < g_tel.nseats; i++)
+		if (g_tel.seats[i].ptr == p) return &g_tel.seats[i];
+	return NULL;
+}
+static struct seat_track *tel_by_kbd(struct wl_keyboard *k)
+{
+	for (int i = 0; i < g_tel.nseats; i++)
+		if (g_tel.seats[i].kbd == k) return &g_tel.seats[i];
+	return NULL;
+}
+
+static void tel_write(void)
+{
+	if (!g_tel.path) return;
+	char tmp[1024];
+	snprintf(tmp, sizeof tmp, "%s.tmp", g_tel.path);
+	FILE *f = fopen(tmp, "wb");
+	if (!f) return;
+	int tpe = 0, tpm = 0, tbp = 0, tke = 0, tkp = 0;
+	fprintf(f, "{\"label\":\"%s\",\"output_id\":%ld,\"generation\":%ld,"
+		   "\"seats_seen\":%d,\"seats\":[",
+		g_tel.label ? g_tel.label : "", g_tel.output_id,
+		g_tel.generation, g_tel.nseats);
+	for (int i = 0; i < g_tel.nseats; i++) {
+		struct seat_track *s = &g_tel.seats[i];
+		tpe += s->ptr_enter; tpm += s->ptr_motion; tbp += s->btn_press;
+		tke += s->kbd_enter; tkp += s->key_press;
+		fprintf(f, "%s{\"name\":%u,\"has_pointer\":%d,\"has_keyboard\":%d,"
+			   "\"pointer_enter\":%d,\"pointer_motion\":%d,"
+			   "\"button_press\":%d,\"keyboard_enter\":%d,"
+			   "\"key_press\":%d,\"last_x\":%d,\"last_y\":%d}",
+			i ? "," : "", s->gname, s->ptr ? 1 : 0, s->kbd ? 1 : 0,
+			s->ptr_enter, s->ptr_motion, s->btn_press, s->kbd_enter,
+			s->key_press, s->last_x, s->last_y);
+	}
+	fprintf(f, "],\"totals\":{\"pointer_enter\":%d,\"pointer_motion\":%d,"
+		   "\"button_press\":%d,\"keyboard_enter\":%d,\"key_press\":%d}}\n",
+		tpe, tpm, tbp, tke, tkp);
+	fflush(f);
+	int fd = fileno(f);
+	if (fd >= 0) fsync(fd);
+	fclose(f);
+	rename(tmp, g_tel.path);   /* atomic replace */
+}
+
+/* wl_pointer (bound at v1: enter/leave/motion/button/axis). */
+static void p_enter(void *d, struct wl_pointer *p, uint32_t serial,
+		    struct wl_surface *s, wl_fixed_t x, wl_fixed_t y)
+{
+	(void)d; (void)serial; (void)s;
+	struct seat_track *t = tel_by_ptr(p);
+	if (t) { t->ptr_enter++; t->last_x = wl_fixed_to_int(x);
+		 t->last_y = wl_fixed_to_int(y); tel_write(); }
+}
+static void p_leave(void *d, struct wl_pointer *p, uint32_t serial,
+		    struct wl_surface *s) { (void)d;(void)p;(void)serial;(void)s; }
+static void p_motion(void *d, struct wl_pointer *p, uint32_t t_,
+		     wl_fixed_t x, wl_fixed_t y)
+{
+	(void)d; (void)t_;
+	struct seat_track *t = tel_by_ptr(p);
+	if (t) { t->ptr_motion++; t->last_x = wl_fixed_to_int(x);
+		 t->last_y = wl_fixed_to_int(y); tel_write(); }
+}
+static void p_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t t_,
+		     uint32_t button, uint32_t state)
+{
+	(void)d; (void)serial; (void)t_; (void)button;
+	struct seat_track *t = tel_by_ptr(p);
+	if (t && state == WL_POINTER_BUTTON_STATE_PRESSED) { t->btn_press++; tel_write(); }
+}
+static void p_axis(void *d, struct wl_pointer *p, uint32_t t_, uint32_t axis,
+		   wl_fixed_t v) { (void)d;(void)p;(void)t_;(void)axis;(void)v; }
+static const struct wl_pointer_listener ptr_impl = {
+	.enter = p_enter, .leave = p_leave, .motion = p_motion,
+	.button = p_button, .axis = p_axis,
+};
+
+/* wl_keyboard (bound at v1: keymap/enter/leave/key/modifiers). */
+static void k_keymap(void *d, struct wl_keyboard *k, uint32_t fmt, int32_t fd,
+		     uint32_t sz) { (void)d;(void)k;(void)fmt;(void)sz; if (fd >= 0) close(fd); }
+static void k_enter(void *d, struct wl_keyboard *k, uint32_t serial,
+		    struct wl_surface *s, struct wl_array *keys)
+{
+	(void)d; (void)serial; (void)s; (void)keys;
+	struct seat_track *t = tel_by_kbd(k);
+	if (t) { t->kbd_enter++; tel_write(); }
+}
+static void k_leave(void *d, struct wl_keyboard *k, uint32_t serial,
+		    struct wl_surface *s) { (void)d;(void)k;(void)serial;(void)s; }
+static void k_key(void *d, struct wl_keyboard *k, uint32_t serial, uint32_t t_,
+		  uint32_t key, uint32_t state)
+{
+	(void)d; (void)serial; (void)t_; (void)key;
+	struct seat_track *t = tel_by_kbd(k);
+	if (t && state == WL_KEYBOARD_KEY_STATE_PRESSED) { t->key_press++; tel_write(); }
+}
+static void k_mods(void *d, struct wl_keyboard *k, uint32_t serial, uint32_t md,
+		   uint32_t ml, uint32_t lk, uint32_t grp)
+{ (void)d;(void)k;(void)serial;(void)md;(void)ml;(void)lk;(void)grp; }
+static const struct wl_keyboard_listener kbd_impl = {
+	.keymap = k_keymap, .enter = k_enter, .leave = k_leave,
+	.key = k_key, .modifiers = k_mods,
+};
+
+/* wl_seat: create pointer/keyboard objects as capabilities arrive. */
+static void s_caps(void *d, struct wl_seat *seat, uint32_t caps)
+{
+	(void)d;
+	struct seat_track *t = NULL;
+	for (int i = 0; i < g_tel.nseats; i++)
+		if (g_tel.seats[i].seat == seat) { t = &g_tel.seats[i]; break; }
+	if (!t) return;
+	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !t->ptr) {
+		t->ptr = wl_seat_get_pointer(seat);
+		wl_pointer_add_listener(t->ptr, &ptr_impl, NULL);
+	}
+	if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !t->kbd) {
+		t->kbd = wl_seat_get_keyboard(seat);
+		wl_keyboard_add_listener(t->kbd, &kbd_impl, NULL);
+	}
+	tel_write();
+}
+static void s_name(void *d, struct wl_seat *seat, const char *name)
+{ (void)d;(void)seat;(void)name; }
+static const struct wl_seat_listener seat_impl = {
+	.capabilities = s_caps, .name = s_name,
+};
+
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
 			    const char *iface, uint32_t version)
 {
@@ -215,6 +372,18 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
 	else if (!strcmp(iface, xdg_wm_base_interface.name)) {
 		c->xdg_wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
 		xdg_wm_base_add_listener(c->xdg_wm_base, &xdg_wm_base_impl, NULL);
+	}
+	/* Telemetry mode: track every seat (incl. the per-stream seat that the
+	 * forward's injection rides) so we can count injected input. */
+	else if (g_tel.path && !strcmp(iface, wl_seat_interface.name)
+		 && g_tel.nseats < MAX_SEATS) {
+		struct seat_track *t = &g_tel.seats[g_tel.nseats];
+		(void)version;
+		t->seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
+		t->gname = name;
+		wl_seat_add_listener(t->seat, &seat_impl, NULL);
+		g_tel.nseats++;
+		tel_write();
 	}
 }
 static void registry_global_remove(void *d, struct wl_registry *r, uint32_t n)
@@ -280,6 +449,7 @@ int main(int argc, char **argv)
 	int W = 1280, H = 480, seam_x = -1, animate_ms = 0, fullscreen = 0;
 	long output_id = 1, generation = 1, frame = 0;
 	const char *dump_ppm = NULL;
+	const char *telemetry = NULL, *label = NULL;
 	struct option opts[] = {
 		{"width", required_argument, 0, 'w'},
 		{"height", required_argument, 0, 'h'},
@@ -290,10 +460,12 @@ int main(int argc, char **argv)
 		{"animate-ms", required_argument, 0, 'a'},
 		{"dump-ppm", required_argument, 0, 'd'},
 		{"fullscreen", no_argument, 0, 'F'},
+		{"telemetry", required_argument, 0, 'T'},
+		{"label", required_argument, 0, 'L'},
 		{0, 0, 0, 0},
 	};
 	int o;
-	while ((o = getopt_long(argc, argv, "w:h:s:o:g:f:a:d:F", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "w:h:s:o:g:f:a:d:FT:L:", opts, NULL)) != -1) {
 		switch (o) {
 		case 'w': W = atoi(optarg); break;
 		case 'h': H = atoi(optarg); break;
@@ -304,11 +476,14 @@ int main(int argc, char **argv)
 		case 'a': animate_ms = atoi(optarg); break;
 		case 'd': dump_ppm = optarg; break;
 		case 'F': fullscreen = 1; break;
+		case 'T': telemetry = optarg; break;
+		case 'L': label = optarg; break;
 		default:
 			fprintf(stderr, "usage: %s [--width W] [--height H] "
 				"[--seam-x X] [--output-id N] [--generation N] "
 				"[--frame N] [--animate-ms MS] [--dump-ppm PATH] "
-				"[--fullscreen]\n", argv[0]);
+				"[--fullscreen] [--telemetry PATH] [--label NAME]\n",
+				argv[0]);
 			return 2;
 		}
 	}
@@ -336,6 +511,15 @@ int main(int argc, char **argv)
 
 	struct wl_display *display = wl_display_connect(NULL);
 	if (!display) { fprintf(stderr, "wl_display_connect failed\n"); return 1; }
+	/* arm telemetry BEFORE the registry roundtrip so seats are tracked (incl.
+	 * the per-stream seat that appears later — the registry listener stays live). */
+	if (telemetry) {
+		g_tel.path = telemetry;
+		g_tel.label = label;
+		g_tel.output_id = output_id;
+		g_tel.generation = generation;
+		tel_write();                 /* an initial (empty) telemetry file */
+	}
 	struct ctx c = {0};
 	struct wl_registry *reg = wl_display_get_registry(display);
 	wl_registry_add_listener(reg, &registry_listener, &c);

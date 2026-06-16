@@ -168,6 +168,12 @@ struct app {
 	struct stream_info streams[MAX_STREAMS];
 	struct pending_subscribe pending;
 	char peer_label[64];
+	/* --allow-input: request an input-capable subscription (allow_input=1)
+	 * instead of the read-only default. A HINT — the server's admin approval
+	 * still decides. Used by the step-8 input-confinement gate (codex impl-10)
+	 * so the spawned qdistro-forward gets the qdwin_stream_input_v1 channel and
+	 * injects the remote RDP subscriber's input into the per-stream seat. */
+	int allow_input;
 	/* §P10 --forward-session: when set, every toplevel_added emits a
 	 * "FORWARD toplevel ..." stdout line so a wrapping waypipe-server
 	 * (and any downstream consumer) sees the enumeration. Per-inner-
@@ -539,7 +545,9 @@ do_subscribe(struct app *a, uint32_t handle)
 	}
 	const char *label = a->peer_label[0] ? a->peer_label : "qdwin-bystander";
 	struct qdwin_view_stream_v1 *s = qdwin_shell_v1_subscribe_view_stream(
-		a->shell, handle, label, 0, 0, 0);
+		a->shell, handle, label, 0, 0, a->allow_input ? 1u : 0u);
+	fprintf(stderr, "qdwin-bystander: subscribe handle=%u allow_input=%d\n",
+		handle, a->allow_input ? 1 : 0);
 	if (!s) {
 		fprintf(stderr, "qdwin-bystander: subscribe handle=%u: proxy create failed\n",
 			handle);
@@ -871,8 +879,9 @@ usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n"
-		"          [--inner-display <wayland-socket>] [--forward-session]\n"
-		"          [--connect <wayland-socket>] [--forward-all-toplevels]\n",
+		"          [--allow-input] [--inner-display <wayland-socket>]\n"
+		"          [--forward-session] [--connect <wayland-socket>]\n"
+		"          [--forward-all-toplevels]\n",
 		argv0);
 }
 
@@ -893,6 +902,8 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--peer-label") == 0 && i + 1 < argc) {
 			snprintf(g_app.peer_label, sizeof g_app.peer_label,
 				 "%s", argv[++i]);
+		} else if (strcmp(argv[i], "--allow-input") == 0) {
+			g_app.allow_input = 1;          /* input-confinement gate */
 		} else if ((strcmp(argv[i], "--inner-display") == 0
 			    || strcmp(argv[i], "--connect") == 0)
 			   && i + 1 < argc) {
