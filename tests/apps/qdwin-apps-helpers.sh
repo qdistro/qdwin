@@ -12,21 +12,10 @@
 # - The active wayland socket name is auto-detected because weston
 #   restarts cycle through wayland-1 / wayland-2.
 
-# Worktree-aware workspace lookup — see qdwin-helpers.sh for the rationale.
-# Walk upward until a checkout with qdistro/scripts/vm/vm-exec is found so
-# vm-exec resolves correctly when this runs from a .worktrees/<name>/ checkout.
-qdwin_find_workspace() {
-    local d
-    d=$(cd "${1:-.}" 2>/dev/null && pwd -P) || return 1
-    while [ -n "$d" ] && [ "$d" != / ]; do
-        if [ -e "$d/qdistro/scripts/vm/vm-exec" ]; then
-            printf '%s\n' "$d"
-            return 0
-        fi
-        d=$(dirname "$d")
-    done
-    return 1
-}
+# qdwin_find_workspace() — shared with tests/gui/qdwin-helpers.sh; see
+# tests/lib/workspace.sh for the rationale (worktree-aware upward search).
+# shellcheck source=../lib/workspace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/workspace.sh"
 
 : "${VMNAME:=}"
 : "${QDWIN_VIRSH:=virsh -c qemu:///session}"

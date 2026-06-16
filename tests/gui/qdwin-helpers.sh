@@ -35,25 +35,10 @@
 # bleed into the caller's shell and break interactive use. Helpers
 # return nonzero on failure; callers can `set -e` themselves.
 
-# Resolve the workspace root — the directory that holds the sibling product
-# repos (qdistro, qdshell, ...). Walk upward from $1 until a checkout with
-# qdistro/scripts/vm/vm-exec is found. This works both in the normal layout
-# (qdwin a sibling of qdistro under the project root) AND from a git worktree
-# under .worktrees/<name>/, where $repo/.. is the worktrees dir — not the
-# project root — so the old "$ROOT/.." derivation pointed vm-exec at a path
-# that does not exist. Prints the workspace dir, or returns 1 if none found.
-qdwin_find_workspace() {
-    local d
-    d=$(cd "${1:-.}" 2>/dev/null && pwd -P) || return 1
-    while [ -n "$d" ] && [ "$d" != / ]; do
-        if [ -e "$d/qdistro/scripts/vm/vm-exec" ]; then
-            printf '%s\n' "$d"
-            return 0
-        fi
-        d=$(dirname "$d")
-    done
-    return 1
-}
+# qdwin_find_workspace() — shared with tests/apps/qdwin-apps-helpers.sh; see
+# tests/lib/workspace.sh for the rationale (worktree-aware upward search).
+# shellcheck source=../lib/workspace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/workspace.sh"
 
 : "${VMNAME:=}"
 : "${QDWIN_VIRSH:=virsh -c qemu:///session}"
