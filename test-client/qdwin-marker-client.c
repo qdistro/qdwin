@@ -277,7 +277,7 @@ static int write_ppm(const char *path, const uint32_t *fb, int W, int H)
 
 int main(int argc, char **argv)
 {
-	int W = 1280, H = 480, seam_x = -1, animate_ms = 0;
+	int W = 1280, H = 480, seam_x = -1, animate_ms = 0, fullscreen = 0;
 	long output_id = 1, generation = 1, frame = 0;
 	const char *dump_ppm = NULL;
 	struct option opts[] = {
@@ -289,10 +289,11 @@ int main(int argc, char **argv)
 		{"frame", required_argument, 0, 'f'},
 		{"animate-ms", required_argument, 0, 'a'},
 		{"dump-ppm", required_argument, 0, 'd'},
+		{"fullscreen", no_argument, 0, 'F'},
 		{0, 0, 0, 0},
 	};
 	int o;
-	while ((o = getopt_long(argc, argv, "w:h:s:o:g:f:a:d:", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "w:h:s:o:g:f:a:d:F", opts, NULL)) != -1) {
 		switch (o) {
 		case 'w': W = atoi(optarg); break;
 		case 'h': H = atoi(optarg); break;
@@ -302,11 +303,12 @@ int main(int argc, char **argv)
 		case 'f': frame = atol(optarg); break;
 		case 'a': animate_ms = atoi(optarg); break;
 		case 'd': dump_ppm = optarg; break;
+		case 'F': fullscreen = 1; break;
 		default:
 			fprintf(stderr, "usage: %s [--width W] [--height H] "
 				"[--seam-x X] [--output-id N] [--generation N] "
-				"[--frame N] [--animate-ms MS] [--dump-ppm PATH]\n",
-				argv[0]);
+				"[--frame N] [--animate-ms MS] [--dump-ppm PATH] "
+				"[--fullscreen]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -351,6 +353,8 @@ int main(int argc, char **argv)
 	xdg_toplevel_add_listener(top, &tl_impl, NULL);
 	xdg_toplevel_set_title(top, "qdwin-marker-client");
 	xdg_toplevel_set_app_id(top, "qdwin-marker-client");
+	if (fullscreen)
+		xdg_toplevel_set_fullscreen(top, NULL);  /* fill an output at 0,0 */
 	wl_surface_commit(surf);
 	wl_display_roundtrip(display);
 
