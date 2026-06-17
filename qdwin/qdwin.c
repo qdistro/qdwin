@@ -36,6 +36,7 @@
 #include <strings.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -228,6 +229,7 @@ static void qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 static void qdwin_nested_proxy_send_close(struct qdwin_toplevel *tl);
 static void qdwin_popup_teardown(struct qdwin_popup *p);
 static void qdwin_view_stream_unpin(struct qdwin_view_stream *s);
+static void qdwin_view_stream_reap_forward(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_init(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_release(struct qdwin_view_stream *s);
 /* spec/10 clear_selection forward decls — defined in the
@@ -574,6 +576,19 @@ struct qdwin_view_stream {
 
 	/* S3: external qdistro-forward proxy lifecycle */
 	pid_t forward_pid;                /* 0 if not spawned */
+	/* item 5 (codex impl-26): pidfd death-watch on the forward child. weston
+	 * owns SIGCHLD via a signalfd and waitpid(-1)-reaps EVERY child, so qdwin
+	 * (a shell plugin) cannot install a SIGCHLD handler nor reliably waitpid the
+	 * forward to detect its death. Instead we hold a pidfd to the EXACT child we
+	 * forked and watch it for readiness (process exit) on weston's wl_event_loop;
+	 * pidfd readiness is independent of who reaps the zombie. On readiness we emit
+	 * torn_down("forward exited") and run the normal stream teardown. DISARMED
+	 * (source removed, fd closed, both fields reset) before any qdwin-initiated
+	 * teardown so the callback can never fire against a freed stream. The fd is
+	 * -1 and the source NULL whenever the watch is not armed (note: calloc zeroes
+	 * the fd to 0 — a VALID fd — so it MUST be reset to -1 at creation). */
+	int forward_pidfd;                /* -1 when not armed */
+	struct wl_event_source *forward_pidfd_source;  /* NULL when not armed */
 	uint32_t rdp_port;                /* 0 if not spawned */
 	char access_token[33];            /* 32 hex chars + NUL */
 	char rdp_password[17];            /* 16 hex chars + NUL */
@@ -4365,6 +4380,73 @@ qdwin_forward_write_secret(int fd, const char *secret)
 	return 0;
 }
 
+/* item 5 (codex impl-26): open a pidfd to a child we forked. glibc may expose
+ * pidfd_open(2) directly, but we don't want a configure-time probe — go straight
+ * through the syscall, guarded so a kernel/headers without SYS_pidfd_open fails
+ * loudly (the target host is kernel 6.18, where this is always present). */
+static int
+qdwin_pidfd_open(pid_t pid)
+{
+#ifdef SYS_pidfd_open
+	return (int)syscall(SYS_pidfd_open, pid, 0u);
+#else
+	(void)pid;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+/* item 5: DISARM the forward death-watch — idempotent. Removes the event source
+ * and closes the pidfd, resetting both fields so a later call (or the death
+ * callback itself) is a no-op. MUST run before the stream struct is freed and
+ * before any qdwin-initiated reap, so the event loop can never dispatch
+ * qdwin_forward_pidfd_ready against a freed/partly-torn-down stream. */
+static void
+qdwin_view_stream_disarm_pidfd(struct qdwin_view_stream *s)
+{
+	struct wl_event_source *src = s->forward_pidfd_source;
+	int fd = s->forward_pidfd;
+	s->forward_pidfd_source = NULL;
+	s->forward_pidfd = -1;
+	/* libwayland defers the source free to post-dispatch, so removing the
+	 * currently-dispatching source from inside its own callback is safe. */
+	if (src)
+		wl_event_source_remove(src);
+	if (fd >= 0)
+		close(fd);
+}
+
+/* item 5: the forward child exited on its own (crash, exec failure, or a future
+ * fatal PipeWire error). weston's signalfd handler waitpid(-1)-reaps it; we just
+ * learn of the death via pidfd readiness and run the ONE teardown path: tell the
+ * subscriber (torn_down "forward exited"), then destroy the stream resource so
+ * qdwin_stream_resource_destroyed performs the existing unpin / seat release /
+ * input-handle destroy / list removal / free. We do NOT waitpid (weston owns
+ * reaping) and do NOT use s after wl_resource_destroy returns. */
+static int
+qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
+{
+	struct qdwin_view_stream *s = data;
+	(void)fd;
+	(void)mask;
+	pid_t dead = s->forward_pid;
+	/* Disarm FIRST: stop this (level-triggered) source from re-firing and stop
+	 * the upcoming resource-destroyed reap from touching the source/fd again. */
+	qdwin_view_stream_disarm_pidfd(s);
+	/* Drop our ownership of the pid WITHOUT waiting — weston already reaps. */
+	s->forward_pid = 0;
+	weston_log("qdwin: qdistro-forward pid=%d exited; tearing down view_stream "
+		   "rdp_port=%u (forward exited)\n", (int)dead, s->rdp_port);
+	if (s->resource) {
+		qdwin_view_stream_v1_send_torn_down(s->resource, "forward exited");
+		/* Single teardown path: resource-destroyed runs reap_forward (a now
+		 * no-op disarm + early return on forward_pid==0), unpin, seat release,
+		 * list removal, free. */
+		wl_resource_destroy(s->resource);
+	}
+	return 0;
+}
+
 static int
 qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 				const char *pw_node_name,
@@ -4464,7 +4546,39 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 		return -1;
 	}
 	s->forward_pid = pid;
-	weston_log("qdwin: spawned qdistro-forward pid=%d port=%u node=%s\n",
+	/* item 5 (codex impl-26): arm the pidfd death-watch on THIS exact child,
+	 * synchronously in the parent BEFORE we return to weston's event loop — so
+	 * weston's signalfd reaper cannot have run yet and pidfd_open still has a live
+	 * (possibly already-zombie-but-unreaped) target. A failure to arm makes the
+	 * stream non-item-5-compliant, so we kill the forward and fail the spawn
+	 * rather than leave a death-blind stream. */
+	int pidfd = qdwin_pidfd_open(pid);
+	if (pidfd < 0) {
+		weston_log("qdwin: pidfd_open(qdistro-forward pid=%d) failed: %m; "
+			   "killing forward + failing stream\n", (int)pid);
+		/* codex impl-27 MED: keep forward_pid set and route through the SINGLE
+		 * ownership path (disarm-noop + SIGTERM + best-effort reap + clear) so a
+		 * child that outlives the WNOHANG isn't hidden from later cleanup. */
+		qdwin_view_stream_reap_forward(s);
+		return -1;
+	}
+	struct wl_event_source *src = wl_event_loop_add_fd(
+		wl_display_get_event_loop(s->qdwin->compositor->wl_display),
+		pidfd, WL_EVENT_READABLE, qdwin_forward_pidfd_ready, s);
+	if (!src) {
+		weston_log("qdwin: wl_event_loop_add_fd(pidfd) failed for "
+			   "qdistro-forward pid=%d; killing forward + failing stream\n",
+			   (int)pid);
+		/* pidfd is local-only here (never stored on s, so disarm won't see it);
+		 * close it, then reap the forward via the single ownership path. */
+		close(pidfd);
+		qdwin_view_stream_reap_forward(s);
+		return -1;
+	}
+	s->forward_pidfd = pidfd;
+	s->forward_pidfd_source = src;
+	weston_log("qdwin: spawned qdistro-forward pid=%d port=%u node=%s "
+		   "(pidfd death-watch armed)\n",
 		   (int)pid, s->rdp_port, pw_node_name);
 	return 0;
 }
@@ -4472,13 +4586,22 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 static void
 qdwin_view_stream_reap_forward(struct qdwin_view_stream *s)
 {
+	/* item 5 (codex impl-26): disarm the pidfd death-watch FIRST — before we
+	 * SIGTERM/reap or free anything — so the event loop can never dispatch
+	 * qdwin_forward_pidfd_ready against a stream we're tearing down (it would
+	 * re-enter teardown on a freed struct). Idempotent: a no-op if the death
+	 * callback already disarmed (qdwin-initiated path) or if never armed. */
+	qdwin_view_stream_disarm_pidfd(s);
 	if (s->forward_pid <= 0)
 		return;
 	if (kill(s->forward_pid, SIGTERM) != 0 && errno != ESRCH)
 		weston_log("qdwin: SIGTERM qdistro-forward pid=%d failed: %m\n",
 			   (int)s->forward_pid);
 	/* Non-blocking reap; let weston's SIGCHLD-or-idle loop catch it.
-	 * If we block here we stall the wayland dispatch. */
+	 * If we block here we stall the wayland dispatch. ECHILD is EXPECTED:
+	 * weston's signalfd handler waitpid(-1)-reaps EVERY child, so it may have
+	 * already reaped this forward — the result is best-effort only and is never
+	 * used to decide teardown (the pidfd death-watch alone emits torn_down). */
 	int status;
 	pid_t got = waitpid(s->forward_pid, &status, WNOHANG);
 	if (got == s->forward_pid) {
@@ -4599,6 +4722,10 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 	s->qdwin = qdwin;
 	s->tl = tl;
 	s->pw_output = pw;
+	/* item 5: calloc zeroed forward_pidfd to 0 (a valid fd); reset to -1 so the
+	 * disarm helper never closes stdin if the watch was never armed. */
+	s->forward_pidfd = -1;
+	s->forward_pidfd_source = NULL;
 	/* The subscriber's allow_input is now ENFORCED (was ignored): a read-only
 	 * export (allow_input=0) keeps its pixel stream + per-stream seat (for focus
 	 * locking) but DROPS every injected event at the inject_* boundary below, so a
