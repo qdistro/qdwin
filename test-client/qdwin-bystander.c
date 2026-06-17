@@ -83,6 +83,7 @@
  *   min <handle>      → request_minimize(handle)
  *   close <handle>    → request_close(handle)
  *   focus <handle>    → set_keyboard_focus("default", handle)
+ *   raise <handle>    → request_raise(handle)  (deterministic z-order)
  *   subscribe <handle> → subscribe_view_stream(handle)
  *   subscribelast     → subscribe to the most recently added toplevel
  *   list              → print last seen toplevels to stderr
@@ -858,6 +859,9 @@ process_command(struct app *a, char *line)
 	} else if (strcmp(cmd, "focus") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd focus handle=%u\n", handle);
 		qdwin_shell_v1_set_keyboard_focus(a->shell, "default", handle);
+	} else if (strcmp(cmd, "raise") == 0 && has_handle) {
+		fprintf(stderr, "qdwin-bystander: cmd raise handle=%u\n", handle);
+		qdwin_shell_v1_request_raise(a->shell, handle);
 	} else if (strcmp(cmd, "subscribe") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd subscribe handle=%u\n", handle);
 		do_subscribe(a, handle);
