@@ -217,7 +217,11 @@ static const struct xdg_wm_base_listener xdg_wm_base_impl = { .ping = xdg_wm_bas
 #define MAX_SEATS 8
 struct seat_track {
 	struct wl_seat *seat;
-	uint32_t gname;            /* registry global name (seat identity) */
+	uint32_t gname;            /* registry global name (numeric identity) */
+	char name[64];             /* wl_seat.name string (e.g. "qdwin-stream-5555"),
+	                            * the per-stream seat identity — bound at v2 so the
+	                            * compositor delivers the name event. Empty if the
+	                            * server never sent a name. */
 	struct wl_pointer *ptr;
 	struct wl_keyboard *kbd;
 	int ptr_enter, ptr_motion, btn_press, kbd_enter, key_press;
@@ -276,11 +280,14 @@ static void tel_write(void)
 		struct seat_track *s = &g_tel.seats[i];
 		tpe += s->ptr_enter; tpm += s->ptr_motion; tbp += s->btn_press;
 		tke += s->kbd_enter; tkp += s->key_press;
-		fprintf(f, "%s{\"name\":%u,\"has_pointer\":%d,\"has_keyboard\":%d,"
+		char sname[256];
+		json_escape(sname, sizeof sname, s->name);
+		fprintf(f, "%s{\"name\":%u,\"seat_name\":\"%s\","
+			   "\"has_pointer\":%d,\"has_keyboard\":%d,"
 			   "\"pointer_enter\":%d,\"pointer_motion\":%d,"
 			   "\"button_press\":%d,\"keyboard_enter\":%d,"
 			   "\"key_press\":%d,\"last_x\":%d,\"last_y\":%d}",
-			i ? "," : "", s->gname, s->ptr ? 1 : 0, s->kbd ? 1 : 0,
+			i ? "," : "", s->gname, sname, s->ptr ? 1 : 0, s->kbd ? 1 : 0,
 			s->ptr_enter, s->ptr_motion, s->btn_press, s->kbd_enter,
 			s->key_press, s->last_x, s->last_y);
 	}
@@ -373,7 +380,16 @@ static void s_caps(void *d, struct wl_seat *seat, uint32_t caps)
 	tel_write();
 }
 static void s_name(void *d, struct wl_seat *seat, const char *name)
-{ (void)d;(void)seat;(void)name; }
+{
+	(void)d;
+	for (int i = 0; i < g_tel.nseats; i++)
+		if (g_tel.seats[i].seat == seat) {
+			snprintf(g_tel.seats[i].name, sizeof g_tel.seats[i].name,
+				 "%s", name ? name : "");
+			tel_write();
+			return;
+		}
+}
 static const struct wl_seat_listener seat_impl = {
 	.capabilities = s_caps, .name = s_name,
 };
@@ -396,8 +412,11 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
 	else if (g_tel.path && !strcmp(iface, wl_seat_interface.name)
 		 && g_tel.nseats < MAX_SEATS) {
 		struct seat_track *t = &g_tel.seats[g_tel.nseats];
-		(void)version;
-		t->seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
+		/* Bind at v2 so the compositor delivers wl_seat.name (the
+		 * per-stream seat identity "qdwin-stream-<port>"); pointer/
+		 * keyboard tracking is unchanged from v1. */
+		t->seat = wl_registry_bind(reg, name, &wl_seat_interface,
+					   version >= 2 ? 2 : version);
 		t->gname = name;
 		wl_seat_add_listener(t->seat, &seat_impl, NULL);
 		g_tel.nseats++;

@@ -592,6 +592,15 @@ struct qdwin_view_stream {
 	struct weston_seat stream_seat;
 	int seat_inited;
 
+	/* IMPL-19: per-stream pointer grab that HARD-LOCKS the stream seat's
+	 * pointer focus to tl->view, so injected remote input cannot leak to
+	 * another view stacked at the same compositor-global coordinate. Without
+	 * it, notify_motion_absolute re-picks focus geometrically and a local
+	 * window overlapping the source view at the injected point would steal
+	 * the press. Installed on claim, ended on handle release / seat teardown. */
+	struct weston_pointer_grab confine_grab;
+	int confine_grab_active;
+
 	struct wl_list link;              /* qdwin::view_streams */
 };
 
@@ -4674,6 +4683,148 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
  * whether the events originated from RDP, an AI policy, or a fuzzer.
  * ------------------------------------------------------------------ */
 
+/* IMPL-19 per-stream confinement grab. Modeled on the locked-session branch of
+ * the default proxy grab: it FORCES pointer focus to the source view (tl->view)
+ * and delivers there, ignoring the compositor-global picker — so injected remote
+ * input is confined to the exported window even when a local view overlaps it at
+ * the same global coordinate. If the source view is gone / input is no longer
+ * allowed, events are DROPPED rather than falling back to geometric focus. */
+static struct weston_view *
+qdwin_stream_confine_target(struct qdwin_view_stream *s)
+{
+	if (!s || !s->allow_input || !s->tl || s->tl->nested_proxy_pending_decision)
+		return NULL;
+	if (!s->tl->view || !s->tl->view->surface)
+		return NULL;
+	return s->tl->view;
+}
+
+static void
+qdwin_stream_confine_focus(struct weston_pointer_grab *grab)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (v && grab->pointer->focus != v)
+		weston_pointer_set_focus(grab->pointer, v);
+}
+
+static void
+qdwin_stream_confine_motion(struct weston_pointer_grab *grab,
+			    const struct timespec *time,
+			    struct weston_pointer_motion_event *event)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_pointer *pointer = grab->pointer;
+	weston_pointer_move(pointer, event);
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (!v)
+		return;                  /* source view gone: drop, don't re-pick */
+	if (pointer->focus != v)
+		weston_pointer_set_focus(pointer, v);
+	weston_pointer_send_motion(pointer, time, event);
+}
+
+static void
+qdwin_stream_confine_button(struct weston_pointer_grab *grab,
+			    const struct timespec *time,
+			    uint32_t button, uint32_t state)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_pointer *pointer = grab->pointer;
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (!v)
+		return;
+	if (pointer->focus != v)
+		weston_pointer_set_focus(pointer, v);
+	weston_pointer_send_button(pointer, time, button, state);
+}
+
+static void
+qdwin_stream_confine_axis(struct weston_pointer_grab *grab,
+			  const struct timespec *time,
+			  struct weston_pointer_axis_event *event)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_pointer *pointer = grab->pointer;
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (!v)
+		return;
+	if (pointer->focus != v)
+		weston_pointer_set_focus(pointer, v);
+	weston_pointer_send_axis(pointer, time, event);
+}
+
+static void
+qdwin_stream_confine_axis_source(struct weston_pointer_grab *grab,
+				 uint32_t source)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	if (!qdwin_stream_confine_target(s))
+		return;                  /* drop when no source view, like motion/axis */
+	weston_pointer_send_axis_source(grab->pointer, source);
+}
+
+static void
+qdwin_stream_confine_frame(struct weston_pointer_grab *grab)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	if (!qdwin_stream_confine_target(s))
+		return;
+	weston_pointer_send_frame(grab->pointer);
+}
+
+static void
+qdwin_stream_confine_cancel(struct weston_pointer_grab *grab)
+{
+	/* Weston calls cancel when another grab replaces ours (or on teardown).
+	 * After that our grab is no longer the pointer's active grab, so clear
+	 * the active flag — otherwise a later grab_end would call
+	 * weston_pointer_end_grab on a pointer whose grab is now someone else's
+	 * and tear down the wrong grab (codex impl-20). */
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	s->confine_grab_active = 0;
+}
+
+static const struct weston_pointer_grab_interface qdwin_stream_confine_grab_iface = {
+	qdwin_stream_confine_focus,
+	qdwin_stream_confine_motion,
+	qdwin_stream_confine_button,
+	qdwin_stream_confine_axis,
+	qdwin_stream_confine_axis_source,
+	qdwin_stream_confine_frame,
+	qdwin_stream_confine_cancel,
+};
+
+static void
+qdwin_stream_confine_grab_start(struct qdwin_view_stream *s)
+{
+	if (s->confine_grab_active || !s->seat_inited)
+		return;
+	struct weston_pointer *ptr = weston_seat_get_pointer(&s->stream_seat);
+	if (!ptr)
+		return;
+	s->confine_grab.interface = &qdwin_stream_confine_grab_iface;
+	weston_pointer_start_grab(ptr, &s->confine_grab);
+	s->confine_grab_active = 1;
+	weston_log("qdwin: stream seat '%s' confinement grab started (port=%u)\n",
+		   s->stream_seat.seat_name ? s->stream_seat.seat_name : "?",
+		   s->rdp_port);
+}
+
+static void
+qdwin_stream_confine_grab_end(struct qdwin_view_stream *s)
+{
+	if (!s->confine_grab_active)
+		return;
+	s->confine_grab_active = 0;
+	/* Only end the grab if OURS is still the pointer's active grab — if it
+	 * was already replaced/cancelled, ending here would tear down whatever
+	 * grab is active now (codex impl-20). */
+	struct weston_pointer *ptr = s->confine_grab.pointer;
+	if (ptr && ptr->grab == &s->confine_grab)
+		weston_pointer_end_grab(ptr);
+}
+
 static void
 qdwin_stream_seat_init(struct qdwin_view_stream *s)
 {
@@ -4721,6 +4872,9 @@ qdwin_stream_seat_release(struct qdwin_view_stream *s)
 {
 	if (!s->seat_inited)
 		return;
+	/* IMPL-19: end the confinement grab BEFORE releasing the pointer, so we
+	 * don't leave a grab pointing at a freed pointer. */
+	qdwin_stream_confine_grab_end(s);
 	weston_seat_release_touch(&s->stream_seat);
 	weston_seat_release_keyboard(&s->stream_seat);
 	weston_seat_release_pointer(&s->stream_seat);
@@ -4783,6 +4937,7 @@ qdwin_stream_input_handle_resource_destroyed(struct wl_resource *resource)
 	if (s->input_handle == resource) {
 		s->input_handle = NULL;
 		s->input_claimed = 0;
+		qdwin_stream_confine_grab_end(s);   /* IMPL-19: drop the focus lock */
 		weston_log("qdwin: stream_input handle released "
 			   "(rdp_port=%u)\n", s->rdp_port);
 	}
@@ -5022,6 +5177,10 @@ qdwin_stream_input_handle_claim(
 		qdwin_stream_input_handle_resource_destroyed);
 	s->input_claimed = 1;
 	s->input_handle = handle_res;
+
+	/* IMPL-19: lock the per-stream pointer focus to the source view for the
+	 * life of the claim, so injected input can't leak to an overlapping view. */
+	qdwin_stream_confine_grab_start(s);
 
 	weston_log("qdwin: stream_input claim OK rdp_port=%u peer pid=%d "
 		   "uid=%u\n", s->rdp_port, (int)pid, (unsigned)uid);

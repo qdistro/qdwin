@@ -964,6 +964,22 @@ executable('qdwin-marker-client',
   install_dir: get_option('bindir'),
 )
 
+# Compositor-boundary direct claimant for the multi-machine input-isolation
+# gate A1 (todo/multi-machine session 7). Selected by qdwin via QDWIN_FORWARD_BIN
+# in place of qdistro-forward; receives the real per-stream access token over
+# --access-token-fd and drives qdwin_stream_input_v1 claim+inject directly (no
+# RDP/FreeRDP). Links the qdwin_shell_v1 client bindings for the input protocol.
+executable('qdwin-stream-claimant',
+  sources: [
+    'test-client/qdwin-stream-claimant.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
 # Direct xdg_popup spoofing probe for the M1 libweston popup clamp: maps a
 # toplevel, creates an xdg_popup with an off-output positioner, and prints
 # the constrained geometry the compositor reports in xdg_popup.configure.
