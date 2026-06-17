@@ -1781,21 +1781,23 @@
     <request name="request_set_position" since="30">
       <description summary="shell moves a floating toplevel to an explicit position">
         Shell-owned WM control: move the managed toplevel `handle` so its
-        outer-rect top-left sits at the output-local coordinate (x, y),
-        preserving its current size. This is the compositor-driven
-        counterpart to `begin_interactive_move` (which follows the pointer):
-        the shell names the target position directly, so geometry is decided
-        by shell policy, not by the app or by pointer choreography.
+        outer-rect top-left sits at the GLOBAL compositor coordinate (x, y) —
+        the same coordinate space as the `toplevel_geometry` event — preserving
+        its current size. This is the compositor-driven counterpart to
+        `begin_interactive_move` (which follows the pointer): the shell names
+        the target position directly, so geometry is decided by shell policy,
+        not by the app or by pointer choreography.
 
         qdwin refuses (silently ignores) an unknown/destroyed handle and a
         maximized/fullscreen/tiled toplevel (those own their geometry); for a
-        floating toplevel it repositions the view, clamps the position so the
-        window stays reachable on an output, and emits `toplevel_geometry`
-        with the new rectangle. The request never resizes.
+        floating toplevel it clamps the top-left onto the output that contains
+        it (falling back to the primary output) so the window stays reachable,
+        repositions the view, and emits `toplevel_geometry` with the new
+        (global) rectangle. The request never resizes.
       </description>
       <arg name="handle" type="uint"/>
-      <arg name="x" type="int" summary="output-local outer-rect x"/>
-      <arg name="y" type="int" summary="output-local outer-rect y"/>
+      <arg name="x" type="int" summary="global outer-rect x (toplevel_geometry space)"/>
+      <arg name="y" type="int" summary="global outer-rect y (toplevel_geometry space)"/>
     </request>
   </interface>
 

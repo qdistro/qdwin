@@ -3061,16 +3061,27 @@ qdwin_handle_request_set_position(struct wl_client *client,
 		return;
 	}
 
-	/* (x,y) is the OUTER-rect top-left (the coordinate space of the
-	 * toplevel_geometry event). Clamp the top-left onto the primary output
-	 * so the window stays reachable (the titlebar can't be dragged fully
-	 * off-screen). The content view sits inset_w/inset_n inside the outer
-	 * rect; size is preserved (never resized). */
+	/* (x,y) is the GLOBAL outer-rect top-left (the coordinate space of the
+	 * toplevel_geometry event). Clamp the top-left onto the output that
+	 * CONTAINS it (falling back to the primary output) so the window stays
+	 * reachable (the titlebar can't be parked fully off any output) and the
+	 * clamp is correct even when an output has a nonzero global origin. The
+	 * content view sits inset_w/inset_n inside the outer rect; size is
+	 * preserved (never resized). */
 	int cx = x, cy = y;
-	struct weston_output *out = qdwin_primary_output(qdwin);
+	struct weston_output *out = NULL, *o;
+	wl_list_for_each(o, &qdwin->compositor->output_list, link) {
+		if (x >= (int)o->pos.c.x && x < (int)o->pos.c.x + o->width &&
+		    y >= (int)o->pos.c.y && y < (int)o->pos.c.y + o->height) {
+			out = o;
+			break;
+		}
+	}
+	if (!out)
+		out = qdwin_primary_output(qdwin);
 	if (out) {
-		int max_x = out->pos.c.x + out->width - 1;
-		int max_y = out->pos.c.y + out->height - 1;
+		int max_x = (int)out->pos.c.x + out->width - 1;
+		int max_y = (int)out->pos.c.y + out->height - 1;
 		if (cx < (int)out->pos.c.x) cx = (int)out->pos.c.x;
 		if (cy < (int)out->pos.c.y) cy = (int)out->pos.c.y;
 		if (cx > max_x) cx = max_x;

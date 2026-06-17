@@ -793,6 +793,23 @@ outer_teardown(struct outer_state *out)
 static volatile sig_atomic_t stop = 0;
 static void on_int(int s) { (void)s; stop = 1; }
 
+/* Parse an optional allow_input override token: NULL => -1 (use the global
+ * --allow-input flag); literal "0"/"1" => 0/1; anything else => rejected (-1 +
+ * a diagnostic), so a malformed command never silently sets an input policy. */
+static int
+parse_ai_override(const char *s)
+{
+	if (!s)
+		return -1;
+	if (strcmp(s, "0") == 0)
+		return 0;
+	if (strcmp(s, "1") == 0)
+		return 1;
+	fprintf(stderr, "qdwin-bystander: allow_input override must be 0|1, "
+		"got '%s' (using --allow-input default)\n", s);
+	return -1;
+}
+
 static void
 process_command(struct app *a, char *line)
 {
@@ -892,16 +909,18 @@ process_command(struct app *a, char *line)
 			qdwin_shell_v1_request_set_position(a->shell, handle, mx, my);
 		}
 	} else if (strcmp(cmd, "subscribe") == 0 && has_handle) {
-		/* subscribe <handle> [allow_input 0|1] — optional per-handle override. */
+		/* subscribe <handle> [allow_input 0|1] — optional per-handle override.
+		 * Only literal 0/1 accepted; anything else is rejected (no silent
+		 * malformed input policy — this feeds the rung-1 allow_input proof). */
 		char *ais = strtok(NULL, " \t\r\n");
-		a->sub_ai_override = ais ? (int)strtol(ais, NULL, 10) : -1;
+		a->sub_ai_override = parse_ai_override(ais);
 		fprintf(stderr, "qdwin-bystander: cmd subscribe handle=%u ai=%s\n",
 			handle, ais ? ais : "default");
 		do_subscribe(a, handle);
 		a->sub_ai_override = -1;
 	} else if (strcmp(cmd, "subscribelast") == 0 && a->got_last) {
 		/* subscribelast [allow_input 0|1] — `arg` already holds the optional ai. */
-		a->sub_ai_override = arg ? (int)strtol(arg, NULL, 10) : -1;
+		a->sub_ai_override = parse_ai_override(arg);
 		fprintf(stderr, "qdwin-bystander: cmd subscribelast handle=%u ai=%s\n",
 			a->last_handle, arg ? arg : "default");
 		do_subscribe(a, a->last_handle);
