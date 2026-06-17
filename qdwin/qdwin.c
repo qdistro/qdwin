@@ -232,6 +232,7 @@ static void qdwin_view_stream_unpin(struct qdwin_view_stream *s);
 static void qdwin_view_stream_reap_forward(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_init(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_release(struct qdwin_view_stream *s);
+static void qdwin_stream_confine_grab_end(struct qdwin_view_stream *s);
 /* spec/10 clear_selection forward decls — defined in the
  * primary-selection-unstable-v1 block far below, but the qdwin_shell
  * impl table at line ~3600 needs them. */
@@ -1764,6 +1765,27 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 		qdwin_popup_teardown(tl->popup);
 	}
 	qdwin_move_grab_end_for(qdwin, tl->handle);
+
+	/* IMPL-19/rung-1 crash fix: a view_stream may be confining its per-stream
+	 * pointer focus to THIS toplevel's view via an active weston_pointer_grab.
+	 * We are about to weston_view_destroy(tl->view) and free(tl); destroying the
+	 * focused view makes libweston re-pick focus, which dispatches the confine
+	 * grab's focus() callback — and freeing tl would leave s->tl dangling for any
+	 * later pointer event. Either path crashes (observed: SIGSEGV in
+	 * qdwin_stream_confine_focus → weston_pointer_set_focus during multi-stream
+	 * teardown). End the grab and detach the stream from the dying toplevel NOW;
+	 * the stream itself is torn down later when its forward exits (until then it
+	 * has no target and drops input — qdwin_stream_confine_target handles NULL). */
+	{
+		struct qdwin_view_stream *vs;
+		wl_list_for_each(vs, &qdwin->view_streams, link) {
+			if (vs->tl == tl) {
+				qdwin_stream_confine_grab_end(vs);
+				vs->tl = NULL;
+			}
+		}
+	}
+
 	for (int s = 0; s < QDWIN_SIDES; s++)
 		qdwin_chrome_detach(&tl->chrome[s]);
 
@@ -2990,6 +3012,90 @@ qdwin_handle_request_raise(struct wl_client *client,
 		qdwin_toplevel_apply_workspace_visibility(tl);
 	weston_log("qdwin: request_raise handle=%u re-stacked\n", handle);
 	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
+/* v30: shell-owned set-position. The compositor-driven counterpart to
+ * begin_interactive_move — the shell names the target outer-rect top-left
+ * directly (WM policy), rather than the window following the pointer. Used by
+ * the multi-machine viewer to place remote managed peers at deterministic
+ * overlapping geometry. Floating toplevels only: maximised/fullscreen/tiled own
+ * their geometry and are refused silently. Size is preserved. */
+static void
+qdwin_handle_request_set_position(struct wl_client *client,
+				  struct wl_resource *resource,
+				  uint32_t handle, int32_t x, int32_t y)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct qdwin_toplevel *tl;
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+	tl = qdwin_toplevel_from_handle(qdwin, handle);
+	if (!tl || !tl->view) {
+		weston_log("qdwin: request_set_position unknown handle=%u\n", handle);
+		return;
+	}
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: request_set_position handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", handle);
+		return;
+	}
+	if (tl->state & (QDWIN_TS_MAXIMIZED | QDWIN_TS_FULLSCREEN)) {
+		weston_log("qdwin: request_set_position handle=%u ignored — "
+			   "maximised/fullscreen owns its geometry\n", handle);
+		return;
+	}
+	if (tl->tiled != QDWIN_TILE_NONE) {
+		weston_log("qdwin: request_set_position handle=%u ignored — tiled\n",
+			   handle);
+		return;
+	}
+	if (qdwin->move_grab_active && qdwin->move_grab_handle == handle) {
+		weston_log("qdwin: request_set_position handle=%u ignored — "
+			   "interactive move in progress\n", handle);
+		return;
+	}
+
+	/* (x,y) is the OUTER-rect top-left (the coordinate space of the
+	 * toplevel_geometry event). Clamp the top-left onto the primary output
+	 * so the window stays reachable (the titlebar can't be dragged fully
+	 * off-screen). The content view sits inset_w/inset_n inside the outer
+	 * rect; size is preserved (never resized). */
+	int cx = x, cy = y;
+	struct weston_output *out = qdwin_primary_output(qdwin);
+	if (out) {
+		int max_x = out->pos.c.x + out->width - 1;
+		int max_y = out->pos.c.y + out->height - 1;
+		if (cx < (int)out->pos.c.x) cx = (int)out->pos.c.x;
+		if (cy < (int)out->pos.c.y) cy = (int)out->pos.c.y;
+		if (cx > max_x) cx = max_x;
+		if (cy > max_y) cy = max_y;
+	}
+
+	struct weston_coord_global p = {
+		.c = weston_coord(cx + tl->inset_w, cy + tl->inset_n),
+	};
+	weston_view_set_position(tl->view, p);
+	weston_view_update_transform(tl->view);
+	qdwin_toplevel_position_chrome(tl);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+
+	/* The shell's tracked geometry is now stale; send the authoritative
+	 * new rectangle (same outer-rect convention as the move-grab end). */
+	if (qdwin->shell_bound && qdwin->shell_resource) {
+		qdwin_shell_v1_send_toplevel_geometry(
+			qdwin->shell_resource, handle, cx, cy,
+			(uint32_t)tl->last_width, (uint32_t)tl->last_height);
+	}
+	weston_log("qdwin: request_set_position handle=%u outer=(%d,%d) "
+		   "size=%dx%d%s\n", handle, cx, cy, tl->last_width,
+		   tl->last_height,
+		   (cx != x || cy != y) ? " (clamped)" : "");
 }
 
 /* ------------------------------------------------------------------
@@ -8309,6 +8415,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_workspace_name = qdwin_handle_set_workspace_name,
 	.set_pointer_config = qdwin_handle_set_pointer_config,
 	.set_key_repeat = qdwin_handle_set_key_repeat,
+	.request_set_position = qdwin_handle_request_set_position,
 };
 
 static void
@@ -21342,7 +21449,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * unreachable when the global was pinned at 26. */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       29, qdwin, bind_qdwin_shell);
+					       30, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

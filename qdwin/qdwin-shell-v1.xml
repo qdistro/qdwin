@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="29">
+  <interface name="qdwin_shell_v1" version="30">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1776,6 +1776,26 @@
       </description>
       <arg name="rate" type="uint" summary="repeat rate in Hz, 0..255 (0=off)"/>
       <arg name="delay" type="uint" summary="initial delay in ms, 1..10000"/>
+    </request>
+
+    <request name="request_set_position" since="30">
+      <description summary="shell moves a floating toplevel to an explicit position">
+        Shell-owned WM control: move the managed toplevel `handle` so its
+        outer-rect top-left sits at the output-local coordinate (x, y),
+        preserving its current size. This is the compositor-driven
+        counterpart to `begin_interactive_move` (which follows the pointer):
+        the shell names the target position directly, so geometry is decided
+        by shell policy, not by the app or by pointer choreography.
+
+        qdwin refuses (silently ignores) an unknown/destroyed handle and a
+        maximized/fullscreen/tiled toplevel (those own their geometry); for a
+        floating toplevel it repositions the view, clamps the position so the
+        window stays reachable on an output, and emits `toplevel_geometry`
+        with the new rectangle. The request never resizes.
+      </description>
+      <arg name="handle" type="uint"/>
+      <arg name="x" type="int" summary="output-local outer-rect x"/>
+      <arg name="y" type="int" summary="output-local outer-rect y"/>
     </request>
   </interface>
 

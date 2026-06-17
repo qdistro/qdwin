@@ -84,6 +84,7 @@
  *   close <handle>    → request_close(handle)
  *   focus <handle>    → set_keyboard_focus("default", handle)
  *   raise <handle>    → request_raise(handle)  (deterministic z-order)
+ *   move <handle> <x> <y> → request_set_position(handle, x, y)  (v30)
  *   subscribe <handle> → subscribe_view_stream(handle)
  *   subscribelast     → subscribe to the most recently added toplevel
  *   list              → print last seen toplevels to stderr
@@ -116,9 +117,11 @@
 
 /* v25: bind high enough to exercise set_wm_policy / request_fullscreen /
  * request_tile and the v19 register_hotkey path (host test 13-wm-policy).
- * v25 added only requests + enums (no new events), so the listener struct
- * is unchanged. The bind is still clamped to the advertised version. */
-#define BIND_VERSION 26
+ * v30 added request_set_position (shell-owned move) for the multi-machine
+ * viewer; all of these added only requests + enums (no new events), so the
+ * listener struct is unchanged. The bind is still clamped to the advertised
+ * version. */
+#define BIND_VERSION 30
 #define MAX_TOPS 16
 #define MAX_STREAMS 4
 #define FIFO_PATH_DEFAULT "/tmp/qdwin-cmd.fifo"
@@ -862,6 +865,20 @@ process_command(struct app *a, char *line)
 	} else if (strcmp(cmd, "raise") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd raise handle=%u\n", handle);
 		qdwin_shell_v1_request_raise(a->shell, handle);
+	} else if (strcmp(cmd, "move") == 0 && has_handle) {
+		/* move <handle> <x> <y> — v30 shell-owned set-position. The two
+		 * coordinates follow the handle; both required. */
+		char *xs = strtok(NULL, " \t\r\n");
+		char *ys = strtok(NULL, " \t\r\n");
+		if (!xs || !ys) {
+			fprintf(stderr, "qdwin-bystander: move needs <handle> <x> <y>\n");
+		} else {
+			int32_t mx = (int32_t)strtol(xs, NULL, 10);
+			int32_t my = (int32_t)strtol(ys, NULL, 10);
+			fprintf(stderr, "qdwin-bystander: cmd move handle=%u x=%d y=%d\n",
+				handle, mx, my);
+			qdwin_shell_v1_request_set_position(a->shell, handle, mx, my);
+		}
 	} else if (strcmp(cmd, "subscribe") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd subscribe handle=%u\n", handle);
 		do_subscribe(a, handle);
