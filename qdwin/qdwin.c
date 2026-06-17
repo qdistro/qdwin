@@ -177,6 +177,13 @@ static void qdwin_handle_nested_proxy_decision(struct wl_client *client,
 static void qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl);
 static void qdwin_toplevel_release_holding(struct qdwin_toplevel *tl,
 					   const char *cause);
+/* F6#2: the allow-transition core (clear pending, swap-or-capture, release
+ * holding). Shared by the real shell decision handler and the env-gated S3d
+ * post-allow test hook so both drive the IDENTICAL code path. Defined after
+ * qdwin_nested_proxy_activate_pixel_surface; forward-declared here because the
+ * S3d test fire (above the decision handler) calls it. */
+static void qdwin_nested_proxy_apply_allow(struct qdwin_toplevel *tl,
+					   const char *cause);
 static void qdwin_toplevel_move_to_layer(struct qdwin_toplevel *tl,
 					 struct weston_layer *layer);
 static void qdwin_maybe_promote_lock_toplevel(struct qdwin *qdwin,
@@ -17125,7 +17132,36 @@ struct qdwin_s3d_ctx {
 	struct qdwin *qdwin;
 	uint32_t handle;
 	struct wl_event_source *timer;
+	/* F6#2 post-allow lane: phase 0 = first fire (pending-check, and — if
+	 * QDWIN_NESTED_S3D_ALLOW_AFTER_PENDING=1 — apply allow then re-arm a
+	 * phase-1 timer); phase 1 = post-allow routing assertion on the SAME
+	 * handle. 0 for the plain s3d/s3e single-fire lanes. */
+	int phase;
+	/* Phase-0 allow-after-pending: how many times we re-armed phase-0 waiting
+	 * for the probe's bind_proxy_pixels to STASH a surface before applying
+	 * allow. Bounded so a never-binding test can't spin forever. */
+	int allow_poll_tries;
 };
+
+static int qdwin_s3d_route_test_fire(void *data);
+
+/* Arm a one-shot S3d test timer (~500ms) after forcing a repaint so the
+ * deferred fire runs against a current view_list. Frees ctx + returns false on
+ * failure so the caller never leaks. */
+static bool
+qdwin_s3d_arm_timer(struct qdwin_s3d_ctx *ctx)
+{
+	ctx->timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(ctx->qdwin->compositor->wl_display),
+		qdwin_s3d_route_test_fire, ctx);
+	if (!ctx->timer) {
+		free(ctx);
+		return false;
+	}
+	weston_compositor_schedule_repaint(ctx->qdwin->compositor);
+	wl_event_source_timer_update(ctx->timer, 500);
+	return true;
+}
 
 static int
 qdwin_s3d_route_test_fire(void *data)
@@ -17170,6 +17206,84 @@ qdwin_s3d_route_test_fire(void *data)
 				   "pending_unpickable=%d\n",
 				   ctx->handle, picked_desc,
 				   center.c.x, center.c.y, pending_unpickable);
+
+			/* F6#2 post-allow lane (env QDWIN_NESTED_S3D_ALLOW_AFTER_
+			 * PENDING=1): on the FIRST fire only, after the pending
+			 * pick-miss is recorded, drive the SAME proxy through the
+			 * REAL allow mechanism (qdwin_nested_proxy_apply_allow —
+			 * the identical code the shell decision=allow handler runs)
+			 * and re-arm a phase-1 timer that re-runs the visible
+			 * routing branch on this same handle. This proves the
+			 * pending->allow->pickable+routes transition without a v9
+			 * qdshell/broker on the wire. It does NOT alter the pending
+			 * security invariant: the proxy was already verified
+			 * unpickable above; allow is the production transition.
+			 * Gated on phase==0 so a stuck/idempotent state can't loop. */
+			if (ctx->phase == 0 &&
+			    getenv("QDWIN_NESTED_S3D_ALLOW_AFTER_PENDING")) {
+				/* Capture handle BEFORE any arm call — the arm
+				 * helper frees ctx on failure, so reading
+				 * ctx->handle afterwards would be a use-after-free.
+				 */
+				uint32_t h = ctx->handle;
+				/* Determinism gate: only apply allow once the
+				 * probe's bind_proxy_pixels has STASHED a surface
+				 * (proxy_pixel_surface set, no view yet). Otherwise
+				 * the allow could race ahead of the bind and the
+				 * lane would never exercise the stash->allow->
+				 * activate path. If not yet stashed, re-arm phase 0
+				 * (bounded) to poll. */
+				bool stashed = (tl->proxy_pixel_surface &&
+						!tl->proxy_pixel_view);
+				if (!stashed) {
+					if (ctx->allow_poll_tries < 40) {
+						ctx->allow_poll_tries++;
+						wl_event_source_remove(ctx->timer);
+						ctx->timer = NULL;
+						if (!qdwin_s3d_arm_timer(ctx))
+							weston_log("qdwin/nested-"
+								   "proxy: S3d allow-"
+								   "after-pending "
+								   "handle=%u poll re-arm "
+								   "FAILED\n", h);
+						return 0;
+					}
+					/* Poll budget exhausted with no stash: the
+					 * probe never bound a pixel surface in time.
+					 * ABORT the test transition — do NOT apply
+					 * allow (that would contradict the determinism
+					 * gate and leave a stashed=0 transition the
+					 * probe doesn't assert). The proxy stays
+					 * PENDING/unpickable (fail-closed); the probe's
+					 * stashed=1 assertion then fails loudly. */
+					weston_log("qdwin/nested-proxy: S3d allow-"
+						   "after-pending handle=%u — no stash "
+						   "after %d polls; ABORTING test "
+						   "transition (proxy stays pending)\n",
+						   h, ctx->allow_poll_tries);
+					goto s3d_fire_done;
+				}
+				weston_log("qdwin/nested-proxy: S3d allow-after-"
+					   "pending handle=%u stashed=1 — "
+					   "applying allow\n", h);
+				qdwin_nested_proxy_apply_allow(
+					tl, "s3d-test/allow-after-pending");
+				ctx->phase = 1;
+				/* Re-arm a second deferred fire (post-repaint)
+				 * for the routing assertion on the now-approved
+				 * proxy. On arm success the ctx is reused — skip
+				 * the free/remove at the bottom by returning here
+				 * after detaching the spent timer. */
+				wl_event_source_remove(ctx->timer);
+				ctx->timer = NULL;
+				if (!qdwin_s3d_arm_timer(ctx)) {
+					weston_log("qdwin/nested-proxy: S3d "
+						   "allow-after-pending handle=%u "
+						   "re-arm FAILED\n", h);
+					/* ctx already freed by arm helper. */
+				}
+				return 0;
+			}
 		} else {
 			/* Visible/approved: drive the real routing path. */
 			pick_matched = (picked == tl->view);
@@ -17208,6 +17322,7 @@ qdwin_s3d_route_test_fire(void *data)
 		weston_log("qdwin/nested-proxy: S3d route-test handle=%u "
 			   "proxy gone before fire\n", ctx->handle);
 	}
+s3d_fire_done:
 	wl_event_source_remove(ctx->timer);
 	free(ctx);
 	return 0;
@@ -17425,19 +17540,8 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 					if (s3d) {
 						s3d->qdwin = qdwin;
 						s3d->handle = t->proxy_tl->handle;
-						s3d->timer = wl_event_loop_add_timer(
-							wl_display_get_event_loop(
-							  qdwin->compositor->wl_display),
-							qdwin_s3d_route_test_fire,
-							s3d);
-						if (s3d->timer) {
-							weston_compositor_schedule_repaint(
-								qdwin->compositor);
-							wl_event_source_timer_update(
-								s3d->timer, 500);
-						} else {
-							free(s3d);
-						}
+						s3d->phase = 0;
+						(void)qdwin_s3d_arm_timer(s3d);
 					}
 				}
 			} else {
@@ -18968,16 +19072,7 @@ qdwin_handle_nested_proxy_decision(struct wl_client *client,
 				   handle);
 			return;
 		}
-		tl->nested_proxy_pending_decision = false;
-		/* F6#2: now-approved proxy becomes input-pickable. If a pixel
-		 * surface was STASHED by bind_proxy_pixels while pending
-		 * (mechanism A), perform the deferred curtain->pixel swap now;
-		 * otherwise make the placeholder curtain capturing. Either way
-		 * tl->view ends non-NULL and pickable before the layer move.
-		 * Synchronous in the compositor thread — no input interleaves. */
-		if (!qdwin_nested_proxy_activate_pixel_surface(tl))
-			qdwin_nested_proxy_curtain_set_capture(tl, true);
-		qdwin_toplevel_release_holding(tl, "nested_proxy_decision/allow");
+		qdwin_nested_proxy_apply_allow(tl, "nested_proxy_decision/allow");
 		weston_log("qdwin: nested_proxy_decision handle=%u ALLOW "
 			   "reason='%s'\n", handle, reason ? reason : "");
 		break;
@@ -19283,6 +19378,25 @@ qdwin_nested_proxy_activate_pixel_surface(struct qdwin_toplevel *tl)
 	weston_log("qdwin/nested-proxy: activate pixel surface handle=%u "
 		   "(deferred swap on allow)\n", tl->handle);
 	return true;
+}
+
+/* F6#2: the allow-transition core. A now-approved proxy becomes input-pickable:
+ * if a pixel surface was STASHED by bind_proxy_pixels while pending (mechanism
+ * A) perform the deferred curtain->pixel swap now; otherwise make the
+ * placeholder curtain capturing. Either way tl->view ends non-NULL and pickable
+ * before the layer move. Synchronous in the compositor thread — no input
+ * interleaves. Shared verbatim by the real shell decision handler (decision=0)
+ * and the env-gated S3d post-allow test hook; the test hook drives THIS exact
+ * code so the lane proves the real allow mechanism, not a test-only shortcut. */
+static void
+qdwin_nested_proxy_apply_allow(struct qdwin_toplevel *tl, const char *cause)
+{
+	if (!tl || !tl->is_nested_proxy || !tl->nested_proxy_pending_decision)
+		return;
+	tl->nested_proxy_pending_decision = false;
+	if (!qdwin_nested_proxy_activate_pixel_surface(tl))
+		qdwin_nested_proxy_curtain_set_capture(tl, true);
+	qdwin_toplevel_release_holding(tl, cause);
 }
 
 static void
