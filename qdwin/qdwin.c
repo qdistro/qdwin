@@ -1476,6 +1476,24 @@ qdwin_send_toplevel_security_context(struct qdwin *qdwin,
 	}
 }
 
+/* The wp_security_context sandbox engine string for a toplevel's backing client,
+ * or NULL if the client is untagged (unsandboxed) or this is a nested proxy
+ * (whose own wl_client is the shell, not the inner app — see
+ * qdwin_send_toplevel_security_context). Used by compositor policy gates such as
+ * the source-mediated-close guard below. */
+static const char *
+qdwin_toplevel_secctx_engine(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
+	if (!tl || tl->is_nested_proxy || !tl->desktop_surface)
+		return NULL;
+	struct weston_desktop_client *dclient =
+		weston_desktop_surface_get_client(tl->desktop_surface);
+	struct wl_client *client =
+		weston_desktop_client_get_client(dclient);
+	struct qdwin_secctx_client *sc = qdwin_secctx_client_lookup(qdwin, client);
+	return sc ? qdwin_secctx_client_engine(sc) : NULL;
+}
+
 static int
 qdwin_toplevel_is_xwayland(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
@@ -2643,6 +2661,23 @@ qdwin_handle_request_close(struct wl_client *client,
 		qdwin_nested_proxy_send_close(tl);
 		weston_log("qdwin: request_close handle=%u (nested-proxy: "
 			   "fired close_requested)\n", handle);
+		return;
+	}
+	/* Multi-machine remote windows (engine "qdistro.mm") have SOURCE-mediated
+	 * close (codex impl-34 Q3): the shell routes a CloseRequest upstream and
+	 * the source emits Closed; the backing pixel client (windowed FreeRDP)
+	 * then exits, destroying this toplevel via client disconnect. A local
+	 * request_close would xdg-close that client = the forbidden client-tree
+	 * kill. Refuse it here so the COMPOSITOR enforces the invariant (qdshell
+	 * close interception becomes belt+braces, not the only guard). qdshell's
+	 * RemoteMachineWindows never calls request_close for these handles; this
+	 * fires only on a shell bug/compromise — refuse silently (a protocol error
+	 * would needlessly disconnect the shell). */
+	const char *secctx_engine = qdwin_toplevel_secctx_engine(qdwin, tl);
+	if (secctx_engine && strcmp(secctx_engine, "qdistro.mm") == 0) {
+		weston_log("qdwin: request_close handle=%u REFUSED "
+			   "(engine=qdistro.mm: close is source-mediated)\n",
+			   handle);
 		return;
 	}
 	weston_desktop_surface_close(tl->desktop_surface);
