@@ -3701,12 +3701,25 @@ qdwin_toplevel_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
 		qdwin_chrome_at_pos(qdwin, pos, &dummy, NULL, NULL);
 	if (tl)
 		return tl;
-	wl_list_for_each(tl, &qdwin->toplevels, link) {
-		if (tl->nested_proxy_pending_decision)
+	/* Stacking-aware hit test (rung-1 A4 fix): `qdwin->toplevels` is TRACKING
+	 * order, NOT z-order — returning the first list match gives whichever
+	 * toplevel was created/tracked earliest, so in an OVERLAP a lower window
+	 * steals the click and `request_raise` has no effect on pointer routing
+	 * (the click-to-raise/focus target below is derived from this lookup).
+	 * Walk the normal_layer view list FRONT-TO-BACK (topmost first) and return
+	 * the first mapped toplevel whose content rect contains the point, so the
+	 * raised/topmost peer wins pointer hit-testing. Minimised/held toplevels
+	 * are not in normal_layer, so they are correctly never hit. */
+	struct weston_view *v;
+	wl_list_for_each(v, &qdwin->normal_layer.view_list.link, layer_link.link) {
+		struct qdwin_toplevel *cand = NULL, *t;
+		wl_list_for_each(t, &qdwin->toplevels, link) {
+			if (t->view == v) { cand = t; break; }
+		}
+		if (!cand || cand->nested_proxy_pending_decision)
 			continue;
-		struct weston_view *v = tl->view;
-		struct weston_surface *cs = v ? v->surface : NULL;
-		if (!v || !cs || cs->width <= 0 || cs->height <= 0)
+		struct weston_surface *cs = v->surface;
+		if (!cs || cs->width <= 0 || cs->height <= 0)
 			continue;
 		weston_view_update_transform(v);
 		struct weston_coord_global vp =
@@ -3715,7 +3728,7 @@ qdwin_toplevel_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
 		    pos.c.x < vp.c.x + cs->width &&
 		    pos.c.y >= vp.c.y &&
 		    pos.c.y < vp.c.y + cs->height)
-			return tl;
+			return cand;
 	}
 	return NULL;
 }
