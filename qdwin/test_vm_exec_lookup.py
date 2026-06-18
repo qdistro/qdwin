@@ -57,6 +57,19 @@ def source_helper(helper_src, repo_dir, helper_rel, extra_env=None):
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(helper_src) as s, open(dest, "w") as d:
         d.write(s.read())
+    # The helper sources its shared resolver via
+    # `source "$(dirname BASH_SOURCE)/../lib/workspace.sh"` (extracted in
+    # a3e0bb4). Copy that dependency to the matching relative path in the
+    # throwaway repo, or the source fails and qdwin_find_workspace is undefined.
+    ws_src = os.path.normpath(
+        os.path.join(os.path.dirname(helper_src), "..", "lib", "workspace.sh")
+    )
+    ws_dest = os.path.normpath(
+        os.path.join(os.path.dirname(dest), "..", "lib", "workspace.sh")
+    )
+    os.makedirs(os.path.dirname(ws_dest), exist_ok=True)
+    with open(ws_src) as s, open(ws_dest, "w") as d:
+        d.write(s.read())
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "QDWIN_REPO": repo_dir,
