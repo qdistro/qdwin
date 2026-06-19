@@ -80,8 +80,22 @@ if vm_exec "pgrep -x labwc >/dev/null || pgrep -x lxqt-panel >/dev/null || pgrep
 fi
 pass "LXQt/labwc fallback is not running"
 
-bound_ver=$(vm_exec "journalctl _UID=1000 -b --no-pager 2>/dev/null | sed -n 's/.*qdwin_shell_v1 bound v\\([0-9][0-9]*\\).*/\\1/p' | tail -1")
-[ -n "$bound_ver" ] || fail "qdshell qdwin_shell_v1 bind version not found in journal"
+# `systemctl is-active` above only proves qdshell's UNIT started, not that it
+# completed the qdwin_shell_v1 protocol bind. The bind can lag service start by
+# a beat, so poll the boot journal for the bind line instead of sampling once
+# (a single sample raced the bind and spuriously failed). On a genuinely dead
+# session (e.g. qdshell.service start-limit-hit) the bind never appears and we
+# still fail — with the qdshell/qdwin journal tail attached for triage.
+bound_ver=""
+for _ in $(seq 1 50); do
+    bound_ver=$(vm_exec "journalctl _UID=1000 -b --no-pager 2>/dev/null | sed -n 's/.*qdwin_shell_v1 bound v\\([0-9][0-9]*\\).*/\\1/p' | tail -1")
+    [ -n "$bound_ver" ] && break
+    sleep 0.2
+done
+if [ -z "$bound_ver" ]; then
+    vm_exec "journalctl _UID=1000 -b --no-pager -u qdshell.service -u qdwin-compositor.service 2>/dev/null | tail -200" >&2 || true
+    fail "qdshell qdwin_shell_v1 bind version not found in journal"
+fi
 [ "$bound_ver" -ge 14 ] || fail "qdshell bound qdwin_shell_v1 v$bound_ver; need >=14"
 pass "qdshell bound qdwin_shell_v1 v$bound_ver"
 
