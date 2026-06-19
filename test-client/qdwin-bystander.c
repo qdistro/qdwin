@@ -937,7 +937,22 @@ int main(int argc, char **argv)
 	}
 
 	const char *fifo_path = getenv("QDWIN_BYSTANDER_FIFO");
-	if (!fifo_path) fifo_path = FIFO_PATH_DEFAULT;
+	char fifo_buf[256];
+	if (!fifo_path) {
+		/* The harness and every consumer expect the command FIFO in the
+		 * session runtime dir ($XDG_RUNTIME_DIR/qdwin-cmd.fifo, e.g.
+		 * /run/user/1000/qdwin-cmd.fifo). Default there so a bystander
+		 * started without QDWIN_BYSTANDER_FIFO still lands where
+		 * qdwin_apps_session_up() polls, instead of /tmp. */
+		const char *xdg = getenv("XDG_RUNTIME_DIR");
+		if (xdg && xdg[0]) {
+			snprintf(fifo_buf, sizeof fifo_buf,
+				 "%s/qdwin-cmd.fifo", xdg);
+			fifo_path = fifo_buf;
+		} else {
+			fifo_path = FIFO_PATH_DEFAULT;
+		}
+	}
 	unlink(fifo_path);
 	if (mkfifo(fifo_path, 0600) != 0) {
 		fprintf(stderr, "qdwin-bystander: mkfifo %s failed: %s\n",

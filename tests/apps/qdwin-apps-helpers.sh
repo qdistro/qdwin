@@ -63,8 +63,7 @@ EOSCRIPT
     "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash" 2>/dev/null
 }
 
-qdwin_apps_session_up() {
-    qdwin_apps_require_vm || return 1
+_qdwin_apps_check_session() {
     local sock; sock=$(qdwin_apps_active_socket)
     [ -n "$sock" ] || { echo "qdwin-apps-helpers: weston not running" >&2; return 1; }
     local b64; b64=$(base64 -w0 <<EOSCRIPT
@@ -74,6 +73,93 @@ echo "ok sock=$sock"
 EOSCRIPT
 )
     "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+}
+
+# Assert the app-test session is healthy: weston up, bystander holding the
+# shell role, command FIFO present at the canonical path. Self-healing — if
+# the bystander/FIFO aren't ready (e.g. fresh boot still running qdshell, or a
+# bystander that defaulted its FIFO elsewhere) it runs qdwin_apps_become_shell
+# once and re-checks, so scenarios get a deterministic shell without each
+# Setup block reimplementing the takeover.
+qdwin_apps_session_up() {
+    qdwin_apps_require_vm || return 1
+    if _qdwin_apps_check_session; then
+        return 0
+    fi
+    echo "qdwin-apps-helpers: session not ready; taking over shell role" >&2
+    qdwin_apps_become_shell || return 1
+    _qdwin_apps_check_session
+}
+
+# Deterministically take over the qdwin shell role as the bystander.
+#
+# The qdwin app scenarios need exactly ONE shell-role client. If qdshell is
+# running (or systemd's Restart= relaunches it mid-test) it competes with the
+# bystander for the qdwin_shell_v1 role: the loser logs
+# "qdwin_shell_v1: shell role already claimed", crashes 255, and respawns
+# until `start-limit-hit` — spamming the journal and racing the bystander's
+# bind. Agents previously improvised this transition (kill qdshell, start
+# bystander) inconsistently and often without QDWIN_BYSTANDER_FIFO set, so the
+# FIFO landed in /tmp instead of the polled /run/user/1000 path.
+#
+# This centralises it: cleanly STOP qdshell (a manual `systemctl stop`
+# suppresses Restart= — systemd never relaunches an explicitly-stopped unit —
+# so the role stays free WITHOUT masking, leaving no persistent state to leak
+# if a scenario aborts before restore), evict any stray non-systemd `qs`, then
+# (re)launch the bystander with the canonical FIFO path + wayland env explicit
+# and wait for the FIFO. Call in Setup before qdwin_apps_session_up; pair with
+# qdwin_apps_restore_shell in Teardown to bring the desktop shell back.
+qdwin_apps_become_shell() {
+    qdwin_apps_require_vm || return 1
+    local sock; sock=$(qdwin_apps_active_socket)
+    [ -n "$sock" ] || { echo "qdwin-apps-helpers: weston not running" >&2; return 1; }
+    local b64; b64=$(base64 -w0 <<EOSCRIPT
+# reset-failed first in case qdshell parked in failed(start-limit-hit); the
+# clean stop then keeps it down (Restart= does not fire on an explicit stop).
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user reset-failed qdshell.service 2>/dev/null || true
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user stop qdshell.service 2>/dev/null || true
+pkill -u admin -x qs 2>/dev/null || true
+pkill -u admin -x qdwin-bystander 2>/dev/null || true
+sleep 0.5
+rm -f "$QDWIN_BYSTANDER_FIFO"
+runuser -u admin -- bash -c '
+    export XDG_RUNTIME_DIR=/run/user/1000
+    export WAYLAND_DISPLAY=$sock
+    export QDWIN_BYSTANDER_FIFO="$QDWIN_BYSTANDER_FIFO"
+    setsid qdwin-bystander >"$QDWIN_BYSTANDER_LOG" 2>&1 &
+'
+# The bystander creates the FIFO before its wayland connect, so a short poll
+# is enough; fail loudly if it never appears.
+for _i in \$(seq 1 40); do
+    [ -p "$QDWIN_BYSTANDER_FIFO" ] && break
+    sleep 0.1
+done
+[ -p "$QDWIN_BYSTANDER_FIFO" ] || {
+    echo "bystander FIFO never appeared at $QDWIN_BYSTANDER_FIFO" >&2
+    tail -5 "$QDWIN_BYSTANDER_LOG" 2>/dev/null >&2
+    exit 1
+}
+echo "become-shell ok sock=$sock fifo=$QDWIN_BYSTANDER_FIFO"
+EOSCRIPT
+)
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+}
+
+# Undo qdwin_apps_become_shell: stop the bystander and restart qdshell so the
+# normal desktop session reclaims the shell role after the app matrix finishes.
+# Best-effort. (No unmask needed — become_shell only stops, never masks.)
+qdwin_apps_restore_shell() {
+    qdwin_apps_require_vm || return 1
+    local b64; b64=$(base64 -w0 <<'EOSCRIPT'
+pkill -u admin -x qdwin-bystander 2>/dev/null || true
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user start qdshell.service 2>/dev/null || true
+true
+EOSCRIPT
+)
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash" >/dev/null 2>&1 || true
 }
 
 # Launch <name> as admin against the active wayland socket. Logs go to

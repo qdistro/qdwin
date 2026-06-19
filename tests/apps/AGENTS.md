@@ -42,8 +42,25 @@ qdwin_apps_set_vm "${VMNAME:-apps-qdwin-...}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 ```
 
+`qdwin_apps_session_up` is **self-healing**: if the bystander/FIFO aren't
+ready (fresh boot still running qdshell, or a bystander whose FIFO defaulted
+elsewhere) it calls `qdwin_apps_become_shell` once and re-checks, so you do not
+have to hand-roll the "kill qdshell, start bystander" dance — and it always
+starts the bystander with `QDWIN_BYSTANDER_FIFO=/run/user/1000/qdwin-cmd.fifo`
+so the FIFO lands where every helper polls. Pair it with
+`qdwin_apps_restore_shell` in your Cleanup/Teardown to bring the desktop
+`qdshell` back.
+
 The helper provides:
 
+- `qdwin_apps_become_shell` — deterministically take the shell role for the
+  bystander: cleanly `systemctl --user stop qdshell.service` (a manual stop
+  suppresses `Restart=`, so qdshell stays down without masking), evict stray
+  `qs`, then launch the bystander with the canonical FIFO + wayland env and
+  wait for the FIFO. Called automatically by `qdwin_apps_session_up` when
+  needed; call it directly only if you want the takeover without the check.
+- `qdwin_apps_restore_shell` — undo the above: stop the bystander, restart
+  `qdshell.service`. Best-effort; safe to call in Cleanup.
 - `qdwin_apps_launch <name> <cmd>` — start an app as `admin` against the
   active wayland socket with the standard env (`MOZ_ENABLE_WAYLAND=1`,
   `QT_QPA_PLATFORM=wayland`, `GDK_BACKEND=wayland`, `DISPLAY=:0`).
