@@ -106,9 +106,11 @@ trap cleanup EXIT
 cleanup
 
 cursor_start=$(journal_cursor)
-vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 300 --height 180 --color 0xff203060 >/tmp/$title_one.log 2>&1 &"
+# setsid -f: detach so the client survives vm_exec returning (a bare `&` gets
+# SIGHUP'd when the agent command exits, so the toplevel never reaches qdwin).
+vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 300 --height 180 --color 0xff203060 >/tmp/$title_one.log 2>&1"
 sleep 0.8
-vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_two' --width 300 --height 180 --color 0xff604020 >/tmp/$title_two.log 2>&1 &"
+vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_two' --width 300 --height 180 --color 0xff604020 >/tmp/$title_two.log 2>&1"
 
 read -r handle_one handle_two < <(wait_for_new_handles "$cursor_start") \
     || fail "test windows did not appear in qdwin journal"

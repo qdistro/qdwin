@@ -115,7 +115,10 @@ wait_for_log "$cursor_key" 'qdwin: launcher_requested' \
 cleanup
 cursor_win=$(journal_cursor)
 title="agent-mvp-release-$$"
-vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title' --width 300 --height 180 --color 0xff304050 >/tmp/$title.log 2>&1 &"
+# setsid -f detaches the client into its own session so it survives the
+# vm_exec shell returning; a bare `&` background gets SIGHUP'd when the agent
+# command exits, so the toplevel never maps and "reached qdwin" times out.
+vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title' --width 300 --height 180 --color 0xff304050 >/tmp/$title.log 2>&1"
 wait_for_log "$cursor_win" 'qdwin: toplevel_added handle=[0-9]+ uid=1000 app_id=qdistro-test-window' \
     "test toplevel reached qdwin"
 wait_for_log "$cursor_win" 'qdwin: holding_released handle=[0-9]+ via (set_border_color|default_toplevel_policy)' \
