@@ -74,7 +74,7 @@ wait_for_handles() {
     local cursor=$1 want=$2 handles
     for _ in $(seq 1 30); do
         handles=$(journal_after "$cursor" \
-            | sed -n 's/.*qdwin: toplevel_added handle=\([0-9][0-9]*\) uid=1000 app_id=qdistro-test-window.*/\1/p' \
+            | sed -n 's/.*qdwin: toplevel_added handle=\([0-9][0-9]*\) uid=1000 pid=[0-9][0-9]* app_id=qdistro-test-window.*/\1/p' \
             | head -n"$want" | tr '\n' ' ')
         if [ "$(wc -w <<<"$handles")" -ge "$want" ]; then
             echo "$handles"
