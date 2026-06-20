@@ -3601,6 +3601,13 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 		 * composited into the framebuffer. */
 		struct qdwin_toplevel *tl_under =
 			qdwin_toplevel_at_pos(qdwin_singleton, pointer->pos);
+		/* Diagnostic: log the pointer position and resolved toplevel
+		 * handle so the journal reveals coord-vs-pick on click-to-focus
+		 * (whether the click coord missed the window or the pick
+		 * returned NULL/the wrong toplevel). */
+		weston_log("qdwin: click-focus pick pos=%d,%d -> handle=%u\n",
+			   (int)pointer->pos.c.x, (int)pointer->pos.c.y,
+			   tl_under ? tl_under->handle : 0xffffffffu);
 		if (tl_under) {
 			/* Raise on the normal layer (re-stack to top). v25:
 			 * gated on the raise-on-click policy — focus still

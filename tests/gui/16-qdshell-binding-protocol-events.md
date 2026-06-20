@@ -24,6 +24,11 @@ materially uses them to maintain state.
   these, the QML import fails silently and qdshell runs with the
   no-binding fallback stubs.
 - `qs` / `noctalia-qs` 0.0.12+ installed on the VM.
+- `qdistro-test-window` on the VM PATH (the same reliable test client
+  the qdwin SMOKES use; it deterministically produces a qdwin toplevel
+  with `app_id=qdistro-test-window`). This scenario uses it instead of
+  `foot`, which is not installed on the VM and so cannot exercise the
+  protocol-event paths.
 
 Fail loudly if any prereq is missing; do not skip.
 
@@ -36,7 +41,13 @@ qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 
 "$QDWIN_VM_EXEC" "$VMNAME" 'test -f /usr/share/qdistro/qml/Qdistro/Qdwin/libqdistro-qdwin.so' \
     || { echo "FAIL: QML plugin not installed on VM"; exit 1; }
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; sleep 1' >/dev/null
+
+# PRECONDITION (infra): the test client must be installed. Absence is an
+# ERROR (the scenario cannot be exercised), NOT a product FAIL.
+"$QDWIN_VM_EXEC" "$VMNAME" 'command -v qdistro-test-window >/dev/null' \
+    || { echo "ERROR: qdistro-test-window not installed on VM (cannot exercise protocol events)"; exit 1; }
+
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window" 2>/dev/null; sleep 1' >/dev/null
 ```
 
 ## Steps
@@ -67,26 +78,31 @@ the plugin loaded and dispatched the `hello` event up to QML.)
 ```bash
 CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
+# setsid -f detaches the client into its own session so it survives the
+# vm_exec shell returning (a bare `&` gets SIGHUP'd and the toplevel
+# never maps). Same launch pattern the qdwin smokes use.
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     WAYLAND_DISPLAY=wayland-1 nohup foot sleep 600 >/dev/null 2>&1 &'"
+    "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title 'qd16-step2' \
+     --width 300 --height 180 --color 0xff304050 >/tmp/qd16-step2.log 2>&1"
 sleep 2
 
 HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
   "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
-   grep -E 'qdwin: toplevel_added' | tail -1 | \
+   grep -E 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=qdistro-test-window' | tail -1 | \
    sed -nE 's/.*handle=([0-9]+).*/\1/p'")
 echo "subject handle=$HANDLE"
 ```
 
-**Assert (2.1):** $HANDLE is a number (qdwin's toplevel_added log
-line fires).
+**Assert (2.1):** $HANDLE is a number (qdwin's `toplevel_added
+handle=<N> uid=1000 pid=<N> app_id=qdistro-test-window` log line
+fires).
 
 **Assert (2.2):** the `qdwin: seat_focus_changed seat=default
 handle=$HANDLE` line is present after `$CURSOR`. This line is
 gated behind "a v14+ shell is bound" — it is the load-bearing
 proof that the binding is exercising the protocol-emit branch
-(prior to workstream A, this line was absent on a foot spawn,
+(prior to workstream A, this line was absent on a toplevel spawn,
 even though the underlying `qdwin: focus handle=` ground-truth
 line still fired).
 
@@ -94,15 +110,16 @@ line still fired).
 
 The qdshell bar's ActiveWindow widget reads
 `Qdwin.getFocusedWindowTitle()`. With the binding in place,
-spawning foot should make the bar reflect the title.
+spawning the test window should make the bar reflect its title.
 
 ```bash
 sleep 1
-qdwin_screenshot /tmp/16-step3-foot-focused.png
+qdwin_screenshot /tmp/16-step3-window-focused.png
 ```
 
 **Assert (3.1):** the screenshot's top-bar region (y in [0, 31])
-contains the substring "foot" — visible because the
+contains the substring "qd16-step2" (the spawned window's title) —
+visible because the
 `ActiveWindow` widget pulls from `Qdwin.windows`'s focused row.
 Use `tesseract` OCR or a `convert -crop` + grep on the rendered
 text. Failure here is informative: the QML side received
@@ -115,7 +132,7 @@ onToplevelAdded is broken.
 ```bash
 CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot'
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window --title qd16-step2"'
 sleep 1
 ```
 
@@ -135,14 +152,31 @@ in `qdshell/Services/Qdwin/Qdwin.qml`) walk the windows ListModel
 and call `qdwinBinding.focusWindow(handle)` on commit.
 
 ```bash
+# Capture a cursor BEFORE spawning so we can HARD-GATE on both toplevels
+# reaching qdwin — an ungated spawn would leave the Alt+Tab assertions
+# depending on windows that may never have mapped (the original failure mode).
+SPAWN_CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
+  --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     WAYLAND_DISPLAY=wayland-1 nohup foot sleep 600 >/dev/null 2>&1 &'"
+    "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title 'qd16-step5a' \
+     --width 300 --height 180 --color 0xff304050 >/tmp/qd16-step5a.log 2>&1"
 sleep 1
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     WAYLAND_DISPLAY=wayland-1 nohup foot sleep 600 >/dev/null 2>&1 &'"
-sleep 2
+    "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title 'qd16-step5b' \
+     --width 300 --height 180 --color 0xff405060 >/tmp/qd16-step5b.log 2>&1"
+# Both qdistro-test-window toplevels must reach qdwin before we exercise
+# Alt+Tab; otherwise this is a precondition ERROR, not a switcher FAIL.
+step5_ok=
+for _ in $(seq 1 40); do
+    n=$("$QDWIN_VM_EXEC" "$VMNAME" \
+        "journalctl _UID=1000 --after-cursor='$SPAWN_CURSOR' --no-pager | \
+         grep -cE 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=qdistro-test-window'")
+    [ "${n:-0}" -ge 2 ] && { step5_ok=1; break; }
+    sleep 0.2
+done
+[ -n "$step5_ok" ] || { echo "ERROR: Step 5 — fewer than 2 qdistro-test-window toplevels reached qdwin (got ${n:-0})"; exit 1; }
 CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
 qdwin_chord alt -- tab
@@ -162,7 +196,7 @@ called `set_keyboard_focus` and qdwin honored it. Before the
 ### Cleanup
 
 ```bash
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; true' >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window" 2>/dev/null; true' >/dev/null
 ```
 
 ## Pass criteria

@@ -26,6 +26,13 @@ Same as `16-qdshell-binding-protocol-events.md`. Additionally:
 
 Fail loudly if the IPC isn't available; do not skip.
 
+Additionally:
+
+- `qdistro-test-window` on the VM PATH (the same reliable test client
+  the qdwin SMOKES use; it deterministically produces a qdwin toplevel
+  with `app_id=qdistro-test-window`). This scenario uses it as the
+  close target instead of `foot`, which is not installed on the VM.
+
 ## Setup
 
 ```bash
@@ -39,7 +46,12 @@ qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
     | grep -q Qdwin \
     || { echo "FAIL: qs ipc bridge or Qdwin singleton not reachable"; exit 1; }
 
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; sleep 1' >/dev/null
+# PRECONDITION (infra): the test client must be installed. Absence is an
+# ERROR (the scenario cannot be exercised), NOT a product FAIL.
+"$QDWIN_VM_EXEC" "$VMNAME" 'command -v qdistro-test-window >/dev/null' \
+    || { echo "ERROR: qdistro-test-window not installed on VM (cannot drive close)"; exit 1; }
+
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window" 2>/dev/null; sleep 1' >/dev/null
 ```
 
 ## Steps
@@ -47,15 +59,20 @@ qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 ### Step 1 — spawn a target toplevel
 
 ```bash
+CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
+  --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
+# setsid -f detaches the client into its own session so it survives the
+# vm_exec shell returning. Same launch pattern the qdwin smokes use.
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     WAYLAND_DISPLAY=wayland-1 nohup foot sleep 600 >/dev/null 2>&1 &'"
+    "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title 'qd17-target' \
+     --width 300 --height 180 --color 0xff304050 >/tmp/qd17-target.log 2>&1"
 sleep 2
 HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
-  "journalctl _UID=1000 --no-pager | \
-   grep -E 'qdwin: toplevel_added' | tail -1 | \
+  "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
+   grep -E 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=qdistro-test-window' | tail -1 | \
    sed -nE 's/.*handle=([0-9]+).*/\1/p'")
-[ -n "$HANDLE" ] || { echo "FAIL: no toplevel_added handle"; exit 1; }
+[ -n "$HANDLE" ] || { echo "ERROR: no toplevel_added handle (test window never mapped)"; exit 1; }
 ```
 
 ### Step 2 — drive close via QML IPC
@@ -76,8 +93,8 @@ issued the `qdwin_shell_v1.request_close` request and the
 compositor processed it.
 
 **Assert (2.2):** within 2s of the above, `qdwin: toplevel_removed
-handle=$HANDLE` appears in the journal — foot exited cleanly in
-response to xdg_toplevel.close.
+handle=$HANDLE` appears in the journal — the test window exited
+cleanly in response to xdg_toplevel.close.
 
 **Assert (2.3):** `qdwin: seat_focus_changed seat=default
 handle=4294967295` (or to a surviving sibling) appears within
@@ -97,7 +114,7 @@ shown, or a placeholder). Mirrors the
 ### Cleanup
 
 ```bash
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; true' >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window" 2>/dev/null; true' >/dev/null
 ```
 
 ## Pass criteria
@@ -113,9 +130,9 @@ shown, or a placeholder). Mirrors the
   argument marshalling matched (the IPC bridge wraps args in JSON;
   the QML side may need `parseInt`).
 - 2.2 fires but 2.1 silent: that's impossible — qdwin can't kill
-  a toplevel without an originating request, unless the foot
-  process itself exited on its own (the `sleep 600` SIGCHLD would
-  fire after 10 minutes). Re-check $HANDLE.
+  a toplevel without an originating request, unless the
+  qdistro-test-window process itself exited on its own. Re-check
+  $HANDLE.
 - 2.3 silent: focus-recovery didn't run, or it ran but didn't
   emit `seat_focus_changed`. The latter would imply the binding
   unwound mid-request — check for `qdwin-binding: error:` lines
