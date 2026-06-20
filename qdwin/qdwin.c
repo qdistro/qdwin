@@ -6577,6 +6577,7 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 	}
 	struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
 	struct weston_surface *target = NULL;
+	struct weston_view *target_view = NULL;
 		if (target_handle != UINT32_MAX) {
 			struct qdwin_toplevel *tl;
 			wl_list_for_each(tl, &qdwin->toplevels, link) {
@@ -6588,8 +6589,10 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 							   target_handle);
 						return;
 					}
-					if (tl->view && tl->view->surface)
+					if (tl->view && tl->view->surface) {
 						target = tl->view->surface;
+						target_view = tl->view;
+					}
 					break;
 			}
 		}
@@ -6608,7 +6611,19 @@ qdwin_handle_set_keyboard_focus(struct wl_client *client,
 	struct qdwin_primary_seat *pseat = qdwin_primary_seat_find(qdwin, seat);
 	if (pseat)
 		qdwin_primary_seat_clear_selection(pseat, 1);
-	if (kbd) {
+	if (target_view) {
+		/* Activate (not just set keyboard focus): weston_view_activate_input
+		 * calls weston_seat_set_keyboard_focus AND emits
+		 * compositor->activate_signal, which weston's Xwayland WM uses to set
+		 * X11 input focus (xcb_set_input_focus / WM_TAKE_FOCUS). A bare
+		 * weston_keyboard_set_focus emits only the keyboard focus_signal, so
+		 * XWayland clients got Wayland focus but never X11 focus and received
+		 * no keys. Native Wayland clients are unaffected. */
+		weston_view_activate_input(target_view, seat,
+					   WESTON_ACTIVATE_FLAG_CONFIGURE);
+	} else if (kbd) {
+		/* Clearing focus (target_handle == UINT32_MAX): no view to activate,
+		 * so drop keyboard focus directly. */
 		weston_keyboard_set_focus(kbd, target);
 	} else {
 		weston_log("qdwin: set_keyboard_focus seat=%s has no keyboard "
@@ -6682,6 +6697,7 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 	}
 	struct weston_keyboard *kbd = weston_seat_get_keyboard(seat);
 	struct weston_surface *target = NULL;
+	struct weston_view *target_view = NULL;
 		if (target_handle != UINT32_MAX) {
 			struct qdwin_toplevel *tl;
 			wl_list_for_each(tl, &qdwin->toplevels, link) {
@@ -6693,8 +6709,10 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 							   target_handle);
 						return;
 					}
-					if (tl->view && tl->view->surface)
+					if (tl->view && tl->view->surface) {
 						target = tl->view->surface;
+						target_view = tl->view;
+					}
 					break;
 			}
 		}
@@ -6728,16 +6746,19 @@ qdwin_handle_set_keyboard_focus_v2(struct wl_client *client,
 			qdwin_primary_seat_clear_selection(pseat, 1);
 	}
 
-	if (kbd) {
-		/* Use weston_seat_set_keyboard_focus (the public helper) so
-		 * the new focus client receives the active selection event
-		 * via wl_data_device_set_keyboard_focus. v1 used
-		 * weston_keyboard_set_focus directly because the
-		 * unconditional clear immediately above made a re-send
-		 * unnecessary (selection was NULL). On the v2 same-silo
-		 * path we DON'T clear — the source's offer must reach the
-		 * new focus client so its sink path can call
-		 * wl_data_offer.receive. */
+	if (target_view) {
+		/* weston_view_activate_input calls weston_seat_set_keyboard_focus
+		 * (the public helper, so the new focus client still receives the
+		 * active selection event via wl_data_device_set_keyboard_focus —
+		 * the v2 same-silo data path is preserved) AND emits
+		 * compositor->activate_signal, which weston's Xwayland WM uses to
+		 * set X11 input focus. Without the activate_signal, XWayland clients
+		 * got Wayland focus but no X11 focus and received no keys. */
+		weston_view_activate_input(target_view, seat,
+					   WESTON_ACTIVATE_FLAG_CONFIGURE);
+	} else if (kbd) {
+		/* Clearing focus (target_handle == UINT32_MAX): no view to
+		 * activate; drop keyboard focus directly via the seat helper. */
 		weston_seat_set_keyboard_focus(seat, target);
 	} else {
 		weston_log("qdwin: set_keyboard_focus_v2 seat=%s has no "
