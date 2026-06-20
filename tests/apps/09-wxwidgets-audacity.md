@@ -20,7 +20,10 @@ qdwin_apps_kill_all
 ### Step 1 — launch
 
 ```bash
-qdwin_apps_launch audacity "audacity"
+# Force the X11/GDK backend so wxGTK runs through XWayland (the launch helper
+# exports GDK_BACKEND=wayland by default; this scenario asserts xwayland=1, so
+# wxWidgets must go via XWayland, not native Wayland).
+qdwin_apps_launch audacity "env GDK_BACKEND=x11 audacity"
 sleep 12
 qdwin_apps_screenshot /tmp/09-step1-launched.png
 ```

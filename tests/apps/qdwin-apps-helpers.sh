@@ -180,6 +180,18 @@ runuser -u admin -- bash -c '
     export MOZ_ENABLE_WAYLAND=1
     export QT_QPA_PLATFORM=wayland
     export GDK_BACKEND=wayland
+    # Push the display env into the D-Bus activation environment so
+    # GApplication single-instance apps (e.g. gnome-text-editor) whose real
+    # window is created by a dbus-activated service inherit WAYLAND_DISPLAY/
+    # DISPLAY — without this they exit immediately with "cannot open display"
+    # (the documented dbus-activation race). Best-effort; harmless to apps
+    # that do not use dbus activation.
+    # Only the display/runtime vars — NOT GDK_BACKEND/QT_QPA_PLATFORM, so a
+    # per-app backend override (e.g. `env GDK_BACKEND=x11` for the XWayland
+    # scenarios) is not clobbered by a dbus-activated instance inheriting
+    # wayland from the activation env.
+    dbus-update-activation-environment --systemd \
+        WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR 2>/dev/null || true
     setsid sh -c "$cmd" </dev/null >/tmp/${name}.log 2>&1 &
 '
 EOLAUNCH
