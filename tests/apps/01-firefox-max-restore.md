@@ -34,7 +34,7 @@ black margin on at least one edge.
 ### Step 2 — maximise via shell
 
 ```bash
-qdwin_apps_ctl "max"
+qdwin_apps_ctl "maxlast"
 sleep 2
 qdwin_apps_screenshot /tmp/01-step2-max.png
 ```
@@ -47,7 +47,7 @@ output. No black margin on any edge. Tabs/URL bar at the very top.
 ### Step 3 — restore via shell
 
 ```bash
-qdwin_apps_ctl "restore"
+qdwin_apps_ctl "restorelast"
 sleep 2
 qdwin_apps_screenshot /tmp/01-step3-restored.png
 ```

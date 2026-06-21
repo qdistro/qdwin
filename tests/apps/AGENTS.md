@@ -64,8 +64,9 @@ The helper provides:
 - `qdwin_apps_launch <name> <cmd>` — start an app as `admin` against the
   active wayland socket with the standard env (`MOZ_ENABLE_WAYLAND=1`,
   `QT_QPA_PLATFORM=wayland`, `GDK_BACKEND=wayland`, `DISPLAY=:0`).
-- `qdwin_apps_ctl <command>` — push a line to the bystander FIFO. e.g.
-  `qdwin_apps_ctl max`, `qdwin_apps_ctl "max 7"`.
+- `qdwin_apps_ctl <command>` — push a line to the bystander FIFO. Prefer
+  `qdwin_apps_ctl maxlast` / `restorelast` after launching one app, or pass an
+  explicit handle such as `qdwin_apps_ctl "max 7"`.
 - `qdwin_apps_screenshot <path>` — `virsh screenshot` to host path.
 - `qdwin_apps_send_key KEY_*` / `qdwin_apps_type "string"`.
 - `qdwin_apps_kill_all` — `pkill -u admin -9` everything we might have

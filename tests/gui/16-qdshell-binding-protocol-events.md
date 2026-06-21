@@ -20,7 +20,7 @@ materially uses them to maintain state.
   `qdshell/build/qml-plugin/libqdistro-qdwin.so` exists.
 - `install-qdwin-session-for-vm.sh` has installed the plugin to
   `/usr/share/qdistro/qml/Qdistro/Qdwin/` and dropped in the
-  `noctalia-shell.service` `QML_IMPORT_PATH` Environment. Without
+  `qdshell.service` `QML_IMPORT_PATH` Environment. Without
   these, the QML import fails silently and qdshell runs with the
   no-binding fallback stubs.
 - `qs` / `noctalia-qs` 0.0.12+ installed on the VM.
@@ -61,7 +61,7 @@ CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
 "$QDWIN_VM_EXEC" "$VMNAME" \
     "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     systemctl --user restart noctalia-shell.service'"
+     systemctl --user restart qdshell.service'"
 sleep 8
 ```
 
@@ -213,7 +213,7 @@ QML-side UI consumption has a separate issue worth filing.
   but raced/segfaulted before bind_as_shell. Check qs stderr for
   segfault.
 - 1.2 silent: plugin .so isn't on QML_IMPORT_PATH (check the
-  noctalia-shell.service Environment), OR the plugin loaded but
+  qdshell.service Environment), OR the plugin loaded but
   the QdwinBinding constructor errored before `hello`. Check
   for `qdwin-binding: error:` lines in journal.
 - 5.1 silent + 5.2 silent: qdwin's switcher_grab never entered.

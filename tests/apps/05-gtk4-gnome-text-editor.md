@@ -45,7 +45,7 @@ area (cursor blinking after the `n`). The titlebar updates to show
 ### Step 3 — maximise
 
 ```bash
-qdwin_apps_ctl "max"
+qdwin_apps_ctl "maxlast"
 sleep 2
 qdwin_apps_screenshot /tmp/05-step3-max.png
 ```
@@ -56,7 +56,7 @@ qdwin_apps_screenshot /tmp/05-step3-max.png
 ### Step 4 — restore
 
 ```bash
-qdwin_apps_ctl "restore"
+qdwin_apps_ctl "restorelast"
 sleep 2
 qdwin_apps_screenshot /tmp/05-step4-restore.png
 ```

@@ -144,13 +144,11 @@ cleanup
 
 # Spawn handle_one then handle_two; handle_two becomes foreground.
 cursor_start=$(journal_cursor)
-# Use the exact same window geometry as agent-click-smoke so qdwin's
-# default placement + 40px cascade behaves the same way. Larger windows
-# moved the exposed top-left out from under the centre point that
-# qdwin's default placement actually uses on noctalia-bootstrap.
+# Use a larger background window and smaller foreground window so the target
+# pixel is exposed even if qdwin centers both windows instead of cascading.
 # setsid -f: detach so the client survives vm_exec returning (a bare `&` gets
 # SIGHUP'd when the agent command exits, so the toplevel never reaches qdwin).
-vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 300 --height 180 --color 0xff206040 >/tmp/$title_one.log 2>&1"
+vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 520 --height 360 --color 0xff206040 >/tmp/$title_one.log 2>&1"
 sleep 0.8
 vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_two' --width 300 --height 180 --color 0xff604020 >/tmp/$title_two.log 2>&1"
 
@@ -158,17 +156,15 @@ read -r handle_one handle_two < <(wait_for_handles "$cursor_start" 2) \
     || fail "two test windows did not appear in qdwin journal"
 pass "windows handle_one=$handle_one handle_two=$handle_two"
 
-content_w=300
-content_h=180
-one_x=$(( (QDWIN_SCREEN_W - content_w) / 2 ))
-one_y=$(( (QDWIN_SCREEN_H - content_h) / 2 ))
+one_w=520
+one_h=360
+one_x=$(( (QDWIN_SCREEN_W - one_w) / 2 ))
+one_y=$(( (QDWIN_SCREEN_H - one_h) / 2 ))
 
-# Park pointer over the exposed top-left of handle_one (offset 20,20
-# from the chrome-relative origin so we are inside the visible content
-# strip). This is the spot we will click after confirming cursor sprite
-# is mapped.
-target_x=$(( one_x + 20 ))
-target_y=$(( one_y + 20 ))
+# Park pointer over the exposed left side of handle_one. This spot remains
+# outside the smaller foreground window whether qdwin centers or cascades.
+target_x=$(( one_x + 30 ))
+target_y=$(( one_y + one_h / 2 ))
 
 cursor_park=$(journal_cursor)
 qdwin_mouse_move "$target_x" "$target_y"

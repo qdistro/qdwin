@@ -18,8 +18,7 @@ Same as `16-qdshell-binding-protocol-events.md`. Additionally:
   the agent runs:
 
   ```bash
-  qs -p /usr/share/quickshell/qdshell ipc \
-      'Qdwin.closeWindow({handle: HANDLE})'
+  qs -p /usr/share/quickshell/qdshell ipc call qdwin closeWindow HANDLE
   ```
 
   inside the admin user session.
@@ -42,9 +41,9 @@ qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 
 "$QDWIN_VM_EXEC" "$VMNAME" \
     "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     qs -p /usr/share/quickshell/qdshell ipc list 2>&1 | head -3'" \
-    | grep -q Qdwin \
-    || { echo "FAIL: qs ipc bridge or Qdwin singleton not reachable"; exit 1; }
+     qs -p /usr/share/quickshell/qdshell ipc call qdwin capabilities'" \
+    | grep -q 'bound=true' \
+    || { echo "FAIL: qs ipc bridge or qdwin binding not reachable"; exit 1; }
 
 # PRECONDITION (infra): the test client must be installed. Absence is an
 # ERROR (the scenario cannot be exercised), NOT a product FAIL.
@@ -82,8 +81,7 @@ CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
 "$QDWIN_VM_EXEC" "$VMNAME" \
     "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     qs -p /usr/share/quickshell/qdshell ipc call \
-     Qdwin closeWindow {\"handle\":$HANDLE}'"
+     qs -p /usr/share/quickshell/qdshell ipc call qdwin closeWindow $HANDLE'"
 sleep 1
 ```
 
@@ -124,11 +122,9 @@ shown, or a placeholder). Mirrors the
 ## Known-broken-if
 
 - 2.1 silent: the IPC call reached the QML side but
-  `qdwinBinding.closeWindow` didn't fire the request. Likely the
-  QML binding's `Q_INVOKABLE void closeWindow(quint32 handle)`
-  isn't reachable through the IPC bridge — check that the
-  argument marshalling matched (the IPC bridge wraps args in JSON;
-  the QML side may need `parseInt`).
+  `qdwinBinding.closeWindow` didn't fire the request. Check
+  `Services/Qdwin/Qdwin.qml`'s `IpcHandler { target: "qdwin" }`
+  and confirm `qs ipc call qdwin capabilities` reports `bound=true`.
 - 2.2 fires but 2.1 silent: that's impossible — qdwin can't kill
   a toplevel without an originating request, unless the
   qdistro-test-window process itself exited on its own. Re-check
@@ -140,13 +136,7 @@ shown, or a placeholder). Mirrors the
 
 ## Why agent-driven
 
-The IPC mechanism (`qs ipc call ...`) is the right invocation
-shape but the *exact* JSON encoding for the second argument
-(`{handle: N}`) depends on Quickshell's IpcHandler conventions —
-something an agent can iterate on with `qs ipc list` introspection
-faster than a fixed shell script. Step 3 (visual confirmation of
-the bar's empty state) also benefits from agent-side
-screenshot/OCR. The whole scenario is a contract test for a
-new code path; framing it as an exploration that emits a
-PASS/FAIL CHECK line is more robust than locking the JSON shape
-into a deterministic .bats test on day one.
+The IPC mechanism (`qs ipc call qdwin ...`) is the supported
+Quickshell test surface for this scenario. Step 3 (visual
+confirmation of the bar's empty state) still benefits from
+agent-side screenshot/OCR.

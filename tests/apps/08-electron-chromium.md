@@ -38,7 +38,7 @@ ozone path, but our test launcher doesn't activate it.)
 ### Step 2 — maximise
 
 ```bash
-qdwin_apps_ctl "max"
+qdwin_apps_ctl "maxlast"
 sleep 2
 qdwin_apps_screenshot /tmp/08-step2-max.png
 ```
@@ -48,7 +48,7 @@ qdwin_apps_screenshot /tmp/08-step2-max.png
 ### Step 3 — restore
 
 ```bash
-qdwin_apps_ctl "restore"
+qdwin_apps_ctl "restorelast"
 sleep 2
 qdwin_apps_screenshot /tmp/08-step3-restore.png
 ```

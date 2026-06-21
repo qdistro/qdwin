@@ -171,32 +171,38 @@ qdwin_apps_launch() {
     local cmd="$*"
     local sock; sock=$(qdwin_apps_active_socket)
     [ -n "$sock" ] || return 1
-    local b64
+    local b64 cmd_b64
+    cmd_b64=$(printf '%s' "$cmd" | base64 -w0)
     b64=$(base64 -w0 <<EOLAUNCH
-runuser -u admin -- bash -c '
-    export XDG_RUNTIME_DIR=/run/user/1000
-    export WAYLAND_DISPLAY=$sock
-    export DISPLAY=:0
-    export MOZ_ENABLE_WAYLAND=1
-    export QT_QPA_PLATFORM=wayland
-    export GDK_BACKEND=wayland
-    # Push the display env into the D-Bus activation environment so
-    # GApplication single-instance apps (e.g. gnome-text-editor) whose real
-    # window is created by a dbus-activated service inherit WAYLAND_DISPLAY/
-    # DISPLAY — without this they exit immediately with "cannot open display"
-    # (the documented dbus-activation race). Best-effort; harmless to apps
-    # that do not use dbus activation.
-    # Only the display/runtime vars — NOT GDK_BACKEND/QT_QPA_PLATFORM, so a
-    # per-app backend override (e.g. `env GDK_BACKEND=x11` for the XWayland
-    # scenarios) is not clobbered by a dbus-activated instance inheriting
-    # wayland from the activation env.
-    dbus-update-activation-environment --systemd \
-        WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR 2>/dev/null || true
-    setsid sh -c "$cmd" </dev/null >/tmp/${name}.log 2>&1 &
-'
+set -eu
+cmd=\$(printf '%s' '$cmd_b64' | base64 -d)
+runuser -u admin -- env -i \
+    HOME=/home/admin \
+    USER=admin \
+    LOGNAME=admin \
+    SHELL=/bin/bash \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    XDG_RUNTIME_DIR=/run/user/1000 \
+    WAYLAND_DISPLAY=$sock \
+    DISPLAY=:0 \
+    MOZ_ENABLE_WAYLAND=1 \
+    QT_QPA_PLATFORM=wayland \
+    GDK_BACKEND=wayland \
+    bash -s -- "\$cmd" "$name" <<'EOADMIN'
+set -eu
+cmd=$1
+name=$2
+# Push only display/runtime vars into the D-Bus activation environment so
+# GApplication single-instance apps (e.g. gnome-text-editor) inherit a display.
+# Do not push toolkit backend variables: per-app XWayland overrides such as
+# `env GDK_BACKEND=x11 ...` must remain effective.
+dbus-update-activation-environment --systemd \
+    WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR 2>/dev/null || true
+setsid sh -c "$cmd" </dev/null >/tmp/${name}.log 2>&1 &
+EOADMIN
 EOLAUNCH
 )
-    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+    "$QDWIN_VM_EXEC" "$VMNAME" "env -i PATH=/usr/local/bin:/usr/bin:/bin bash -c 'printf %s $b64 | base64 -d | bash'"
 }
 
 qdwin_apps_ctl() {

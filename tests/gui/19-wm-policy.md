@@ -17,17 +17,22 @@ hotkeys.
 ## Environment
 
 Standard qdwin GUI harness (`tests/gui/AGENTS.md`): a running libvirt domain
-on `qemu:///session` with `noctalia-session.service` (weston + qdwin-shell.so)
-and `noctalia-shell.service` (qdshell). Deploy the v25 qdwin-shell.so +
-qdshell qml-plugin first (build in-VM, install to `/usr/lib64/weston/` and
-`/usr/share/qdistro/qml/Qdistro/Qdwin/`, restart `noctalia-session.service`).
+on `qemu:///session` with `qdwin-compositor.service` (weston + qdwin-shell.so)
+and `qdshell.service` (qdshell). Deploy the v25 qdwin-shell.so + qdshell
+qml-plugin first (build in-VM, install to `/usr/lib64/weston/` and
+`/usr/share/qdistro/qml/Qdistro/Qdwin/`, restart `qdwin-compositor.service`).
 
 ## Path A — qdshell-driven (capability + settings)
 
-1. `journalctl --user -u noctalia-shell.service` shows on bind:
-   `CapabilityServ wmPolicy -> true` and `keybindRegistration -> true`
-   (the binding negotiated qdwin_shell_v1 v25). **Validated 2026-05-29** on
-   `qdistro-daily-2026-05-29`: both flipped true.
+1. The live qdshell IPC capability probe reports a v25+ binding:
+
+   ```bash
+   qs -p /usr/share/quickshell/qdshell ipc call qdwin capabilities
+   ```
+
+   Expected fields: `bound=true`, `wmPolicy=true`, and
+   `keybindRegistration=true`. This is the stable contract; journal strings
+   from `CapabilityService` are diagnostic only.
 2. Open Settings → Window Manager: the persist-only capability banner is
    hidden (canApplyWmPolicy true). Toggle focus policy to "Focus follows
    mouse" → `journalctl -u noctalia-session.service` logs
@@ -45,9 +50,9 @@ qdshell qml-plugin first (build in-VM, install to `/usr/lib64/weston/` and
 ## Path B — compositor functional proof (bystander as shell)
 
 Drives the compositor directly on the live DRM session, independent of
-qdshell's init: stop `noctalia-shell.service`, bind the v25 `qdwin-bystander`
+qdshell's init: stop `qdshell.service`, bind the v25 `qdwin-bystander`
 as the shell, spawn `weston-terminal` (handle 1), drive the FIFO, then restart
-`noctalia-shell.service`. (Script: a sibling of `agent-*` smokes.)
+`qdshell.service`. (Script: a sibling of `agent-*` smokes.)
 
 ```
 wmpolicy 1 250 1 0 2 1 24     # follow-mouse, smart placement, snap 24px

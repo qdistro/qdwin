@@ -108,7 +108,7 @@ cleanup
 cursor_start=$(journal_cursor)
 # setsid -f: detach so the client survives vm_exec returning (a bare `&` gets
 # SIGHUP'd when the agent command exits, so the toplevel never reaches qdwin).
-vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 300 --height 180 --color 0xff203060 >/tmp/$title_one.log 2>&1"
+vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_one' --width 520 --height 360 --color 0xff203060 >/tmp/$title_one.log 2>&1"
 sleep 0.8
 vm_exec "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title '$title_two' --width 300 --height 180 --color 0xff604020 >/tmp/$title_two.log 2>&1"
 
@@ -116,17 +116,19 @@ read -r handle_one handle_two < <(wait_for_new_handles "$cursor_start") \
     || fail "test windows did not appear in qdwin journal"
 pass "windows handle_one=$handle_one handle_two=$handle_two"
 
-content_w=300
-content_h=180
-one_x=$(( (QDWIN_SCREEN_W - content_w) / 2 ))
-one_y=$(( (QDWIN_SCREEN_H - content_h) / 2 ))
-two_x=$(( one_x + 40 ))
-two_y=$(( one_y + 40 ))
+one_w=520
+one_h=360
+two_w=300
+two_h=180
+one_x=$(( (QDWIN_SCREEN_W - one_w) / 2 ))
+one_y=$(( (QDWIN_SCREEN_H - one_h) / 2 ))
+two_x=$(( (QDWIN_SCREEN_W - two_w) / 2 ))
+two_y=$(( (QDWIN_SCREEN_H - two_h) / 2 ))
 
-# Click the exposed top-left content of the first window, which is behind the
-# second cascaded window. This should raise and focus handle_one.
+# Click the exposed left side of the first window, which remains visible even
+# if qdwin centers both windows instead of cascading the second one.
 cursor_click_one=$(journal_cursor)
-qdwin_click "$((one_x + 20))" "$((one_y + 20))"
+qdwin_click "$((one_x + 30))" "$((one_y + one_h / 2))"
 wait_for_focus "$handle_one" "$cursor_click_one" \
     || fail "click on first/background window did not focus handle=$handle_one"
 pass "background-window click focused handle=$handle_one"
@@ -134,7 +136,7 @@ pass "background-window click focused handle=$handle_one"
 # Click the second window again to prove focus can move back through the same
 # QMP mouse path.
 cursor_click_two=$(journal_cursor)
-qdwin_click "$((two_x + content_w / 2))" "$((two_y + content_h / 2))"
+qdwin_click "$((two_x + two_w / 2))" "$((two_y + two_h / 2))"
 wait_for_focus "$handle_two" "$cursor_click_two" \
     || fail "click on second window did not focus handle=$handle_two"
 pass "foreground-window click focused handle=$handle_two"

@@ -38,7 +38,7 @@ falling back to X11 is the symptom we want to catch.
 ### Step 2 — maximise
 
 ```bash
-qdwin_apps_ctl "max"
+qdwin_apps_ctl "maxlast"
 sleep 2
 qdwin_apps_screenshot /tmp/06-step2-max.png
 ```
@@ -49,7 +49,7 @@ more icons.
 ### Step 3 — restore
 
 ```bash
-qdwin_apps_ctl "restore"
+qdwin_apps_ctl "restorelast"
 sleep 2
 qdwin_apps_screenshot /tmp/06-step3-restore.png
 ```

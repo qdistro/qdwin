@@ -38,7 +38,7 @@ background. Title bar reads `feh [1 of 1] - /usr/shar...` (truncated).
 ### Step 2 — verify size
 
 ```bash
-qdwin_apps_ctl "max"
+qdwin_apps_ctl "maxlast"
 sleep 2
 qdwin_apps_screenshot /tmp/11-step2-max.png
 ```
@@ -50,7 +50,7 @@ left of an enlarged window, not stretched. Behaviour is feh-specific
 configure-event handling, not feh's UX.
 
 ```bash
-qdwin_apps_ctl "restore"
+qdwin_apps_ctl "restorelast"
 sleep 1
 qdwin_apps_screenshot /tmp/11-step3-restore.png
 ```
