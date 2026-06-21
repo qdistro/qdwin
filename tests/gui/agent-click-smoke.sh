@@ -73,6 +73,27 @@ wait_for_new_handles() {
     return 1
 }
 
+# Read the actual placement (global content top-left) qdwin logged for a
+# handle: "qdwin: mapped handle=H size=WxH pos=X,Y (...)". Echoes "X Y W H".
+# This makes the smoke independent of qdwin's placement policy (center /
+# smart / cascade) — it clicks where the window actually landed rather than
+# re-deriving the placement math. Retries because the mapped line lands on
+# the buffer commit, shortly after toplevel_added.
+wait_for_geometry() {
+    local handle=$1 cursor=$2 line=
+    for _ in $(seq 1 30); do
+        line=$(journal_after "$cursor" \
+            | sed -n "s/.*qdwin: mapped handle=$handle size=\\([0-9]*\\)x\\([0-9]*\\) pos=\\(-\\?[0-9]*\\),\\(-\\?[0-9]*\\) .*/\\3 \\4 \\1 \\2/p" \
+            | tail -n1)
+        if [ -n "$line" ]; then
+            echo "$line"
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 wait_for_focus() {
     local handle=$1 cursor=$2
     for _ in $(seq 1 20); do
@@ -130,29 +151,29 @@ read -r handle_one handle_two < <(wait_for_new_handles "$cursor_start") \
     || fail "test windows did not appear in qdwin journal"
 pass "windows handle_one=$handle_one handle_two=$handle_two"
 
-one_w=520
-one_h=360
-two_w=300
-two_h=180
-one_x=$(( (QDWIN_SCREEN_W - one_w) / 2 ))
-one_y=$(( (QDWIN_SCREEN_H - one_h) / 2 ))
-two_x=$(( (QDWIN_SCREEN_W - two_w) / 2 ))
-two_y=$(( (QDWIN_SCREEN_H - two_h) / 2 ))
+# Resolve the windows' ACTUAL placement from qdwin's journal rather than
+# assuming a center/cascade layout. qdwin's live WM policy is "smart", which
+# tiles windows to avoid overlap, so the second window is NOT stacked on the
+# first — clicking an assumed center would land on the wrong window.
+read -r one_x one_y one_w one_h < <(wait_for_geometry "$handle_one" "$cursor_start") \
+    || fail "did not observe placement (mapped … pos=) for handle=$handle_one"
+read -r two_x two_y two_w two_h < <(wait_for_geometry "$handle_two" "$cursor_start") \
+    || fail "did not observe placement (mapped … pos=) for handle=$handle_two"
+echo "geometry: handle_one=${one_w}x${one_h}@${one_x},${one_y} handle_two=${two_w}x${two_h}@${two_x},${two_y}"
 
-# Click the exposed left side of the first window, which remains visible even
-# if qdwin centers both windows instead of cascading the second one.
+# Click the center of the first/background window through the QMP mouse path.
 cursor_click_one=$(journal_cursor)
-qdwin_click "$((one_x + 30))" "$((one_y + one_h / 2))"
+qdwin_click "$(( one_x + one_w / 2 ))" "$(( one_y + one_h / 2 ))"
 wait_for_focus "$handle_one" "$cursor_click_one" || {
     dump_click_diag "$cursor_click_one"
     fail "click on first/background window did not focus handle=$handle_one"
 }
 pass "background-window click focused handle=$handle_one"
 
-# Click the second window again to prove focus can move back through the same
-# QMP mouse path.
+# Click the center of the second window to prove focus can move back through
+# the same QMP mouse path.
 cursor_click_two=$(journal_cursor)
-qdwin_click "$((two_x + two_w / 2))" "$((two_y + two_h / 2))"
+qdwin_click "$(( two_x + two_w / 2 ))" "$(( two_y + two_h / 2 ))"
 wait_for_focus "$handle_two" "$cursor_click_two" || {
     dump_click_diag "$cursor_click_two"
     fail "click on second window did not focus handle=$handle_two"

@@ -84,6 +84,24 @@ wait_for_handles() {
     done
     return 1
 }
+# Read the actual placement qdwin logged for a handle ("mapped handle=H
+# size=WxH pos=X,Y (...)"); echoes "X Y W H". Keeps the click target correct
+# under any placement policy (qdwin's live policy is "smart", which tiles to
+# avoid overlap rather than stacking windows at a shared centre).
+wait_for_geometry() {
+    local handle=$1 cursor=$2 line=
+    for _ in $(seq 1 30); do
+        line=$(journal_after "$cursor" \
+            | sed -n "s/.*qdwin: mapped handle=$handle size=\\([0-9]*\\)x\\([0-9]*\\) pos=\\(-\\?[0-9]*\\),\\(-\\?[0-9]*\\) .*/\\3 \\4 \\1 \\2/p" \
+            | tail -n1)
+        if [ -n "$line" ]; then
+            echo "$line"
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
 # Wait for a focus transition into `handle=$next`. The previous owner may be
 # `$prev` or UINT32_MAX: qdshell layer-shell surfaces can legitimately own
 # keyboard focus between setup and click, and qdwin reports that as no qdwin
@@ -161,14 +179,15 @@ read -r handle_one handle_two < <(wait_for_handles "$cursor_start" 2) \
     || fail "two test windows did not appear in qdwin journal"
 pass "windows handle_one=$handle_one handle_two=$handle_two"
 
-one_w=520
-one_h=360
-one_x=$(( (QDWIN_SCREEN_W - one_w) / 2 ))
-one_y=$(( (QDWIN_SCREEN_H - one_h) / 2 ))
+# Resolve handle_one's ACTUAL placement from the journal rather than assuming
+# a centered layout (qdwin's "smart" policy tiles to avoid overlap). Under any
+# policy handle_one and handle_two do not overlap, so handle_one's centre is a
+# safe click target that is outside handle_two.
+read -r one_x one_y one_w one_h < <(wait_for_geometry "$handle_one" "$cursor_start") \
+    || fail "did not observe placement (mapped … pos=) for handle=$handle_one"
+echo "geometry: handle_one=${one_w}x${one_h}@${one_x},${one_y}"
 
-# Park pointer over the exposed left side of handle_one. This spot remains
-# outside the smaller foreground window whether qdwin centers or cascades.
-target_x=$(( one_x + 30 ))
+target_x=$(( one_x + one_w / 2 ))
 target_y=$(( one_y + one_h / 2 ))
 
 cursor_park=$(journal_cursor)

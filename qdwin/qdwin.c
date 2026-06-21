@@ -1824,9 +1824,17 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 				weston_view_update_transform(tl->view);
 			}
 		}
-		weston_log("qdwin: mapped handle=%u size=%dx%d (%s)\n",
-			   tl->handle, surface->width, surface->height,
-			   tl->decorated ? "normal" : "held");
+		{
+			/* Include the placement origin (global content top-left)
+			 * so journal-driven tests can target a window without
+			 * re-deriving the placement math. */
+			struct weston_coord_global mp =
+				weston_view_get_pos_offset_global(tl->view);
+			weston_log("qdwin: mapped handle=%u size=%dx%d pos=%d,%d (%s)\n",
+				   tl->handle, surface->width, surface->height,
+				   (int)mp.c.x, (int)mp.c.y,
+				   tl->decorated ? "normal" : "held");
+		}
 		/* If approval (release_holding) already fired before this
 		 * first commit, qdwin_toplevel_release_holding's autofocus
 		 * call shortcircuited because the surface wasn't yet
@@ -6954,6 +6962,35 @@ qdwin_ffm_consider(struct qdwin *qdwin, struct weston_pointer *pointer)
 	}
 }
 
+/* Total overlap area (px^2) of a candidate slot (ox,oy,sw,sh) against
+ * every other mapped, non-nested toplevel. Used by SMART placement to
+ * score candidate slots. */
+static long
+qdwin_placement_overlap(struct qdwin *qdwin, struct qdwin_toplevel *tl,
+			int ox, int oy, int sw, int sh)
+{
+	long overlap = 0;
+	struct qdwin_toplevel *t;
+	wl_list_for_each(t, &qdwin->toplevels, link) {
+		if (t == tl || t->is_nested_proxy || !t->mapped || !t->view)
+			continue;
+		struct weston_coord_global vp =
+			weston_view_get_pos_offset_global(t->view);
+		struct weston_surface *ts = t->view->surface;
+		int tw = ts ? ts->width : 0;
+		int th = ts ? ts->height : 0;
+		int ix = (ox > (int)vp.c.x) ? ox : (int)vp.c.x;
+		int iy = (oy > (int)vp.c.y) ? oy : (int)vp.c.y;
+		int ax = (ox + sw < (int)vp.c.x + tw) ? ox + sw
+						      : (int)vp.c.x + tw;
+		int ay = (oy + sh < (int)vp.c.y + th) ? oy + sh
+						      : (int)vp.c.y + th;
+		if (ax > ix && ay > iy)
+			overlap += (long)(ax - ix) * (ay - iy);
+	}
+	return overlap;
+}
+
 /* Compute the new-window content top-left (global px) per the placement
  * policy. Mirrors the legacy centre+cascade math; cx/cy are the content
  * origin the caller hands to weston_view_set_position. */
@@ -6984,50 +7021,40 @@ qdwin_compute_placement(struct qdwin *qdwin, struct qdwin_toplevel *tl,
 	case QDWIN_PLACE_SMART: {
 		/* Pick the candidate slot (a coarse grid over the work area)
 		 * with the least total overlap against existing mapped
-		 * toplevels. Centre wins ties (checked first). */
+		 * toplevels, preferring the centre on ties.
+		 *
+		 * The centre slot is scored first and seeds best_*; grid slots
+		 * only win with STRICTLY less overlap. This is what makes the
+		 * common cases land where the user expects: with no other
+		 * windows (or no overlap at centre) every slot ties at zero, so
+		 * the new window centres rather than piling into the work-area
+		 * top-left corner. (A prior version seeded best_overlap=-1 and
+		 * accepted the first grid slot — gx=gy=0, the corner — on the
+		 * first zero-overlap hit, so the first window always landed at
+		 * (wx,wy) instead of centred.) */
 		const int STEPS = 5;
-		long best_overlap = -1;
+		long best_overlap =
+			qdwin_placement_overlap(qdwin, tl, center_x, center_y,
+						sw, sh);
 		int best_x = center_x, best_y = center_y;
-		for (int gy = 0; gy < STEPS; gy++) {
-			for (int gx = 0; gx < STEPS; gx++) {
-				int ox = wx + (STEPS > 1 ?
-					(ww - sw) * gx / (STEPS - 1) : 0);
-				int oy = wy + (STEPS > 1 ?
-					(wh - sh) * gy / (STEPS - 1) : 0);
-				if (ox < wx) ox = wx;
-				if (oy < wy) oy = wy;
-				long overlap = 0;
-				struct qdwin_toplevel *t;
-				wl_list_for_each(t, &qdwin->toplevels, link) {
-					if (t == tl || t->is_nested_proxy ||
-					    !t->mapped || !t->view)
-						continue;
-					struct weston_coord_global vp =
-					 weston_view_get_pos_offset_global(t->view);
-					struct weston_surface *ts =
-						t->view->surface;
-					int tw = ts ? ts->width : 0;
-					int th = ts ? ts->height : 0;
-					int ix = (ox > (int)vp.c.x) ? ox
-						: (int)vp.c.x;
-					int iy = (oy > (int)vp.c.y) ? oy
-						: (int)vp.c.y;
-					int ax = (ox + sw < (int)vp.c.x + tw)
-						? ox + sw : (int)vp.c.x + tw;
-					int ay = (oy + sh < (int)vp.c.y + th)
-						? oy + sh : (int)vp.c.y + th;
-					if (ax > ix && ay > iy)
-						overlap += (long)(ax - ix) *
-							   (ay - iy);
-				}
-				/* Prefer centre on ties: seed best with the
-				 * centre slot (gx==gy==middle handled by < ). */
-				if (best_overlap < 0 || overlap < best_overlap) {
-					best_overlap = overlap;
-					best_x = ox;
-					best_y = oy;
-					if (overlap == 0)
-						goto smart_done;
+		if (best_overlap > 0) {
+			for (int gy = 0; gy < STEPS; gy++) {
+				for (int gx = 0; gx < STEPS; gx++) {
+					int ox = wx + (STEPS > 1 ?
+						(ww - sw) * gx / (STEPS - 1) : 0);
+					int oy = wy + (STEPS > 1 ?
+						(wh - sh) * gy / (STEPS - 1) : 0);
+					if (ox < wx) ox = wx;
+					if (oy < wy) oy = wy;
+					long overlap = qdwin_placement_overlap(
+						qdwin, tl, ox, oy, sw, sh);
+					if (overlap < best_overlap) {
+						best_overlap = overlap;
+						best_x = ox;
+						best_y = oy;
+						if (overlap == 0)
+							goto smart_done;
+					}
 				}
 			}
 		}
