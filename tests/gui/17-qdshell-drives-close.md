@@ -18,10 +18,15 @@ Same as `16-qdshell-binding-protocol-events.md`. Additionally:
   the agent runs:
 
   ```bash
-  qs -p /usr/share/quickshell/qdshell ipc call qdwin closeWindow HANDLE
+  runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+    qs ipc -p /usr/share/quickshell/qdshell call qdwin closeWindow HANDLE
   ```
 
-  inside the admin user session.
+  inside the admin user session. Note the proven-working shape (mirrors
+  `qdshell/tests/ui/runner.py`'s `ipc_vm`): `runuser -u admin -- env …`
+  (NOT `runuser -l`, whose login shell scrubs the env), an explicit
+  `WAYLAND_DISPLAY=wayland-1`, and `-p PATH` placed AFTER the `ipc`
+  subcommand (`qs ipc -p PATH call …`), not before it.
 
 Fail loudly if the IPC isn't available; do not skip.
 
@@ -39,9 +44,32 @@ source ${QDWIN_REPO}/tests/gui/qdwin-helpers.sh
 qdwin_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
 qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 
-"$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     qs -p /usr/share/quickshell/qdshell ipc call qdwin capabilities'" \
+# qs_ipc <method> [args...] — call a qdwin IPC method on the running qdshell
+# instance. Uses the proven-working invocation (runner.py ipc_vm shape):
+# `runuser -u admin -- env … WAYLAND_DISPLAY=wayland-1 qs ipc -p PATH call …`.
+# If the -p path-based lookup can't find the -p-launched instance, fall back
+# to PID targeting (`qs ipc --pid PID call …`), resolving the qs child pid
+# (the non-dbus-run-session process under admin).
+QS_PATH=/usr/share/quickshell/qdshell
+qs_ipc() {
+    local out
+    out=$("$QDWIN_VM_EXEC" "$VMNAME" \
+        "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+         qs ipc -p $QS_PATH call qdwin $*" 2>&1)
+    if printf '%s' "$out" | grep -qiE 'no running instance|No such'; then
+        local pid
+        pid=$("$QDWIN_VM_EXEC" "$VMNAME" \
+            "pgrep -u admin -f 'qs -p $QS_PATH' | while read p; do \
+               grep -q dbus-run-session /proc/\$p/cmdline 2>/dev/null || { echo \$p; break; }; done")
+        [ -n "$pid" ] || { printf '%s\n' "$out"; return 1; }
+        out=$("$QDWIN_VM_EXEC" "$VMNAME" \
+            "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+             qs ipc --pid $pid call qdwin $*" 2>&1)
+    fi
+    printf '%s\n' "$out"
+}
+
+qs_ipc capabilities \
     | grep -q 'bound=true' \
     || { echo "FAIL: qs ipc bridge or qdwin binding not reachable"; exit 1; }
 
@@ -79,9 +107,7 @@ HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
 ```bash
 CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
-"$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     qs -p /usr/share/quickshell/qdshell ipc call qdwin closeWindow $HANDLE'"
+qs_ipc closeWindow "$HANDLE"
 sleep 1
 ```
 
@@ -124,7 +150,7 @@ shown, or a placeholder). Mirrors the
 - 2.1 silent: the IPC call reached the QML side but
   `qdwinBinding.closeWindow` didn't fire the request. Check
   `Services/Qdwin/Qdwin.qml`'s `IpcHandler { target: "qdwin" }`
-  and confirm `qs ipc call qdwin capabilities` reports `bound=true`.
+  and confirm `qs_ipc capabilities` reports `bound=true`.
 - 2.2 fires but 2.1 silent: that's impossible — qdwin can't kill
   a toplevel without an originating request, unless the
   qdistro-test-window process itself exited on its own. Re-check

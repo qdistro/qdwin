@@ -84,6 +84,20 @@ wait_for_focus() {
     return 1
 }
 
+# Dump the deciding journal lines for a click-to-focus failure: the
+# position-based pick (qdwin.c click-focus pick), the low-level button
+# notify, and any focus transitions. Distinguishes a dropped QMP button
+# event (no pick/notify line) from a downstream focus/emit bug (pick line
+# present, no focus transition). See /tmp/opus-analysis-round1.md §1/§2.
+dump_click_diag() {
+    local cursor=$1
+    echo "---- click-focus diagnostics (after cursor) ----" >&2
+    journal_after "$cursor" \
+        | grep -E 'click-focus pick|notify_button|qdwin: focus handle=|toplevel_added' \
+        | tail -20 >&2 || true
+    echo "------------------------------------------------" >&2
+}
+
 [ -n "$VMNAME" ] || fail "no running VM; set VMNAME or start qdistro-daily"
 $QDWIN_VIRSH domstate "$VMNAME" >/dev/null || fail "VM '$VMNAME' not found"
 vm_exec "test -S /run/user/1000/wayland-1" >/dev/null \
@@ -129,16 +143,20 @@ two_y=$(( (QDWIN_SCREEN_H - two_h) / 2 ))
 # if qdwin centers both windows instead of cascading the second one.
 cursor_click_one=$(journal_cursor)
 qdwin_click "$((one_x + 30))" "$((one_y + one_h / 2))"
-wait_for_focus "$handle_one" "$cursor_click_one" \
-    || fail "click on first/background window did not focus handle=$handle_one"
+wait_for_focus "$handle_one" "$cursor_click_one" || {
+    dump_click_diag "$cursor_click_one"
+    fail "click on first/background window did not focus handle=$handle_one"
+}
 pass "background-window click focused handle=$handle_one"
 
 # Click the second window again to prove focus can move back through the same
 # QMP mouse path.
 cursor_click_two=$(journal_cursor)
 qdwin_click "$((two_x + two_w / 2))" "$((two_y + two_h / 2))"
-wait_for_focus "$handle_two" "$cursor_click_two" \
-    || fail "click on second window did not focus handle=$handle_two"
+wait_for_focus "$handle_two" "$cursor_click_two" || {
+    dump_click_diag "$cursor_click_two"
+    fail "click on second window did not focus handle=$handle_two"
+}
 pass "foreground-window click focused handle=$handle_two"
 
 # The user-facing launcher icon is qdshell-owned UI, not the compositor's

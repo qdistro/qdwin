@@ -267,14 +267,38 @@ qdwin_mouse_button() {
         ]}}" >/dev/null
 }
 
-# Click left button at (x, y) — move + press + release.
+# Send an abs-move AND a button event in a SINGLE input-send-event so the
+# pointer position and the button transition arrive atomically at QEMU's
+# input layer. QEMU's USB tablet can drop a standalone `btn` that is not
+# accompanied by a position update on the same report; coalescing the move
+# with the press/release is the reliable shape (see comment above re:
+# atomic multi-event batches).
+qdwin_mouse_move_button() {
+    qdwin_require_vm
+    local x="$1" y="$2" btn="$3" updown="$4"
+    local ax=$(( x * 32767 / QDWIN_SCREEN_W ))
+    local ay=$(( y * 32767 / QDWIN_SCREEN_H ))
+    local down=true
+    [ "$updown" = up ] && down=false
+    $QDWIN_VIRSH qemu-monitor-command "$VMNAME" \
+        "{\"execute\": \"input-send-event\", \"arguments\": {\"events\": [
+            {\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$ax}},
+            {\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$ay}},
+            {\"type\":\"btn\",\"data\":{\"button\":\"$btn\",\"down\":$down}}
+        ]}}" >/dev/null
+}
+
+# Click left button at (x, y) — press (with move) then release (with move).
+# The move is batched into BOTH the press and release events so the button
+# transition is never sent as a standalone report (which QEMU's tablet can
+# drop). See qdwin_mouse_move_button.
 qdwin_click() {
     local x="$1" y="$2" btn="${3:-left}"
     qdwin_mouse_move "$x" "$y"
     sleep 0.05
-    qdwin_mouse_button "$btn" down
+    qdwin_mouse_move_button "$x" "$y" "$btn" down
     sleep 0.05
-    qdwin_mouse_button "$btn" up
+    qdwin_mouse_move_button "$x" "$y" "$btn" up
     sleep 0.05
 }
 
@@ -319,12 +343,14 @@ qdwin_screenshot() {
 
 # ----------------------------------------------------- session sanity
 #
-# Returns 0 if the qdwin session is up under admin and qdshell ctrl-socket
-# is reachable; nonzero otherwise. Use as the first step of any
-# scenario.
+# Returns 0 if the qdwin user session is up: the admin wayland socket
+# exists and the qdwin-compositor + qdshell user units are active.
+# Mirrors the gui gate liveness probe (qdistro/ci/lib/gates/gui.sh) — the
+# old qdshell ctrl-socket ("launcher" command) was removed when qdshell
+# moved to Quickshell IPC, so probing it always failed. Use as the first
+# step of any scenario.
 qdwin_session_healthy() {
     qdwin_require_vm || return 2
-    local resp
-    resp=$(qdwin_ctrl "launcher" 2>/dev/null || true)
-    [[ "$resp" == ok\ launcher* ]]
+    "$QDWIN_VM_EXEC" "$VMNAME" \
+        "test -S /run/user/1000/wayland-1 && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active qdwin-compositor.service qdshell.service >/dev/null"
 }

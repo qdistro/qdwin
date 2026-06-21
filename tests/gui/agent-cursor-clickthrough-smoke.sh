@@ -97,8 +97,13 @@ wait_for_strict_focus_transition() {
         fi
         sleep 0.2
     done
-    journal_after "$cursor" | grep -E 'qdwin: focus handle=|toplevel_added' \
-        | tail -10 >&2
+    # Dump the deciding journal lines: the position-based pick and the
+    # low-level button notify distinguish a dropped QMP button event (no
+    # pick/notify) from a downstream focus/emit bug (pick present, no focus
+    # transition). See /tmp/opus-analysis-round1.md §1.
+    journal_after "$cursor" \
+        | grep -E 'click-focus pick|notify_button|qdwin: focus handle=|toplevel_added' \
+        | tail -20 >&2
     return 1
 }
 

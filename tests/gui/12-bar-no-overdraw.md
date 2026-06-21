@@ -41,8 +41,9 @@ fix has regressed — see `Settings.data.bar.exclusionZoneBleed`.
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-  "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-   WAYLAND_DISPLAY=wayland-1 foot --maximized sleep 600 &' " >/dev/null
+  "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+   WAYLAND_DISPLAY=wayland-1 foot --maximized sleep 600 \
+   >/tmp/qd12-foot.log 2>&1" >/dev/null
 sleep 2
 "$QDWIN_VM_EXEC" "$VMNAME" \
   "journalctl _UID=1000 --no-pager | grep 'qdwin: set_maximized' | tail -1"

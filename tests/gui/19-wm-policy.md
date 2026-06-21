@@ -18,25 +18,45 @@ hotkeys.
 
 Standard qdwin GUI harness (`tests/gui/AGENTS.md`): a running libvirt domain
 on `qemu:///session` with `qdwin-compositor.service` (weston + qdwin-shell.so)
-and `qdshell.service` (qdshell). Deploy the v25 qdwin-shell.so + qdshell
-qml-plugin first (build in-VM, install to `/usr/lib64/weston/` and
-`/usr/share/qdistro/qml/Qdistro/Qdwin/`, restart `qdwin-compositor.service`).
+and `qdshell.service` (qdshell). **The session is already fully provisioned by
+the GUI gate** — the vendored libweston, qdwin-shell.so, qdshell, and the
+qml-plugin are baked into the VM image and the user units are active before the
+scenario runs. Do NOT build or deploy anything in-VM; just probe the live
+session below. (If a precondition probe fails, that is an ERROR to report, not
+a cue to provision.)
 
 ## Path A — qdshell-driven (capability + settings)
+
+0. Precondition — verify the live admin user session (mirrors 16/17), so the
+   scenario probes the running session rather than guessing about provisioning:
+
+   ```bash
+   source ${QDWIN_REPO}/tests/gui/qdwin-helpers.sh
+   qdwin_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
+   qdwin_session_healthy \
+     || { echo "ERROR: qdwin/qdshell user session not up"; exit 1; }
+   ```
 
 1. The live qdshell IPC capability probe reports a v25+ binding:
 
    ```bash
-   qs -p /usr/share/quickshell/qdshell ipc call qdwin capabilities
+   runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+     qs ipc -p /usr/share/quickshell/qdshell call qdwin capabilities
    ```
+
+   (Same proven-working invocation as `17-qdshell-drives-close.md`: `runuser -u
+   admin -- env …` with `WAYLAND_DISPLAY=wayland-1`, and `-p PATH` placed after
+   the `ipc` subcommand. If the `-p` lookup can't find the instance, fall back
+   to `qs ipc --pid <PID> call …` where PID is the non-`dbus-run-session` qs
+   child, e.g. `pgrep -u admin -f 'qs -p /usr/share/quickshell/qdshell'`.)
 
    Expected fields: `bound=true`, `wmPolicy=true`, and
    `keybindRegistration=true`. This is the stable contract; journal strings
    from `CapabilityService` are diagnostic only.
 2. Open Settings → Window Manager: the persist-only capability banner is
    hidden (canApplyWmPolicy true). Toggle focus policy to "Focus follows
-   mouse" → `journalctl -u noctalia-session.service` logs
-   `qdwin: set_wm_policy focus=1 …`.
+   mouse" → the user journal (`journalctl _UID=1000 --no-pager`, the same
+   stream the other gui scenarios read) logs `qdwin: set_wm_policy focus=1 …`.
 3. Bind a WM shortcut (e.g. tile-left = Super+Left), focus a window, press it:
    the window tiles to the left half.
 
