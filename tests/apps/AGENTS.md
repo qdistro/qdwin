@@ -108,7 +108,7 @@ on one VM produce spurious FAILs. Spin up a second clone via
 `qdistro/scripts/vm/clone-baseweed.sh apps-qdwin --from-baked` if
 you need wall-clock parallelism.
 
-Pre-conditions every runner assumes:
+Pre-conditions for app-deps runs:
 
 - VM is running, weston is up, bystander is up, bystander FIFO is at
   `/run/user/1000/qdwin-cmd.fifo`.
@@ -122,6 +122,10 @@ Pre-conditions every runner assumes:
   live under `phase1/gui-tests/qdwin-apps/demos/` and are served
   from the host HTTP server rooted at the qdistro repo top.
 
-If any precondition is missing, runners should fail with
-`INFRA: <thing>` and the orchestrator decides whether to bake/install
-or skip.
+These heavy app dependencies are opt-in for lean GUI goldens. If an
+app-specific package such as `chromium` is absent because the VM was
+not built with `QDWIN_APP_DEPS=1`, report a clean `SKIP: <app> not
+installed; qdwin app deps are opt-in`, not a compositor failure. If
+the app-deps lane was explicitly requested and a listed package is
+still missing, report `INFRA: <thing>` so the orchestrator can rebake
+or fix the package list.

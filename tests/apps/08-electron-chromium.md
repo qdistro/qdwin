@@ -13,6 +13,10 @@ which is the load-bearing path for most Electron apps in practice.
 source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
+if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v chromium >/dev/null 2>&1'; then
+    echo "SKIP: chromium not installed; qdwin app deps are opt-in (rerun with QDWIN_APP_DEPS=1)"
+    exit 0
+fi
 qdwin_apps_kill_all
 "$QDWIN_VM_EXEC" "$VMNAME" 'rm -rf /tmp/chr-scenario08'
 ```
@@ -80,3 +84,7 @@ qdwin_apps_kill_all
   failed run forces chromium into "Restoring tabs?" UI which doesn't
   match the assertions. Setup should `rm -rf /tmp/chr-scenario08`
   before launch.
+- **Missing Chromium** — the qdwin app matrix is optional. A default
+  lean GUI VM may omit Chromium unless the golden was built with
+  `QDWIN_APP_DEPS=1`; in that profile this scenario is a clean SKIP,
+  not an XWayland/Ozone regression.
