@@ -14,6 +14,7 @@ source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 qdwin_apps_kill_all
+"$QDWIN_VM_EXEC" "$VMNAME" 'rm -rf /tmp/chr-scenario08'
 ```
 
 ## Steps
@@ -21,7 +22,7 @@ qdwin_apps_kill_all
 ### Step 1 — launch
 
 ```bash
-qdwin_apps_launch chromium "chromium --no-sandbox --user-data-dir=/tmp/chr-scenario08"
+qdwin_apps_launch chromium "env OZONE_PLATFORM=x11 QT_QPA_PLATFORM=xcb GDK_BACKEND=x11 chromium --no-sandbox --user-data-dir=/tmp/chr-scenario08 --ozone-platform=x11"
 sleep 18
 qdwin_apps_screenshot /tmp/08-step1-launched.png
 ```

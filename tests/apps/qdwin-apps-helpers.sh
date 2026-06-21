@@ -202,12 +202,16 @@ setsid sh -c "$cmd" </dev/null >/tmp/${name}.log 2>&1 &
 EOADMIN
 EOLAUNCH
 )
-    "$QDWIN_VM_EXEC" "$VMNAME" "env -i PATH=/usr/local/bin:/usr/bin:/bin bash -c 'printf %s $b64 | base64 -d | bash'"
+    "$QDWIN_VM_EXEC" "$VMNAME" "env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin bash -c 'printf %s $b64 | base64 -d | bash'"
 }
 
 qdwin_apps_ctl() {
     qdwin_apps_require_vm || return 1
     local cmd="$*"
+    case "$cmd" in
+        maxlast) cmd=max ;;
+        restorelast) cmd=restore ;;
+    esac
     local b64
     b64=$(base64 -w0 <<EOCTL
 echo '$cmd' > $QDWIN_BYSTANDER_FIFO
