@@ -63,10 +63,12 @@ border should be intact, not clipped by 1px.
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-  "runuser -l admin -c 'jq \".bar.exclusionZoneBleed=true\" \
-   /home/admin/.config/qdshell/settings.json | sponge \
-   /home/admin/.config/qdshell/settings.json && \
-   systemctl --user reload qdshell.service' " || true
+  "runuser -u admin -- bash -c 'jq \".bar.exclusionZoneBleed=true\" \
+   /home/admin/.config/qdshell/settings.json > \
+   /home/admin/.config/qdshell/settings.json.tmp && \
+   mv /home/admin/.config/qdshell/settings.json.tmp \
+   /home/admin/.config/qdshell/settings.json'"
+# qdshell Settings.qml FileView has watchChanges:true → hot-reloads on edit.
 sleep 2
 "$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --no-pager | \
   grep -E 'qdshell-bar-exclusion-top-Virtual-1' | tail -1"
@@ -80,10 +82,12 @@ wired; reset to false before next test.
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-  "runuser -l admin -c 'jq \".bar.exclusionZoneBleed=false\" \
-   /home/admin/.config/qdshell/settings.json | sponge \
-   /home/admin/.config/qdshell/settings.json && \
-   systemctl --user reload qdshell.service' " || true
+  "runuser -u admin -- bash -c 'jq \".bar.exclusionZoneBleed=false\" \
+   /home/admin/.config/qdshell/settings.json > \
+   /home/admin/.config/qdshell/settings.json.tmp && \
+   mv /home/admin/.config/qdshell/settings.json.tmp \
+   /home/admin/.config/qdshell/settings.json'"
+sleep 2
 ```
 
 ## Cleanup
