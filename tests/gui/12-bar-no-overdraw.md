@@ -100,12 +100,25 @@ top border / titlebar should be intact, not clipped by 1px.
   "runuser -u admin -- bash -c 'jq \".bar.exclusionZoneBleed=true\" \
    /home/admin/.config/qdshell/settings.json > \
    /home/admin/.config/qdshell/settings.json.tmp && \
-   mv /home/admin/.config/qdshell/settings.json.tmp \
-   /home/admin/.config/qdshell/settings.json'"
-# qdshell Settings.qml FileView has watchChanges:true → hot-reloads on edit.
-sleep 2
-"$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --no-pager | \
-  grep -E 'qdshell-bar-exclusion-top-Virtual-1' | tail -1"
+   cat /home/admin/.config/qdshell/settings.json.tmp > \
+   /home/admin/.config/qdshell/settings.json && \
+   rm -f /home/admin/.config/qdshell/settings.json.tmp'"
+# Inode-preserving in-place write (cat > file, NOT mv): a rename-replace
+# swaps the inode, and qdshell's FileView/QFileSystemWatcher can miss or
+# lag the change by minutes (run 877512 reloaded ~2.5 min late; run
+# 1793885 never reloaded in-window → 3.1 false-FAIL). Truncating the SAME
+# inode fires IN_MODIFY → FileView watchChanges:true reloads promptly →
+# Settings.data.bar.exclusionZoneBleed flips → BarExclusionZone bleedInset
+# rebinds → implicitHeight 31→30 → qdwin reconfigures the exclusion zone.
+# Poll for that reconfigure (don't single-sleep-race the async reload).
+EXCL=""
+for _ in $(seq 1 15); do
+  sleep 1
+  EXCL=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --no-pager | \
+    grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1920x[0-9]+' | tail -1")
+  [ "$EXCL" = "1920x30" ] && break
+done
+echo "exclusion-top height after bleed=true: ${EXCL:-<none>}"
 ```
 
 **Assert (3.1):** with the bleed toggled on, the exclusion-top height
@@ -119,8 +132,9 @@ wired; reset to false before next test.
   "runuser -u admin -- bash -c 'jq \".bar.exclusionZoneBleed=false\" \
    /home/admin/.config/qdshell/settings.json > \
    /home/admin/.config/qdshell/settings.json.tmp && \
-   mv /home/admin/.config/qdshell/settings.json.tmp \
-   /home/admin/.config/qdshell/settings.json'"
+   cat /home/admin/.config/qdshell/settings.json.tmp > \
+   /home/admin/.config/qdshell/settings.json && \
+   rm -f /home/admin/.config/qdshell/settings.json.tmp'"
 sleep 2
 ```
 
