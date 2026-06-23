@@ -107,6 +107,10 @@ for _ in $(seq 1 10); do
 done
 [ -n "$MAXLINE" ] || { echo "ERROR: Super+Up did not maximize handle=$HANDLE (no set_maximized after the chord — WM shortcut not registered/dispatched?)"; exit 1; }
 echo "set_maximized (this run): $MAXLINE"
+case "$MAXLINE" in
+  *"outer=1920x1049 at (0,31)"*) ;;
+  *) echo "FAIL(2.1): set_maximized geometry wrong — expected outer=1920x1049 at (0,31), got: $MAXLINE"; exit 1;;
+esac
 qdwin_screenshot /tmp/12-step2-maximized.png
 ```
 
@@ -122,29 +126,41 @@ top border / titlebar should be intact, not clipped by 1px.
 ### Step 3 — toggle `exclusionZoneBleed: true` and confirm the regression
 
 ```bash
+# qdshell's FileView watchChanges hot-reload of settings.json is wildly
+# nondeterministic (reload latency ranged ~seconds to ~2.5min across runs,
+# independent of write method; a truncate-in-place write can also race a
+# mid-write read). The real user path is the in-process settings UI
+# (setText), not the file watcher, and there is no settings reload/set IPC.
+# So persist the change ATOMICALLY (mktemp+mv) and RESTART qdshell, which
+# re-reads settings.json on startup. This still proves the setting's effect
+# (bleed=true ⇒ exclusion 30) deterministically, decoupled from the flaky
+# watcher latency (codex design review, option B).
 "$QDWIN_VM_EXEC" "$VMNAME" \
-  "runuser -u admin -- bash -c 'jq \".bar.exclusionZoneBleed=true\" \
-   /home/admin/.config/qdshell/settings.json > \
-   /home/admin/.config/qdshell/settings.json.tmp && \
-   cat /home/admin/.config/qdshell/settings.json.tmp > \
-   /home/admin/.config/qdshell/settings.json && \
-   rm -f /home/admin/.config/qdshell/settings.json.tmp'"
-# Inode-preserving in-place write (cat > file, NOT mv): a rename-replace
-# swaps the inode, and qdshell's FileView/QFileSystemWatcher can miss or
-# lag the change by minutes (run 877512 reloaded ~2.5 min late; run
-# 1793885 never reloaded in-window → 3.1 false-FAIL). Truncating the SAME
-# inode fires IN_MODIFY → FileView watchChanges:true reloads promptly →
-# Settings.data.bar.exclusionZoneBleed flips → BarExclusionZone bleedInset
-# rebinds → implicitHeight 31→30 → qdwin reconfigures the exclusion zone.
-# Poll for that reconfigure (don't single-sleep-race the async reload).
+  "runuser -u admin -- bash -lc 'set -euo pipefail
+   cfg=/home/admin/.config/qdshell/settings.json
+   tmp=\$(mktemp /home/admin/.config/qdshell/settings.json.XXXXXX)
+   jq \".bar.exclusionZoneBleed=true\" \"\$cfg\" > \"\$tmp\"
+   mv \"\$tmp\" \"\$cfg\"'"
+
+# Cursor before the restart so we read the freshly-mapped exclusion surface.
+CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
+  --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
+"$QDWIN_VM_EXEC" "$VMNAME" \
+  "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+   systemctl --user restart qdshell.service"
+
 EXCL=""
-for _ in $(seq 1 15); do
+for _ in $(seq 1 20); do
   sleep 1
-  EXCL=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --no-pager | \
+  "$QDWIN_VM_EXEC" "$VMNAME" \
+    "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     systemctl --user is-active --quiet qdshell.service" || continue
+  EXCL=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
     grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1920x[0-9]+' | tail -1")
   [ "$EXCL" = "1920x30" ] && break
 done
-echo "exclusion-top height after bleed=true: ${EXCL:-<none>}"
+echo "exclusion-top height after bleed=true restart: ${EXCL:-<none>}"
+[ "$EXCL" = "1920x30" ] || { echo "FAIL(3.1): exclusionZoneBleed=true did not produce 1920x30 after qdshell restart"; exit 1; }
 ```
 
 **Assert (3.1):** with the bleed toggled on, the exclusion-top height
@@ -155,13 +171,30 @@ wired; reset to false before next test.
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-  "runuser -u admin -- bash -c 'jq \".bar.exclusionZoneBleed=false\" \
-   /home/admin/.config/qdshell/settings.json > \
-   /home/admin/.config/qdshell/settings.json.tmp && \
-   cat /home/admin/.config/qdshell/settings.json.tmp > \
-   /home/admin/.config/qdshell/settings.json && \
-   rm -f /home/admin/.config/qdshell/settings.json.tmp'"
-sleep 2
+  "runuser -u admin -- bash -lc 'set -euo pipefail
+   cfg=/home/admin/.config/qdshell/settings.json
+   tmp=\$(mktemp /home/admin/.config/qdshell/settings.json.XXXXXX)
+   jq \".bar.exclusionZoneBleed=false\" \"\$cfg\" > \"\$tmp\"
+   mv \"\$tmp\" \"\$cfg\"'"
+
+CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
+  --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
+"$QDWIN_VM_EXEC" "$VMNAME" \
+  "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+   systemctl --user restart qdshell.service"
+
+EXCL=""
+for _ in $(seq 1 20); do
+  sleep 1
+  "$QDWIN_VM_EXEC" "$VMNAME" \
+    "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     systemctl --user is-active --quiet qdshell.service" || continue
+  EXCL=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
+    grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1920x[0-9]+' | tail -1")
+  [ "$EXCL" = "1920x31" ] && break
+done
+echo "exclusion-top height after bleed=false restart: ${EXCL:-<none>}"
+[ "$EXCL" = "1920x31" ] || { echo "FAIL: exclusionZoneBleed=false did not restore 1920x31 after qdshell restart"; exit 1; }
 ```
 
 ## Cleanup
