@@ -74,13 +74,39 @@ HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
    qs ipc -p /usr/share/quickshell/qdshell call qdwin focusWindow $HANDLE" >/dev/null 2>&1
 sleep 1
 
+# Best-effort wait for qdshell's WindowManagerService to register the WM
+# shortcuts, so the Super+Up chord isn't dropped by lazy registration
+# under full-run load (per 19-wm-policy.md). The HARD guard is the
+# cursor-scoped set_maximized check below; this only reduces flake.
+for _ in $(seq 1 10); do
+  "$QDWIN_VM_EXEC" "$VMNAME" \
+    "journalctl _UID=1000 --no-pager | grep -q 'registered WM shortcuts'" && break
+  sleep 1
+done
+
+# Capture a fresh cursor IMMEDIATELY before the chord so the set_maximized
+# assertion reads ONLY this chord's effect — never a stale or unrelated
+# line. Since the client does not self-maximize, this journal line is the
+# sole proof the Super+Up → request_maximize path actually fired.
+MAXCURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
+  --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
+
 # Maximize via the WM Super+Up shortcut (real-keyboard chord through
 # QMP — the same mechanism 04/15/19 use for compositor-side chords).
 qdwin_chord meta_l -- up
-sleep 2
 
-"$QDWIN_VM_EXEC" "$VMNAME" \
-  "journalctl _UID=1000 --no-pager | grep 'qdwin: set_maximized' | tail -1"
+# Poll (don't single-sleep-race) for THIS chord's set_maximized on our
+# handle, scoped to the post-chord cursor.
+MAXLINE=""
+for _ in $(seq 1 10); do
+  sleep 1
+  MAXLINE=$("$QDWIN_VM_EXEC" "$VMNAME" \
+    "journalctl _UID=1000 --after-cursor='$MAXCURSOR' --no-pager | \
+     grep -E 'qdwin: set_maximized handle=$HANDLE max=1' | tail -1")
+  [ -n "$MAXLINE" ] && break
+done
+[ -n "$MAXLINE" ] || { echo "ERROR: Super+Up did not maximize handle=$HANDLE (no set_maximized after the chord — WM shortcut not registered/dispatched?)"; exit 1; }
+echo "set_maximized (this run): $MAXLINE"
 qdwin_screenshot /tmp/12-step2-maximized.png
 ```
 
