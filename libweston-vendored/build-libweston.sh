@@ -100,9 +100,25 @@ fi
 
 cd "$SRC"
 
-# Reconfigure if build/ doesn't exist. meson handles incremental rebuilds
-# thereafter; delete the build dir to force a profile/option change.
-if [[ ! -f "$BUILD/build.ninja" ]]; then
+# Reuse the existing build dir for fast incremental rebuilds, but ONLY when it
+# was configured against *this* source tree. meson bakes the absolute source
+# path into the build config, so a build dir produced against a different tree —
+# e.g. an in-tree build-prod/ that rode along in a VM source snapshot, or a
+# sibling checkout under a different path — leaves ninja unable to regenerate
+# (its recorded srcdir no longer exists). That fails the bake, and the caller
+# silently degrades to distro libweston. Detect the mismatch and reconfigure
+# from scratch; on any doubt, wipe (a clean rebuild is always correct, just
+# slower). Delete the build dir by hand to force a profile/option change.
+reuse_build=0
+if [[ -f "$BUILD/build.ninja" && -f "$BUILD/meson-info/meson-info.json" ]]; then
+    if grep -Fq "\"source\": \"$(realpath "$SRC")\"" "$BUILD/meson-info/meson-info.json"; then
+        reuse_build=1
+    else
+        echo "note: libweston build dir $BUILD was configured against a" \
+             "different source tree (not $SRC) — wiping and reconfiguring" >&2
+    fi
+fi
+if [[ "$reuse_build" -eq 0 ]]; then
     rm -rf "$BUILD"
     # The trailing -D flags disable optional weston features qdwin does not use
     # so the production tree builds without their devel deps. backend-drm's
