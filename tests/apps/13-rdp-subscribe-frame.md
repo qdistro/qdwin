@@ -26,7 +26,12 @@ This scenario REQUIRES:
   pipewire output, qdwin emits `denied "no free pipewire output"`
   and the rest of the scenario short-circuits.
 
-Fail loudly if any prereq is missing; do not skip.
+Fail loudly if any of the *infrastructure* prereqs above (host `xfreerdp`,
+VM `qdistro-forward`, `qdwin-bystander`, a free pipewire output) is missing;
+do not skip those. The *subject* app `foot`, however, is part of the opt-in
+`QDWIN_APP_DEPS` matrix: on a lean GUI golden (no `QDWIN_APP_DEPS=1`) it is
+legitimately absent, so SKIP cleanly per the apps/AGENTS.md rule rather than
+ERROR (see the Setup guard below).
 
 ## Setup
 
@@ -42,6 +47,14 @@ command -v xfreerdp >/dev/null 2>&1 || command -v xfreerdp3 >/dev/null 2>&1 \
 # VM: confirm qdistro-forward.
 "$QDWIN_VM_EXEC" "$VMNAME" 'test -x /usr/bin/qdistro-forward' \
     || { echo "FAIL: qdistro-forward not installed on VM"; exit 1; }
+
+# Subject app: foot is the toplevel shared over RDP and is part of the opt-in
+# qdwin app-deps matrix. On a lean GUI golden (no QDWIN_APP_DEPS=1) it is
+# legitimately absent — SKIP cleanly rather than ERROR, matching apps/05/07/08.
+if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v foot >/dev/null 2>&1'; then
+    echo "SKIP: foot not installed; qdwin app deps are opt-in (rerun with QDWIN_APP_DEPS=1)"
+    exit 0
+fi
 
 "$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; sleep 1' >/dev/null
 
