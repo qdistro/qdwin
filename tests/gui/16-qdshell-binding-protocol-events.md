@@ -91,7 +91,15 @@ HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
   "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
    grep -E 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=qdistro-test-window' | tail -1 | \
    sed -nE 's/.*handle=([0-9]+).*/\1/p'")
-echo "subject handle=$HANDLE"
+# Resolve the window's real PID from the SAME toplevel_added line so Step 4
+# can close it by PID rather than by brittle command-line matching. The grep
+# stays scoped to this spawn's `$CURSOR` and this run's `$HANDLE`, so it can
+# never pick up a stale line from an earlier compositor session.
+PID=$("$QDWIN_VM_EXEC" "$VMNAME" \
+  "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
+   grep -E 'qdwin: toplevel_added handle=$HANDLE uid=1000 pid=[0-9]+ app_id=qdistro-test-window' | tail -1 | \
+   sed -nE 's/.*pid=([0-9]+).*/\1/p'")
+echo "subject handle=$HANDLE pid=$PID"
 ```
 
 **Assert (2.1):** $HANDLE is a number (qdwin's `toplevel_added
@@ -129,15 +137,45 @@ onToplevelAdded is broken.
 
 ### Step 4 — toplevel_removed reaches QML and clears focus
 
+Close the window by its resolved PID (`$PID` from Step 2), NOT by
+`pkill -f` on the command line. A process-pattern kill silently
+matches nothing when the client's argv differs from the pattern (the
+original failure mode: `Process info:` was empty at close time, the
+window was never killed, yet removal was still asserted). If no PID
+was resolved we cannot deterministically close the window, so the
+step is classified as an ERROR (test/infra problem) rather than
+asserting the removal of a window we never closed.
+
 ```bash
+# No resolvable PID => cannot close deterministically. ERROR, not FAIL.
+case "$PID" in
+    ''|*[!0-9]*) echo "ERROR: Step 4 — could not resolve a PID for handle=$HANDLE from qdwin's toplevel_added log (cannot close the window deterministically)"; exit 1;;
+esac
+
 CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window --title qd16-step2"'
-sleep 1
+echo "closing qd16-step2 pid=$PID (handle=$HANDLE)"
+"$QDWIN_VM_EXEC" "$VMNAME" "kill $PID 2>/dev/null; true"
+
+# Bounded wait for the compositor to log the teardown, instead of a fixed
+# 2s sleep: poll for `toplevel_removed handle=$HANDLE` for up to ~10s.
+removed=
+for _ in $(seq 1 50); do
+    "$QDWIN_VM_EXEC" "$VMNAME" \
+        "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
+         grep -qE 'qdwin: toplevel_removed handle=$HANDLE'" && { removed=1; break; }
+    sleep 0.2
+done
+
+# Fail loudly if the teardown was never observed, so a non-LLM runner
+# cannot silently continue past an unremoved window.
+[ -n "$removed" ] || { echo "FAIL: no 'qdwin: toplevel_removed handle=$HANDLE' within ~10s of killing pid=$PID"; exit 1; }
 ```
 
 **Assert (4.1):** `qdwin: toplevel_removed handle=$HANDLE` after
-`$CURSOR`.
+`$CURSOR` (i.e. the bounded wait above set `removed=1`). If `removed`
+is empty the window's teardown was never observed within ~10s of the
+kill.
 
 **Assert (4.2):** `qdwin: seat_focus_changed seat=default
 handle=4294967295` after `$CURSOR` — the focus drops to UINT32_MAX

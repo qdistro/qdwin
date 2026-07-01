@@ -118,9 +118,14 @@ Pre-conditions for app-deps runs:
   `zypper -n install` from the matrix run on 2026-05-05; bake into a
   fresh image when the matrix is stable).
 - For the Tk/FLTK/Swing scenarios: `python313-tk`, `libfltk1_3`,
-  `fltk-devel`, `java-25-openjdk-devel` installed; demo source files
-  live under `phase1/gui-tests/qdwin-apps/demos/` and are served
-  from the host HTTP server rooted at the qdistro repo top.
+  `fltk-devel`, `java-25-openjdk-devel`, and an X11 bitmap font package
+  (`xorg-x11-fonts` / `xorg-x11-fonts-core`, needed or Tk fails with
+  `failed to allocate font`) installed; demo source files live under
+  `tests/apps/demos/` (next to the scenarios) and are staged into the
+  VM by scenario 10 itself via a private free-port host HTTP server
+  rooted at that `demos/` directory (no fixed `:8765` port — that was a
+  parallel-CI collision hazard). If Tk fails only on the font, report
+  `INFRA: Tk font allocation failed`, not a compositor FAIL.
 
 These heavy app dependencies are opt-in for lean GUI goldens. If an
 app-specific package such as `chromium` is absent because the VM was
