@@ -463,6 +463,11 @@ def check_capture_and_secctx_are_shell_only(logic_source):
         # findings F4: layer-shell hidden from secctx clients (overlays / lock
         # surfaces are shell/locker-only); bind gate remains as second layer.
         frozenset(["QDWIN_GLOBAL_LAYER_SHELL"]): "cred!=QDWIN_CRED_SECCTX",
+        # fable-6 phase 4: qdwin_locker_v1 and qdwin_nested_manager_v1 are
+        # privileged session/control surfaces. They must be hidden from secctx
+        # clients by the filter, with bind-time gates as a second layer.
+        frozenset(["QDWIN_GLOBAL_LOCKER"]): "cred!=QDWIN_CRED_SECCTX",
+        frozenset(["QDWIN_GLOBAL_NESTED_MANAGER"]): "cred!=QDWIN_CRED_SECCTX",
         # 02/S1 inherited sweep: weston_touch_calibration (global touch remap /
         # touch grab) hidden from secctx/silo clients; ordinary admin tools keep
         # it. libweston applies no bind-time pin, so the filter is the gate.
@@ -549,6 +554,10 @@ FILTER_GATED_KIND = {
     # shell + locker; hidden from secctx clients so the bind gate is a second
     # layer, not the sole defense. Closes qdwin's own "Production TODO".
     "layer_shell_global": "QDWIN_GLOBAL_LAYER_SHELL",
+    # fable-6 phase 4: session locker and nested manager are visible only to
+    # non-secctx session clients; their bind handlers still enforce peer pins.
+    "locker_global": "QDWIN_GLOBAL_LOCKER",
+    "nested_manager_global": "QDWIN_GLOBAL_NESTED_MANAGER",
 }
 FILTER_GATED_GLOBALS = set(FILTER_GATED_KIND)
 
@@ -564,9 +573,7 @@ INTENTIONALLY_VISIBLE_GLOBALS = {
     # NOTE: shell_global moved to FILTER_GATED_KIND (QDWIN_GLOBAL_SHELL) —
     # findings F0; it is now hidden from secctx clients by the filter.
     "output_mgmt_global",      # output-management: S13 om_mutation_allowed gate
-    "locker_global",           # session locker: locker bind gate (host 07)
     "xdg_activation_global",   # xdg-activation: activation gating (host 09)
-    "nested_manager_global",   # nested manager: nested-identity gate (host 16)
     # NOTE: layer_shell_global moved to FILTER_GATED_KIND
     # (QDWIN_GLOBAL_LAYER_SHELL) — findings F4; now hidden from secctx clients.
     "stream_input_global",     # stream-input: request-time claim gate (one-shot

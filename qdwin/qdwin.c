@@ -489,11 +489,13 @@ struct qdwin_toplevel {
 	 * when no sink (e.g. pre-S3 advertise with input_sink=""). Used
 	 * to send PING + (S3b) motion/button/key packets. */
 	int proxy_input_sink_fd;
-	/* §6.8 S4: pending admin gating. Proxy stays held until shell
-	 * issues nested_proxy_decision. Cleared on any decision (allow
-	 * → moves to normal; deny → destroys; defer → stays held with
-	 * pending=true). For pre-v8 shells this stays false (auto-allow). */
-	bool nested_proxy_pending_decision;
+		/* §6.8 S4: pending admin gating. Proxy stays held until shell
+		 * issues nested_proxy_decision. Cleared on any decision (allow
+		 * → moves to normal; deny → destroys; defer → stays held with
+		 * pending=true). In production/default config this is also true
+		 * when no v8+ shell can decide, so no-shell advertises fail
+		 * closed unless QDWIN_NESTED_BROKER_OPTIONAL=1 is set. */
+		bool nested_proxy_pending_decision;
 	/* Back-ref so the qdwin_nested_toplevel resource destroy can
 	 * tear down the proxy. NULL on non-proxy toplevels. */
 	struct qdwin_nested_toplevel *proxy_nested_owner;
@@ -8438,6 +8440,15 @@ bind_qdwin_locker(struct wl_client *client, void *data,
 		   "(allowed_locker_uid=%u)\n",
 		   (int)pid, (unsigned)uid,
 		   (unsigned)qdwin->allowed_locker_uid);
+
+	if (qdwin_secctx_client_find(qdwin, client)) {
+		weston_log("qdwin: locker bind rejected pid=%d uid=%u "
+			   "(secctx client)\n",
+			   (int)pid, (unsigned)uid);
+		wl_client_post_implementation_error(client,
+			"qdwin_locker_v1: secctx clients may not bind");
+		return;
+	}
 
 	if (uid != qdwin->allowed_locker_uid) {
 		wl_client_post_implementation_error(client,
@@ -17055,6 +17066,21 @@ struct qdwin_nested_toplevel {
 	struct wl_list link;  /* qdwin::nested_toplevels */
 };
 
+#define QDWIN_NESTED_TOPLEVEL_CAP_PER_UID 64u
+
+static uint32_t
+qdwin_nested_count_for_uid(struct qdwin *qdwin, uid_t uid)
+{
+	uint32_t n = 0;
+	struct qdwin_nested_toplevel *t;
+
+	wl_list_for_each(t, &qdwin->nested_toplevels, link) {
+		if ((uid_t)t->origin_uid == uid)
+			n++;
+	}
+	return n;
+}
+
 static void
 qdwin_nested_toplevel_destroy_req(struct wl_client *client,
 				  struct wl_resource *resource)
@@ -17416,6 +17442,20 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 		origin_uid = (uint32_t)peer_uid;
 	}
 
+	uint32_t advertised = qdwin_nested_count_for_uid(qdwin, peer_uid);
+	if (advertised >= QDWIN_NESTED_TOPLEVEL_CAP_PER_UID) {
+		weston_log("qdwin: nested-toplevel advertise refused uid=%u "
+			   "count=%u cap=%u\n",
+			   (unsigned)peer_uid, advertised,
+			   QDWIN_NESTED_TOPLEVEL_CAP_PER_UID);
+		wl_resource_post_error(
+			resource,
+			QDWIN_NESTED_MANAGER_V1_ERROR_POLICY_DENIED,
+			"nested toplevel advertise cap reached for uid %u",
+			(unsigned)peer_uid);
+		return;
+	}
+
 	struct wl_resource *tl_res = wl_resource_create(
 		client, &qdwin_nested_toplevel_v1_interface,
 		wl_resource_get_version(resource), id);
@@ -17628,6 +17668,14 @@ bind_qdwin_nested_manager(struct wl_client *client, void *data,
 			  uint32_t version, uint32_t id)
 {
 	struct qdwin *qdwin = data;
+
+	if (qdwin_secctx_client_find(qdwin, client)) {
+		weston_log("qdwin: nested bind refused for secctx client\n");
+		wl_client_post_implementation_error(
+			client,
+			"qdwin_nested: secctx clients may not bind");
+		return;
+	}
 
 	/* Peer-uid filter: same rule as qdwin_shell_v1 — only the
 	 * allowed_uid may bind. Nested-compositor clients run as the
@@ -18968,11 +19016,12 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 		if (cx < 0) cx = 0;
 		if (cy < 0) cy = 0;
 	}
-	/* §6.8 S4: gate visibility behind admin-broker decision when a
-	 * v8+ shell is bound. Pre-v8 shells (or no shell) auto-allow
-	 * unless QDWIN_NESTED_BROKER_REQUIRED=1, in which case we hold
-	 * indefinitely (fail-closed). The proxy starts on held layer
-	 * (invisible) and releases on `allow`, destroys on `deny`.
+	/* §6.8 S4: gate visibility behind admin-broker decision. Production
+	 * defaults fail-closed: pre-v8 shells (or no shell) leave the proxy held
+	 * indefinitely instead of auto-showing. Dev/test can explicitly restore
+	 * the old optional posture with QDWIN_NESTED_BROKER_OPTIONAL=1.
+	 * The proxy starts on held layer (invisible) and releases on `allow`,
+	 * destroys on `deny`.
 	 *
 	 * Decide pending BEFORE building the curtain so its input region
 	 * matches the broker boundary (F6#2): a PENDING proxy keeps an
@@ -18987,10 +19036,10 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 	 * it later replaces the curtain, carries its own (default-full)
 	 * input region. Invariant: pending => empty input; visible => full;
 	 * pixel-bound => the consumer surface's own input. */
-	bool gate_required = false;
-	const char *req_env = getenv("QDWIN_NESTED_BROKER_REQUIRED");
-	if (req_env && strcmp(req_env, "1") == 0)
-		gate_required = true;
+	bool gate_required = true;
+	const char *opt_env = getenv("QDWIN_NESTED_BROKER_OPTIONAL");
+	if (opt_env && strcmp(opt_env, "1") == 0)
+		gate_required = false;
 	bool shell_can_gate = (qdwin->shell_bound && qdwin->shell_resource &&
 		wl_resource_get_version(qdwin->shell_resource) >= 8);
 	bool pending = (shell_can_gate || gate_required);
@@ -20698,6 +20747,12 @@ qdwin_classify_global(struct qdwin *qdwin, const struct wl_global *global)
 	if (qdwin->layer_shell_global &&
 	    global == qdwin->layer_shell_global)
 		return QDWIN_GLOBAL_LAYER_SHELL;
+	if (qdwin->locker_global &&
+	    global == qdwin->locker_global)
+		return QDWIN_GLOBAL_LOCKER;
+	if (qdwin->nested_manager_global &&
+	    global == qdwin->nested_manager_global)
+		return QDWIN_GLOBAL_NESTED_MANAGER;
 	return QDWIN_GLOBAL_ORDINARY;
 }
 

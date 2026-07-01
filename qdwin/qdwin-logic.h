@@ -161,6 +161,8 @@ enum qdwin_global_kind {
 	QDWIN_GLOBAL_SHELL = 6,             /* qdwin_shell_v1 (trusted shell role) */
 	QDWIN_GLOBAL_LAYER_SHELL = 7,       /* zwlr_layer_shell_v1 (overlays/lock) */
 	QDWIN_GLOBAL_TOUCH_CALIBRATION = 8, /* weston_touch_calibration (input remap) */
+	QDWIN_GLOBAL_LOCKER = 9,            /* qdwin_locker_v1 (session lock/unlock) */
+	QDWIN_GLOBAL_NESTED_MANAGER = 10,   /* qdwin_nested_manager_v1 */
 };
 
 /* Pure policy: may a client of credential class `cred` SEE/BIND a global of

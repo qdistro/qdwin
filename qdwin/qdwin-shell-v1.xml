@@ -765,8 +765,9 @@
 
         `handle` matches the toplevel_added event's handle that fired
         immediately before this. Shells that don't bind v8 don't get
-        this event and proxies auto-allow (compositor's
-        `QDWIN_NESTED_BROKER_REQUIRED=1` env can override to fail-closed).
+        this event; in production/default config those proxies remain
+        held fail-closed. Dev/test can explicitly restore the old
+        auto-allow posture with `QDWIN_NESTED_BROKER_OPTIONAL=1`.
       </description>
       <arg name="handle" type="uint"/>
       <arg name="app_id" type="string"/>

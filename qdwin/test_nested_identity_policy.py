@@ -87,6 +87,101 @@ def check_advertise_binds_origin_uid(source):
     return 0
 
 
+def check_nested_manager_bind_rejects_secctx(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+bind_qdwin_nested_manager\s*\(",
+        "bind_qdwin_nested_manager",
+    )
+    if err:
+        return fail(err)
+    if "qdwin_secctx_client_find(qdwin, client)" not in body:
+        return fail("nested_manager bind does not reject secctx clients")
+    gate = re.search(
+        r"if\s*\(\s*qdwin_secctx_client_find\(qdwin,\s*client\)\s*\)\s*\{"
+        r"(.*?)\n\t\}",
+        body, re.DOTALL)
+    if not gate:
+        return fail("nested_manager secctx bind gate not found in expected shape")
+    if "wl_client_post_implementation_error" not in gate.group(1) or \
+            "return;" not in gate.group(1):
+        return fail("nested_manager secctx bind gate does not reject before "
+                    "resource creation")
+    secctx_pos = body.find("qdwin_secctx_client_find(qdwin, client)")
+    create_pos = body.find("wl_resource_create")
+    if create_pos < 0 or secctx_pos > create_pos:
+        return fail("nested_manager secctx bind gate must run before "
+                    "wl_resource_create")
+    return 0
+
+
+def check_locker_bind_rejects_secctx(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+bind_qdwin_locker\s*\(",
+        "bind_qdwin_locker",
+    )
+    if err:
+        return fail(err)
+    if "qdwin_secctx_client_find(qdwin, client)" not in body:
+        return fail("locker bind does not reject secctx clients")
+    secctx_pos = body.find("qdwin_secctx_client_find(qdwin, client)")
+    uid_pos = body.find("uid != qdwin->allowed_locker_uid")
+    create_pos = body.find("wl_resource_create")
+    if create_pos < 0 or secctx_pos < 0 or secctx_pos > create_pos:
+        return fail("locker secctx bind gate must run before "
+                    "wl_resource_create")
+    if uid_pos >= 0 and secctx_pos > uid_pos:
+        return fail("locker secctx bind gate should run before the uid-only "
+                    "locker gate")
+    return 0
+
+
+def check_nested_advertise_has_cap(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_nested_manager_advertise_toplevel\s*\(",
+        "qdwin_nested_manager_advertise_toplevel",
+    )
+    if err:
+        return fail(err)
+    if "QDWIN_NESTED_TOPLEVEL_CAP_PER_UID" not in source:
+        return fail("nested advertise has no named per-uid/per-client cap")
+    if "qdwin_nested_count_for_uid" not in body:
+        return fail("advertise_toplevel does not count existing nested "
+                    "toplevels before allocation")
+    if "QDWIN_NESTED_MANAGER_V1_ERROR_POLICY_DENIED" not in body:
+        return fail("advertise_toplevel cap does not fail closed with a "
+                    "protocol error")
+    count_pos = body.find("qdwin_nested_count_for_uid")
+    create_pos = body.find("wl_resource_create")
+    if create_pos < 0 or count_pos < 0 or count_pos > create_pos:
+        return fail("nested advertise cap must run before wl_resource_create "
+                    "and calloc")
+    return 0
+
+
+def check_nested_broker_gate_defaults_closed(source):
+    body, err = _function_body(
+        source,
+        r"static struct qdwin_toplevel \*\s+qdwin_nested_proxy_create\s*\(",
+        "qdwin_nested_proxy_create",
+    )
+    if err:
+        return fail(err)
+    if "QDWIN_NESTED_BROKER_OPTIONAL" not in body:
+        return fail("nested broker gate lacks an explicit dev/test optional "
+                    "override")
+    if re.search(r"bool\s+gate_required\s*=\s*false\s*;", body):
+        return fail("nested broker gate still defaults optional/open")
+    if not re.search(r"bool\s+gate_required\s*=\s*true\s*;", body):
+        return fail("nested broker gate does not default to required/closed")
+    if "strcmp(opt_env, \"1\") == 0" not in body:
+        return fail("nested broker optional mode is not explicitly gated by "
+                    "QDWIN_NESTED_BROKER_OPTIONAL=1")
+    return 0
+
+
 def check_input_sink_peercred(source):
     body, err = _function_body(
         source,
@@ -689,9 +784,9 @@ def check_generic_raise_paths_preserve_pending_gate(source):
 
 
 def check_stream_input_helper_bound(source):
-    """The view-stream input claim must remain tied to the spawned helper
-    pid (defence-in-depth alongside the one-shot access_token). This is the
-    pre-existing contract we must not regress."""
+    """The view-stream input claim remains filter-visible by design, so the
+    request-time capability must be unguessable, one-shot, and tied to the
+    spawned helper pid."""
     body, err = _function_body(
         source,
         r"static void\s+qdwin_stream_input_handle_claim\s*\(",
@@ -704,6 +799,32 @@ def check_stream_input_helper_bound(source):
     if "pid != s->forward_pid" not in body:
         return fail("stream_input claim no longer binds the claiming pid to "
                     "the spawned forward helper")
+    if "s->input_claimed" not in body:
+        return fail("stream_input claim no longer enforces one-shot token use")
+    if "QDWIN_STREAM_INPUT_V1_ERROR_ALREADY_CLAIMED" not in body:
+        return fail("stream_input duplicate claim does not fail closed")
+    token_fn, err = _function_body(
+        source,
+        r"static int\s+qdwin_hex_token\s*\(",
+        "qdwin_hex_token",
+    )
+    if err:
+        return fail(err)
+    if "getrandom" not in token_fn:
+        return fail("stream_input token source is not kernel getrandom")
+    stream_body, err = _function_body(
+        source,
+        r"static void\s+qdwin_handle_subscribe_view_stream\s*\(",
+        "qdwin_handle_subscribe_view_stream",
+    )
+    if err:
+        return fail(err)
+    if "qdwin_hex_token(s->access_token, sizeof s->access_token, 16)" not in stream_body:
+        return fail("stream_input access_token is not generated from 16 "
+                    "random bytes")
+    if "qdwin_view_stream_spawn_forward" not in stream_body:
+        return fail("stream_input access_token is not handed only to the "
+                    "spawned forward helper path")
     return 0
 
 
@@ -714,6 +835,10 @@ def main():
 
     checks = (
         check_fd_peer_uid_fails_closed,
+        check_nested_manager_bind_rejects_secctx,
+        check_locker_bind_rejects_secctx,
+        check_nested_advertise_has_cap,
+        check_nested_broker_gate_defaults_closed,
         check_advertise_binds_origin_uid,
         check_input_sink_peercred,
         check_bind_proxy_pixels_ownership,

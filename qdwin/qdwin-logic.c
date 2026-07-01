@@ -201,6 +201,18 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 		 * instead of the sole defense. not-SECCTX, same rationale as the
 		 * shell global re: ordinary clients and startup. */
 		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_LOCKER:
+		/* qdwin_locker_v1 can drive lock/unlock state. qdlocker is a
+		 * non-secctx session component; sandboxed silo clients should not
+		 * see the global, and bind_qdwin_locker keeps the uid/exe/label
+		 * identity pin as the second layer. */
+		return cred != QDWIN_CRED_SECCTX;
+	case QDWIN_GLOBAL_NESTED_MANAGER:
+		/* qdwin_nested_manager_v1 advertises proxy toplevels into the
+		 * trusted shell. Hide it from secctx clients, then bind-time uid
+		 * and secctx gates plus advertise caps enforce the remaining
+		 * boundary. */
+		return cred != QDWIN_CRED_SECCTX;
 	case QDWIN_GLOBAL_TOUCH_CALIBRATION:
 		/* weston_touch_calibration drives global touch-input calibration
 		 * and grabs touch during a calibration session — a cross-silo
