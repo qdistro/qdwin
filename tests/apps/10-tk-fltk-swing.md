@@ -15,6 +15,29 @@ source).
 source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
+
+# App-deps gate (opt-in): Tk/FLTK/Swing are heavy toolkit deps that are only
+# baked into the QDWIN_APP_DEPS golden, not the lean GUI golden. Detect each
+# toolkit's build/run prerequisite IN THE VM up front:
+#   - Tk    : `python3 -c 'import tkinter'`   (python313-tk)
+#   - FLTK  : `g++` + the FLTK dev headers    (fltk-devel, pulls gcc-c++)
+#   - Swing : `javac`                          (java-25-openjdk-devel)
+# If NONE are installed this is a lean golden -> clean SKIP (never ERROR/FAIL),
+# exactly like the chromium/vlc scenarios. Mirrors tests/apps/AGENTS.md:
+# "an app-specific package absent because the VM was not built with
+#  QDWIN_APP_DEPS=1 -> clean SKIP: <app> not installed; qdwin app deps are
+#  opt-in". Each present toolkit still runs; a per-step guard below skips any
+# individual toolkit whose dep is missing (partial app-deps image) rather than
+# erroring.
+HAVE_TK=0;    "$QDWIN_VM_EXEC" "$VMNAME" "python3 -c 'import tkinter' 2>/dev/null" && HAVE_TK=1
+HAVE_FLTK=0;  "$QDWIN_VM_EXEC" "$VMNAME" 'command -v g++ >/dev/null 2>&1 && test -e /usr/include/FL/Fl.H' && HAVE_FLTK=1
+HAVE_SWING=0; "$QDWIN_VM_EXEC" "$VMNAME" 'command -v javac >/dev/null 2>&1' && HAVE_SWING=1
+echo "toolkit deps: tk=$HAVE_TK fltk=$HAVE_FLTK swing=$HAVE_SWING"
+if [ "$HAVE_TK" = 0 ] && [ "$HAVE_FLTK" = 0 ] && [ "$HAVE_SWING" = 0 ]; then
+    echo "SKIP: no Tk/FLTK/Swing toolkits installed (python313-tk / fltk-devel / java-25-openjdk-devel); qdwin app deps are opt-in (rerun with QDWIN_APP_DEPS=1)"
+    exit 0
+fi
+
 qdwin_apps_kill_all
 
 # Locate the checked-in demo sources on the host. They live in demos/
@@ -60,6 +83,11 @@ echo "serving $DEMOS_DIR at $DEMOS (pid $DEMOS_HTTP_PID)"
 ### Step 1 — Tk via Python
 
 ```bash
+# Re-detect Tk inline so this guard is correct even if $HAVE_TK from Setup did
+# not persist into this step's shell.
+if ! "$QDWIN_VM_EXEC" "$VMNAME" "python3 -c 'import tkinter' 2>/dev/null"; then
+    echo "SKIP step 1 (Tk): python313-tk not installed; qdwin app deps are opt-in"
+else
 qdwin_apps_launch tk "wget -qO /tmp/tk-demo.py $DEMOS/tk-demo.py && python3 /tmp/tk-demo.py" \
     2>&1 | tee /tmp/10-step1-launch.log
 sleep 6
@@ -79,9 +107,10 @@ qdwin_apps_kill_all
 if grep -q 'failed to allocate font' /tmp/10-step1-tk.log 2>/dev/null; then
     echo "INFRA: Tk font allocation failed in VM template (install xorg-x11-fonts / xorg-x11-fonts-core); Tk sub-case is an env prerequisite, not a qdwin bug"
 fi
+fi
 ```
 
-**Assert (1.1):** screenshot shows the Tk window: title "Tk on qdwin",
+**Assert (1.1):** if `HAVE_TK=1`, screenshot shows the Tk window: title "Tk on qdwin",
 "Tkinter demo" header in bold, an entry field with "type here", and
 a "Click me" button. Standard Tk theme (grey background, default
 ttk widgets).
@@ -97,6 +126,9 @@ In-VM build of the fetched `fltk-demo.cxx`. The bake step is
 idempotent.
 
 ```bash
+if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v g++ >/dev/null 2>&1 && test -e /usr/include/FL/Fl.H'; then
+    echo "SKIP step 2 (FLTK): fltk-devel/g++ not installed; qdwin app deps are opt-in"
+else
 "$QDWIN_VM_EXEC" "$VMNAME" "wget -qO /tmp/fltk-demo.cxx $DEMOS/fltk-demo.cxx && \
     g++ -o /tmp/fltk-demo /tmp/fltk-demo.cxx -lfltk" \
     2>&1 | tee /tmp/10-step2-build.log | tail -3
@@ -106,9 +138,10 @@ sleep 4
 qdwin_apps_screenshot /tmp/10-step2-fltk.png
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/fltk.log" 2>&1 | tee /tmp/10-step2-fltk.log
 qdwin_apps_kill_all
+fi
 ```
 
-**Assert (2.1):** screenshot shows the FLTK window: title "FLTK on
+**Assert (2.1):** if `HAVE_FLTK=1`, screenshot shows the FLTK window: title "FLTK on
 qdwin", File / Edit menu bar, "FLTK demo" centred header, "Text:"
 label with entry "type here", "Click me" button. Distinctive flat
 FLTK widgets.
@@ -116,6 +149,9 @@ FLTK widgets.
 ### Step 3 — Java Swing
 
 ```bash
+if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v javac >/dev/null 2>&1'; then
+    echo "SKIP step 3 (Swing): javac (java-25-openjdk-devel) not installed; qdwin app deps are opt-in"
+else
 "$QDWIN_VM_EXEC" "$VMNAME" "wget -qO /tmp/SwingDemo.java $DEMOS/SwingDemo.java && \
     cd /tmp && javac SwingDemo.java" \
     2>&1 | tee /tmp/10-step3-build.log | tail -3
@@ -125,9 +161,10 @@ sleep 10
 qdwin_apps_screenshot /tmp/10-step3-swing.png
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/swing.log" 2>&1 | tee /tmp/10-step3-swing.log
 qdwin_apps_kill_all
+fi
 ```
 
-**Assert (3.1):** screenshot shows the Swing window: title "Swing on
+**Assert (3.1):** if `HAVE_SWING=1`, screenshot shows the Swing window: title "Swing on
 qdwin", File / Edit menu bar, "Swing demo" header, "type here" text
 field, "Click me" button. Metal (Java default) look-and-feel.
 
@@ -142,13 +179,21 @@ qdwin_apps_kill_all
 
 ## Pass criteria
 
-- Each of Tk/FLTK/Swing renders a window with the named widgets.
-- Bystander log shows `xwayland=1` for each toplevel.
+- Each INSTALLED toolkit (`HAVE_*=1`) renders a window with the named
+  widgets, and the bystander log shows `xwayland=1` for its toplevel.
+- A toolkit whose dep is absent is a **clean SKIP**, never a FAIL/ERROR:
+  Tk/FLTK/Swing are opt-in `QDWIN_APP_DEPS` packages, so on a lean golden
+  the whole scenario short-circuits to `SKIP` in Setup, and on a partial
+  app-deps image each missing toolkit's step reports `SKIP step N (...)`.
+  Overall status is `PASS` if every installed toolkit passed, `SKIP` if
+  none were installed.
 
 ## Known failure modes
 
-- **`python3 -c "import tkinter"` fails** — VM is missing
-  `python313-tk`. Install in Setup.
+- **`python3 -c "import tkinter"` fails** — VM is missing `python313-tk`.
+  This is an opt-in app dep, so the Setup gate records `HAVE_TK=0` and Step 1
+  reports `SKIP step 1 (Tk)` — it is NOT a FAIL. Install `python313-tk`
+  (via `QDWIN_APP_DEPS=1`) to exercise it.
 - **`_tkinter.TclError: failed to allocate font`** — the VM template
   has no usable X11 bitmap font, so Tk cannot allocate its default
   font and the window is black with no `toplevel_added`. This is an
@@ -156,7 +201,10 @@ qdwin_apps_kill_all
   `xorg-x11-fonts` (and `xorg-x11-fonts-core`) are installed in the
   template; if absent, report the Tk sub-case as
   `INFRA: Tk font allocation failed` per AGENTS.md rather than FAIL.
-- **`g++` not found** — VM missing `gcc-c++`. The fltk-devel pull
-  drags it in; double-check `which g++`.
-- **`javac` not found** — VM has only `java-25-openjdk-headless` (no
-  JDK). Install `java-25-openjdk-devel`.
+- **`g++` / FLTK headers not found** — VM missing `gcc-c++` / `fltk-devel`.
+  The Setup gate records `HAVE_FLTK=0` and Step 2 reports `SKIP step 2 (FLTK)`
+  — an opt-in app dep, not a FAIL. `fltk-devel` drags in `gcc-c++`.
+- **`javac` not found** — VM has only `java-25-openjdk-headless` (no JDK),
+  or no Java at all. The Setup gate records `HAVE_SWING=0` and Step 3 reports
+  `SKIP step 3 (Swing)` — an opt-in app dep, not a FAIL. Install
+  `java-25-openjdk-devel` (via `QDWIN_APP_DEPS=1`) to exercise Swing.
