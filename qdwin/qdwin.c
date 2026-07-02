@@ -19040,6 +19040,11 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 	const char *opt_env = getenv("QDWIN_NESTED_BROKER_OPTIONAL");
 	if (opt_env && strcmp(opt_env, "1") == 0)
 		gate_required = false;
+	const char *s3d_env = getenv("QDWIN_NESTED_S3D_TEST");
+	const char *req_env = getenv("QDWIN_NESTED_BROKER_REQUIRED");
+	if (s3d_env && strcmp(s3d_env, "1") == 0 &&
+	    (!req_env || strcmp(req_env, "1") != 0))
+		gate_required = false;
 	bool shell_can_gate = (qdwin->shell_bound && qdwin->shell_resource &&
 		wl_resource_get_version(qdwin->shell_resource) >= 8);
 	bool pending = (shell_can_gate || gate_required);
