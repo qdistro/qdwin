@@ -10,7 +10,7 @@ which is the load-bearing path for most Electron apps in practice.
 ## Setup
 
 ```bash
-source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
+source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v chromium >/dev/null 2>&1'; then

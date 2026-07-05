@@ -8,7 +8,7 @@ hardcoded to 0 in `qdwin_send_toplevel_added` at `qdwin.c:752`).
 ## Setup
 
 ```bash
-source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
+source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 qdwin_apps_kill_all

@@ -37,7 +37,7 @@ The scenarios use a shared helper at `qdwin-apps-helpers.sh`. Source it
 once per session:
 
 ```bash
-source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
+source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME:-apps-qdwin-...}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 ```

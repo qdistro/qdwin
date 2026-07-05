@@ -190,15 +190,15 @@ runuser -u admin -- env -i \
     GDK_BACKEND=wayland \
     bash -s -- "\$cmd" "$name" <<'EOADMIN'
 set -eu
-cmd=$1
-name=$2
+cmd=\$1
+name=\$2
 # Push only display/runtime vars into the D-Bus activation environment so
 # GApplication single-instance apps (e.g. gnome-text-editor) inherit a display.
-# Do not push toolkit backend variables: per-app XWayland overrides such as
-# `env GDK_BACKEND=x11 ...` must remain effective.
+# Do not push toolkit backend variables: per-app XWayland overrides (e.g.
+# env GDK_BACKEND=x11) must remain effective.
 dbus-update-activation-environment --systemd \
     WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR 2>/dev/null || true
-setsid sh -c "$cmd" </dev/null >/tmp/${name}.log 2>&1 &
+setsid sh -c "\$cmd" </dev/null >/tmp/\${name}.log 2>&1 &
 EOADMIN
 EOLAUNCH
 )

@@ -12,7 +12,7 @@ source).
 ## Setup
 
 ```bash
-source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
+source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 
@@ -41,8 +41,7 @@ fi
 qdwin_apps_kill_all
 
 # Locate the checked-in demo sources on the host. They live in demos/
-# next to this scenario (tests/apps/demos), NOT under the historical
-# phase1/gui-tests/qdwin-apps/demos path.
+# next to this scenario (tests/apps/demos), not under a compatibility shim.
 DEMOS_DIR=""
 for cand in "${QDWIN_REPO:-}/tests/apps/demos" \
             "$QDWIN_WORKSPACE/qdwin/tests/apps/demos"; do

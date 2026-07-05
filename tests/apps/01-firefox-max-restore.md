@@ -8,7 +8,7 @@ sticking at the maximised dimensions. Regression-tests qdwin bug #1
 ## Setup
 
 ```bash
-source phase1/gui-tests/qdwin-apps/qdwin-apps-helpers.sh
+source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 qdwin_apps_kill_all
