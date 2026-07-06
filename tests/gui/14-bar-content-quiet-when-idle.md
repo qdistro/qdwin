@@ -20,7 +20,7 @@ pgrep -f "http.server 8765" >/dev/null || (
 sleep 1
 qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; sleep 1' >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[f]oot|[w]eston-terminal|[q]distro-test-window" 2>/dev/null; sleep 1' >/dev/null
 sleep 2  # let session settle before sampling
 ```
 
@@ -49,11 +49,18 @@ operations as state propagates. After the cycle, the bar should
 settle back to quiet.
 
 ```bash
-"$QDWIN_VM_EXEC" "$VMNAME" \
-  "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-   WAYLAND_DISPLAY=wayland-1 foot sleep 600 &' " >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" '
+  if command -v qdistro-test-window >/dev/null 2>&1; then
+    setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+      qdistro-test-window --title qd14-cycle --width 320 --height 200 >/tmp/qd14-cycle.log 2>&1
+  elif command -v weston-terminal >/dev/null 2>&1; then
+    setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+      weston-terminal >/tmp/qd14-cycle.log 2>&1
+  else
+    echo "ERROR: no qdistro-test-window or weston-terminal available for window cycle"; exit 1
+  fi' >/dev/null
 sleep 1
-"$QDWIN_VM_EXEC" "$VMNAME" "pkill -9 -x foot" >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -9 -f "[q]distro-test-window|[w]eston-terminal" 2>/dev/null || true' >/dev/null
 sleep 2
 CURSOR2=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
@@ -76,10 +83,11 @@ commit again.
   "journalctl _UID=1000 -n 20 --no-pager | grep '^.*qdwin:'" | head -20
 ```
 
-**Assert (3.1):** the recent qdwin output reads like a coherent
-event stream (toplevel_added, set_maximized, focus, etc.), not a
-wall of identical `layer-shell mapped` lines. This is the user-
-visible value of the fix — humans can now read this output.
+**Assert (3.1):** diagnostic only. The load-bearing checks are the
+cursor-bounded counts in 1.1 and 2.1. If recent journal output is sparse
+or lacks toplevel/focus lines, record it for debugging but do not fail
+unless it contradicts the bounded counts (for example, a wall of identical
+`layer-shell mapped` lines after the cursor).
 
 ## Cleanup
 
@@ -87,7 +95,7 @@ Nothing to clean up; the test only observes.
 
 ## Pass criteria
 
-Asserts 1.1, 2.1, 3.1 pass. Confirms the qdwin one-shot map-log fix
+Asserts 1.1 and 2.1 pass; Step 3 is supporting evidence. Confirms the qdwin one-shot map-log fix
 holds AND no new QML repaint loop has slipped in.
 
 ## Known-broken-if

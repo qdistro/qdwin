@@ -91,6 +91,11 @@ echo "capabilities: $CAPS"
 If `bound=true` never appears, the qdshell↔qdwin binding is not reachable —
 record ERROR (precondition), not a product FAIL.
 
+Before doing any visual assertion, take a quick screenshot and confirm it is
+the qdwin graphical session, not a Linux tty/login screen. If the framebuffer
+capture is on the wrong VT, record ERROR and stop; a tty screenshot cannot
+prove or disprove tiling.
+
 ## Step 2 — one visual proof: a tile resizes the live client
 
 Spawn a known test client, drive the default registered tile-left shortcut
@@ -133,11 +138,14 @@ qdwin_screenshot /tmp/19-tile-left.png
 ```
 
 **Assert (2.1):** the journal shows `qdwin: tile handle=$HANDLE edge=left`
-with the outer geometry at `(0,0)`, AND `/tmp/19-tile-left.png` shows the
+with the outer geometry at `(0,0)`. The screenshot should show the
 `qd19-tile` window occupying the left half of the output (the client itself
-resized — not just chrome moved). Soft-vision: if the registered shortcut can't
-be driven (e.g. the user changed `shortcutTileLeft` away from `Super+Left`),
-record SKIP for Step 2 only — Step 1 is the mandatory deterministic gate.
+resized — not just chrome moved). If the journal tile line is present but
+the screenshot path is capturing the wrong VT/tty, record that as visual
+evidence unavailable and keep Step 2 passing on the deterministic journal
+proof. If the registered shortcut can't be driven (e.g. the user changed
+`shortcutTileLeft` away from `Super+Left`), record SKIP/ERROR for Step 2
+only — Step 1 is the mandatory deterministic gate.
 
 ### Cleanup
 

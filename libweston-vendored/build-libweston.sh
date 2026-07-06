@@ -29,6 +29,36 @@ SRC="$HERE/src"
 
 PROFILE="${QDWIN_LIBWESTON_PROFILE:-headless}"
 
+prepare_pinned_git_subproject() {
+    local name="$1"
+    local wrap="$SRC/subprojects/$name.wrap"
+    local dir="$SRC/subprojects/$name"
+    local revision want have
+
+    [ -f "$wrap" ] || return 0
+    revision=$(sed -n 's/^[[:space:]]*revision[[:space:]]*=[[:space:]]*//p' "$wrap" | head -n1)
+    [ -n "$revision" ] || return 0
+    [ -d "$dir" ] || return 0
+
+    if [ ! -d "$dir/.git" ]; then
+        echo "note: removing non-git subproject $dir so Meson can honor $wrap" >&2
+        rm -rf "$dir"
+        return 0
+    fi
+
+    if want=$(git -C "$dir" rev-parse --verify "$revision^{commit}" 2>/dev/null); then
+        have=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
+        if [ "$have" != "$want" ]; then
+            echo "note: resetting subproject $name from ${have:-unknown} to pinned $revision" >&2
+            git -C "$dir" checkout -q --detach "$want"
+            git -C "$dir" clean -fdx -q
+        fi
+    else
+        echo "note: removing subproject $dir; existing checkout lacks pinned revision $revision" >&2
+        rm -rf "$dir"
+    fi
+}
+
 case "$PROFILE" in
 headless)
     BUILD="$SRC/build"
@@ -99,6 +129,13 @@ if [[ ! -d "$SRC" ]]; then
 fi
 
 cd "$SRC"
+
+# Meson prefers an existing subprojects/<name>/ checkout over the .wrap file.
+# qci source tarballs can therefore carry a stale display-info checkout from a
+# prior local build; Weston 14 needs libdisplay-info < 0.3.0, while a stale
+# checkout at newer upstream HEAD reports 0.4.0-dev and makes the DRM backend
+# configure fail. Keep the checkout aligned with display-info.wrap before setup.
+prepare_pinned_git_subproject "display-info"
 
 # Reuse the existing build dir for fast incremental rebuilds, but ONLY when it
 # was configured against *this* source tree. meson bakes the absolute source

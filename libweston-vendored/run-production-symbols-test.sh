@@ -153,7 +153,7 @@ preflight_deps() {
         "fontconfig         libfontconfig-dev     fontconfig-devel         always"
         "glib-2.0           libglib2.0-dev        glib2-devel              always"
         "libva              libva-dev             libva-devel              always"
-        "lcms2              liblcms2-dev          lcms2-devel              lcms"
+        "lcms2              liblcms2-dev          liblcms2-devel           lcms"
         "egl                libegl-dev            Mesa-libEGL-devel        gl"
         "glesv2             libgles-dev           Mesa-libGLESv2-devel     gl"
         "x11                libx11-dev            libX11-devel             x11"

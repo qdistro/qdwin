@@ -155,7 +155,7 @@ esac
 CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
 echo "closing qd16-step2 pid=$PID (handle=$HANDLE)"
-"$QDWIN_VM_EXEC" "$VMNAME" "kill $PID 2>/dev/null; true"
+"$QDWIN_VM_EXEC" "$VMNAME" "kill -TERM $PID 2>/dev/null; sleep 0.5; kill -KILL $PID 2>/dev/null || true"
 
 # Bounded wait for the compositor to log the teardown, instead of a fixed
 # 2s sleep: poll for `toplevel_removed handle=$HANDLE` for up to ~10s.
@@ -175,7 +175,7 @@ done
 **Assert (4.1):** `qdwin: toplevel_removed handle=$HANDLE` after
 `$CURSOR` (i.e. the bounded wait above set `removed=1`). If `removed`
 is empty the window's teardown was never observed within ~10s of the
-kill.
+TERM/KILL close sequence.
 
 **Assert (4.2):** `qdwin: seat_focus_changed seat=default
 handle=4294967295` after `$CURSOR` — the focus drops to UINT32_MAX

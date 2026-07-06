@@ -14,6 +14,10 @@ the 2026-05-14 fix.
 
 ```bash
 source ${QDWIN_REPO}/tests/gui/qdwin-helpers.sh
+if [ -f "${QDLOCKER_REPO:-${QDWIN_REPO}/../qdlocker}/tests/gui/qdlocker-helpers.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${QDLOCKER_REPO:-${QDWIN_REPO}/../qdlocker}/tests/gui/qdlocker-helpers.sh"
+fi
 qdwin_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
 
 pgrep -f "http.server 8765" >/dev/null || (
@@ -23,7 +27,24 @@ pgrep -f "http.server 8765" >/dev/null || (
 sleep 1
 qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 
-"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; sleep 1' >/dev/null
+# A previous qdlocker scenario can leave the compositor in a real locked
+# state. In that state global keybindings are intentionally suppressed and
+# the keyboard is routed to the locker as `overlay_key role=2`, which is not
+# a failure of the keybinding instrumentation this scenario is trying to
+# exercise.
+if command -v qdlocker_drain_lock_state >/dev/null 2>&1; then
+    qdlocker_drain_lock_state || { echo "FAIL: could not drain stale qdlocker lock state"; exit 1; }
+else
+    case "$("$QDWIN_VM_EXEC" "$VMNAME" 'printf "status\n" | runuser -u admin -- socat -t 1 - UNIX-CONNECT:/run/user/1000/qdlocker.sock 2>/dev/null || true')" in
+        *locked=True*)
+            "$QDWIN_VM_EXEC" "$VMNAME" \
+              'runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart qdlocker.service; sleep 2' \
+              >/dev/null
+            ;;
+    esac
+fi
+
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[f]oot|[w]eston-terminal|[q]distro-test-window" 2>/dev/null; sleep 1' >/dev/null
 ```
 
 ## Steps
@@ -55,9 +76,16 @@ a proxy if the screenshot is ambiguous).
 ```bash
 # Need two windows for the switcher to do meaningful work.
 for i in 1 2; do
-    "$QDWIN_VM_EXEC" "$VMNAME" \
-      "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-       WAYLAND_DISPLAY=wayland-1 foot sleep 600 &' " >/dev/null
+    "$QDWIN_VM_EXEC" "$VMNAME" '
+      if command -v qdistro-test-window >/dev/null 2>&1; then
+        setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+          qdistro-test-window --title "qd15-switch-'"$i"'" --width 320 --height 200 >/tmp/qd15-switch-'"$i"'.log 2>&1
+      elif command -v weston-terminal >/dev/null 2>&1; then
+        setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+          weston-terminal >/tmp/qd15-switch-'"$i"'.log 2>&1
+      else
+        echo "ERROR: no qdistro-test-window or weston-terminal available"; exit 1
+      fi' >/dev/null
     sleep 1
 done
 CURSOR2=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
@@ -119,6 +147,7 @@ keystroke. **Skipped when no registering shell is present.**
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; true' >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[w]eston-terminal|[q]distro-test-window" 2>/dev/null; true' >/dev/null
 ```
 
 ## Pass criteria
@@ -140,5 +169,8 @@ Confirms the 2026-05-14 keybinding-instrumentation fix
   you used `qdwin_chord alt -- tab` (QMP), NOT
   `qdwin_send_key KEY_LEFTALT KEY_TAB` (virsh send-key). See the
   AGENTS.md "Why two key paths" post-mortem.
+- all steps show only `qdwin: overlay_key role=2`: the screen is locked
+  and the locker grab is active. The setup drain failed or was skipped;
+  fix the stale lock state before blaming qdwin keybindings.
 - 3.1 silent: `qdwin_handle_lock_key` reached but didn't reach any
   log branch — gate inversion somewhere.
