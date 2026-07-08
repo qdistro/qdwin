@@ -191,6 +191,9 @@ static void qdwin_maybe_promote_lock_toplevel(struct qdwin *qdwin,
 					      const char *cause);
 static void qdwin_demote_lock_toplevel(struct qdwin *qdwin,
 				       const char *cause);
+static void qdwin_install_lock_curtain(struct qdwin *qdwin);
+static void qdwin_remove_lock_curtain(struct qdwin *qdwin);
+static void qdwin_lock_curtain_to_bottom(struct qdwin *qdwin);
 static struct qdwin_toplevel *
 qdwin_toplevel_from_handle(struct qdwin *qdwin, uint32_t handle);
 /* v24 workspaces — mechanics + ext-workspace-v1 server. Forward-declared
@@ -854,6 +857,17 @@ struct qdwin {
 	 * pre-v18 shells and as a safety net if the shell's background
 	 * is destroyed. */
 	struct weston_curtain *background;
+	/* Opaque black curtain kept at the BOTTOM of lock_layer whenever the
+	 * compositor is locked. While locked, qdwin_hide_non_lock_layers()
+	 * unsets every non-lock layer — including background_layer and its own
+	 * black curtain — so lock_layer is the only thing composited. If the
+	 * locker surface is transparent, absent, or crashed, the pixman/DRM
+	 * renderer (which repaints only damaged regions) would leave stale
+	 * desktop pixels on screen (the qdlocker software-GL transparent-buffer
+	 * leak). This curtain paints the whole output black every frame so a
+	 * broken locker can only ever yield black, never a desktop leak. The
+	 * real lock view is stacked above it. Mirrors `background`. */
+	struct weston_curtain *lock_curtain;
 	/* v18 shell-owned desktop background. NULL until attach_background. */
 	struct qdwin_background *shell_background;
 	struct wl_listener output_created_listener;
@@ -1366,6 +1380,7 @@ qdwin_maybe_promote_lock_toplevel(struct qdwin *qdwin,
 	qdwin->lock_view_is_toplevel = 1;
 
 	qdwin_toplevel_move_to_layer(tl, &qdwin->lock_layer);
+	qdwin_lock_curtain_to_bottom(qdwin);
 	qdwin_toplevel_set_fullscreen(qdwin, tl, true, NULL);
 	weston_log("qdwin: promoted locker toplevel handle=%u to lock_layer via %s\n",
 		   tl->handle, cause ? cause : "unknown");
@@ -6046,6 +6061,8 @@ qdwin_lock_surface_commit_cb(struct wl_listener *l, void *data)
 	struct qdwin *qdwin = wl_container_of(l, qdwin, lock_surface_commit);
 	(void)data;
 	qdwin_lock_surface_place(qdwin);
+	if (qdwin->locked)
+		qdwin_lock_curtain_to_bottom(qdwin);
 	weston_compositor_schedule_repaint(qdwin->compositor);
 }
 
@@ -6093,6 +6110,10 @@ qdwin_lock_surface_destroyed_cb(struct wl_listener *l, void *data)
 		 * a toplevel exists; the legacy shell lock path uses a raw
 		 * view, so repaint explicitly). */
 		qdwin_demote_lock_toplevel(qdwin, "lock-surface-destroy");
+		/* Reassert the black curtain so the now-empty lock layer is
+		 * actually composited to black (the demoted toplevel is gone;
+		 * without the curtain the renderer would leave stale pixels). */
+		qdwin_install_lock_curtain(qdwin);
 		weston_compositor_schedule_repaint(qdwin->compositor);
 		weston_log("qdwin: lock held (fail-secure) "
 			   "cause=lock-surface-destroy — awaiting fresh locker\n");
@@ -6409,8 +6430,10 @@ qdwin_handle_set_locked(struct wl_client *client,
 	if (want) {
 		if (wl_resource_get_version(resource) >= 17)
 			qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
+		qdwin_install_lock_curtain(qdwin);
 		qdwin_hide_non_lock_layers(qdwin);
 	} else {
+		qdwin_remove_lock_curtain(qdwin);
 		if (qdwin->overlay_grab_active &&
 		    qdwin->overlay_grab_role == 2)
 			qdwin_overlay_grab_end(qdwin);
@@ -8358,6 +8381,11 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 	if (qdwin->locked == want) return;
 	qdwin->locked = want;
 	if (want) {
+		/* Install the curtain first so the toplevels promoted below
+		 * (which insert at the head of lock_layer) naturally land above
+		 * it; qdwin_maybe_promote_lock_toplevel re-bottoms the curtain
+		 * after each move as belt-and-suspenders. */
+		qdwin_install_lock_curtain(qdwin);
 		struct qdwin_toplevel *tl;
 		wl_list_for_each(tl, &qdwin->toplevels, link)
 			qdwin_maybe_promote_lock_toplevel(qdwin, tl,
@@ -8365,6 +8393,7 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 		qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 		qdwin_hide_non_lock_layers(qdwin);
 	} else {
+		qdwin_remove_lock_curtain(qdwin);
 		qdwin_demote_lock_toplevel(qdwin, "locker_set_locked=0");
 		if (qdwin->overlay_grab_active &&
 		    qdwin->overlay_grab_role == 2)
@@ -8633,6 +8662,105 @@ qdwin_refresh_background(struct qdwin *qdwin)
 				  &qdwin->background_layer.view_list);
 	weston_log("qdwin: background curtain %dx%d installed\n",
 		   max_x, max_y);
+}
+
+/* Move the lock curtain to the BOTTOM of lock_layer. weston_layer.view_list
+ * is front-to-back (head = topmost); weston_view_move_to_layer() inserts at
+ * the head, so we then relink the curtain to the tail. Re-asserted after any
+ * path that can restack a real lock view (promote/place/commit) so the curtain
+ * always sits behind the actual lock UI. Weston 14 has no
+ * weston_layer_entry_insert(), hence the raw wl_list splice. */
+static void
+qdwin_lock_curtain_to_bottom(struct qdwin *qdwin)
+{
+	struct weston_view *view;
+
+	if (!qdwin->lock_curtain)
+		return;
+	view = qdwin->lock_curtain->view;
+	if (view->layer_link.layer != &qdwin->lock_layer)
+		weston_view_move_to_layer(view, &qdwin->lock_layer.view_list);
+	wl_list_remove(&view->layer_link.link);
+	wl_list_insert(qdwin->lock_layer.view_list.link.prev,
+		       &view->layer_link.link);
+	view->layer_link.layer = &qdwin->lock_layer;
+	qdwin->compositor->view_list_needs_rebuild = true;
+	weston_surface_damage(view->surface);
+}
+
+static void
+qdwin_remove_lock_curtain(struct qdwin *qdwin)
+{
+	if (!qdwin->lock_curtain)
+		return;
+	weston_shell_utils_curtain_destroy(qdwin->lock_curtain);
+	qdwin->lock_curtain = NULL;
+	qdwin->compositor->view_list_needs_rebuild = true;
+}
+
+/* (Re)create the opaque black lock curtain sized to the spanning output bbox
+ * and park it at the bottom of lock_layer. No-op-removes it if not locked, so
+ * it is safe to call from output-resize while the lock state is unknown. */
+static void
+qdwin_install_lock_curtain(struct qdwin *qdwin)
+{
+	int min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+	struct weston_output *out;
+	bool have_output = false;
+
+	if (!qdwin->locked) {
+		qdwin_remove_lock_curtain(qdwin);
+		return;
+	}
+
+	/* Full spanning bbox, tracking min AND max so outputs at negative
+	 * global coordinates are covered — a lock curtain that missed an
+	 * output would leak the desktop there once non-lock layers are hidden. */
+	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		int left = out->pos.c.x, top = out->pos.c.y;
+		int right = left + out->width, bottom = top + out->height;
+		if (!have_output) {
+			min_x = left; min_y = top;
+			max_x = right; max_y = bottom;
+			have_output = true;
+			continue;
+		}
+		if (left < min_x) min_x = left;
+		if (top < min_y) min_y = top;
+		if (right > max_x) max_x = right;
+		if (bottom > max_y) max_y = bottom;
+	}
+	if (!have_output || max_x <= min_x || max_y <= min_y) {
+		/* No usable output geometry (e.g. all outputs transiently gone
+		 * during a hotplug reconfigure). Deliberately KEEP any existing
+		 * curtain rather than remove it: while locked, a stale black
+		 * curtain is fail-secure; dropping it could momentarily expose
+		 * the desktop. output-create/resize will re-install at the
+		 * correct bbox once an output returns. */
+		return;
+	}
+
+	if (qdwin->lock_curtain)
+		qdwin_remove_lock_curtain(qdwin);
+
+	struct weston_curtain_params params = {
+		.r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 1.0f,
+		.pos = { .c = weston_coord(min_x, min_y) },
+		.width = max_x - min_x,
+		.height = max_y - min_y,
+		.capture_input = false,  /* never steal pointer/overlay grab */
+	};
+	qdwin->lock_curtain =
+		weston_shell_utils_curtain_create(qdwin->compositor, &params);
+	if (!qdwin->lock_curtain) {
+		weston_log("qdwin: lock curtain create failed\n");
+		return;
+	}
+	weston_view_move_to_layer(qdwin->lock_curtain->view,
+				  &qdwin->lock_layer.view_list);
+	qdwin_lock_curtain_to_bottom(qdwin);
+	weston_log("qdwin: lock curtain %dx%d @ (%d,%d) installed\n",
+		   max_x - min_x, max_y - min_y, min_x, min_y);
 }
 
 /* ------------------------------------------------------------------
@@ -10923,6 +11051,8 @@ qdwin_om_config_realize(struct qdwin_om_config *cfg, bool test_only)
 	/* Re-derive dependent shell state (background/panels/fractional-scale)
 	 * the same way the output_changed listener does. */
 	qdwin_refresh_background(qdwin);
+	if (qdwin->locked)
+		qdwin_install_lock_curtain(qdwin);  /* resize to new bbox */
 	qdwin_fractional_scale_broadcast(qdwin);
 	qdwin_panels_on_output_change(qdwin);
 	return true;
@@ -11549,6 +11679,10 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	if (qdwin->background) {
 		weston_shell_utils_curtain_destroy(qdwin->background);
 		qdwin->background = NULL;
+	}
+	if (qdwin->lock_curtain) {
+		weston_shell_utils_curtain_destroy(qdwin->lock_curtain);
+		qdwin->lock_curtain = NULL;
 	}
 	wl_list_remove(&qdwin->output_created_listener.link);
 	wl_list_remove(&qdwin->output_resized_listener.link);

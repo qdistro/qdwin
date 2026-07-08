@@ -88,6 +88,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <time.h>
 
 #include <wayland-client.h>
@@ -100,6 +101,9 @@ struct probe {
 	uint32_t locker_version;
 	int saw_global;
 	int got_ready;
+	/* Only bound in --transparent-lock mode (map a lock surface). */
+	struct wl_compositor *compositor;
+	struct wl_shm *shm;
 };
 
 static void
@@ -135,6 +139,11 @@ on_global(void *data, struct wl_registry *reg, uint32_t name,
 		p->saw_global = 1;
 		p->locker_name = name;
 		p->locker_version = version < 1 ? version : 1;
+	} else if (strcmp(interface, wl_compositor_interface.name) == 0) {
+		p->compositor = wl_registry_bind(reg, name,
+						 &wl_compositor_interface, 1);
+	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
+		p->shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
 	}
 }
 
@@ -359,9 +368,84 @@ run_separate_takeover(void)
 	return 6;
 }
 
+/* Fully-transparent (premultiplied ARGB 0x00000000) SHM buffer. */
+static struct wl_buffer *
+make_transparent_buffer(struct wl_shm *shm, int w, int h)
+{
+	int stride = w * 4, size = stride * h;
+	int fd = memfd_create("qdwin-locker-probe", MFD_CLOEXEC);
+	if (fd < 0)
+		return NULL;
+	if (ftruncate(fd, size) < 0) { close(fd); return NULL; }
+	uint32_t *px = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (px == MAP_FAILED) { close(fd); return NULL; }
+	memset(px, 0, size);  /* 0x00000000 => fully transparent */
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+	struct wl_buffer *buf = wl_shm_pool_create_buffer(
+		pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+	wl_shm_pool_destroy(pool);
+	munmap(px, size);
+	close(fd);
+	return buf;
+}
+
+/* --transparent-lock: model a broken/hostile locker that attaches a fully
+ * TRANSPARENT lock surface and locks. The compositor's lock curtain must still
+ * occlude the desktop (black), never let lower layers show through. Bind as
+ * locker, attach a transparent lock surface, set_locked(1), print a readiness
+ * marker, then idle (dispatching) until the harness kills us so it can
+ * screenshot the locked output. Drives tests/host/26-lock-curtain-occludes.md.
+ * This never returns 0 on its own; the harness terminates it. */
+static int
+run_transparent_lock(void)
+{
+	struct probe p;
+	struct qdwin_locker_v1 *l = NULL;
+
+	if (fresh_locker_conn(&p, &l) != 0)
+		return 2;
+	if (!p.compositor || !p.shm) {
+		fprintf(stderr, "qdwin-locker-probe: transparent-lock needs "
+			"wl_compositor + wl_shm (not advertised)\n");
+		return 2;
+	}
+	qdwin_locker_v1_bind_as_locker(l);
+	if (roundtrip_err(&p, "bind_as_locker", NULL, NULL) != 0 || !p.got_ready) {
+		fprintf(stderr, "qdwin-locker-probe: bind_as_locker/ready "
+			"failed\n");
+		return 2;
+	}
+
+	struct wl_surface *surface = wl_compositor_create_surface(p.compositor);
+	struct qdwin_locker_surface_v1 *ls =
+		qdwin_locker_v1_attach_lock_surface(l, surface);
+	(void)ls;
+	struct wl_buffer *buf = make_transparent_buffer(p.shm, 1920, 1080);
+	if (!buf) {
+		fprintf(stderr, "qdwin-locker-probe: transparent buffer "
+			"alloc failed\n");
+		return 2;
+	}
+	wl_surface_attach(surface, buf, 0, 0);
+	wl_surface_damage(surface, 0, 0, 1920, 1080);
+	wl_surface_commit(surface);
+	qdwin_locker_v1_set_locked(l, 1);
+	if (wl_display_roundtrip(p.display) < 0)
+		return 2;
+
+	/* Readiness marker: the harness screenshots after this line. */
+	printf("qdwin-locker-probe: transparent lock engaged\n");
+	fflush(stdout);
+
+	while (wl_display_dispatch(p.display) != -1)
+		;
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	enum { M_DEFAULT, M_DOUBLE, M_REBIND, M_SEP_TAKEOVER } mode = M_DEFAULT;
+	enum { M_DEFAULT, M_DOUBLE, M_REBIND, M_SEP_TAKEOVER,
+	       M_TRANSPARENT_LOCK } mode = M_DEFAULT;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--double-bind") == 0)
 			mode = M_DOUBLE;
@@ -369,10 +453,14 @@ int main(int argc, char *argv[])
 			mode = M_REBIND;
 		else if (strcmp(argv[i], "--separate-takeover") == 0)
 			mode = M_SEP_TAKEOVER;
+		else if (strcmp(argv[i], "--transparent-lock") == 0)
+			mode = M_TRANSPARENT_LOCK;
 	}
 
 	if (mode == M_SEP_TAKEOVER)
 		return run_separate_takeover();
+	if (mode == M_TRANSPARENT_LOCK)
+		return run_transparent_lock();
 
 	struct probe p = {0};
 	p.display = wl_display_connect(NULL);
