@@ -5326,8 +5326,13 @@ qdwin_stream_input_inject_pointer_button(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited)
-		return;                  /* allow_input=0 => read-only: drop the event */
+	if (!s || !s->allow_input || !s->seat_inited ||
+	    !s->tl || !s->tl->view || !s->tl->view->surface)
+		return;                  /* allow_input=0 or detached target (toplevel
+					  * torn down, stream awaiting forward exit):
+					  * fail closed — after the confine grab ends
+					  * the default grab would route this to an
+					  * UNRELATED window (mm-merge review HIGH) */
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
 	notify_button(&s->stream_seat, &ts, (int32_t)button,
 		      state ? WL_POINTER_BUTTON_STATE_PRESSED
@@ -5344,8 +5349,13 @@ qdwin_stream_input_inject_pointer_axis(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited)
-		return;                  /* allow_input=0 => read-only: drop the event */
+	if (!s || !s->allow_input || !s->seat_inited ||
+	    !s->tl || !s->tl->view || !s->tl->view->surface)
+		return;                  /* allow_input=0 or detached target (toplevel
+					  * torn down, stream awaiting forward exit):
+					  * fail closed — after the confine grab ends
+					  * the default grab would route this to an
+					  * UNRELATED window (mm-merge review HIGH) */
 	struct weston_pointer_axis_event ev = {
 		.axis = axis,  /* 0=vertical, 1=horizontal (wl_pointer.axis) */
 		.value = wl_fixed_to_double(value),
@@ -5363,8 +5373,13 @@ qdwin_stream_input_inject_key(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited)
-		return;                  /* allow_input=0 => read-only: drop the event */
+	if (!s || !s->allow_input || !s->seat_inited ||
+	    !s->tl || !s->tl->view || !s->tl->view->surface)
+		return;                  /* allow_input=0 or detached target (toplevel
+					  * torn down, stream awaiting forward exit):
+					  * fail closed — after the confine grab ends
+					  * the default grab would route this to an
+					  * UNRELATED window (mm-merge review HIGH) */
 
 	qdwin_stream_seat_assert_focus(s);
 

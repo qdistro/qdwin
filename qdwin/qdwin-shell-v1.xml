@@ -268,7 +268,10 @@
       <description summary="user clicked close on the chrome">
         Forward a close request to the backing toplevel. qdwin calls
         `xdg_toplevel.close` after checking policy (not locked,
-        not rate-limited).
+        not rate-limited). Exception: toplevels whose security context
+        engine is `qdistro.mm` (multi-machine remote windows) are
+        silently refused — their close is source-mediated through the
+        mm broker; xdg-closing the local viewer client is forbidden.
       </description>
       <arg name="handle" type="uint"/>
     </request>
