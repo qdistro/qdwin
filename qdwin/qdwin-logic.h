@@ -172,6 +172,17 @@ enum qdwin_global_kind {
 bool qdwin_global_visible(enum qdwin_cred_class cred,
 			  enum qdwin_global_kind kind);
 
+/* Narrow exception to the generic SECCTX denial for the nested-manager
+ * global. Tier-2's launcher deliberately gives its inner Weston publisher a
+ * security context; only that exact engine + executable pair may see/bind the
+ * manager. All ordinary silo applications remain denied. */
+bool qdwin_nested_secctx_publisher_allowed(const char *sandbox_engine,
+					   const char *peer_exe);
+
+/* Exact root-installed helper allowed to obtain a secondary shell-protocol
+ * resource for bind_proxy_pixels without acquiring the shell role. */
+bool qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe);
+
 /* ------------------------------------------------------------------
  * Deliberate fail-open / broad-trust pins (02/S13).
  *

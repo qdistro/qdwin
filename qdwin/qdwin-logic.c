@@ -233,6 +233,26 @@ qdwin_global_visible(enum qdwin_cred_class cred,
 }
 
 bool
+qdwin_nested_secctx_publisher_allowed(const char *sandbox_engine,
+				      const char *peer_exe)
+{
+	/* The production tier-2 path mounts the root-owned qdwin shell module
+	 * into its read-only image and connects the inner /usr/bin/weston through
+	 * a launcher-minted qdistro.tier2 security-context socket. Do not accept
+	 * a basename, an empty/unreadable executable, or another silo engine. */
+	return sandbox_engine && peer_exe &&
+	       strcmp(sandbox_engine, "qdistro.tier2") == 0 &&
+	       strcmp(peer_exe, "/usr/bin/weston") == 0;
+}
+
+bool
+qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe)
+{
+	return peer_exe &&
+	       strcmp(peer_exe, "/usr/bin/qdistro-nested-pixelfeed") == 0;
+}
+
+bool
 qdwin_om_mutation_allowed(bool client_is_bound_shell,
 			  bool shell_bound,
 			  pid_t client_pid, uid_t client_uid,

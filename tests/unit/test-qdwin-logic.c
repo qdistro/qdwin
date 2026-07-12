@@ -416,6 +416,46 @@ static void test_global_visibility(void)
 	      "unknown global kind denied to secctx (fail closed)");
 }
 
+/* Ensures: the production tier-2 nested compositor can publish its window,
+ * while another sandbox application cannot gain the nested-manager global by
+ * merely carrying a security context or a weston-looking basename. */
+static void test_nested_secctx_publisher_identity(void)
+{
+	CHECK(qdwin_nested_secctx_publisher_allowed(
+		      "qdistro.tier2", "/usr/bin/weston"),
+	      "tier2 inner /usr/bin/weston is an authorized nested publisher");
+	CHECK(!qdwin_nested_secctx_publisher_allowed(
+		       "qdistro.tier1", "/usr/bin/weston"),
+	      "other sandbox engines cannot publish nested toplevels");
+	CHECK(!qdwin_nested_secctx_publisher_allowed(
+		       "qdistro.tier2", "/usr/bin/weston-terminal"),
+	      "tier2 workload executable cannot bind the nested manager");
+	CHECK(!qdwin_nested_secctx_publisher_allowed(
+		       "qdistro.tier2", "weston"),
+	      "basename-only weston identity is rejected");
+	CHECK(!qdwin_nested_secctx_publisher_allowed("qdistro.tier2", ""),
+	      "unreadable nested publisher executable is rejected");
+	CHECK(!qdwin_nested_secctx_publisher_allowed(NULL, "/usr/bin/weston"),
+	      "missing sandbox engine is rejected");
+}
+
+static void test_nested_pixelfeed_peer_identity(void)
+{
+	CHECK(qdwin_nested_pixelfeed_peer_allowed(
+		      "/usr/bin/qdistro-nested-pixelfeed"),
+	      "root-installed nested pixelfeed helper is recognized");
+	CHECK(!qdwin_nested_pixelfeed_peer_allowed(NULL),
+	      "missing pixelfeed executable is rejected");
+	CHECK(!qdwin_nested_pixelfeed_peer_allowed(""),
+	      "empty pixelfeed executable is rejected");
+	CHECK(!qdwin_nested_pixelfeed_peer_allowed(
+		       "qdistro-nested-pixelfeed"),
+	      "basename-only pixelfeed identity is rejected");
+	CHECK(!qdwin_nested_pixelfeed_peer_allowed(
+		       "/tmp/qdistro-nested-pixelfeed"),
+	      "lookalike pixelfeed path is rejected");
+}
+
 /* ---- deliberate fail-open / broad-trust pins (02/S13) ----
  *
  * These tests pin explicit risk-register entries rather than asserting ideal
@@ -598,6 +638,8 @@ int main(void)
 	test_fractional_scale();
 	test_inset_inner_extent();
 	test_global_visibility();
+	test_nested_secctx_publisher_identity();
+	test_nested_pixelfeed_peer_identity();
 	test_s13_fail_open_pins();
 	test_popup_constrain();
 

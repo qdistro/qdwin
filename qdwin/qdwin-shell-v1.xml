@@ -830,6 +830,11 @@
 
         Issuing this on a non-existent or non-proxy `handle` raises
         `invalid_handle`.
+
+        The compositor permits the root-installed
+        `/usr/bin/qdistro-nested-pixelfeed` helper to bind a secondary
+        qdwin_shell_v1 resource for this request. It does not acquire the
+        shell role, and proxy ownership is still checked against its peer uid.
       </description>
       <arg name="handle" type="uint"
            summary="toplevel handle from nested_proxy_pixel_source"/>
