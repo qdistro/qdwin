@@ -39,6 +39,39 @@ placeholder surface. The dmabuf path is true zero-copy when the
 outer's GL renderer can import the inner's render format; otherwise
 the daemon falls back to wl_shm with a single CPU copy per frame.
 
+The production qdshell currently pins this consumer to the SHM fallback. The
+dmabuf path is implemented and useful diagnostically, but is not the default
+until the nested PipeWire producer has a repeated crash-free reliability gate.
+
+## Local-only boundary
+
+`qdwin_nested_v1` is deliberately a local protocol. Its object model is useful
+for a future remote transport, but its carriers and identity checks must not be
+forwarded or weakened to make it cross a network:
+
+| Local resource | Purpose and authority | Required remote replacement |
+| --- | --- | --- |
+| Outer Wayland connection | Carries advertise/configure/focus/close object lifetime; manager bind and advertised `origin_uid` are pinned to the kernel-resolved peer uid | Authenticated session carrying explicit origin, stream, generation, ordering, and reconnect state |
+| PipeWire node name | Selects a node in the same local PipeWire graph | Encoded media transport with authentication, format negotiation, flow control, and bounded buffering |
+| dmabuf or SHM buffer fd | Supplies a local `wl_buffer` to the outer proxy | Decoder-owned local buffers; never forward fd numbers or assume remote dmabuf importability |
+| Input-sink AF_UNIX path | Carries QDNI events; the listener verifies the connecting peer uid | Authenticated, replay-protected input messages bound to the exact remote stream and input grant |
+| `bind_proxy_pixels` caller uid | Prevents a different local uid replacing an advertised proxy's pixels | Separate token/capability-authorized remote pixel producer; keep the local uid check unchanged |
+| Wayland resource destruction | Removes the proxy while the inner compositor and its app remain the lifetime owners | Explicit close/closed and disconnect/reconcile state machine; transport loss must not imply source-app death |
+
+Consequently, R5 is a local liveness audit of these exact resources. R6 is not
+“Wayland forwarding”: it needs a new authenticated remote-proxy adapter that
+terminates network media/input/control and creates local resources on each end.
+The adapter may reuse the nested toplevel semantics, but it must not generalize
+`proxy_origin_uid`, accept network-supplied Unix paths, or relax
+`bind_proxy_pixels` ownership.
+
+The durable source lifecycle for R5 is the
+`qdwin_nested_toplevel_v1` resource itself: outer close produces
+`close_requested`; only inner resource destruction removes the proxy. The older
+multi-machine RDP bystander FIFO is therefore not on the R5 lifecycle path. A
+production source service still replaces that FIFO before an RDP-derived or
+network adapter is treated as the R6 source authority.
+
 ## Admit-or-deny gate
 
 When the inner compositor first announces a proxy toplevel, qdwin
