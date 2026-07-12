@@ -8626,6 +8626,8 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 	}
 }
 
+static char *qdwin_proc_exe(pid_t pid);
+
 static void
 bind_qdwin_shell(struct wl_client *client, void *data,
 		 uint32_t version, uint32_t id)
@@ -8639,19 +8641,29 @@ bind_qdwin_shell(struct wl_client *client, void *data,
 	weston_log("qdwin: bind attempt pid=%d uid=%u (allowed_uid=%u)\n",
 		   (int)pid, (unsigned)uid, (unsigned)qdwin->allowed_uid);
 
-	if (qdwin->shell_bound && !qdwin_client_is_bound_shell(qdwin, client)) {
-		wl_client_post_implementation_error(
-			client,
-			"qdwin_shell_v1: shell role already claimed");
-		return;
-	}
-
 	if (uid != qdwin->allowed_uid) {
 		wl_client_post_implementation_error(
 			client,
 			"qdwin_shell_v1: uid %u not permitted (allowed uid=%u)",
 			(unsigned)uid, (unsigned)qdwin->allowed_uid);
 		return;
+	}
+
+	/* The nested pixel consumer is a separate, root-installed executable.
+	 * It needs a protocol resource solely to issue bind_proxy_pixels, whose
+	 * handler independently proves that the caller owns the advertised
+	 * proxy. Keep the normal single-shell rule for every other peer. */
+	if (qdwin->shell_bound && !qdwin_client_is_bound_shell(qdwin, client)) {
+		char *peer_exe = qdwin_proc_exe(pid);
+		bool pixelfeed =
+			qdwin_nested_pixelfeed_peer_allowed(peer_exe);
+		free(peer_exe);
+		if (!pixelfeed) {
+			wl_client_post_implementation_error(
+				client,
+				"qdwin_shell_v1: shell role already claimed");
+			return;
+		}
 	}
 
 	/* Defense-in-depth (findings F0): reject sandboxed silo clients
@@ -18364,12 +18376,20 @@ bind_qdwin_nested_manager(struct wl_client *client, void *data,
 			  uint32_t version, uint32_t id)
 {
 	struct qdwin *qdwin = data;
+	struct qdwin_secctx_client *sc =
+		qdwin_secctx_client_find(qdwin, client);
 
-	if (qdwin_secctx_client_find(qdwin, client)) {
-		weston_log("qdwin: nested bind refused for secctx client\n");
+	if (sc && !qdwin_nested_secctx_publisher_allowed(
+			  qdwin_secctx_client_engine(sc),
+			  qdwin_secctx_client_peer_exe(sc))) {
+		weston_log("qdwin: nested bind refused for secctx client "
+			   "engine=%s exe=%s\n",
+			   qdwin_secctx_client_engine(sc),
+			   qdwin_secctx_client_peer_exe(sc));
 		wl_client_post_implementation_error(
 			client,
-			"qdwin_nested: secctx clients may not bind");
+			"qdwin_nested: secctx client is not an authorized "
+			"nested publisher");
 		return;
 	}
 
@@ -21482,8 +21502,16 @@ qdwin_secctx_global_filter(const struct wl_client *client,
 	 * those, so we don't read pid/exe for every IME/VK filter call (whose row
 	 * folds SHELL and ORDINARY together anyway). */
 	enum qdwin_cred_class cred;
-	if (qdwin_secctx_client_find(qdwin, cw) != NULL) {
-		cred = QDWIN_CRED_SECCTX;
+	struct qdwin_secctx_client *sc = qdwin_secctx_client_find(qdwin, cw);
+	if (sc != NULL) {
+		/* Generic silo clients stay on the matrix's fail-closed SECCTX row.
+		 * The sole exception is the launcher-minted tier-2 inner Weston
+		 * publisher; the bind handler repeats this exact identity gate. */
+		cred = kind == QDWIN_GLOBAL_NESTED_MANAGER &&
+		       qdwin_nested_secctx_publisher_allowed(
+			       qdwin_secctx_client_engine(sc),
+			       qdwin_secctx_client_peer_exe(sc))
+			? QDWIN_CRED_ORDINARY : QDWIN_CRED_SECCTX;
 	} else if (kind == QDWIN_GLOBAL_SECCTX_MANAGER ||
 		   kind == QDWIN_GLOBAL_WESTON_CAPTURE) {
 		pid_t pid; uid_t uid; gid_t gid;

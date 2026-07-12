@@ -87,7 +87,7 @@ def check_advertise_binds_origin_uid(source):
     return 0
 
 
-def check_nested_manager_bind_rejects_secctx(source):
+def check_nested_manager_bind_restricts_secctx(source):
     body, err = _function_body(
         source,
         r"static void\s+bind_qdwin_nested_manager\s*\(",
@@ -96,22 +96,19 @@ def check_nested_manager_bind_rejects_secctx(source):
     if err:
         return fail(err)
     if "qdwin_secctx_client_find(qdwin, client)" not in body:
-        return fail("nested_manager bind does not reject secctx clients")
-    gate = re.search(
-        r"if\s*\(\s*qdwin_secctx_client_find\(qdwin,\s*client\)\s*\)\s*\{"
-        r"(.*?)\n\t\}",
-        body, re.DOTALL)
-    if not gate:
-        return fail("nested_manager secctx bind gate not found in expected shape")
-    if "wl_client_post_implementation_error" not in gate.group(1) or \
-            "return;" not in gate.group(1):
-        return fail("nested_manager secctx bind gate does not reject before "
-                    "resource creation")
+        return fail("nested_manager bind does not resolve secctx identity")
+    if "qdwin_nested_secctx_publisher_allowed" not in body:
+        return fail("nested_manager bind lacks the narrow nested-publisher "
+                    "identity exception")
     secctx_pos = body.find("qdwin_secctx_client_find(qdwin, client)")
+    identity_pos = body.find("qdwin_nested_secctx_publisher_allowed")
+    reject_pos = body.find("wl_client_post_implementation_error", identity_pos)
+    return_pos = body.find("return;", reject_pos)
     create_pos = body.find("wl_resource_create")
-    if create_pos < 0 or secctx_pos > create_pos:
-        return fail("nested_manager secctx bind gate must run before "
-                    "wl_resource_create")
+    if min(secctx_pos, identity_pos, reject_pos, return_pos, create_pos) < 0 or \
+            not (secctx_pos < identity_pos < reject_pos < return_pos < create_pos):
+        return fail("nested_manager secctx identity gate must reject an "
+                    "unauthorized publisher before wl_resource_create")
     return 0
 
 
@@ -835,7 +832,7 @@ def main():
 
     checks = (
         check_fd_peer_uid_fails_closed,
-        check_nested_manager_bind_rejects_secctx,
+        check_nested_manager_bind_restricts_secctx,
         check_locker_bind_rejects_secctx,
         check_nested_advertise_has_cap,
         check_nested_broker_gate_defaults_closed,

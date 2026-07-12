@@ -51,9 +51,10 @@
 
     Authorisation:
 
-      The manager global is hidden from secctx/silo clients and
-      peer-uid-filtered at bind time — only authorised nested
-      compositors can bind. Advertised inner toplevels are capped per
+      The manager global is hidden from generic secctx/silo clients. The
+      launcher-minted `qdistro.tier2` `/usr/bin/weston` publisher is the sole
+      secctx exception, repeated at bind time; all binders are also
+      peer-uid-filtered. Advertised inner toplevels are capped per
       uid before allocation. The outer-qdwin-side policy decision for
       "is this nested compositor allowed to publish each of its inner
       toplevels" lives in the admin broker
@@ -65,9 +66,11 @@
 
   <interface name="qdwin_nested_manager_v1" version="2">
     <description summary="bind entry point for nested compositor passthrough">
-      Obtained via wl_registry.bind by the nested compositor. Hidden
-      from secctx clients by the global filter, and filtered by
-      peer-uid plus an explicit secctx bind rejection at bind time.
+      Obtained via wl_registry.bind by the nested compositor. Hidden from
+      generic secctx clients by the global filter, with an exact
+      `qdistro.tier2` + `/usr/bin/weston` exception for the production nested
+      publisher. The bind handler repeats that identity check and applies the
+      peer-uid filter.
     </description>
 
     <request name="destroy" type="destructor">
