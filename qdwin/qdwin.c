@@ -36,6 +36,7 @@
 #include <strings.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -238,8 +239,10 @@ static void qdwin_handle_bind_proxy_pixels(struct wl_client *client,
 static void qdwin_nested_proxy_send_close(struct qdwin_toplevel *tl);
 static void qdwin_popup_teardown(struct qdwin_popup *p);
 static void qdwin_view_stream_unpin(struct qdwin_view_stream *s);
+static void qdwin_view_stream_reap_forward(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_init(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_release(struct qdwin_view_stream *s);
+static void qdwin_stream_confine_grab_end(struct qdwin_view_stream *s);
 /* spec/10 clear_selection forward decls — defined in the
  * primary-selection-unstable-v1 block far below, but the qdwin_shell
  * impl table at line ~3600 needs them. */
@@ -586,12 +589,28 @@ struct qdwin_view_stream {
 
 	/* S3: external qdistro-forward proxy lifecycle */
 	pid_t forward_pid;                /* 0 if not spawned */
+	/* item 5 (codex impl-26): pidfd death-watch on the forward child. weston
+	 * owns SIGCHLD via a signalfd and waitpid(-1)-reaps EVERY child, so qdwin
+	 * (a shell plugin) cannot install a SIGCHLD handler nor reliably waitpid the
+	 * forward to detect its death. Instead we hold a pidfd to the EXACT child we
+	 * forked and watch it for readiness (process exit) on weston's wl_event_loop;
+	 * pidfd readiness is independent of who reaps the zombie. On readiness we emit
+	 * torn_down("forward exited") and run the normal stream teardown. DISARMED
+	 * (source removed, fd closed, both fields reset) before any qdwin-initiated
+	 * teardown so the callback can never fire against a freed stream. The fd is
+	 * -1 and the source NULL whenever the watch is not armed (note: calloc zeroes
+	 * the fd to 0 — a VALID fd — so it MUST be reset to -1 at creation). */
+	int forward_pidfd;                /* -1 when not armed */
+	struct wl_event_source *forward_pidfd_source;  /* NULL when not armed */
 	uint32_t rdp_port;                /* 0 if not spawned */
 	char access_token[33];            /* 32 hex chars + NUL */
 	char rdp_password[17];            /* 16 hex chars + NUL */
 
 	/* S5: input-injection channel claimed by qdistro-forward */
 	int input_claimed;                /* 1 once claim() succeeded */
+	int allow_input;                  /* server-side permission bit: 0 => read-only
+	                                   * export, injected events are DROPPED at the
+	                                   * inject_* boundary (subscribe allow_input) */
 	struct wl_resource *input_handle; /* qdwin_stream_input_handle_v1, if claimed */
 
 	/* S5c: virtual input device for this view, fed by whichever wl_client
@@ -600,6 +619,15 @@ struct qdwin_view_stream {
 	 * focus; focus on this seat is pinned to tl->view. */
 	struct weston_seat stream_seat;
 	int seat_inited;
+
+	/* IMPL-19: per-stream pointer grab that HARD-LOCKS the stream seat's
+	 * pointer focus to tl->view, so injected remote input cannot leak to
+	 * another view stacked at the same compositor-global coordinate. Without
+	 * it, notify_motion_absolute re-picks focus geometrically and a local
+	 * window overlapping the source view at the injected point would steal
+	 * the press. Installed on claim, ended on handle release / seat teardown. */
+	struct weston_pointer_grab confine_grab;
+	int confine_grab_active;
 
 	struct wl_list link;              /* qdwin::view_streams */
 };
@@ -1472,6 +1500,24 @@ qdwin_send_toplevel_security_context(struct qdwin *qdwin,
 	}
 }
 
+/* The wp_security_context sandbox engine string for a toplevel's backing client,
+ * or NULL if the client is untagged (unsandboxed) or this is a nested proxy
+ * (whose own wl_client is the shell, not the inner app — see
+ * qdwin_send_toplevel_security_context). Used by compositor policy gates such as
+ * the source-mediated-close guard below. */
+static const char *
+qdwin_toplevel_secctx_engine(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
+	if (!tl || tl->is_nested_proxy || !tl->desktop_surface)
+		return NULL;
+	struct weston_desktop_client *dclient =
+		weston_desktop_surface_get_client(tl->desktop_surface);
+	struct wl_client *client =
+		weston_desktop_client_get_client(dclient);
+	struct qdwin_secctx_client *sc = qdwin_secctx_client_lookup(qdwin, client);
+	return sc ? qdwin_secctx_client_engine(sc) : NULL;
+}
+
 static int
 qdwin_toplevel_is_xwayland(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
@@ -1588,6 +1634,60 @@ qdwin_primary_output(struct qdwin *qdwin)
 	wl_list_for_each(out, &qdwin->compositor->output_list, link)
 		return out;
 	return NULL;
+}
+
+/* A1-min TEST-ONLY placement hook (codex impl-5). When env
+ * QDWIN_TEST_PLACE_APPID matches a toplevel's app-id, place it at the explicit
+ * GLOBAL coordinate (QDWIN_TEST_PLACE_X, QDWIN_TEST_PLACE_Y), bypassing qdwin's
+ * one-output placement policy so the view's rect can overlap two outputs and
+ * libweston composites it onto both (output_mask). This is a deliberately
+ * narrow probe for the two-output straddle render gate — it sets ONLY the
+ * initial position for one targeted app, and does NOT alter maximize, tiling,
+ * fullscreen, chrome, snapping, or output-change reflow. NOT a user feature;
+ * delete/replace when real multi-output WM policy (§6.5) lands. Returns 1 if it
+ * placed the view (caller skips normal placement), else 0. */
+static int
+qdwin_test_place(struct qdwin *qdwin, struct qdwin_toplevel *tl)
+{
+#ifdef QDWIN_ENABLE_TEST_PLACE
+	/* Compiled in ONLY for dedicated test builds (meson -Denable_test_place=true,
+	 * codex impl-6 M7) — production qdwin does not contain this code path, so it
+	 * cannot be driven by ambient env there. */
+	(void)qdwin;
+	const char *want = getenv("QDWIN_TEST_PLACE_APPID");
+	if (!want || !*want || !tl || !tl->view || !tl->cached_app_id)
+		return 0;
+	if (strcmp(want, tl->cached_app_id) != 0)
+		return 0;
+	const char *xs = getenv("QDWIN_TEST_PLACE_X");
+	const char *ys = getenv("QDWIN_TEST_PLACE_Y");
+	if (!xs || !ys)
+		return 0;
+	/* strtol with validation (not atoi): reject malformed/overflowing config
+	 * and bound to a sane test range instead of silently placing at garbage. */
+	char *ex = NULL, *ey = NULL;
+	long lx = strtol(xs, &ex, 10);
+	long ly = strtol(ys, &ey, 10);
+	if (ex == xs || ey == ys || *ex || *ey ||
+	    lx < -32768 || lx > 32767 || ly < -32768 || ly > 32767) {
+		weston_log("qdwin: TEST placement IGNORED — bad QDWIN_TEST_PLACE_X/Y "
+			   "(\"%s\",\"%s\")\n", xs, ys);
+		return 0;
+	}
+	struct weston_coord_global p = {
+		.c = weston_coord((int)lx, (int)ly),
+	};
+	weston_view_set_position(tl->view, p);
+	weston_view_update_transform(tl->view);
+	weston_log("qdwin: TEST placement app_id=%s at (%ld,%ld) "
+		   "[QDWIN_TEST_PLACE_* — straddle probe, NOT WM policy]\n",
+		   tl->cached_app_id, lx, ly);
+	return 1;
+#else
+	(void)qdwin;
+	(void)tl;
+	return 0;     /* production build: no test hook, dead branch at call site */
+#endif
 }
 
 /* ------------------------------------------------------------------
@@ -1707,6 +1807,27 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 		qdwin_popup_teardown(tl->popup);
 	}
 	qdwin_move_grab_end_for(qdwin, tl->handle);
+
+	/* IMPL-19/rung-1 crash fix: a view_stream may be confining its per-stream
+	 * pointer focus to THIS toplevel's view via an active weston_pointer_grab.
+	 * We are about to weston_view_destroy(tl->view) and free(tl); destroying the
+	 * focused view makes libweston re-pick focus, which dispatches the confine
+	 * grab's focus() callback — and freeing tl would leave s->tl dangling for any
+	 * later pointer event. Either path crashes (observed: SIGSEGV in
+	 * qdwin_stream_confine_focus → weston_pointer_set_focus during multi-stream
+	 * teardown). End the grab and detach the stream from the dying toplevel NOW;
+	 * the stream itself is torn down later when its forward exits (until then it
+	 * has no target and drops input — qdwin_stream_confine_target handles NULL). */
+	{
+		struct qdwin_view_stream *vs;
+		wl_list_for_each(vs, &qdwin->view_streams, link) {
+			if (vs->tl == tl) {
+				qdwin_stream_confine_grab_end(vs);
+				vs->tl = NULL;
+			}
+		}
+	}
+
 	for (int s = 0; s < QDWIN_SIDES; s++)
 		qdwin_chrome_detach(&tl->chrome[s]);
 
@@ -1809,6 +1930,10 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 			 * lock UI or any early-fullscreen client down/right and
 			 * expose whatever is behind it. */
 			qdwin_toplevel_apply_fullscreen_geometry(qdwin, tl, NULL);
+		} else if (qdwin_test_place(qdwin, tl)) {
+			/* A1-min test hook placed this toplevel at an explicit
+			 * global position straddling outputs (see qdwin_test_place):
+			 * skip the normal one-output placement policy entirely. */
 		} else {
 			/* Centre content on the primary output so chrome fits
 			 * within visible bounds. Without this the view defaults
@@ -2570,6 +2695,23 @@ qdwin_handle_request_close(struct wl_client *client,
 			   "fired close_requested)\n", handle);
 		return;
 	}
+	/* Multi-machine remote windows (engine "qdistro.mm") have SOURCE-mediated
+	 * close (codex impl-34 Q3): the shell routes a CloseRequest upstream and
+	 * the source emits Closed; the backing pixel client (windowed FreeRDP)
+	 * then exits, destroying this toplevel via client disconnect. A local
+	 * request_close would xdg-close that client = the forbidden client-tree
+	 * kill. Refuse it here so the COMPOSITOR enforces the invariant (qdshell
+	 * close interception becomes belt+braces, not the only guard). qdshell's
+	 * RemoteMachineWindows never calls request_close for these handles; this
+	 * fires only on a shell bug/compromise — refuse silently (a protocol error
+	 * would needlessly disconnect the shell). */
+	const char *secctx_engine = qdwin_toplevel_secctx_engine(qdwin, tl);
+	if (secctx_engine && strcmp(secctx_engine, "qdistro.mm") == 0) {
+		weston_log("qdwin: request_close handle=%u REFUSED "
+			   "(engine=qdistro.mm: close is source-mediated)\n",
+			   handle);
+		return;
+	}
 	weston_desktop_surface_close(tl->desktop_surface);
 	weston_log("qdwin: request_close handle=%u dispatched\n", handle);
 }
@@ -2937,6 +3079,101 @@ qdwin_handle_request_raise(struct wl_client *client,
 		qdwin_toplevel_apply_workspace_visibility(tl);
 	weston_log("qdwin: request_raise handle=%u re-stacked\n", handle);
 	weston_compositor_schedule_repaint(qdwin->compositor);
+}
+
+/* v30: shell-owned set-position. The compositor-driven counterpart to
+ * begin_interactive_move — the shell names the target outer-rect top-left
+ * directly (WM policy), rather than the window following the pointer. Used by
+ * the multi-machine viewer to place remote managed peers at deterministic
+ * overlapping geometry. Floating toplevels only: maximised/fullscreen/tiled own
+ * their geometry and are refused silently. Size is preserved. */
+static void
+qdwin_handle_request_set_position(struct wl_client *client,
+				  struct wl_resource *resource,
+				  uint32_t handle, int32_t x, int32_t y)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct qdwin_toplevel *tl;
+	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+	tl = qdwin_toplevel_from_handle(qdwin, handle);
+	if (!tl || !tl->view) {
+		weston_log("qdwin: request_set_position unknown handle=%u\n", handle);
+		return;
+	}
+	if (tl->nested_proxy_pending_decision) {
+		weston_log("qdwin: request_set_position handle=%u ignored — "
+			   "nested-proxy waiting for admin decision\n", handle);
+		return;
+	}
+	if (tl->state & (QDWIN_TS_MAXIMIZED | QDWIN_TS_FULLSCREEN)) {
+		weston_log("qdwin: request_set_position handle=%u ignored — "
+			   "maximised/fullscreen owns its geometry\n", handle);
+		return;
+	}
+	if (tl->tiled != QDWIN_TILE_NONE) {
+		weston_log("qdwin: request_set_position handle=%u ignored — tiled\n",
+			   handle);
+		return;
+	}
+	if (qdwin->move_grab_active && qdwin->move_grab_handle == handle) {
+		weston_log("qdwin: request_set_position handle=%u ignored — "
+			   "interactive move in progress\n", handle);
+		return;
+	}
+
+	/* (x,y) is the GLOBAL outer-rect top-left (the coordinate space of the
+	 * toplevel_geometry event). Clamp the top-left onto the output that
+	 * CONTAINS it (falling back to the primary output) so the window stays
+	 * reachable (the titlebar can't be parked fully off any output) and the
+	 * clamp is correct even when an output has a nonzero global origin. The
+	 * content view sits inset_w/inset_n inside the outer rect; size is
+	 * preserved (never resized). */
+	int cx = x, cy = y;
+	struct weston_output *out = NULL, *o;
+	wl_list_for_each(o, &qdwin->compositor->output_list, link) {
+		if (x >= (int)o->pos.c.x && x < (int)o->pos.c.x + o->width &&
+		    y >= (int)o->pos.c.y && y < (int)o->pos.c.y + o->height) {
+			out = o;
+			break;
+		}
+	}
+	if (!out)
+		out = qdwin_primary_output(qdwin);
+	if (out) {
+		int max_x = (int)out->pos.c.x + out->width - 1;
+		int max_y = (int)out->pos.c.y + out->height - 1;
+		if (cx < (int)out->pos.c.x) cx = (int)out->pos.c.x;
+		if (cy < (int)out->pos.c.y) cy = (int)out->pos.c.y;
+		if (cx > max_x) cx = max_x;
+		if (cy > max_y) cy = max_y;
+	}
+
+	struct weston_coord_global p = {
+		.c = weston_coord(cx + tl->inset_w, cy + tl->inset_n),
+	};
+	weston_view_set_position(tl->view, p);
+	weston_view_update_transform(tl->view);
+	qdwin_toplevel_position_chrome(tl);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+
+	/* The shell's tracked geometry is now stale; send the authoritative
+	 * new rectangle (same outer-rect convention as the move-grab end). */
+	if (qdwin->shell_bound && qdwin->shell_resource) {
+		qdwin_shell_v1_send_toplevel_geometry(
+			qdwin->shell_resource, handle, cx, cy,
+			(uint32_t)tl->last_width, (uint32_t)tl->last_height);
+	}
+	weston_log("qdwin: request_set_position handle=%u outer=(%d,%d) "
+		   "size=%dx%d%s\n", handle, cx, cy, tl->last_width,
+		   tl->last_height,
+		   (cx != x || cy != y) ? " (clamped)" : "");
 }
 
 /* ------------------------------------------------------------------
@@ -3542,12 +3779,25 @@ qdwin_toplevel_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
 		qdwin_chrome_at_pos(qdwin, pos, &dummy, NULL, NULL);
 	if (tl)
 		return tl;
-	wl_list_for_each(tl, &qdwin->toplevels, link) {
-		if (tl->nested_proxy_pending_decision)
+	/* Stacking-aware hit test (rung-1 A4 fix): `qdwin->toplevels` is TRACKING
+	 * order, NOT z-order — returning the first list match gives whichever
+	 * toplevel was created/tracked earliest, so in an OVERLAP a lower window
+	 * steals the click and `request_raise` has no effect on pointer routing
+	 * (the click-to-raise/focus target below is derived from this lookup).
+	 * Walk the normal_layer view list FRONT-TO-BACK (topmost first) and return
+	 * the first mapped toplevel whose content rect contains the point, so the
+	 * raised/topmost peer wins pointer hit-testing. Minimised/held toplevels
+	 * are not in normal_layer, so they are correctly never hit. */
+	struct weston_view *v;
+	wl_list_for_each(v, &qdwin->normal_layer.view_list.link, layer_link.link) {
+		struct qdwin_toplevel *cand = NULL, *t;
+		wl_list_for_each(t, &qdwin->toplevels, link) {
+			if (t->view == v) { cand = t; break; }
+		}
+		if (!cand || cand->nested_proxy_pending_decision)
 			continue;
-		struct weston_view *v = tl->view;
-		struct weston_surface *cs = v ? v->surface : NULL;
-		if (!v || !cs || cs->width <= 0 || cs->height <= 0)
+		struct weston_surface *cs = v->surface;
+		if (!cs || cs->width <= 0 || cs->height <= 0)
 			continue;
 		weston_view_update_transform(v);
 		struct weston_coord_global vp =
@@ -3556,7 +3806,7 @@ qdwin_toplevel_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
 		    pos.c.x < vp.c.x + cs->width &&
 		    pos.c.y >= vp.c.y &&
 		    pos.c.y < vp.c.y + cs->height)
-			return tl;
+			return cand;
 	}
 	return NULL;
 }
@@ -4298,6 +4548,23 @@ qdwin_forward_bin_path(void)
 	return "/usr/bin/qdistro-forward";
 }
 
+/* The wayland socket qdistro-forward must connect back to in order to claim the
+ * per-stream input-injection channel (qdwin_stream_input_v1). This is qdwin's OWN
+ * compositor socket — weston exports it as WAYLAND_DISPLAY in our process env when
+ * it adds the socket (`--socket=NAME`), so the forward lands on whatever socket
+ * this qdwin actually listens on, not a hardcoded "wayland-0". Was hardcoded
+ * "wayland-0", which forced any input-capable export to run qdwin on exactly that
+ * socket (session-4 input-confinement foot-gun); reading the env removes that
+ * coupling. Falls back to "wayland-0" only if the env is somehow unset. */
+static const char *
+qdwin_forward_wayland_display(void)
+{
+	const char *disp = getenv("WAYLAND_DISPLAY");
+	if (disp && *disp)
+		return disp;
+	return "wayland-0";
+}
+
 static int
 qdwin_forward_write_secret(int fd, const char *secret)
 {
@@ -4317,6 +4584,73 @@ qdwin_forward_write_secret(int fd, const char *secret)
 	return 0;
 }
 
+/* item 5 (codex impl-26): open a pidfd to a child we forked. glibc may expose
+ * pidfd_open(2) directly, but we don't want a configure-time probe — go straight
+ * through the syscall, guarded so a kernel/headers without SYS_pidfd_open fails
+ * loudly (the target host is kernel 6.18, where this is always present). */
+static int
+qdwin_pidfd_open(pid_t pid)
+{
+#ifdef SYS_pidfd_open
+	return (int)syscall(SYS_pidfd_open, pid, 0u);
+#else
+	(void)pid;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+/* item 5: DISARM the forward death-watch — idempotent. Removes the event source
+ * and closes the pidfd, resetting both fields so a later call (or the death
+ * callback itself) is a no-op. MUST run before the stream struct is freed and
+ * before any qdwin-initiated reap, so the event loop can never dispatch
+ * qdwin_forward_pidfd_ready against a freed/partly-torn-down stream. */
+static void
+qdwin_view_stream_disarm_pidfd(struct qdwin_view_stream *s)
+{
+	struct wl_event_source *src = s->forward_pidfd_source;
+	int fd = s->forward_pidfd;
+	s->forward_pidfd_source = NULL;
+	s->forward_pidfd = -1;
+	/* libwayland defers the source free to post-dispatch, so removing the
+	 * currently-dispatching source from inside its own callback is safe. */
+	if (src)
+		wl_event_source_remove(src);
+	if (fd >= 0)
+		close(fd);
+}
+
+/* item 5: the forward child exited on its own (crash, exec failure, or a future
+ * fatal PipeWire error). weston's signalfd handler waitpid(-1)-reaps it; we just
+ * learn of the death via pidfd readiness and run the ONE teardown path: tell the
+ * subscriber (torn_down "forward exited"), then destroy the stream resource so
+ * qdwin_stream_resource_destroyed performs the existing unpin / seat release /
+ * input-handle destroy / list removal / free. We do NOT waitpid (weston owns
+ * reaping) and do NOT use s after wl_resource_destroy returns. */
+static int
+qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
+{
+	struct qdwin_view_stream *s = data;
+	(void)fd;
+	(void)mask;
+	pid_t dead = s->forward_pid;
+	/* Disarm FIRST: stop this (level-triggered) source from re-firing and stop
+	 * the upcoming resource-destroyed reap from touching the source/fd again. */
+	qdwin_view_stream_disarm_pidfd(s);
+	/* Drop our ownership of the pid WITHOUT waiting — weston already reaps. */
+	s->forward_pid = 0;
+	weston_log("qdwin: qdistro-forward pid=%d exited; tearing down view_stream "
+		   "rdp_port=%u (forward exited)\n", (int)dead, s->rdp_port);
+	if (s->resource) {
+		qdwin_view_stream_v1_send_torn_down(s->resource, "forward exited");
+		/* Single teardown path: resource-destroyed runs reap_forward (a now
+		 * no-op disarm + early return on forward_pid==0), unpin, seat release,
+		 * list removal, free. */
+		wl_resource_destroy(s->resource);
+	}
+	return 0;
+}
+
 static int
 qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 				const char *pw_node_name,
@@ -4324,6 +4658,17 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 {
 	int token_pipe[2] = { -1, -1 };
 	int password_pipe[2] = { -1, -1 };
+	/* Resolve qdwin's real wayland socket in the PARENT (getenv is not
+	 * async-signal-safe to call in the post-fork child); the child references
+	 * this pointer into environ, valid across fork. Log the choice + its source:
+	 * a fallback to "wayland-0" in a real session means WAYLAND_DISPLAY was
+	 * unset/wrong, which would be an input-routing bug worth surfacing (not a
+	 * silent default). */
+	const char *wl_env = getenv("WAYLAND_DISPLAY");
+	const char *wl_display = qdwin_forward_wayland_display();
+	weston_log("qdwin: qdistro-forward will use wayland display %s (%s)\n",
+		   wl_display,
+		   (wl_env && *wl_env) ? "from WAYLAND_DISPLAY" : "FALLBACK wayland-0");
 	if (pipe(token_pipe) != 0) {
 		weston_log("qdwin: pipe failed for qdistro-forward token: %m\n");
 		return -1;
@@ -4379,7 +4724,7 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 		      "--access-token-fd", token_fd_arg,
 		      "--rdp-port", port_arg,
 		      "--rdp-password-fd", password_fd_arg,
-		      "--wayland-display", "wayland-0",
+		      "--wayland-display", wl_display,
 		      "--width", width_arg,
 		      "--height", height_arg,
 		      (char *)NULL);
@@ -4405,7 +4750,39 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 		return -1;
 	}
 	s->forward_pid = pid;
-	weston_log("qdwin: spawned qdistro-forward pid=%d port=%u node=%s\n",
+	/* item 5 (codex impl-26): arm the pidfd death-watch on THIS exact child,
+	 * synchronously in the parent BEFORE we return to weston's event loop — so
+	 * weston's signalfd reaper cannot have run yet and pidfd_open still has a live
+	 * (possibly already-zombie-but-unreaped) target. A failure to arm makes the
+	 * stream non-item-5-compliant, so we kill the forward and fail the spawn
+	 * rather than leave a death-blind stream. */
+	int pidfd = qdwin_pidfd_open(pid);
+	if (pidfd < 0) {
+		weston_log("qdwin: pidfd_open(qdistro-forward pid=%d) failed: %m; "
+			   "killing forward + failing stream\n", (int)pid);
+		/* codex impl-27 MED: keep forward_pid set and route through the SINGLE
+		 * ownership path (disarm-noop + SIGTERM + best-effort reap + clear) so a
+		 * child that outlives the WNOHANG isn't hidden from later cleanup. */
+		qdwin_view_stream_reap_forward(s);
+		return -1;
+	}
+	struct wl_event_source *src = wl_event_loop_add_fd(
+		wl_display_get_event_loop(s->qdwin->compositor->wl_display),
+		pidfd, WL_EVENT_READABLE, qdwin_forward_pidfd_ready, s);
+	if (!src) {
+		weston_log("qdwin: wl_event_loop_add_fd(pidfd) failed for "
+			   "qdistro-forward pid=%d; killing forward + failing stream\n",
+			   (int)pid);
+		/* pidfd is local-only here (never stored on s, so disarm won't see it);
+		 * close it, then reap the forward via the single ownership path. */
+		close(pidfd);
+		qdwin_view_stream_reap_forward(s);
+		return -1;
+	}
+	s->forward_pidfd = pidfd;
+	s->forward_pidfd_source = src;
+	weston_log("qdwin: spawned qdistro-forward pid=%d port=%u node=%s "
+		   "(pidfd death-watch armed)\n",
 		   (int)pid, s->rdp_port, pw_node_name);
 	return 0;
 }
@@ -4413,13 +4790,22 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 static void
 qdwin_view_stream_reap_forward(struct qdwin_view_stream *s)
 {
+	/* item 5 (codex impl-26): disarm the pidfd death-watch FIRST — before we
+	 * SIGTERM/reap or free anything — so the event loop can never dispatch
+	 * qdwin_forward_pidfd_ready against a stream we're tearing down (it would
+	 * re-enter teardown on a freed struct). Idempotent: a no-op if the death
+	 * callback already disarmed (qdwin-initiated path) or if never armed. */
+	qdwin_view_stream_disarm_pidfd(s);
 	if (s->forward_pid <= 0)
 		return;
 	if (kill(s->forward_pid, SIGTERM) != 0 && errno != ESRCH)
 		weston_log("qdwin: SIGTERM qdistro-forward pid=%d failed: %m\n",
 			   (int)s->forward_pid);
 	/* Non-blocking reap; let weston's SIGCHLD-or-idle loop catch it.
-	 * If we block here we stall the wayland dispatch. */
+	 * If we block here we stall the wayland dispatch. ECHILD is EXPECTED:
+	 * weston's signalfd handler waitpid(-1)-reaps EVERY child, so it may have
+	 * already reaped this forward — the result is best-effort only and is never
+	 * used to decide teardown (the pidfd death-watch alone emits torn_down). */
 	int status;
 	pid_t got = waitpid(s->forward_pid, &status, WNOHANG);
 	if (got == s->forward_pid) {
@@ -4480,7 +4866,6 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 				   uint32_t allow_input)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(shell_resource);
-	(void)allow_input;
 
 	if (!qdwin_shell_require_bound(qdwin, shell_resource))
 		return;
@@ -4541,6 +4926,15 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 	s->qdwin = qdwin;
 	s->tl = tl;
 	s->pw_output = pw;
+	/* item 5: calloc zeroed forward_pidfd to 0 (a valid fd); reset to -1 so the
+	 * disarm helper never closes stdin if the watch was never armed. */
+	s->forward_pidfd = -1;
+	s->forward_pidfd_source = NULL;
+	/* The subscriber's allow_input is now ENFORCED (was ignored): a read-only
+	 * export (allow_input=0) keeps its pixel stream + per-stream seat (for focus
+	 * locking) but DROPS every injected event at the inject_* boundary below, so a
+	 * read-only export cannot be driven by the remote subscriber's forward. */
+	s->allow_input = allow_input ? 1 : 0;
 	wl_list_insert(&qdwin->view_streams, &s->link);
 
 	wl_resource_set_implementation(stream_resource, &qdwin_stream_impl,
@@ -4620,6 +5014,148 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
  * whether the events originated from RDP, an AI policy, or a fuzzer.
  * ------------------------------------------------------------------ */
 
+/* IMPL-19 per-stream confinement grab. Modeled on the locked-session branch of
+ * the default proxy grab: it FORCES pointer focus to the source view (tl->view)
+ * and delivers there, ignoring the compositor-global picker — so injected remote
+ * input is confined to the exported window even when a local view overlaps it at
+ * the same global coordinate. If the source view is gone / input is no longer
+ * allowed, events are DROPPED rather than falling back to geometric focus. */
+static struct weston_view *
+qdwin_stream_confine_target(struct qdwin_view_stream *s)
+{
+	if (!s || !s->allow_input || !s->tl || s->tl->nested_proxy_pending_decision)
+		return NULL;
+	if (!s->tl->view || !s->tl->view->surface)
+		return NULL;
+	return s->tl->view;
+}
+
+static void
+qdwin_stream_confine_focus(struct weston_pointer_grab *grab)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (v && grab->pointer->focus != v)
+		weston_pointer_set_focus(grab->pointer, v);
+}
+
+static void
+qdwin_stream_confine_motion(struct weston_pointer_grab *grab,
+			    const struct timespec *time,
+			    struct weston_pointer_motion_event *event)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_pointer *pointer = grab->pointer;
+	weston_pointer_move(pointer, event);
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (!v)
+		return;                  /* source view gone: drop, don't re-pick */
+	if (pointer->focus != v)
+		weston_pointer_set_focus(pointer, v);
+	weston_pointer_send_motion(pointer, time, event);
+}
+
+static void
+qdwin_stream_confine_button(struct weston_pointer_grab *grab,
+			    const struct timespec *time,
+			    uint32_t button, uint32_t state)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_pointer *pointer = grab->pointer;
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (!v)
+		return;
+	if (pointer->focus != v)
+		weston_pointer_set_focus(pointer, v);
+	weston_pointer_send_button(pointer, time, button, state);
+}
+
+static void
+qdwin_stream_confine_axis(struct weston_pointer_grab *grab,
+			  const struct timespec *time,
+			  struct weston_pointer_axis_event *event)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	struct weston_pointer *pointer = grab->pointer;
+	struct weston_view *v = qdwin_stream_confine_target(s);
+	if (!v)
+		return;
+	if (pointer->focus != v)
+		weston_pointer_set_focus(pointer, v);
+	weston_pointer_send_axis(pointer, time, event);
+}
+
+static void
+qdwin_stream_confine_axis_source(struct weston_pointer_grab *grab,
+				 uint32_t source)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	if (!qdwin_stream_confine_target(s))
+		return;                  /* drop when no source view, like motion/axis */
+	weston_pointer_send_axis_source(grab->pointer, source);
+}
+
+static void
+qdwin_stream_confine_frame(struct weston_pointer_grab *grab)
+{
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	if (!qdwin_stream_confine_target(s))
+		return;
+	weston_pointer_send_frame(grab->pointer);
+}
+
+static void
+qdwin_stream_confine_cancel(struct weston_pointer_grab *grab)
+{
+	/* Weston calls cancel when another grab replaces ours (or on teardown).
+	 * After that our grab is no longer the pointer's active grab, so clear
+	 * the active flag — otherwise a later grab_end would call
+	 * weston_pointer_end_grab on a pointer whose grab is now someone else's
+	 * and tear down the wrong grab (codex impl-20). */
+	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
+	s->confine_grab_active = 0;
+}
+
+static const struct weston_pointer_grab_interface qdwin_stream_confine_grab_iface = {
+	qdwin_stream_confine_focus,
+	qdwin_stream_confine_motion,
+	qdwin_stream_confine_button,
+	qdwin_stream_confine_axis,
+	qdwin_stream_confine_axis_source,
+	qdwin_stream_confine_frame,
+	qdwin_stream_confine_cancel,
+};
+
+static void
+qdwin_stream_confine_grab_start(struct qdwin_view_stream *s)
+{
+	if (s->confine_grab_active || !s->seat_inited)
+		return;
+	struct weston_pointer *ptr = weston_seat_get_pointer(&s->stream_seat);
+	if (!ptr)
+		return;
+	s->confine_grab.interface = &qdwin_stream_confine_grab_iface;
+	weston_pointer_start_grab(ptr, &s->confine_grab);
+	s->confine_grab_active = 1;
+	weston_log("qdwin: stream seat '%s' confinement grab started (port=%u)\n",
+		   s->stream_seat.seat_name ? s->stream_seat.seat_name : "?",
+		   s->rdp_port);
+}
+
+static void
+qdwin_stream_confine_grab_end(struct qdwin_view_stream *s)
+{
+	if (!s->confine_grab_active)
+		return;
+	s->confine_grab_active = 0;
+	/* Only end the grab if OURS is still the pointer's active grab — if it
+	 * was already replaced/cancelled, ending here would tear down whatever
+	 * grab is active now (codex impl-20). */
+	struct weston_pointer *ptr = s->confine_grab.pointer;
+	if (ptr && ptr->grab == &s->confine_grab)
+		weston_pointer_end_grab(ptr);
+}
+
 static void
 qdwin_stream_seat_init(struct qdwin_view_stream *s)
 {
@@ -4667,6 +5203,9 @@ qdwin_stream_seat_release(struct qdwin_view_stream *s)
 {
 	if (!s->seat_inited)
 		return;
+	/* IMPL-19: end the confinement grab BEFORE releasing the pointer, so we
+	 * don't leave a grab pointing at a freed pointer. */
+	qdwin_stream_confine_grab_end(s);
 	weston_seat_release_touch(&s->stream_seat);
 	weston_seat_release_keyboard(&s->stream_seat);
 	weston_seat_release_pointer(&s->stream_seat);
@@ -4729,6 +5268,7 @@ qdwin_stream_input_handle_resource_destroyed(struct wl_resource *resource)
 	if (s->input_handle == resource) {
 		s->input_handle = NULL;
 		s->input_claimed = 0;
+		qdwin_stream_confine_grab_end(s);   /* IMPL-19: drop the focus lock */
 		weston_log("qdwin: stream_input handle released "
 			   "(rdp_port=%u)\n", s->rdp_port);
 	}
@@ -4748,9 +5288,9 @@ qdwin_stream_input_inject_pointer_motion(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited ||
+	if (!s || !s->allow_input || !s->seat_inited ||
 	    !s->tl || !s->tl->view || !s->tl->view->surface)
-		return;
+		return;                  /* allow_input=0 => read-only: drop the event */
 
 	qdwin_stream_seat_assert_focus(s);
 
@@ -4786,8 +5326,8 @@ qdwin_stream_input_inject_pointer_button(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited)
-		return;
+	if (!s || !s->allow_input || !s->seat_inited)
+		return;                  /* allow_input=0 => read-only: drop the event */
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
 	notify_button(&s->stream_seat, &ts, (int32_t)button,
 		      state ? WL_POINTER_BUTTON_STATE_PRESSED
@@ -4804,8 +5344,8 @@ qdwin_stream_input_inject_pointer_axis(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited)
-		return;
+	if (!s || !s->allow_input || !s->seat_inited)
+		return;                  /* allow_input=0 => read-only: drop the event */
 	struct weston_pointer_axis_event ev = {
 		.axis = axis,  /* 0=vertical, 1=horizontal (wl_pointer.axis) */
 		.value = wl_fixed_to_double(value),
@@ -4823,8 +5363,8 @@ qdwin_stream_input_inject_key(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->seat_inited)
-		return;
+	if (!s || !s->allow_input || !s->seat_inited)
+		return;                  /* allow_input=0 => read-only: drop the event */
 
 	qdwin_stream_seat_assert_focus(s);
 
@@ -4853,6 +5393,8 @@ qdwin_stream_input_inject_modifiers(
 	 * future claimant needs explicit modifier overrides, the right
 	 * route is to add a new request that takes evdev codes, not masks. */
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
+	if (!s || !s->allow_input)
+		return;                  /* allow_input=0 => read-only: drop (completeness) */
 	weston_log("qdwin: inject modifiers (advisory) stream=%u "
 		   "dep=0x%x lat=0x%x lock=0x%x grp=%u\n",
 		   s ? s->rdp_port : 0, depressed, latched, locked, group);
@@ -4966,6 +5508,10 @@ qdwin_stream_input_handle_claim(
 		qdwin_stream_input_handle_resource_destroyed);
 	s->input_claimed = 1;
 	s->input_handle = handle_res;
+
+	/* IMPL-19: lock the per-stream pointer focus to the source view for the
+	 * life of the claim, so injected input can't leak to an overlapping view. */
+	qdwin_stream_confine_grab_start(s);
 
 	weston_log("qdwin: stream_input claim OK rdp_port=%u peer pid=%d "
 		   "uid=%u\n", s->rdp_port, (int)pid, (unsigned)uid);
@@ -8015,6 +8561,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_workspace_name = qdwin_handle_set_workspace_name,
 	.set_pointer_config = qdwin_handle_set_pointer_config,
 	.set_key_repeat = qdwin_handle_set_key_repeat,
+	.request_set_position = qdwin_handle_request_set_position,
 };
 
 static void
@@ -21324,7 +21871,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	 * unreachable when the global was pinned at 26. */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       29, qdwin, bind_qdwin_shell);
+					       30, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

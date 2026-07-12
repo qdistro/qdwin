@@ -83,6 +83,8 @@
  *   min <handle>      → request_minimize(handle)
  *   close <handle>    → request_close(handle)
  *   focus <handle>    → set_keyboard_focus("default", handle)
+ *   raise <handle>    → request_raise(handle)  (deterministic z-order)
+ *   move <handle> <x> <y> → request_set_position(handle, x, y)  (v30)
  *   subscribe <handle> → subscribe_view_stream(handle)
  *   subscribelast     → subscribe to the most recently added toplevel
  *   list              → print last seen toplevels to stderr
@@ -115,9 +117,11 @@
 
 /* v25: bind high enough to exercise set_wm_policy / request_fullscreen /
  * request_tile and the v19 register_hotkey path (host test 13-wm-policy).
- * v25 added only requests + enums (no new events), so the listener struct
- * is unchanged. The bind is still clamped to the advertised version. */
-#define BIND_VERSION 26
+ * v30 added request_set_position (shell-owned move) for the multi-machine
+ * viewer; all of these added only requests + enums (no new events), so the
+ * listener struct is unchanged. The bind is still clamped to the advertised
+ * version. */
+#define BIND_VERSION 30
 #define MAX_TOPS 16
 #define MAX_STREAMS 4
 #define FIFO_PATH_DEFAULT "/tmp/qdwin-cmd.fifo"
@@ -168,6 +172,18 @@ struct app {
 	struct stream_info streams[MAX_STREAMS];
 	struct pending_subscribe pending;
 	char peer_label[64];
+	/* --allow-input: request an input-capable subscription (allow_input=1)
+	 * instead of the read-only default. SERVER-ENFORCED (codex impl-14): with
+	 * allow_input=0 the compositor DROPS every injected event for the stream, so
+	 * a read-only export cannot be driven by the subscriber's qdistro-forward.
+	 * Used by the step-8 input-confinement gate + its read-only negative control
+	 * (codex impl-10/13): allow_input=1 lets the forward inject into the per-stream
+	 * seat; allow_input=0 must yield zero injected presses. */
+	int allow_input;
+	/* Transient per-subscribe allow_input override (-1 = use `allow_input`).
+	 * Set by the `subscribe`/`subscribelast` FIFO commands when they carry an
+	 * explicit 0/1, consumed by do_subscribe, then reset to -1. */
+	int sub_ai_override;
 	/* §P10 --forward-session: when set, every toplevel_added emits a
 	 * "FORWARD toplevel ..." stdout line so a wrapping waypipe-server
 	 * (and any downstream consumer) sees the enumeration. Per-inner-
@@ -538,8 +554,18 @@ do_subscribe(struct app *a, uint32_t handle)
 		return;
 	}
 	const char *label = a->peer_label[0] ? a->peer_label : "qdwin-bystander";
+	/* ai_override <0 => use the process-global --allow-input flag; 0/1 => set
+	 * this subscription's allow_input explicitly. Per-handle override lets ONE
+	 * bystander (qdwin_shell_v1 is a singleton role) give two exported streams
+	 * DIFFERENT allow_input — needed by the rung-1 per-window allow_input gate
+	 * (A=0/B=1 then flipped). */
+	uint32_t ai = (a->sub_ai_override >= 0)
+		? (uint32_t)(a->sub_ai_override ? 1 : 0)
+		: (a->allow_input ? 1u : 0u);
 	struct qdwin_view_stream_v1 *s = qdwin_shell_v1_subscribe_view_stream(
-		a->shell, handle, label, 0, 0, 0);
+		a->shell, handle, label, 0, 0, ai);
+	fprintf(stderr, "qdwin-bystander: subscribe handle=%u allow_input=%u\n",
+		handle, ai);
 	if (!s) {
 		fprintf(stderr, "qdwin-bystander: subscribe handle=%u: proxy create failed\n",
 			handle);
@@ -767,6 +793,23 @@ outer_teardown(struct outer_state *out)
 static volatile sig_atomic_t stop = 0;
 static void on_int(int s) { (void)s; stop = 1; }
 
+/* Parse an optional allow_input override token: NULL => -1 (use the global
+ * --allow-input flag); literal "0"/"1" => 0/1; anything else => rejected (-1 +
+ * a diagnostic), so a malformed command never silently sets an input policy. */
+static int
+parse_ai_override(const char *s)
+{
+	if (!s)
+		return -1;
+	if (strcmp(s, "0") == 0)
+		return 0;
+	if (strcmp(s, "1") == 0)
+		return 1;
+	fprintf(stderr, "qdwin-bystander: allow_input override must be 0|1, "
+		"got '%s' (using --allow-input default)\n", s);
+	return -1;
+}
+
 static void
 process_command(struct app *a, char *line)
 {
@@ -848,13 +891,40 @@ process_command(struct app *a, char *line)
 	} else if (strcmp(cmd, "focus") == 0 && has_handle) {
 		fprintf(stderr, "qdwin-bystander: cmd focus handle=%u\n", handle);
 		qdwin_shell_v1_set_keyboard_focus(a->shell, "default", handle);
+	} else if (strcmp(cmd, "raise") == 0 && has_handle) {
+		fprintf(stderr, "qdwin-bystander: cmd raise handle=%u\n", handle);
+		qdwin_shell_v1_request_raise(a->shell, handle);
+	} else if (strcmp(cmd, "move") == 0 && has_handle) {
+		/* move <handle> <x> <y> — v30 shell-owned set-position. The two
+		 * coordinates follow the handle; both required. */
+		char *xs = strtok(NULL, " \t\r\n");
+		char *ys = strtok(NULL, " \t\r\n");
+		if (!xs || !ys) {
+			fprintf(stderr, "qdwin-bystander: move needs <handle> <x> <y>\n");
+		} else {
+			int32_t mx = (int32_t)strtol(xs, NULL, 10);
+			int32_t my = (int32_t)strtol(ys, NULL, 10);
+			fprintf(stderr, "qdwin-bystander: cmd move handle=%u x=%d y=%d\n",
+				handle, mx, my);
+			qdwin_shell_v1_request_set_position(a->shell, handle, mx, my);
+		}
 	} else if (strcmp(cmd, "subscribe") == 0 && has_handle) {
-		fprintf(stderr, "qdwin-bystander: cmd subscribe handle=%u\n", handle);
+		/* subscribe <handle> [allow_input 0|1] — optional per-handle override.
+		 * Only literal 0/1 accepted; anything else is rejected (no silent
+		 * malformed input policy — this feeds the rung-1 allow_input proof). */
+		char *ais = strtok(NULL, " \t\r\n");
+		a->sub_ai_override = parse_ai_override(ais);
+		fprintf(stderr, "qdwin-bystander: cmd subscribe handle=%u ai=%s\n",
+			handle, ais ? ais : "default");
 		do_subscribe(a, handle);
+		a->sub_ai_override = -1;
 	} else if (strcmp(cmd, "subscribelast") == 0 && a->got_last) {
-		fprintf(stderr, "qdwin-bystander: cmd subscribelast handle=%u\n",
-			a->last_handle);
+		/* subscribelast [allow_input 0|1] — `arg` already holds the optional ai. */
+		a->sub_ai_override = parse_ai_override(arg);
+		fprintf(stderr, "qdwin-bystander: cmd subscribelast handle=%u ai=%s\n",
+			a->last_handle, arg ? arg : "default");
 		do_subscribe(a, a->last_handle);
+		a->sub_ai_override = -1;
 	} else if (strcmp(cmd, "list") == 0) {
 		fprintf(stderr, "qdwin-bystander: tracked toplevels:");
 		for (int i = 0; i < MAX_TOPS; i++)
@@ -871,14 +941,16 @@ usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n"
-		"          [--inner-display <wayland-socket>] [--forward-session]\n"
-		"          [--connect <wayland-socket>] [--forward-all-toplevels]\n",
+		"          [--allow-input] [--inner-display <wayland-socket>]\n"
+		"          [--forward-session] [--connect <wayland-socket>]\n"
+		"          [--forward-all-toplevels]\n",
 		argv0);
 }
 
 int main(int argc, char **argv)
 {
 	const char *inner_socket = NULL;
+	g_app.sub_ai_override = -1;        /* default: use the --allow-input flag */
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--subscribe") == 0 && i + 1 < argc) {
 			const char *v = argv[++i];
@@ -893,6 +965,8 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--peer-label") == 0 && i + 1 < argc) {
 			snprintf(g_app.peer_label, sizeof g_app.peer_label,
 				 "%s", argv[++i]);
+		} else if (strcmp(argv[i], "--allow-input") == 0) {
+			g_app.allow_input = 1;          /* input-confinement gate */
 		} else if ((strcmp(argv[i], "--inner-display") == 0
 			    || strcmp(argv[i], "--connect") == 0)
 			   && i + 1 < argc) {

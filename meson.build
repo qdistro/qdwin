@@ -40,6 +40,13 @@ else
   add_project_arguments('-DQDWIN_ROLE_HOST=1', language: 'c')
 endif
 
+# A1-min straddle test hook (codex impl-5/impl-6 M7): compiled in ONLY for
+# dedicated test builds. Production packaging leaves this off so the compositor
+# contains no ambient-env placement-bypass code path.
+if get_option('enable_test_place')
+  add_project_arguments('-DQDWIN_ENABLE_TEST_PLACE=1', language: 'c')
+endif
+
 dep_libweston = dependency('libweston-14', required: false)
 if not dep_libweston.found()
   dep_libweston = dependency('libweston-13')
@@ -935,6 +942,38 @@ executable('qdistro-test-window',
     'test-client/qdistro-test-window.c',
     xdg_shell_client_header,
     xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
+# Deterministic marker client for the multi-machine two-VM display harness
+# (todo/multi-machine/09). Paints the marker contract from
+# qdistro/multimachine/harness/marker.py (colour bands + 8x8 fiducials +
+# machine-readable corner barcode) so the Python pixel oracle can decode
+# output/generation/frame/scale from a capture. KEEP IN SYNC with marker.py.
+executable('qdwin-marker-client',
+  sources: [
+    'test-client/qdwin-marker-client.c',
+    xdg_shell_client_header,
+    xdg_shell_protocol_code_test,
+  ],
+  dependencies: [dep_wayland_client],
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
+# Compositor-boundary direct claimant for the multi-machine input-isolation
+# gate A1 (todo/multi-machine session 7). Selected by qdwin via QDWIN_FORWARD_BIN
+# in place of qdistro-forward; receives the real per-stream access token over
+# --access-token-fd and drives qdwin_stream_input_v1 claim+inject directly (no
+# RDP/FreeRDP). Links the qdwin_shell_v1 client bindings for the input protocol.
+executable('qdwin-stream-claimant',
+  sources: [
+    'test-client/qdwin-stream-claimant.c',
+    qdwin_shell_client_header,
+    qdwin_shell_protocol_code,
   ],
   dependencies: [dep_wayland_client],
   install: true,

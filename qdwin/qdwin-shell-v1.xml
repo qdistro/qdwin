@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="29">
+  <interface name="qdwin_shell_v1" version="30">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -384,11 +384,15 @@
            emits `denied` with a diagnostic reason string.
 
         `desired_width` and `desired_height` are hints for the output
-        size; the compositor may clamp. `allow_input` is purely
-        informational in this version — whether the subscriber may
-        inject input is decided server-side by the admin approval and
-        reflected in whether the compositor advertises
-        `qdwin_stream_input_v1` to the matching qdistro-forward.
+        size; the compositor may clamp. `allow_input` is a
+        SERVER-ENFORCED permission bit: when 0 (read-only) the
+        compositor DROPS every injected event (`inject_pointer_motion`/
+        `inject_pointer_button`/`inject_pointer_axis`/`inject_key`/
+        `inject_modifiers`) for this stream at the compositor boundary,
+        so the subscriber's qdistro-forward cannot drive the source
+        window even though it may still hold the input channel. Pixel
+        frame production (`request_frame`) is unaffected. (Admin approval
+        remains the higher-level gate on granting the stream at all.)
 
         `peer_label` is a caller-chosen short string shown in the
         admin prompt ("Forward to phone", "Share with work").
@@ -400,7 +404,7 @@
       <arg name="desired_width" type="int"/>
       <arg name="desired_height" type="int"/>
       <arg name="allow_input" type="uint"
-           summary="hint: 0 read-only, 1 subscriber may inject input"/>
+           summary="permission bit: 0 read-only (injects dropped), 1 subscriber may inject input"/>
     </request>
 
     <event name="hello">
@@ -1773,6 +1777,28 @@
       </description>
       <arg name="rate" type="uint" summary="repeat rate in Hz, 0..255 (0=off)"/>
       <arg name="delay" type="uint" summary="initial delay in ms, 1..10000"/>
+    </request>
+
+    <request name="request_set_position" since="30">
+      <description summary="shell moves a floating toplevel to an explicit position">
+        Shell-owned WM control: move the managed toplevel `handle` so its
+        outer-rect top-left sits at the GLOBAL compositor coordinate (x, y) —
+        the same coordinate space as the `toplevel_geometry` event — preserving
+        its current size. This is the compositor-driven counterpart to
+        `begin_interactive_move` (which follows the pointer): the shell names
+        the target position directly, so geometry is decided by shell policy,
+        not by the app or by pointer choreography.
+
+        qdwin refuses (silently ignores) an unknown/destroyed handle and a
+        maximized/fullscreen/tiled toplevel (those own their geometry); for a
+        floating toplevel it clamps the top-left onto the output that contains
+        it (falling back to the primary output) so the window stays reachable,
+        repositions the view, and emits `toplevel_geometry` with the new
+        (global) rectangle. The request never resizes.
+      </description>
+      <arg name="handle" type="uint"/>
+      <arg name="x" type="int" summary="global outer-rect x (toplevel_geometry space)"/>
+      <arg name="y" type="int" summary="global outer-rect y (toplevel_geometry space)"/>
     </request>
   </interface>
 
