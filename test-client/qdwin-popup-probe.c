@@ -28,6 +28,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <getopt.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,7 +80,7 @@ static const struct wl_registry_listener registry_listener = {
 };
 
 static struct wl_buffer *
-make_buffer(struct wl_shm *shm, int w, int h)
+make_buffer(struct wl_shm *shm, int w, int h, uint32_t colour)
 {
 	int stride = w * 4, size = stride * h;
 	int fd = memfd_create("qdwin-popup-probe", MFD_CLOEXEC);
@@ -87,7 +88,7 @@ make_buffer(struct wl_shm *shm, int w, int h)
 	if (ftruncate(fd, size) < 0) { close(fd); return NULL; }
 	uint32_t *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	if (p == MAP_FAILED) { close(fd); return NULL; }
-	for (int i = 0; i < w * h; i++) p[i] = 0xff404060;
+	for (int i = 0; i < w * h; i++) p[i] = colour;
 	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
 	struct wl_buffer *buf = wl_shm_pool_create_buffer(
 		pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
@@ -152,6 +153,7 @@ int main(int argc, char **argv)
 	int offx = 100000, offy = 100000;
 	int popup_w = 200, popup_h = 300;
 	int parent_w = 400, parent_h = 300;
+	int hold_seconds = 0;
 	struct option opts[] = {
 		{"offset-x", required_argument, 0, 'x'},
 		{"offset-y", required_argument, 0, 'y'},
@@ -159,10 +161,11 @@ int main(int argc, char **argv)
 		{"popup-h",  required_argument, 0, 'H'},
 		{"parent-w", required_argument, 0, 'p'},
 		{"parent-h", required_argument, 0, 'q'},
+		{"hold-seconds", required_argument, 0, 't'},
 		{0,0,0,0},
 	};
 	int o;
-	while ((o = getopt_long(argc, argv, "x:y:W:H:p:q:", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "x:y:W:H:p:q:t:", opts, NULL)) != -1) {
 		switch (o) {
 		case 'x': offx = atoi(optarg); break;
 		case 'y': offy = atoi(optarg); break;
@@ -170,6 +173,7 @@ int main(int argc, char **argv)
 		case 'H': popup_h = atoi(optarg); break;
 		case 'p': parent_w = atoi(optarg); break;
 		case 'q': parent_h = atoi(optarg); break;
+		case 't': hold_seconds = atoi(optarg); break;
 		default: return 2;
 		}
 	}
@@ -180,7 +184,8 @@ int main(int argc, char **argv)
 	 * the probe is to request an off-output placement). */
 	if (popup_w < 1 || popup_h < 1 || parent_w < 1 || parent_h < 1 ||
 	    popup_w > 16384 || popup_h > 16384 ||
-	    parent_w > 16384 || parent_h > 16384) {
+	    parent_w > 16384 || parent_h > 16384 ||
+	    hold_seconds < 0 || hold_seconds > 3600) {
 		fprintf(stderr, "dimensions must be in 1..16384\n");
 		return 2;
 	}
@@ -208,7 +213,7 @@ int main(int argc, char **argv)
 	wl_surface_commit(surf);
 	while (!c.got_toplevel_configure && wl_display_dispatch(c.display) != -1)
 		;
-	struct wl_buffer *buf = make_buffer(c.shm, parent_w, parent_h);
+	struct wl_buffer *buf = make_buffer(c.shm, parent_w, parent_h, 0xff404060);
 	if (!buf) { fprintf(stderr, "buffer failed\n"); return 1; }
 	wl_surface_attach(surf, buf, 0, 0);
 	wl_surface_damage_buffer(surf, 0, 0, parent_w, parent_h);
@@ -248,12 +253,41 @@ int main(int argc, char **argv)
 	printf("POPUP_GEOM %d %d %d %d\n", c.px, c.py, c.pw, c.ph);
 	fflush(stdout);
 
+	/* Optional live-fixture mode: map a vividly distinct popup and keep the
+	 * real parent+child pair alive long enough for the multi-machine R4 gate to
+	 * subscribe/capture/close it. Default zero preserves the original one-shot
+	 * geometry probe contract. */
+	struct wl_buffer *pbuf = NULL;
+	if (hold_seconds > 0) {
+		pbuf = make_buffer(c.shm, popup_w, popup_h, 0xffff0060);
+		if (!pbuf) { fprintf(stderr, "popup buffer failed\n"); return 1; }
+		wl_surface_attach(psurf, pbuf, 0, 0);
+		wl_surface_damage_buffer(psurf, 0, 0, popup_w, popup_h);
+		wl_surface_commit(psurf);
+		wl_display_roundtrip(c.display);
+		printf("POPUP_MAPPED parent=qdwin-popup-probe\n");
+		fflush(stdout);
+		int remaining_ms = hold_seconds * 1000;
+		while (!c.popup_done && remaining_ms > 0) {
+			struct pollfd pfd = {
+				.fd = wl_display_get_fd(c.display), .events = POLLIN,
+			};
+			int slice = remaining_ms < 100 ? remaining_ms : 100;
+			int rc = poll(&pfd, 1, slice);
+			if (rc < 0) break;
+			if (rc > 0 && wl_display_dispatch(c.display) == -1) break;
+			remaining_ms -= slice;
+		}
+	}
+
 	xdg_popup_destroy(popup);
 	xdg_surface_destroy(pxsurf);
 	wl_surface_destroy(psurf);
 	xdg_toplevel_destroy(top);
 	xdg_surface_destroy(xsurf);
 	wl_surface_destroy(surf);
+	if (pbuf)
+		wl_buffer_destroy(pbuf);
 	wl_buffer_destroy(buf);
 	wl_display_disconnect(c.display);
 	return 0;
