@@ -249,7 +249,8 @@ bool
 qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe)
 {
 	return peer_exe &&
-	       strcmp(peer_exe, "/usr/bin/qdistro-nested-pixelfeed") == 0;
+	       (strcmp(peer_exe, "/usr/bin/qdistro-nested-pixelfeed") == 0 ||
+	        strcmp(peer_exe, "/usr/bin/qdistro-mm-remote-pixelfeed") == 0);
 }
 
 bool

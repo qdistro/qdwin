@@ -444,6 +444,9 @@ static void test_nested_pixelfeed_peer_identity(void)
 	CHECK(qdwin_nested_pixelfeed_peer_allowed(
 		      "/usr/bin/qdistro-nested-pixelfeed"),
 	      "root-installed nested pixelfeed helper is recognized");
+	CHECK(qdwin_nested_pixelfeed_peer_allowed(
+		      "/usr/bin/qdistro-mm-remote-pixelfeed"),
+	      "root-installed remote pixelfeed helper is recognized");
 	CHECK(!qdwin_nested_pixelfeed_peer_allowed(NULL),
 	      "missing pixelfeed executable is rejected");
 	CHECK(!qdwin_nested_pixelfeed_peer_allowed(""),
@@ -454,6 +457,9 @@ static void test_nested_pixelfeed_peer_identity(void)
 	CHECK(!qdwin_nested_pixelfeed_peer_allowed(
 		       "/tmp/qdistro-nested-pixelfeed"),
 	      "lookalike pixelfeed path is rejected");
+	CHECK(!qdwin_nested_pixelfeed_peer_allowed(
+		       "/tmp/qdistro-mm-remote-pixelfeed"),
+	      "lookalike remote pixelfeed path is rejected");
 }
 
 /* ---- deliberate fail-open / broad-trust pins (02/S13) ----
