@@ -482,6 +482,13 @@ struct qdwin_toplevel {
 	char *proxy_app_id;
 	char *proxy_title;
 	uint32_t proxy_origin_uid;
+	/* v31: authority-bound remote identity. These fields are populated only
+	 * by qdwin_nested_toplevel_v1.set_remote_identity after exact publisher
+	 * executable verification; app_id/title never participate in attribution. */
+	char *proxy_remote_source_machine;
+	char *proxy_remote_trust_domain_id;
+	char *proxy_remote_stream_id;
+	uint64_t proxy_remote_generation;
 	/* §6.8 S2b: when the admin shell calls bind_proxy_pixels, the
 	 * compositor swaps the placeholder curtain view for a view of the
 	 * bound surface. proxy_pixel_view is the active view (== tl->view),
@@ -1538,6 +1545,24 @@ qdwin_toplevel_is_xwayland(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 }
 
 static void
+qdwin_emit_nested_proxy_remote_identity(struct qdwin *qdwin,
+					struct qdwin_toplevel *tl)
+{
+	if (!qdwin || !tl || !tl->is_nested_proxy ||
+	    !tl->proxy_remote_source_machine ||
+	    !qdwin->shell_bound || !qdwin->shell_resource ||
+	    wl_resource_get_version(qdwin->shell_resource) < 31)
+		return;
+	qdwin_shell_v1_send_nested_proxy_remote_identity(
+		qdwin->shell_resource, tl->handle,
+		tl->proxy_remote_source_machine,
+		tl->proxy_remote_trust_domain_id,
+		tl->proxy_remote_stream_id,
+		(uint32_t)(tl->proxy_remote_generation >> 32),
+		(uint32_t)tl->proxy_remote_generation);
+}
+
+static void
 qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
 	const char *app_id;
@@ -1570,6 +1595,7 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 					   title  ? title  : "",
 					   (uint32_t)qdwin_toplevel_is_xwayland(qdwin, tl));
 	qdwin_send_toplevel_security_context(qdwin, tl);
+	qdwin_emit_nested_proxy_remote_identity(qdwin, tl);
 	/* v24 sidecar: tell the shell which workspace this window opened on.
 	 * Mirrors the secctx event ordering — immediately after
 	 * toplevel_added so the shell has the row before it fills fields. */
@@ -17865,12 +17891,103 @@ qdwin_nested_toplevel_set_geometry(struct wl_client *client,
 		qdwin_nested_proxy_set_geometry(t->proxy_tl, w, h);
 }
 
+static int
+qdwin_remote_identity_text_valid(const char *text, int stream)
+{
+	if (!text)
+		return 0;
+	size_t length = strlen(text);
+	if (!length || length > 128 || (stream && length < 16))
+		return 0;
+	for (size_t i = 0; i < length; i++) {
+		unsigned char c = (unsigned char)text[i];
+		int alpha_num = (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+		if (!alpha_num && !(i > 0 && (c == '_' || c == '-' ||
+		    (!stream && (c == '.' || c == ':')))))
+			return 0;
+	}
+	return 1;
+}
+
+static void
+qdwin_nested_toplevel_set_remote_identity(struct wl_client *client,
+					   struct wl_resource *resource,
+					   const char *source_machine,
+					   const char *trust_domain_id,
+					   const char *stream_id,
+					   uint32_t generation_hi,
+					   uint32_t generation_lo)
+{
+	struct qdwin_nested_toplevel *t = wl_resource_get_user_data(resource);
+	if (!t || !t->proxy_tl)
+		return;
+	pid_t pid = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	(void)uid;
+	(void)gid;
+	char *peer_exe = qdwin_proc_exe(pid);
+	int publisher_allowed =
+		qdwin_remote_nested_publisher_allowed(peer_exe);
+	free(peer_exe);
+	if (!publisher_allowed) {
+		wl_resource_post_error(resource,
+			QDWIN_NESTED_TOPLEVEL_V1_ERROR_UNAUTHORIZED_REMOTE_IDENTITY,
+			"remote identity publisher is not authorized");
+		return;
+	}
+	uint64_t generation = ((uint64_t)generation_hi << 32) | generation_lo;
+	if (!generation ||
+	    !qdwin_remote_identity_text_valid(source_machine, 0) ||
+	    !qdwin_remote_identity_text_valid(trust_domain_id, 0) ||
+	    !qdwin_remote_identity_text_valid(stream_id, 1)) {
+		wl_resource_post_error(resource,
+			QDWIN_NESTED_TOPLEVEL_V1_ERROR_INVALID_REMOTE_IDENTITY,
+			"remote identity fields are invalid");
+		return;
+	}
+	struct qdwin_toplevel *tl = t->proxy_tl;
+	if (tl->proxy_remote_source_machine) {
+		if (tl->proxy_remote_generation == generation &&
+		    strcmp(tl->proxy_remote_source_machine, source_machine) == 0 &&
+		    strcmp(tl->proxy_remote_trust_domain_id, trust_domain_id) == 0 &&
+		    strcmp(tl->proxy_remote_stream_id, stream_id) == 0)
+			return;
+		wl_resource_post_error(resource,
+			QDWIN_NESTED_TOPLEVEL_V1_ERROR_REMOTE_IDENTITY_IMMUTABLE,
+			"remote identity cannot change");
+		return;
+	}
+	char *source_copy = qdwin_xstrdup_or_null(source_machine);
+	char *trust_copy = qdwin_xstrdup_or_null(trust_domain_id);
+	char *stream_copy = qdwin_xstrdup_or_null(stream_id);
+	if (!source_copy || !trust_copy || !stream_copy) {
+		free(source_copy);
+		free(trust_copy);
+		free(stream_copy);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	tl->proxy_remote_source_machine = source_copy;
+	tl->proxy_remote_trust_domain_id = trust_copy;
+	tl->proxy_remote_stream_id = stream_copy;
+	tl->proxy_remote_generation = generation;
+	weston_log("qdwin/nested-proxy: verified remote identity handle=%u "
+		   "source=%s trust_domain=%s stream=%s generation=%llu\n",
+		   tl->handle, source_copy, trust_copy, stream_copy,
+		   (unsigned long long)generation);
+	qdwin_emit_nested_proxy_remote_identity(tl->qdwin, tl);
+}
+
 static const struct qdwin_nested_toplevel_v1_interface
 qdwin_nested_toplevel_impl = {
 	.destroy      = qdwin_nested_toplevel_destroy_req,
 	.set_title    = qdwin_nested_toplevel_set_title,
 	.set_app_id   = qdwin_nested_toplevel_set_app_id,
 	.set_geometry = qdwin_nested_toplevel_set_geometry,
+	.set_remote_identity = qdwin_nested_toplevel_set_remote_identity,
 };
 
 static void
@@ -20305,6 +20422,9 @@ qdwin_nested_proxy_destroy(struct qdwin_toplevel *tl)
 	wl_list_remove(&tl->link);
 	free(tl->proxy_app_id);
 	free(tl->proxy_title);
+	free(tl->proxy_remote_source_machine);
+	free(tl->proxy_remote_trust_domain_id);
+	free(tl->proxy_remote_stream_id);
 	free(tl);
 }
 
@@ -22165,7 +22285,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_display_set_global_filter(ec->wl_display,
 				     qdwin_secctx_global_filter, qdwin);
 
-	/* §6.8 S1: qdwin_nested_v1 manager global at v2 (string node IDs).
+	/* §6.8 S1: qdwin_nested_v1 manager global at v3 (remote identity).
 	 * Peer-uid-filtered.
 	 *
 	 * §P10: compiled out in role=guest builds. The in-VM compositor
@@ -22178,7 +22298,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 #ifndef QDWIN_ROLE_GUEST
 	qdwin->nested_manager_global = wl_global_create(
 		ec->wl_display, &qdwin_nested_manager_v1_interface,
-		2, qdwin, bind_qdwin_nested_manager);
+		3, qdwin, bind_qdwin_nested_manager);
 	if (!qdwin->nested_manager_global) {
 		weston_log("qdwin: nested-manager wl_global_create failed\n");
 		goto fail;

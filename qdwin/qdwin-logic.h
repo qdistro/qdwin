@@ -183,6 +183,10 @@ bool qdwin_nested_secctx_publisher_allowed(const char *sandbox_engine,
  * resource for bind_proxy_pixels without acquiring the shell role. */
 bool qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe);
 
+/* Only this root-installed publisher may attach authority-bound identity to a
+ * nested proxy. Ordinary weston publishers and path lookalikes fail closed. */
+bool qdwin_remote_nested_publisher_allowed(const char *peer_exe);
+
 /* A nested input peer callback may already be queued while a replacement
  * connection is accepted.  Only the event source for the currently-owned fd
  * may tear down or inject through the per-toplevel input sink. */

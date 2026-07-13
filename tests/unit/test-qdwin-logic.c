@@ -462,6 +462,23 @@ static void test_nested_pixelfeed_peer_identity(void)
 	      "lookalike remote pixelfeed path is rejected");
 }
 
+static void test_remote_nested_publisher_identity(void)
+{
+	CHECK(qdwin_remote_nested_publisher_allowed(
+		      "/usr/bin/qdistro-mm-remote-viewer-helper"),
+	      "root-installed remote viewer helper is recognized");
+	CHECK(!qdwin_remote_nested_publisher_allowed(NULL),
+	      "missing remote publisher executable is rejected");
+	CHECK(!qdwin_remote_nested_publisher_allowed(
+		       "qdistro-mm-remote-viewer-helper"),
+	      "basename-only remote publisher is rejected");
+	CHECK(!qdwin_remote_nested_publisher_allowed(
+		       "/tmp/qdistro-mm-remote-viewer-helper"),
+	      "remote publisher path lookalike is rejected");
+	CHECK(!qdwin_remote_nested_publisher_allowed("/usr/bin/weston"),
+	      "ordinary nested publisher cannot attach remote identity");
+}
+
 /* Ensures: a delayed HUP/readable callback for a replaced nested input peer
  * cannot close or inject through the currently-owned peer connection. */
 static void test_nested_input_peer_event_identity(void)
@@ -660,6 +677,7 @@ int main(void)
 	test_global_visibility();
 	test_nested_secctx_publisher_identity();
 	test_nested_pixelfeed_peer_identity();
+	test_remote_nested_publisher_identity();
 	test_nested_input_peer_event_identity();
 	test_s13_fail_open_pins();
 	test_popup_constrain();

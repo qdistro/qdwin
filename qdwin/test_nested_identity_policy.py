@@ -861,6 +861,33 @@ def check_nested_input_peer_replacement(source):
     return 0
 
 
+def check_remote_identity_is_protected_and_immutable(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_nested_toplevel_set_remote_identity\s*\(",
+        "qdwin_nested_toplevel_set_remote_identity",
+    )
+    if err:
+        return fail(err)
+    required = (
+        "wl_client_get_credentials",
+        "qdwin_proc_exe(pid)",
+        "qdwin_remote_nested_publisher_allowed(peer_exe)",
+        "QDWIN_NESTED_TOPLEVEL_V1_ERROR_UNAUTHORIZED_REMOTE_IDENTITY",
+        "QDWIN_NESTED_TOPLEVEL_V1_ERROR_INVALID_REMOTE_IDENTITY",
+        "QDWIN_NESTED_TOPLEVEL_V1_ERROR_REMOTE_IDENTITY_IMMUTABLE",
+        "qdwin_emit_nested_proxy_remote_identity",
+    )
+    for token in required:
+        if token not in body:
+            return fail("remote identity setter lacks protected step: " + token)
+    identity_at = body.find("qdwin_remote_nested_publisher_allowed")
+    assign_at = body.find("tl->proxy_remote_source_machine = source_copy")
+    if identity_at < 0 or assign_at < 0 or identity_at > assign_at:
+        return fail("remote publisher identity must be verified before storing")
+    return 0
+
+
 def main():
     if len(sys.argv) != 2:
         return fail("usage: test_nested_identity_policy.py <qdwin.c>")
@@ -888,6 +915,7 @@ def main():
         check_generic_raise_paths_preserve_pending_gate,
         check_stream_input_helper_bound,
         check_nested_input_peer_replacement,
+        check_remote_identity_is_protected_and_immutable,
     )
     for check in checks:
         rc = check(source)

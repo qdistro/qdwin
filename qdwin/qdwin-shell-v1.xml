@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="30">
+  <interface name="qdwin_shell_v1" version="31">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1808,6 +1808,21 @@
       <arg name="x" type="int" summary="global outer-rect x (toplevel_geometry space)"/>
       <arg name="y" type="int" summary="global outer-rect y (toplevel_geometry space)"/>
     </request>
+
+    <event name="nested_proxy_remote_identity" since="31">
+      <description summary="authority-bound identity for a remote nested proxy">
+        Emitted only after qdwin verifies that the exact root-installed remote
+        viewer helper attached an immutable identity obtained from its local
+        authenticated controller. This is a protected sidecar to
+        toplevel_added; app_id and title remain untrusted presentation text.
+      </description>
+      <arg name="handle" type="uint"/>
+      <arg name="source_machine" type="string"/>
+      <arg name="trust_domain_id" type="string"/>
+      <arg name="stream_id" type="string"/>
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+    </event>
   </interface>
 
   <interface name="qdwin_background_v1" version="1">

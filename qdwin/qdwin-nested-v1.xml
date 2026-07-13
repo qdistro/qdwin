@@ -64,7 +64,7 @@
       keeps the proxy held fail-closed.
   </description>
 
-  <interface name="qdwin_nested_manager_v1" version="2">
+  <interface name="qdwin_nested_manager_v1" version="3">
     <description summary="bind entry point for nested compositor passthrough">
       Obtained via wl_registry.bind by the nested compositor. Hidden from
       generic secctx clients by the global filter, with an exact
@@ -146,11 +146,17 @@
     </enum>
   </interface>
 
-  <interface name="qdwin_nested_toplevel_v1" version="2">
+  <interface name="qdwin_nested_toplevel_v1" version="3">
     <description summary="one nested inner toplevel, surfaced as outer peer">
       Handle on an advertised inner toplevel. Lifetime is bounded by
       the nested compositor; the outer qdwin only observes.
     </description>
+
+    <enum name="error">
+      <entry name="invalid_remote_identity" value="0"/>
+      <entry name="unauthorized_remote_identity" value="1"/>
+      <entry name="remote_identity_immutable" value="2"/>
+    </enum>
 
     <request name="destroy" type="destructor">
       <description summary="the inner toplevel is gone">
@@ -205,5 +211,19 @@
       </description>
       <arg name="focused" type="uint"/>
     </event>
+
+    <request name="set_remote_identity" since="3">
+      <description summary="attach authority-verified remote origin identity">
+        Available only to the root-installed remote viewer helper. The
+        compositor verifies the publishing process executable independently
+        and accepts this immutable tuple once. Ordinary nested publishers
+        cannot cause qdwin to mark a proxy as remotely authenticated.
+      </description>
+      <arg name="source_machine" type="string"/>
+      <arg name="trust_domain_id" type="string"/>
+      <arg name="stream_id" type="string"/>
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+    </request>
   </interface>
 </protocol>
