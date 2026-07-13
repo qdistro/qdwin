@@ -22070,12 +22070,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request up to v29 (show_popup grab serial; v28 set_pointer_config /
-	 * set_key_repeat). This also fixes v27 (set_workspace_name) being
-	 * unreachable when the global was pinned at 26. */
+	 * request/event through v31 (protected remote nested identity). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       30, qdwin, bind_qdwin_shell);
+					       31, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
