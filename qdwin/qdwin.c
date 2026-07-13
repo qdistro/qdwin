@@ -218,6 +218,12 @@ static void qdwin_ext_ws_resync_all(struct qdwin *qdwin);
  * bound wlr-output-management manager (with a fresh serial) after an output
  * hotplug/resize. Defined near the rest of the output-management code. */
 static void qdwin_om_resync_all(struct qdwin *qdwin);
+/* R8/A4 return-home boundary: output_destroyed calls this while the removed
+ * output is still valid, before publishing output_removed. The definition is
+ * deliberately late so it can drain layer-shell, IME and primary-selection
+ * objects whose complete types are declared below. */
+static void qdwin_output_boundary_transition(struct qdwin *qdwin,
+					      struct weston_output *removed);
 /* §6.8 cursor-sprite full theme forward decl (impl table at L3577 needs
  * the symbol; definition lives near the rest of the cursor-shape code). */
 static void qdwin_handle_set_cursor_sprite(struct wl_client *client,
@@ -1631,8 +1637,10 @@ static struct weston_output *
 qdwin_primary_output(struct qdwin *qdwin)
 {
 	struct weston_output *out;
-	wl_list_for_each(out, &qdwin->compositor->output_list, link)
-		return out;
+	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		if (!out->destroying)
+			return out;
+	}
 	return NULL;
 }
 
@@ -9206,6 +9214,8 @@ qdwin_refresh_background(struct qdwin *qdwin)
 	struct weston_output *out;
 
 	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		if (out->destroying)
+			continue;
 		int right = out->pos.c.x + out->width;
 		int bottom = out->pos.c.y + out->height;
 		if (right > max_x)
@@ -9291,6 +9301,8 @@ qdwin_install_lock_curtain(struct qdwin *qdwin)
 	 * global coordinates are covered — a lock curtain that missed an
 	 * output would leak the desktop there once non-lock layers are hidden. */
 	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		if (out->destroying)
+			continue;
 		int left = out->pos.c.x, top = out->pos.c.y;
 		int right = left + out->width, bottom = top + out->height;
 		if (!have_output) {
@@ -12193,6 +12205,10 @@ qdwin_on_output_destroyed(struct wl_listener *listener, void *data)
 	struct qdwin *qdwin =
 		wl_container_of(listener, qdwin, output_destroyed_listener);
 	struct weston_output *output = data;
+	/* Rescue every surface and close session-scoped input/data state while
+	 * `output` geometry is still readable. Publishing removal first lets the
+	 * shell react while compositor objects still point at the dying output. */
+	qdwin_output_boundary_transition(qdwin, output);
 	qdwin_send_output_removed(qdwin, output);
 	/* ext-workspace: drop the group's association with this output. */
 	if (output)
@@ -17738,6 +17754,332 @@ qdwin_primary_seat_seat_destroyed(struct wl_listener *l, void *data)
 		device->pseat = NULL;
 	wl_list_remove(&pseat->link);
 	free(pseat);
+}
+
+/* ------------------------------------------------------------------
+ * R8/A4 output-loss / return-home boundary.
+ *
+ * Output destruction is a session boundary, not merely a geometry event:
+ * the vanished display may have held an interactive move, popup grab, DND,
+ * IME composition, pointer constraint, or clipboard content. Drain those
+ * capabilities before relocating surfaces so neither a stuck input state nor
+ * stale cross-machine data survives the return-home transition.
+ * ------------------------------------------------------------------ */
+
+static struct weston_output *
+qdwin_output_boundary_survivor(struct qdwin *qdwin,
+			       struct weston_output *removed)
+{
+	struct weston_output *out;
+	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		if (out != removed && !out->destroying)
+			return out;
+	}
+	return NULL;
+}
+
+static void
+qdwin_output_boundary_cancel_state(struct qdwin *qdwin,
+				   struct weston_output *removed)
+{
+	struct qdwin_toplevel *tl;
+	struct qdwin_view_stream *stream;
+	struct qdwin_layer_surface *ls;
+	struct qdwin_input_method *im;
+	struct weston_seat *seat;
+
+	/* Popup objects own pointer grabs; destroy them before the generic DND
+	 * cancellation below so no freed qdwin grab can remain installed. */
+	wl_list_for_each(tl, &qdwin->toplevels, link) {
+		if (tl->popup)
+			qdwin_popup_teardown(tl->popup);
+	}
+	wl_list_for_each(ls, &qdwin->layer_surfaces, link) {
+		struct qdwin_layer_popup *lp, *tmp;
+		wl_list_for_each_safe(lp, tmp, &ls->popups, link) {
+			/* Send xdg_popup.popup_done through the vendored helper before
+			 * dropping qdwin's wrapper; destroy alone only releases local
+			 * state and would strand the client's popup role. */
+			if (lp->grab_active && lp->grab.interface &&
+			    lp->grab.interface->cancel)
+				lp->grab.interface->cancel(&lp->grab);
+			qdwin_layer_popup_destroy(lp);
+		}
+	}
+
+	if (qdwin->move_grab_active)
+		qdwin_move_grab_end_for(qdwin, qdwin->move_grab_handle);
+	qdwin_switcher_grab_end(qdwin);
+	qdwin_overlay_grab_end(qdwin);
+	wl_list_for_each(stream, &qdwin->view_streams, link)
+		qdwin_stream_confine_grab_end(stream);
+
+	/* Deactivate composition and revoke its raw-keyboard grab. The IME may
+	 * bind a fresh grab after focus is re-established on the survivor. */
+	wl_list_for_each(im, &qdwin->input_methods, link) {
+		if (im->active)
+			qdwin_im_deactivate(im);
+		if (im->grab && im->grab->resource)
+			wl_resource_destroy(im->grab->resource);
+	}
+
+	wl_list_for_each(seat, &qdwin->compositor->seat_list, link) {
+		struct weston_pointer *pointer = weston_seat_get_pointer(seat);
+		struct weston_keyboard *keyboard = weston_seat_get_keyboard(seat);
+		struct weston_touch *touch = weston_seat_get_touch(seat);
+
+		/* A non-default grab left after qdwin's own grabs are gone is the
+		 * libweston data-device drag (or another core grab). Its cancel
+		 * callback performs the protocol cancellation and frees its state. */
+		if (pointer && pointer->grab != &pointer->default_grab &&
+		    pointer->grab->interface && pointer->grab->interface->cancel) {
+			pointer->grab->interface->cancel(pointer->grab);
+			if (pointer->grab != &pointer->default_grab)
+				weston_pointer_end_grab(pointer);
+		}
+		if (touch && touch->grab != &touch->default_grab &&
+		    touch->grab->interface && touch->grab->interface->cancel) {
+			touch->grab->interface->cancel(touch->grab);
+			if (touch->grab != &touch->default_grab)
+				weston_touch_end_grab(touch);
+		}
+		if (keyboard && keyboard->grab != &keyboard->default_grab &&
+		    keyboard->grab->interface && keyboard->grab->interface->cancel) {
+			keyboard->grab->interface->cancel(keyboard->grab);
+			if (keyboard->grab != &keyboard->default_grab)
+				weston_keyboard_end_grab(keyboard);
+		}
+
+		/* leave/focus reset makes clients release locally-held input and
+		 * cancels any focus-derived pointer constraint. */
+		if (pointer)
+			weston_pointer_set_focus(pointer, NULL);
+		if (keyboard)
+			weston_keyboard_set_focus(keyboard, NULL);
+		if (touch)
+			weston_touch_set_focus(touch, NULL);
+		if (seat->output == removed)
+			seat->output = NULL;
+
+		/* Clipboard and primary selection are session scoped. Never carry
+		 * their contents across an unmount/output-loss boundary. */
+		if (seat->selection_data_source)
+			weston_seat_set_selection(
+				seat, NULL,
+				wl_display_next_serial(qdwin->compositor->wl_display));
+		struct qdwin_primary_seat *pseat =
+			qdwin_primary_seat_find(qdwin, seat);
+		if (pseat && qdwin_primary_seat_has_source(pseat))
+			qdwin_primary_seat_clear_selection(pseat, 1);
+	}
+}
+
+static void
+qdwin_output_boundary_rehome_saved(struct qdwin_toplevel *tl,
+				   struct weston_output *survivor,
+				   double *content_x, double *content_y,
+				   int outer_w, int outer_h)
+{
+	int wx, wy, ww, wh, x, y;
+	qdwin_output_work_area(tl->qdwin, survivor, &wx, &wy, &ww, &wh);
+	qdwin_rehome_outer_rect((int32_t)(*content_x - tl->inset_w),
+				(int32_t)(*content_y - tl->inset_n),
+				outer_w, outer_h, wx, wy, ww, wh, &x, &y);
+	*content_x = x + tl->inset_w;
+	*content_y = y + tl->inset_n;
+}
+
+static bool
+qdwin_toplevel_belongs_to_output(struct qdwin_toplevel *tl,
+				 struct weston_output *output)
+{
+	if (!tl || !tl->view || !output)
+		return false;
+	if (tl->view->output == output)
+		return true;
+
+	struct weston_coord_global pos =
+		weston_view_get_pos_offset_global(tl->view);
+	int w = tl->outer_width > 0 ? tl->outer_width : tl->last_width;
+	int h = tl->outer_height > 0 ? tl->outer_height : tl->last_height;
+	if (w <= 0) w = 1;
+	if (h <= 0) h = 1;
+	double cx = pos.c.x - tl->inset_w + (double)w / 2.0;
+	double cy = pos.c.y - tl->inset_n + (double)h / 2.0;
+	return cx >= output->pos.c.x &&
+	       cx < output->pos.c.x + output->width &&
+	       cy >= output->pos.c.y &&
+	       cy < output->pos.c.y + output->height;
+}
+
+static void
+qdwin_output_boundary_rehome_toplevel(struct qdwin *qdwin,
+				      struct qdwin_toplevel *tl,
+				      struct weston_output *survivor)
+{
+	struct weston_coord_global pos =
+		weston_view_get_pos_offset_global(tl->view);
+	int outer_w = tl->outer_width > 0 ? tl->outer_width : tl->last_width;
+	int outer_h = tl->outer_height > 0 ? tl->outer_height : tl->last_height;
+	if (outer_w <= 0) outer_w = 800;
+	if (outer_h <= 0) outer_h = 600;
+
+	/* Restore slots must move too, otherwise the next unmaximize/untile
+	 * jumps straight back onto the vanished output. */
+	if (tl->saved_outer_w > 0 && tl->saved_outer_h > 0)
+		qdwin_output_boundary_rehome_saved(
+			tl, survivor, &tl->saved_x, &tl->saved_y,
+			tl->saved_outer_w, tl->saved_outer_h);
+	if (tl->tile_saved_outer_w > 0 && tl->tile_saved_outer_h > 0)
+		qdwin_output_boundary_rehome_saved(
+			tl, survivor, &tl->tile_saved_x, &tl->tile_saved_y,
+			tl->tile_saved_outer_w, tl->tile_saved_outer_h);
+
+	weston_view_set_output(tl->view, survivor);
+	if (tl->state & QDWIN_TS_FULLSCREEN) {
+		qdwin_toplevel_apply_fullscreen_geometry(qdwin, tl, survivor);
+	} else if (tl->state & QDWIN_TS_MAXIMIZED) {
+		int wx, wy, ww, wh;
+		qdwin_output_work_area(qdwin, survivor, &wx, &wy, &ww, &wh);
+		tl->outer_width = ww;
+		tl->outer_height = wh;
+		if (tl->is_nested_proxy)
+			qdwin_nested_proxy_set_geometry(tl, ww, wh);
+		else
+			weston_desktop_surface_set_maximized(tl->desktop_surface,
+							true);
+		struct weston_coord_global origin = {
+			.c = weston_coord(wx + tl->inset_w, wy + tl->inset_n),
+		};
+		weston_view_set_position(tl->view, origin);
+		qdwin_toplevel_apply_inset(tl);
+		qdwin_toplevel_position_chrome(tl);
+	} else if (tl->tiled == QDWIN_TILE_LEFT ||
+		   tl->tiled == QDWIN_TILE_RIGHT) {
+		int wx, wy, ww, wh;
+		qdwin_output_work_area(qdwin, survivor, &wx, &wy, &ww, &wh);
+		int left_w = ww / 2;
+		int tile_w = tl->tiled == QDWIN_TILE_RIGHT ? ww - left_w : left_w;
+		int tile_x = tl->tiled == QDWIN_TILE_RIGHT ? wx + left_w : wx;
+		tl->outer_width = tile_w;
+		tl->outer_height = wh;
+		struct weston_coord_global origin = {
+			.c = weston_coord(tile_x + tl->inset_w,
+					  wy + tl->inset_n),
+		};
+		weston_view_set_position(tl->view, origin);
+		if (tl->is_nested_proxy)
+			qdwin_nested_proxy_set_geometry(tl, tile_w, wh);
+		else
+			qdwin_toplevel_apply_inset(tl);
+		qdwin_toplevel_position_chrome(tl);
+	} else {
+		int wx, wy, ww, wh, x, y;
+		qdwin_output_work_area(qdwin, survivor, &wx, &wy, &ww, &wh);
+		qdwin_rehome_outer_rect((int32_t)(pos.c.x - tl->inset_w),
+					(int32_t)(pos.c.y - tl->inset_n),
+					outer_w, outer_h,
+					wx, wy, ww, wh, &x, &y);
+		struct weston_coord_global origin = {
+			.c = weston_coord(x + tl->inset_w, y + tl->inset_n),
+		};
+		weston_view_set_position(tl->view, origin);
+		qdwin_toplevel_apply_inset(tl);
+		qdwin_toplevel_position_chrome(tl);
+	}
+
+	weston_view_update_transform(tl->view);
+	if (qdwin->shell_bound && qdwin->shell_resource) {
+		struct weston_coord_global now =
+			weston_view_get_pos_offset_global(tl->view);
+		qdwin_shell_v1_send_toplevel_geometry(
+			qdwin->shell_resource, tl->handle,
+			(int)(now.c.x - tl->inset_w),
+			(int)(now.c.y - tl->inset_n),
+			(uint32_t)(tl->outer_width > 0 ? tl->outer_width : outer_w),
+			(uint32_t)(tl->outer_height > 0 ? tl->outer_height : outer_h));
+	}
+	weston_log("qdwin: output-boundary rehomed handle=%u to output=%s\n",
+		   tl->handle, survivor->name ? survivor->name : "(unnamed)");
+}
+
+static void
+qdwin_output_boundary_transition(struct qdwin *qdwin,
+				 struct weston_output *removed)
+{
+	struct weston_output *survivor =
+		qdwin_output_boundary_survivor(qdwin, removed);
+	struct qdwin_panel *panel;
+	struct qdwin_notification *notification;
+	struct qdwin_launcher *launcher;
+	struct qdwin_layer_surface *ls;
+	struct qdwin_toplevel *tl;
+	struct qdwin_view_stream *stream;
+
+	qdwin_output_boundary_cancel_state(qdwin, removed);
+
+	/* Eliminate every long-lived pointer to the dying output before any
+	 * work-area calculation. Shell chrome and credential prompts move first
+	 * so maximized/tiled applications see the survivor's real reserved area. */
+	wl_list_for_each(panel, &qdwin->panels, link) {
+		if (panel->output == removed) {
+			panel->output = survivor;
+			qdwin_panel_place(panel);
+		}
+	}
+	wl_list_for_each(notification, &qdwin->notifications, link) {
+		if (notification->output == removed) {
+			notification->output = survivor;
+			qdwin_notification_place(notification);
+		}
+	}
+	wl_list_for_each(launcher, &qdwin->launchers, link) {
+		if (launcher->output == removed) {
+			launcher->output = survivor;
+			qdwin_launcher_place(launcher);
+		}
+	}
+	wl_list_for_each(ls, &qdwin->layer_surfaces, link) {
+		if (!ls->output || ls->output == removed)
+			ls->output = survivor;
+		if (survivor && ls->output == survivor) {
+			qdwin_layer_surface_send_configure(ls);
+			if (ls->view)
+				qdwin_layer_surface_apply(ls);
+		}
+	}
+
+	/* A stream unpinned later must never restore its source view onto the
+	 * removed output. The PipeWire target itself is handled by its normal
+	 * backend teardown, but its restore destination is repaired here. */
+	wl_list_for_each(stream, &qdwin->view_streams, link) {
+		if (stream->prev_output == removed)
+			stream->prev_output = survivor;
+	}
+
+	if (!survivor) {
+		weston_log("qdwin: output-boundary output=%s: no survivor; "
+			   "input/data state cleared, surface rescue deferred\n",
+			   removed && removed->name ? removed->name : "(unnamed)");
+		return;
+	}
+
+	wl_list_for_each(tl, &qdwin->toplevels, link) {
+		if (qdwin_toplevel_belongs_to_output(tl, removed))
+			qdwin_output_boundary_rehome_toplevel(qdwin, tl, survivor);
+	}
+	qdwin_refresh_background(qdwin);
+	if (qdwin->shell_background) {
+		qdwin_background_place(qdwin->shell_background);
+		qdwin_background_send_geometry(qdwin->shell_background);
+	}
+	qdwin_lock_surface_place(qdwin);
+	if (qdwin->locked)
+		qdwin_install_lock_curtain(qdwin);
+	weston_compositor_schedule_repaint(qdwin->compositor);
+	weston_log("qdwin: output-boundary removed=%s survivor=%s complete\n",
+		   removed && removed->name ? removed->name : "(unnamed)",
+		   survivor->name ? survivor->name : "(unnamed)");
 }
 
 /* ------------------------------------------------------------------

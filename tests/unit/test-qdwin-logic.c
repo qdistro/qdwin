@@ -314,6 +314,33 @@ static void test_inset_inner_extent(void)
 	      qdwin_inset_inner_extent(0, 0, 0));
 }
 
+static void test_rehome_outer_rect(void)
+{
+	int32_t x = 0, y = 0;
+
+	qdwin_rehome_outer_rect(2200, 300, 800, 600,
+				100, 40, 1920, 1040, &x, &y);
+	CHECK(x == 1220, "rehome clamps floating window at right edge: got %d", x);
+	CHECK(y == 300, "rehome preserves an in-range vertical position: got %d", y);
+
+	qdwin_rehome_outer_rect(-900, -700, 800, 600,
+				100, 40, 1920, 1040, &x, &y);
+	CHECK(x == 100, "rehome clamps floating window at left edge: got %d", x);
+	CHECK(y == 40, "rehome clamps floating window at top edge: got %d", y);
+
+	qdwin_rehome_outer_rect(INT32_MAX, INT32_MAX, 4000, 3000,
+				1000, 2000, 800, 600, &x, &y);
+	CHECK(x == 1000, "oversize rehome keeps leading edge reachable: got %d", x);
+	CHECK(y == 2000, "oversize rehome keeps title edge reachable: got %d", y);
+
+	qdwin_rehome_outer_rect(INT32_MIN, INT32_MIN, 0, -1,
+				INT32_MAX, INT32_MAX, 0, 0, &x, &y);
+	CHECK(x == INT32_MAX,
+	      "degenerate rehome extent is overflow safe (x): got %d", x);
+	CHECK(y == INT32_MAX,
+	      "degenerate rehome extent is overflow safe (y): got %d", y);
+}
+
 /* ---- advertised-global visibility matrix (02/S1, the §4b finding) ----
  *
  * Enumerate every (credential class × global kind) cell so a regression —
@@ -637,6 +664,7 @@ int main(void)
 	test_compute_box();
 	test_fractional_scale();
 	test_inset_inner_extent();
+	test_rehome_outer_rect();
 	test_global_visibility();
 	test_nested_secctx_publisher_identity();
 	test_nested_pixelfeed_peer_identity();

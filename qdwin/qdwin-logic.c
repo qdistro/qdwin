@@ -5,6 +5,7 @@
  */
 #include "qdwin-logic.h"
 
+#include <limits.h>
 #include <string.h>
 
 enum libinput_config_accel_profile
@@ -116,6 +117,49 @@ qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead, int32_t inset_trail)
 	if (inner < 1)
 		inner = 1;
 	return inner;
+}
+
+static int32_t
+qdwin_i64_to_i32(int64_t value)
+{
+	if (value < INT32_MIN)
+		return INT32_MIN;
+	if (value > INT32_MAX)
+		return INT32_MAX;
+	return (int32_t)value;
+}
+
+void
+qdwin_rehome_outer_rect(int32_t outer_x, int32_t outer_y,
+			 int32_t outer_w, int32_t outer_h,
+			 int32_t work_x, int32_t work_y,
+			 int32_t work_w, int32_t work_h,
+			 int32_t *out_x, int32_t *out_y)
+{
+	int64_t ow = outer_w > 0 ? outer_w : 1;
+	int64_t oh = outer_h > 0 ? outer_h : 1;
+	int64_t ww = work_w > 0 ? work_w : 1;
+	int64_t wh = work_h > 0 ? work_h : 1;
+	int64_t min_x = work_x;
+	int64_t min_y = work_y;
+	int64_t max_x = ow <= ww ? min_x + ww - ow : min_x;
+	int64_t max_y = oh <= wh ? min_y + wh - oh : min_y;
+	int64_t x = outer_x;
+	int64_t y = outer_y;
+
+	if (x < min_x)
+		x = min_x;
+	else if (x > max_x)
+		x = max_x;
+	if (y < min_y)
+		y = min_y;
+	else if (y > max_y)
+		y = max_y;
+
+	if (out_x)
+		*out_x = qdwin_i64_to_i32(x);
+	if (out_y)
+		*out_y = qdwin_i64_to_i32(y);
 }
 
 uint32_t
