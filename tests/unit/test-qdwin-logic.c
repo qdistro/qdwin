@@ -462,6 +462,20 @@ static void test_nested_pixelfeed_peer_identity(void)
 	      "lookalike remote pixelfeed path is rejected");
 }
 
+/* Ensures: a delayed HUP/readable callback for a replaced nested input peer
+ * cannot close or inject through the currently-owned peer connection. */
+static void test_nested_input_peer_event_identity(void)
+{
+	CHECK(qdwin_nested_input_peer_event_current(42, 42),
+	      "current nested input peer event is accepted");
+	CHECK(!qdwin_nested_input_peer_event_current(41, 42),
+	      "replaced nested input peer event is rejected");
+	CHECK(!qdwin_nested_input_peer_event_current(-1, 42),
+	      "invalid nested input event fd is rejected");
+	CHECK(!qdwin_nested_input_peer_event_current(42, -1),
+	      "nested input event is rejected after current peer teardown");
+}
+
 /* ---- deliberate fail-open / broad-trust pins (02/S13) ----
  *
  * These tests pin explicit risk-register entries rather than asserting ideal
@@ -646,6 +660,7 @@ int main(void)
 	test_global_visibility();
 	test_nested_secctx_publisher_identity();
 	test_nested_pixelfeed_peer_identity();
+	test_nested_input_peer_event_identity();
 	test_s13_fail_open_pins();
 	test_popup_constrain();
 

@@ -825,6 +825,42 @@ def check_stream_input_helper_bound(source):
     return 0
 
 
+def check_nested_input_peer_replacement(source):
+    """A replacement peer must retire its old event source before the sink
+    helper closes the old fd, and a stale callback must not touch the new fd."""
+    listen, err = _function_body(
+        source,
+        r"static int\s+qdwin_nested_input_sink_listen_cb\s*\(",
+        "qdwin_nested_input_sink_listen_cb",
+    )
+    if err:
+        return fail(err)
+    remove_at = listen.find("wl_event_source_remove(")
+    accept_at = listen.find("qdwin_nested_input_sink_accept(")
+    if remove_at < 0 or accept_at < 0 or remove_at > accept_at:
+        return fail("nested input replacement does not remove the old event "
+                    "source before accept closes/replaces its peer fd")
+    if "old_peer_fd" not in listen or "peer_fd == old_peer_fd" not in listen:
+        return fail("nested input replacement does not restore the old watch "
+                    "when accept loses a readiness race")
+
+    peer, err = _function_body(
+        source,
+        r"static int\s+qdwin_nested_input_sink_peer_cb\s*\(",
+        "qdwin_nested_input_sink_peer_cb",
+    )
+    if err:
+        return fail(err)
+    current_at = peer.find("qdwin_nested_input_peer_event_current(")
+    hangup_at = peer.find("WL_EVENT_HANGUP")
+    if current_at < 0 or hangup_at < 0 or current_at > hangup_at:
+        return fail("nested input peer callback can process HUP before proving "
+                    "the event fd is still current")
+    if "ignoring stale input-sink peer event" not in peer:
+        return fail("stale nested input peer rejection is not observable")
+    return 0
+
+
 def main():
     if len(sys.argv) != 2:
         return fail("usage: test_nested_identity_policy.py <qdwin.c>")
@@ -851,6 +887,7 @@ def main():
         check_pixel_destroy_preserves_position,
         check_generic_raise_paths_preserve_pending_gate,
         check_stream_input_helper_bound,
+        check_nested_input_peer_replacement,
     )
     for check in checks:
         rc = check(source)

@@ -183,6 +183,11 @@ bool qdwin_nested_secctx_publisher_allowed(const char *sandbox_engine,
  * resource for bind_proxy_pixels without acquiring the shell role. */
 bool qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe);
 
+/* A nested input peer callback may already be queued while a replacement
+ * connection is accepted.  Only the event source for the currently-owned fd
+ * may tear down or inject through the per-toplevel input sink. */
+bool qdwin_nested_input_peer_event_current(int event_fd, int current_peer_fd);
+
 /* ------------------------------------------------------------------
  * Deliberate fail-open / broad-trust pins (02/S13).
  *

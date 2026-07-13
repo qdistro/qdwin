@@ -254,6 +254,13 @@ qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe)
 }
 
 bool
+qdwin_nested_input_peer_event_current(int event_fd, int current_peer_fd)
+{
+	return event_fd >= 0 && current_peer_fd >= 0 &&
+	       event_fd == current_peer_fd;
+}
+
+bool
 qdwin_om_mutation_allowed(bool client_is_bound_shell,
 			  bool shell_bound,
 			  pid_t client_pid, uid_t client_uid,

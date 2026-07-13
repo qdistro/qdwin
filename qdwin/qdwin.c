@@ -19359,7 +19359,14 @@ static int
 qdwin_nested_input_sink_peer_cb(int fd, uint32_t mask, void *data)
 {
 	struct qdwin_toplevel *tl = data;
-	(void)fd;
+	int current_fd = tl->nested_input_sink
+		? tl->nested_input_sink->peer_fd : -1;
+	if (!qdwin_nested_input_peer_event_current(fd, current_fd)) {
+		weston_log("qdwin/nested: ignoring stale input-sink peer event "
+			   "handle=%u event_fd=%d current_fd=%d\n",
+			   tl->handle, fd, current_fd);
+		return 0;
+	}
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		weston_log("qdwin/nested: input-sink peer closed handle=%u\n",
 			   tl->handle);
@@ -19456,8 +19463,35 @@ qdwin_nested_input_sink_listen_cb(int fd, uint32_t mask, void *data)
 	(void)fd;
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR))
 		return 0;
-	if (qdwin_nested_input_sink_accept(tl->nested_input_sink) < 0)
+
+	/* The sink helper closes the old peer only after accept4 succeeds.  Its
+	 * wl_event_source must be removed first: otherwise a delayed HUP for the
+	 * closed fd can run after peer_fd has been replaced and close the new
+	 * peer.  If accept4 loses a readiness race, restore the old watch. */
+	int old_peer_fd = tl->nested_input_sink
+		? tl->nested_input_sink->peer_fd : -1;
+	if (tl->nested_input_peer_source) {
+		wl_event_source_remove(tl->nested_input_peer_source);
+		tl->nested_input_peer_source = NULL;
+	}
+	if (qdwin_nested_input_sink_accept(tl->nested_input_sink) < 0) {
+		if (old_peer_fd >= 0 && tl->nested_input_sink &&
+		    tl->nested_input_sink->peer_fd == old_peer_fd) {
+			struct wl_event_loop *loop = wl_display_get_event_loop(
+				qdwin->compositor->wl_display);
+			tl->nested_input_peer_source = wl_event_loop_add_fd(
+				loop, old_peer_fd, WL_EVENT_READABLE,
+				qdwin_nested_input_sink_peer_cb, tl);
+			if (!tl->nested_input_peer_source) {
+				close(old_peer_fd);
+				tl->nested_input_sink->peer_fd = -1;
+				weston_log("qdwin/nested: failed to restore "
+					   "input-sink peer watch handle=%u\n",
+					   tl->handle);
+			}
+		}
 		return 0;
+	}
 	weston_log("qdwin/nested: input-sink connected handle=%u\n",
 		   tl->handle);
 	struct wl_event_loop *loop = wl_display_get_event_loop(
@@ -19465,6 +19499,13 @@ qdwin_nested_input_sink_listen_cb(int fd, uint32_t mask, void *data)
 	tl->nested_input_peer_source = wl_event_loop_add_fd(
 		loop, tl->nested_input_sink->peer_fd, WL_EVENT_READABLE,
 		qdwin_nested_input_sink_peer_cb, tl);
+	if (!tl->nested_input_peer_source) {
+		close(tl->nested_input_sink->peer_fd);
+		tl->nested_input_sink->peer_fd = -1;
+		weston_log("qdwin/nested: failed to watch input-sink peer "
+			   "handle=%u\n", tl->handle);
+		return 0;
+	}
 	return 1;
 }
 
