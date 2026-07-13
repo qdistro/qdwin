@@ -1091,6 +1091,18 @@ test('nested-identity-policy',
   ],
 )
 
+# R8/A4 return-home invariants: the output-destroy callback drains transient
+# input/data authority before publishing removal, relocates all shell + app
+# surface classes, repairs restore slots, and never selects a destroying output.
+test('output-boundary-policy',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_output_boundary_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # RDP-headless focus-listener rebind invariants. Driven by
 # tests/host/20-rdp-focus-rebind.md (live VM half is PENDING residue).
 test('rdp-focus-rebind',

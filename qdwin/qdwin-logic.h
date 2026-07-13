@@ -95,6 +95,17 @@ void qdwin_layer_compute_box(uint32_t anchor,
 int32_t qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead,
 				 int32_t inset_trail);
 
+/* Relocate a chrome-inclusive toplevel rectangle into a surviving output's
+ * work area after its previous output disappears. Windows which fit are
+ * fully clamped inside the work area; oversize windows are anchored at the
+ * work-area origin so their title/leading edge remains reachable. All
+ * arithmetic is overflow-safe and degenerate extents are treated as 1. */
+void qdwin_rehome_outer_rect(int32_t outer_x, int32_t outer_y,
+			     int32_t outer_w, int32_t outer_h,
+			     int32_t work_x, int32_t work_y,
+			     int32_t work_w, int32_t work_h,
+			     int32_t *out_x, int32_t *out_y);
+
 /* ------------------------------------------------------------------
  * wp_fractional_scale: clamp / env-override arithmetic.
  *
