@@ -1103,6 +1103,15 @@ test('output-boundary-policy',
   ],
 )
 
+test('cross-output-position-policy',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_cross_output_position_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # RDP-headless focus-listener rebind invariants. Driven by
 # tests/host/20-rdp-focus-rebind.md (live VM half is PENDING residue).
 test('rdp-focus-rebind',
