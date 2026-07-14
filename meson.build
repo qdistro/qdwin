@@ -1125,6 +1125,18 @@ test('rdp-external-listener-tls',
   ],
 )
 
+# A multi-backend Weston frontend consumes the shared --width/--height before
+# it loads RDP. Let the trusted launcher seed one bounded, initial-only slot
+# mode so the authenticated display lease can name an actually advertised mode.
+test('rdp-initial-mode',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_rdp_initial_mode.py'),
+    files('libweston-vendored/src/libweston/backend-rdp/rdp.c'),
+  ],
+)
+
 # text-input-unstable-v3 foundation invariants (Bucket A / P1): manager open
 # at v1, focus-driven client-scoped enter/leave, and the inert "no IME events
 # without an input-method" contract. Driven by tests/host/21-text-input.md;

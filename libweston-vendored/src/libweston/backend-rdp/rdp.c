@@ -28,6 +28,7 @@
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -339,6 +340,37 @@ rdp_output_disable_resize(struct weston_output *base)
 }
 
 static void
+rdp_output_apply_initial_mode(struct weston_output *base,
+			      struct weston_mode *mode)
+{
+	const char *requested;
+	int width, height;
+	char trailing;
+
+	/* The stock multi-backend frontend consumes --width/--height while
+	 * loading the first backend, leaving an RDP slot at 640x480.  A trusted
+	 * launcher can seed the pre-created slot's leaseable mode explicitly.
+	 * This is initial-state only: negotiated peer resize and later output
+	 * management continue through the ordinary backend path. */
+	if (base->current_mode)
+		return;
+	requested = getenv("QDWIN_RDP_INITIAL_MODE");
+	if (!requested || !*requested)
+		return;
+	if (sscanf(requested, "%dx%d%c", &width, &height, &trailing) != 2 ||
+	    width < 64 || width > 16384 || height < 64 || height > 16384 ||
+	    (int64_t)width * height > 67108864) {
+		weston_log("Ignoring invalid QDWIN_RDP_INITIAL_MODE='%s'\n",
+			   requested);
+		return;
+	}
+	mode->width = width;
+	mode->height = height;
+	weston_log("RDP initial output mode seeded by trusted launcher: %dx%d\n",
+		   width, height);
+}
+
+static void
 rdp_output_set_mode(struct weston_output *base, struct weston_mode *mode)
 {
 	struct rdp_output *rdpOutput = container_of(base, struct rdp_output, base);
@@ -348,6 +380,7 @@ rdp_output_set_mode(struct weston_output *base, struct weston_mode *mode)
 	rdpSettings *settings;
 	struct weston_renderbuffer *new_renderbuffer;
 
+	rdp_output_apply_initial_mode(base, mode);
 	mode->refresh = b->rdp_monitor_refresh_rate;
 	weston_output_set_single_mode(base, mode);
 
