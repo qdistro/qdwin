@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="32">
+  <interface name="qdwin_shell_v1" version="33">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1848,6 +1848,26 @@
       </description>
       <arg name="output_name" type="string"/>
       <arg name="enabled" type="uint"/>
+      <arg name="applied" type="uint"/>
+    </event>
+
+    <request name="drain_remote_output_state" since="33">
+      <description summary="drain session input and transfer state before detach">
+        Runs qdwin's fail-safe output-boundary cancellation without removing
+        the named output: cancel active grabs, DND, IME composition and pointer
+        constraints; clear keyboard/pointer/touch focus; and clear clipboard
+        plus primary selection. The controller invokes this only after RDP
+        input is disabled and before closing the authenticated carrier.
+      </description>
+      <arg name="output_name" type="string" summary="exact rdp-N slot name"/>
+    </request>
+
+    <event name="remote_output_drain_result" since="33">
+      <description summary="authoritative result of remote-output state drain">
+        `applied` is 1 only after the named output was found and the complete
+        cancellation boundary returned.
+      </description>
+      <arg name="output_name" type="string"/>
       <arg name="applied" type="uint"/>
     </event>
   </interface>

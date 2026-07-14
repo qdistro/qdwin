@@ -247,6 +247,8 @@ static void qdwin_om_resync_all(struct qdwin *qdwin);
  * objects whose complete types are declared below. */
 static void qdwin_output_boundary_transition(struct qdwin *qdwin,
 					      struct weston_output *removed);
+static void qdwin_output_boundary_cancel_state(struct qdwin *qdwin,
+					       struct weston_output *removed);
 /* §6.8 cursor-sprite full theme forward decl (impl table at L3577 needs
  * the symbol; definition lives near the rest of the cursor-shape code). */
 static void qdwin_handle_set_cursor_sprite(struct wl_client *client,
@@ -3295,6 +3297,38 @@ qdwin_handle_set_remote_output_input(struct wl_client *client,
 		   output_name, enabled, applied ? "applied" : "rejected");
 	qdwin_shell_v1_send_remote_output_input_result(
 		resource, output_name, enabled, applied ? 1u : 0u);
+}
+
+/* v33: run the R8 cancellation half before carrier close. This is deliberately
+ * separate from output removal so transfer state is gone while the peer is
+ * still connected and the controller can wait for an authoritative result. */
+static void
+qdwin_handle_drain_remote_output_state(struct wl_client *client,
+				       struct wl_resource *resource,
+				       const char *output_name)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct weston_output *output;
+	bool applied = false;
+	(void)client;
+
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (!qdwin_remote_output_name_valid(output_name)) {
+		weston_log("qdwin: remote output drain rejected invalid request\n");
+		return;
+	}
+	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+		if (!output->name || strcmp(output->name, output_name) != 0)
+			continue;
+		qdwin_output_boundary_cancel_state(qdwin, output);
+		applied = true;
+		break;
+	}
+	weston_log("qdwin: remote output drain output=%s result=%s\n",
+		   output_name, applied ? "applied" : "rejected");
+	qdwin_shell_v1_send_remote_output_drain_result(
+		resource, output_name, applied ? 1u : 0u);
 }
 
 /* ------------------------------------------------------------------
@@ -8699,6 +8733,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_key_repeat = qdwin_handle_set_key_repeat,
 	.request_set_position = qdwin_handle_request_set_position,
 	.set_remote_output_input = qdwin_handle_set_remote_output_input,
+	.drain_remote_output_state = qdwin_handle_drain_remote_output_state,
 };
 
 static void
@@ -22516,10 +22551,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request/event through v32 (fail-closed remote-output input gate). */
+	 * request/event through v33 (remote-output safety drain). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       32, qdwin, bind_qdwin_shell);
+					       33, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

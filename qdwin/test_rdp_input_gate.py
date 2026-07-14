@@ -45,6 +45,7 @@ def main() -> int:
         release = body(rdp, "rdp_peer_release_input")
         backend_gate = body(rdp, "rdp_output_set_input_enabled")
         shell_gate = body(qdwin, "qdwin_handle_set_remote_output_input")
+        drain = body(qdwin, "qdwin_handle_drain_remote_output_state")
         shell_destroy = body(qdwin, "qdwin_shell_resource_destroy")
         input_handlers = [
             body(rdp, name) for name in (
@@ -75,21 +76,34 @@ def main() -> int:
             return fail(f"qdwin remote input gate is missing {token}")
     if "qdwin_set_remote_output_input" not in shell_destroy or "false" not in shell_destroy:
         return fail("shell loss does not revoke RDP input")
-    if 'interface name="qdwin_shell_v1" version="32"' not in protocol:
-        return fail("qdwin shell protocol was not bumped to v32")
+    interface = re.search(
+        r'interface name="qdwin_shell_v1" version="(\d+)"', protocol)
+    if interface is None or int(interface.group(1)) < 32:
+        return fail("qdwin shell protocol does not include the v32 input gate")
     if 'request name="set_remote_output_input" since="32"' not in protocol:
         return fail("qdwin shell protocol lacks the v32 input request")
     if 'event name="remote_output_input_result" since="32"' not in protocol:
         return fail("qdwin shell protocol lacks the authoritative input result")
     if "send_remote_output_input_result" not in shell_gate:
         return fail("qdwin does not acknowledge the backend input transition")
+    if 'interface name="qdwin_shell_v1" version="33"' not in protocol:
+        return fail("qdwin shell protocol was not bumped for safety drain")
+    if 'request name="drain_remote_output_state" since="33"' not in protocol:
+        return fail("qdwin shell protocol lacks the safety drain request")
+    for token in (
+        "qdwin_shell_require_bound", "qdwin_remote_output_name_valid",
+        "qdwin_output_boundary_cancel_state",
+        "send_remote_output_drain_result",
+    ):
+        if token not in drain:
+            return fail(f"qdwin remote output drain is missing {token}")
     advertised = re.search(
         r"wl_global_create\(ec->wl_display,\s*"
         r"&qdwin_shell_v1_interface,\s*(\d+),",
         qdwin,
     )
-    if advertised is None or int(advertised.group(1)) < 32:
-        return fail("qdwin does not advertise the v32 input gate")
+    if advertised is None or int(advertised.group(1)) < 33:
+        return fail("qdwin does not advertise the v33 safety boundary")
 
     print("PASS: RDP input is fail-closed and bound-shell controlled")
     return 0
