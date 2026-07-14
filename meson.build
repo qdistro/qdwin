@@ -1114,6 +1114,17 @@ test('rdp-focus-rebind',
   ],
 )
 
+# R9 authenticated display carrier: the vendored Weston RDP backend must keep
+# inner certificate-based TLS when its listener is a broker-owned inherited fd.
+test('rdp-external-listener-tls',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_rdp_external_listener_tls.py'),
+    files('libweston-vendored/src/libweston/backend-rdp/rdp.c'),
+  ],
+)
+
 # text-input-unstable-v3 foundation invariants (Bucket A / P1): manager open
 # at v1, focus-driven client-scoped enter/leave, and the inert "no IME events
 # without an input-method" contract. Driven by tests/host/21-text-input.md;

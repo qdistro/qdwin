@@ -1944,9 +1944,14 @@ rdp_backend_create(struct weston_compositor *compositor,
 			goto err_free_strings;
 	}
 
-	/* if we are listening for client connections on an external listener
-	 * fd, we don't need to enforce TLS or RDP security, since FreeRDP
-	 * will consider it to be a local connection */
+	/* An external listener controls *who may connect* but does not make the
+	 * byte stream cryptographically authenticated.  Historically this path
+	 * unconditionally disabled TLS because it was intended for an already-
+	 * trusted local transport (for example a Hyper-V socket).  Qdistro passes
+	 * a mode-0600 AF_UNIX listener reached only through its paired mTLS relay,
+	 * and still requires an independently pinned inner RDP certificate.  Honor
+	 * an explicitly supplied cert/key for external listeners too.  Keep the
+	 * old no-certificate local-transport behavior for existing callers. */
 	fd = config->external_listener_fd;
 	if (fd < 0) {
 		if (!b->rdp_key && (!b->server_cert || !b->server_key)) {
@@ -1954,10 +1959,13 @@ rdp_backend_create(struct weston_compositor *compositor,
 				   "--rdp4-key or --rdp-tls-cert/--rdp-tls-key)\n");
 			goto err_free_strings;
 		}
-		if (b->server_cert && b->server_key) {
-			b->tls_enabled = 1;
+	}
+	if (b->server_cert && b->server_key) {
+		b->tls_enabled = 1;
+		if (fd >= 0)
+			weston_log("RDP TLS support activated on external listener\n");
+		else
 			rdp_debug(b, "TLS support activated\n");
-		}
 	}
 
 	wl_list_init(&b->peers);
