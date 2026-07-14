@@ -113,6 +113,7 @@ struct rdp_backend {
 	int external_listener_fd;
 	int rdp_monitor_refresh_rate;
 	pid_t compositor_tid;
+	bool input_enabled;
 
         rdp_audio_in_setup audio_in_setup;
         rdp_audio_in_teardown audio_in_teardown;

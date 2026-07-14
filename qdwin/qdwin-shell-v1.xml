@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="31">
+  <interface name="qdwin_shell_v1" version="32">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1822,6 +1822,33 @@
       <arg name="stream_id" type="string"/>
       <arg name="generation_hi" type="uint"/>
       <arg name="generation_lo" type="uint"/>
+    </event>
+
+    <request name="set_remote_output_input" since="32">
+      <description summary="gate console-equivalent input from one RDP output">
+        Enables or disables RDP peer input at the compositor backend for the
+        named pre-created rdp-N output. Disabling deterministically releases
+        every held key and pointer button before returning. The backend starts
+        disabled, and qdwin disables it again if the bound shell disappears.
+
+        This is a safety boundary, not ordinary settings IPC. Only the
+        exclusively bound shell may invoke it; the shell in turn accepts the
+        exact generation/slot transition only from the authenticated display
+        controller transaction.
+      </description>
+      <arg name="output_name" type="string" summary="exact rdp-N slot name"/>
+      <arg name="enabled" type="uint" summary="0 disabled, 1 enabled"/>
+    </request>
+
+    <event name="remote_output_input_result" since="32">
+      <description summary="authoritative result of an RDP input gate request">
+        Correlates the exact output name and requested state. `applied` is 1
+        only after the RDP backend accepted the transition and, for disable,
+        released its held input state.
+      </description>
+      <arg name="output_name" type="string"/>
+      <arg name="enabled" type="uint"/>
+      <arg name="applied" type="uint"/>
     </event>
   </interface>
 

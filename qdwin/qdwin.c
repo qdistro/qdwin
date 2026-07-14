@@ -44,6 +44,7 @@
 
 #include <libweston/libweston.h>
 #include <libweston/desktop.h>
+#include <libweston/plugin-registry.h>
 #include <libweston/shell-utils.h>
 #include <libweston/xwayland-api.h>
 #include <wayland-server-core.h>
@@ -54,6 +55,28 @@
  * header, but resolvable at dlopen time against the executable's
  * symbol table (same trick kiosk-shell uses). */
 int screenshooter_create(struct weston_compositor *ec);
+
+/* qdwin builds against the distribution's stable libweston headers while the
+ * in-tree RDP backend carries an additive tail to the v2 API. Keep a private
+ * ABI view of that registered vtable: the first three entries are the stock v2
+ * layout and the final entry is the input gate. Function-pointer
+ * representation is the ABI contract; qdwin calls only the final typed
+ * member. */
+#define QDWIN_RDP_OUTPUT_API_NAME "weston_rdp_output_api_v2"
+struct qdwin_rdp_output_api_extended_v2 {
+	void (*head_get_monitor)(void);
+	void (*output_set_mode)(void);
+	void (*disable_output_resize)(void);
+	bool (*output_set_input_enabled)(struct weston_output *output,
+					 bool enabled);
+};
+
+static const struct qdwin_rdp_output_api_extended_v2 *
+qdwin_rdp_output_get_api(struct weston_compositor *compositor)
+{
+	return weston_plugin_api_get(compositor, QDWIN_RDP_OUTPUT_API_NAME,
+				     sizeof(struct qdwin_rdp_output_api_extended_v2));
+}
 
 #include "qdwin-shell-v1-server-protocol.h"
 #include "qdwin-locker-v1-server-protocol.h"
@@ -3208,6 +3231,70 @@ qdwin_handle_request_set_position(struct wl_client *client,
 		   "size=%dx%d%s\n", handle, cx, cy, tl->last_width,
 		   tl->last_height,
 		   (cx != x || cy != y) ? " (clamped)" : "");
+}
+
+static bool
+qdwin_remote_output_name_valid(const char *name)
+{
+	const char *p;
+	if (!name || strncmp(name, "rdp-", 4) != 0 || !name[4])
+		return false;
+	for (p = name + 4; *p; p++)
+		if (*p < '0' || *p > '9')
+			return false;
+	return p - (name + 4) <= 3;
+}
+
+static bool
+qdwin_set_remote_output_input(struct qdwin *qdwin, const char *output_name,
+			      bool enabled)
+{
+	const struct qdwin_rdp_output_api_extended_v2 *api;
+	struct weston_output *output;
+
+	if (!qdwin_remote_output_name_valid(output_name))
+		return false;
+	api = qdwin_rdp_output_get_api(qdwin->compositor);
+	if (!api || !api->output_set_input_enabled)
+		return false;
+	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+		if (output->name && strcmp(output->name, output_name) == 0)
+			return api->output_set_input_enabled(output, enabled);
+	}
+	return false;
+}
+
+/* v32: the authenticated display controller reaches this only through the
+ * exclusively bound qdshell transaction. RDP starts fail-closed; disabling
+ * also releases backend-held keys/buttons. */
+static void
+qdwin_handle_set_remote_output_input(struct wl_client *client,
+				     struct wl_resource *resource,
+				     const char *output_name,
+				     uint32_t enabled)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	bool applied;
+	(void)client;
+
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (enabled > 1 || !qdwin_remote_output_name_valid(output_name)) {
+		weston_log("qdwin: remote input gate rejected invalid request\n");
+		return;
+	}
+	/* Safety-off remains available while locked; safety-on does not. */
+	if (enabled && qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+	applied = qdwin_set_remote_output_input(
+		qdwin, output_name, enabled != 0);
+	weston_log("qdwin: remote input gate output=%s enabled=%u result=%s\n",
+		   output_name, enabled, applied ? "applied" : "rejected");
+	qdwin_shell_v1_send_remote_output_input_result(
+		resource, output_name, enabled, applied ? 1u : 0u);
 }
 
 /* ------------------------------------------------------------------
@@ -8611,6 +8698,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_pointer_config = qdwin_handle_set_pointer_config,
 	.set_key_repeat = qdwin_handle_set_key_repeat,
 	.request_set_position = qdwin_handle_request_set_position,
+	.set_remote_output_input = qdwin_handle_set_remote_output_input,
 };
 
 static void
@@ -8618,6 +8706,14 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	if (qdwin->shell_resource == resource) {
+		struct weston_output *output;
+		/* v32: shell loss is authority loss. Revoke every live RDP seat
+		 * before clearing the binding; the backend releases held input. */
+		wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+			if (qdwin_remote_output_name_valid(output->name))
+				qdwin_set_remote_output_input(
+					qdwin, output->name, false);
+		}
 		qdwin_hotkeys_purge(qdwin);
 		if (qdwin->move_grab_active) {
 			qdwin->move_grab_active = 0;
@@ -22420,10 +22516,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request/event through v31 (protected remote nested identity). */
+	 * request/event through v32 (fail-closed remote-output input gate). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       31, qdwin, bind_qdwin_shell);
+					       32, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

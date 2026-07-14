@@ -765,7 +765,7 @@ def check_generic_raise_paths_preserve_pending_gate(source):
     )
     if err:
         return fail(err)
-    if "tl->nested_proxy_pending_decision" not in hit_body:
+    if "nested_proxy_pending_decision" not in hit_body:
         return fail("click hit-test does not skip pending nested proxies")
 
     chrome_body, err = _function_body(

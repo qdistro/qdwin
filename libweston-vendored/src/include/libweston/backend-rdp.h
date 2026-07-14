@@ -56,6 +56,11 @@ struct weston_rdp_output_api {
 
 	/** disable output resize */
 	void (*disable_output_resize)(struct weston_output *output);
+
+	/** Admit or reject input from every peer driving this RDP output.
+	 * Disabling also releases all held pointer buttons and keyboard keys. */
+	bool (*output_set_input_enabled)(struct weston_output *output,
+					 bool enabled);
 };
 
 static inline const struct weston_rdp_output_api *

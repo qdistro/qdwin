@@ -1146,6 +1146,18 @@ test('rdp-initial-mode',
   ],
 )
 
+test('rdp-input-gate',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_rdp_input_gate.py'),
+    files('libweston-vendored/src/libweston/backend-rdp/rdp.c'),
+    files('libweston-vendored/src/include/libweston/backend-rdp.h'),
+    files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-shell-v1.xml'),
+  ],
+)
+
 # text-input-unstable-v3 foundation invariants (Bucket A / P1): manager open
 # at v1, focus-driven client-scoped enter/leave, and the inert "no IME events
 # without an input-method" contract. Driven by tests/host/21-text-input.md;

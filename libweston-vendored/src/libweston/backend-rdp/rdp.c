@@ -822,6 +822,76 @@ out_error_nsc:
 	return FALSE;
 }
 
+static bool
+rdp_peer_input_allowed(RdpPeerContext *peer_context)
+{
+	return peer_context->rdpBackend->input_enabled &&
+		(peer_context->item.flags & RDP_PEER_ACTIVATED) &&
+		peer_context->item.seat;
+}
+
+static void
+rdp_peer_release_input(RdpPeerContext *peer_context)
+{
+	struct weston_keyboard *keyboard;
+	struct timespec time;
+	uint32_t *keys;
+	bool pointer_frame = false;
+	unsigned int i;
+
+	if (!(peer_context->item.flags & RDP_PEER_ACTIVATED) ||
+	    !peer_context->item.seat)
+		return;
+
+	weston_compositor_get_time(&time);
+	for (i = 0; i < ARRAY_LENGTH(peer_context->button_state); i++) {
+		if (!peer_context->button_state[i])
+			continue;
+		notify_button(peer_context->item.seat, &time, BTN_LEFT + i,
+			      WL_POINTER_BUTTON_STATE_RELEASED);
+		peer_context->button_state[i] = false;
+		pointer_frame = true;
+	}
+	if (pointer_frame)
+		notify_pointer_frame(peer_context->item.seat);
+
+	keyboard = weston_seat_get_keyboard(peer_context->item.seat);
+	while (keyboard && keyboard->keys.size >= sizeof(uint32_t)) {
+		keys = keyboard->keys.data;
+		/* notify_key removes the released key from this same array. */
+		notify_key(peer_context->item.seat, &time,
+			   keys[keyboard->keys.size / sizeof(uint32_t) - 1],
+			   WL_KEYBOARD_KEY_STATE_RELEASED,
+			   STATE_UPDATE_AUTOMATIC);
+	}
+}
+
+static bool
+rdp_output_set_input_enabled(struct weston_output *base, bool enabled)
+{
+	struct rdp_output *output = to_rdp_output(base);
+	struct rdp_backend *backend;
+	struct rdp_peers_item *item;
+
+	if (!output)
+		return false;
+	backend = output->backend;
+	if (backend->input_enabled == enabled)
+		return true;
+
+	backend->input_enabled = enabled;
+	if (!enabled) {
+		wl_list_for_each(item, &backend->peers, link) {
+			RdpPeerContext *context =
+				(RdpPeerContext *)item->peer->context;
+			rdp_peer_release_input(context);
+		}
+	}
+	weston_log("RDP input gate output=%s enabled=%d\n",
+		   base->name ? base->name : "(unnamed)", enabled);
+	return true;
+}
+
 static void
 rdp_peer_context_free(freerdp_peer* client, RdpPeerContext* context)
 {
@@ -1418,6 +1488,8 @@ xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
 	bool need_frame = false;
 	struct timespec time;
 
+	if (!rdp_peer_input_allowed(peerContext))
+		return TRUE;
 	dump_mouseinput(peerContext, flags, x, y, false);
 
 	/* Per RDP spec, the x,y position is valid on all input mouse messages,
@@ -1479,6 +1551,8 @@ xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
 	struct timespec time;
 	struct weston_coord_global pos;
 
+	if (!rdp_peer_input_allowed(peerContext))
+		return TRUE;
 	dump_mouseinput(peerContext, flags, x, y, true);
 
 	if (flags & PTR_XFLAGS_BUTTON1)
@@ -1523,7 +1597,9 @@ xf_input_synchronize_event(rdpInput *input, UINT32 flags)
 	struct rdp_output *output = rdp_get_first_output(b);
 	struct weston_keyboard *keyboard;
 
-        rdp_debug_verbose(b, "RDP backend: %s ScrLk:%d, NumLk:%d, CapsLk:%d, KanaLk:%d\n",
+	if (!rdp_peer_input_allowed(peerCtx))
+		return TRUE;
+	rdp_debug_verbose(b, "RDP backend: %s ScrLk:%d, NumLk:%d, CapsLk:%d, KanaLk:%d\n",
 			  __func__,
 			  flags & KBD_SYNC_SCROLL_LOCK ? 1 : 0,
 			  flags & KBD_SYNC_NUM_LOCK ? 1 : 0,
@@ -1563,7 +1639,7 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, XF_KEV_CODE_TYPE code)
         rdp_debug_verbose(peerContext->rdpBackend, "RDP backend: %s flags:0x%x, code:0x%x\n",
 			  __func__, flags, code);
 
-	if (!(peerContext->item.flags & RDP_PEER_ACTIVATED)) {
+	if (!rdp_peer_input_allowed(peerContext)) {
 		rdp_debug_verbose(peerContext->rdpBackend, " -> NOT ACTIVATED\n");
 		return TRUE;
 	}
@@ -1912,6 +1988,7 @@ static const struct weston_rdp_output_api api = {
 	rdp_head_get_monitor,
 	rdp_output_set_mode,
 	rdp_output_disable_resize,
+	rdp_output_set_input_enabled,
 };
 
 static const uint32_t rdp_formats[] = {
@@ -1957,6 +2034,9 @@ rdp_backend_create(struct weston_compositor *compositor,
 	/* After here, rdp_debug() is ready to be used */
 
 	b->rdp_monitor_refresh_rate = config->refresh_rate * 1000;
+	/* Fail closed until the exclusively bound shell admits this peer after
+	 * authenticated carrier establishment. */
+	b->input_enabled = false;
 	rdp_debug(b, "RDP backend: WESTON_RDP_MONITOR_REFRESH_RATE: %d\n", b->rdp_monitor_refresh_rate);
 
 	b->clipboard_debug = weston_log_ctx_add_log_scope(b->compositor->weston_log_ctx,
