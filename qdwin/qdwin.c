@@ -3253,15 +3253,24 @@ qdwin_set_remote_output_input(struct qdwin *qdwin, const char *output_name,
 {
 	const struct qdwin_rdp_output_api_extended_v2 *api;
 	struct weston_output *output;
+	struct wl_list *lists[2] = {
+		&qdwin->compositor->output_list,
+		&qdwin->compositor->pending_output_list,
+	};
 
 	if (!qdwin_remote_output_name_valid(output_name))
 		return false;
 	api = qdwin_rdp_output_get_api(qdwin->compositor);
 	if (!api || !api->output_set_input_enabled)
 		return false;
-	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
-		if (output->name && strcmp(output->name, output_name) == 0)
-			return api->output_set_input_enabled(output, enabled);
+	/* A disabled pre-created RDP slot lives on pending_output_list. Safety-off
+	 * must remain idempotent there during cold-start and crash recovery; only
+	 * searching active outputs made the daemon reject an already-safe disable. */
+	for (int i = 0; i < 2; i++) {
+		wl_list_for_each(output, lists[i], link) {
+			if (output->name && strcmp(output->name, output_name) == 0)
+				return api->output_set_input_enabled(output, enabled);
+		}
 	}
 	return false;
 }
@@ -3309,6 +3318,10 @@ qdwin_handle_drain_remote_output_state(struct wl_client *client,
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	struct weston_output *output;
+	struct wl_list *lists[2] = {
+		&qdwin->compositor->output_list,
+		&qdwin->compositor->pending_output_list,
+	};
 	bool applied = false;
 	(void)client;
 
@@ -3318,12 +3331,14 @@ qdwin_handle_drain_remote_output_state(struct wl_client *client,
 		weston_log("qdwin: remote output drain rejected invalid request\n");
 		return;
 	}
-	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
-		if (!output->name || strcmp(output->name, output_name) != 0)
-			continue;
-		qdwin_output_boundary_cancel_state(qdwin, output);
-		applied = true;
-		break;
+	for (int i = 0; i < 2 && !applied; i++) {
+		wl_list_for_each(output, lists[i], link) {
+			if (!output->name || strcmp(output->name, output_name) != 0)
+				continue;
+			qdwin_output_boundary_cancel_state(qdwin, output);
+			applied = true;
+			break;
+		}
 	}
 	weston_log("qdwin: remote output drain output=%s result=%s\n",
 		   output_name, applied ? "applied" : "rejected");
