@@ -557,11 +557,8 @@ struct qdwin_toplevel {
 	 * compare on every commit to detect xdg_toplevel.set_title and
 	 * forward the change to qdshell. NULL until the first publish. */
 	char *cached_title;
-	/* Last app_id observed on this toplevel. xdg_toplevel.set_app_id
-	 * post-map currently logs only — no protocol event yet, so
-	 * qdshell can't react. Once a toplevel_app_id event lands in
-	 * qdwin-shell-v1, send it here on diff. NULL until first
-	 * commit. */
+	/* Last app_id observed on this toplevel. v31 forwards post-map
+	 * xdg_toplevel/WM_CLASS changes to the shell. NULL until first commit. */
 	char *cached_app_id;
 	struct wl_list link;           /* qdwin::toplevels */
 };
@@ -1544,10 +1541,9 @@ qdwin_toplevel_is_xwayland(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 }
 
 /* libweston-desktop may not have copied WM_CLASS into app_id yet when its
- * surface_added callback fires.  XWayland already owns the property at that
- * point, so use its surface API as the authoritative fallback.  This keeps
- * the one-shot toplevel_added event useful for shells without inventing an
- * update event that older qdwin-shell protocol versions cannot consume. */
+ * surface_added callback fires. XWayland already owns the property at that
+ * point, so use its surface API as the authoritative fallback. v31 also
+ * forwards a later value when the property was unavailable at first map. */
 static const char *
 qdwin_toplevel_effective_app_id(struct qdwin *qdwin,
 				 struct qdwin_toplevel *tl)
@@ -1570,6 +1566,19 @@ qdwin_toplevel_effective_app_id(struct qdwin *qdwin,
 	const char *wm_class = qdwin->xwayland_surface_api->
 		get_xwayland_window_name(surface, WM_CLASS);
 	return wm_class && *wm_class ? wm_class : app_id;
+}
+
+static void
+qdwin_emit_toplevel_app_id(struct qdwin *qdwin,
+			    struct qdwin_toplevel *tl,
+			    const char *app_id)
+{
+	if (!qdwin || !tl || !qdwin->shell_bound || !qdwin->shell_resource)
+		return;
+	if (wl_resource_get_version(qdwin->shell_resource) < 31)
+		return;
+	qdwin_shell_v1_send_toplevel_app_id(qdwin->shell_resource,
+					   tl->handle, app_id ? app_id : "");
 }
 
 static void
@@ -1939,19 +1948,18 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 								   tl->handle, cur_safe);
 		}
 	}
-	/* xdg_toplevel.set_app_id diff. Same shape as the title diff:
-	 * detect changes on commit, log them. No protocol event yet
-	 * (qdwin_shell_v1 ships app_id only at toplevel_added) so this
-	 * is log-only — but the diff path is in place for when a
-	 * toplevel_app_id event lands. */
+	/* xdg_toplevel.set_app_id / XWayland WM_CLASS diff. v31 shells receive
+	 * the live value; older shells keep the one-shot value from
+	 * toplevel_added. */
 	{
 		const char *cur = qdwin_toplevel_effective_app_id(qdwin, tl);
 		const char *cur_safe = cur ? cur : "";
 		if (!tl->cached_app_id || strcmp(tl->cached_app_id, cur_safe) != 0) {
 			free(tl->cached_app_id);
 			tl->cached_app_id = qdwin_xstrdup_or_null(cur_safe);
-			weston_log("qdwin: toplevel_app_id handle=%u app_id=\"%s\" (log-only — no protocol event yet)\n",
+			weston_log("qdwin: toplevel_app_id handle=%u app_id=\"%s\"\n",
 				   tl->handle, cur_safe);
+			qdwin_emit_toplevel_app_id(qdwin, tl, cur_safe);
 		}
 	}
 
@@ -20698,11 +20706,9 @@ qdwin_nested_proxy_set_app_id(struct qdwin_toplevel *tl, const char *app_id)
 		return;
 	free(tl->proxy_app_id);
 	tl->proxy_app_id = qdwin_xstrdup_or_null(app_id);
-	/* qdwin_shell_v1 has no app_id-changed event today (app_id is
-	 * sent once at toplevel_added). Cached value still affects
-	 * subsequent re-emissions / debug output. */
-	weston_log("qdwin/nested-proxy: handle=%u app_id updated to %s "
-		   "(no shell event — qdwin_shell_v1 lacks toplevel_app_id)\n",
+	qdwin_emit_toplevel_app_id(tl->qdwin, tl,
+				    tl->proxy_app_id ? tl->proxy_app_id : "");
+	weston_log("qdwin/nested-proxy: handle=%u app_id updated to %s\n",
 		   tl->handle, app_id ? app_id : "");
 }
 
@@ -22318,12 +22324,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request up to v29 (show_popup grab serial; v28 set_pointer_config /
-	 * set_key_repeat). This also fixes v27 (set_workspace_name) being
-	 * unreachable when the global was pinned at 26. */
+	 * request/event through v31 (live app-id updates). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       30, qdwin, bind_qdwin_shell);
+					       31, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;

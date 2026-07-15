@@ -27,9 +27,13 @@ qdwin_apps_screenshot /tmp/01-step1-launched.png
 **Assert (1.1):** screenshot shows the Firefox window with tabs and
 URL bar visible. Window does NOT fill the screen — there should be
 black margin on at least one edge.
-**Assert (1.2):** bystander log line for this step contains
-`toplevel_added handle=<N> app_id="firefox"`. (Verify via
-`qdwin_apps_log_grep 'toplevel_added.*firefox'`.)
+**Assert (1.2):** the bystander protocol log contains Firefox's effective
+app ID, either in the initial `toplevel_added handle=<N> app_id="firefox"`
+or in the v31 live update `toplevel_app_id handle=<N> app_id="firefox"`.
+XWayland may publish WM_CLASS only after its first mapped commit, so an empty
+app ID in `toplevel_added` is valid only when the non-empty v31 update follows.
+(Verify via
+`qdwin_apps_log_grep 'toplevel_(added|app_id).*app_id="firefox"'`.)
 
 ### Step 2 — maximise via shell
 

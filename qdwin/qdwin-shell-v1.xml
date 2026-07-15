@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="30">
+  <interface name="qdwin_shell_v1" version="31">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -176,6 +176,13 @@
       fail safe on out-of-range values and no-op on backends without
       libinput devices (e.g. headless); pre-v28 shells keep those tabs
       persist-only. See the per-request docs below.
+
+      Version 31 adds `toplevel_app_id`, the live counterpart to the
+      app_id field in `toplevel_added`. XWayland applications may publish
+      WM_CLASS only after their first mapped commit, so the initial event
+      can legitimately carry an empty app_id. The sidecar delivers that
+      eventual identity and all later changes. Pre-v31 shells retain the
+      one-shot app_id behaviour.
     </description>
 
     <enum name="error">
@@ -1808,6 +1815,18 @@
       <arg name="x" type="int" summary="global outer-rect x (toplevel_geometry space)"/>
       <arg name="y" type="int" summary="global outer-rect y (toplevel_geometry space)"/>
     </request>
+
+    <event name="toplevel_app_id" since="31">
+      <description summary="a toplevel's application id changed">
+        Reports the current effective application id after it changes from
+        the value sent in `toplevel_added`. For native Wayland this is the
+        latest xdg_toplevel app_id. For XWayland, qdwin falls back to
+        WM_CLASS when the desktop-surface app_id is empty, which commonly
+        makes this event the first non-empty identity for a new window.
+      </description>
+      <arg name="handle" type="uint" summary="from toplevel_added"/>
+      <arg name="app_id" type="string" summary="current effective app id"/>
+    </event>
   </interface>
 
   <interface name="qdwin_background_v1" version="1">

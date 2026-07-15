@@ -115,13 +115,10 @@
 #include "qdwin-shell-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-/* v25: bind high enough to exercise set_wm_policy / request_fullscreen /
- * request_tile and the v19 register_hotkey path (host test 13-wm-policy).
- * v30 added request_set_position (shell-owned move) for the multi-machine
- * viewer; all of these added only requests + enums (no new events), so the
- * listener struct is unchanged. The bind is still clamped to the advertised
- * version. */
-#define BIND_VERSION 30
+/* Bind the complete shell protocol: v25 window-manager controls, v30
+ * request_set_position, and v31 live app-id updates. The bind remains clamped
+ * to the version advertised by an older compositor. */
+#define BIND_VERSION 31
 #define MAX_TOPS 16
 #define MAX_STREAMS 4
 #define FIFO_PATH_DEFAULT "/tmp/qdwin-cmd.fifo"
@@ -450,6 +447,13 @@ static void l_popup_button(void *d, struct qdwin_shell_v1 *s, uint32_t h,
 static void l_toplevel_workspace(void *d, struct qdwin_shell_v1 *s,
 				 uint32_t h, uint32_t index)
 { (void)d; (void)s; (void)h; (void)index; }
+static void l_toplevel_app_id(void *d, struct qdwin_shell_v1 *s,
+			      uint32_t h, const char *app_id)
+{
+	(void)d; (void)s;
+	fprintf(stderr, "qdwin-bystander: toplevel_app_id handle=%u app_id=\"%s\"\n",
+		h, app_id ? app_id : "");
+}
 
 static const struct qdwin_shell_v1_listener listener = {
 	.hello                  = on_hello,
@@ -482,6 +486,7 @@ static const struct qdwin_shell_v1_listener listener = {
 	.chrome_button          = l_chrome_button,
 	.popup_button           = l_popup_button,
 	.toplevel_workspace     = l_toplevel_workspace,
+	.toplevel_app_id        = l_toplevel_app_id,
 };
 
 /* ---- qdwin_view_stream_v1 listener ---- */
