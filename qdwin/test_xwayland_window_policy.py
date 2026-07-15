@@ -52,6 +52,12 @@ def main() -> int:
     if min(geometry_at, geometry_width_at, surface_width_at) < 0 or not (
             geometry_at < geometry_width_at < surface_width_at):
         return fail("restore seed must prefer desktop geometry over CSD-inflated buffer size")
+    nested_at = seed.find("if (tl->is_nested_proxy)")
+    nested_return_at = seed.find("return;", nested_at)
+    inset_add_at = seed.find("tl->outer_width = inner_w + tl->inset_w")
+    if min(nested_at, nested_return_at, inset_add_at) < 0 or not (
+            nested_at < nested_return_at < inset_add_at):
+        return fail("nested proxy outer geometry must not add chrome twice")
     for scope, function_body in (
         ("maximize", maximize),
         ("fullscreen", fullscreen),

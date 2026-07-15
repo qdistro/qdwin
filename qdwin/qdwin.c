@@ -2582,24 +2582,26 @@ qdwin_toplevel_seed_outer_from_committed(struct qdwin_toplevel *tl)
 	if (tl->outer_width > 0 && tl->outer_height > 0)
 		return;
 	if (tl->is_nested_proxy) {
-		inner_w = tl->last_width;
-		inner_h = tl->last_height;
-	} else {
-		struct weston_surface *surface =
-			weston_desktop_surface_get_surface(tl->desktop_surface);
-		struct weston_geometry geometry =
-			weston_desktop_surface_get_geometry(tl->desktop_surface);
-
-		/* set_size() takes the desktop window geometry, not the full
-		 * wl_surface buffer.  XWayland CSD/shadows make those differ (52px
-		 * for Firefox and 64px for Chromium in the regression VMs).  Saving
-		 * surface->width here and later feeding it to set_size() made every
-		 * maximise/restore cycle grow the window by exactly that extent. */
-		inner_w = geometry.width > 0 ? geometry.width
-			: (surface ? surface->width : 0);
-		inner_h = geometry.height > 0 ? geometry.height
-			: (surface ? surface->height : 0);
+		/* The proxy curtain already is the outer rect; its separately
+		 * attached chrome must not be added a second time. */
+		tl->outer_width = tl->last_width > 0 ? tl->last_width : 800;
+		tl->outer_height = tl->last_height > 0 ? tl->last_height : 600;
+		return;
 	}
+	struct weston_surface *surface =
+		weston_desktop_surface_get_surface(tl->desktop_surface);
+	struct weston_geometry geometry =
+		weston_desktop_surface_get_geometry(tl->desktop_surface);
+
+	/* set_size() takes the desktop window geometry, not the full wl_surface
+	 * buffer.  XWayland CSD/shadows make those differ (52px for Firefox and
+	 * 64px for Chromium in the regression VMs).  Saving surface->width here
+	 * and later feeding it to set_size() made every maximise/restore cycle
+	 * grow the window by exactly that extent. */
+	inner_w = geometry.width > 0 ? geometry.width
+		: (surface ? surface->width : 0);
+	inner_h = geometry.height > 0 ? geometry.height
+		: (surface ? surface->height : 0);
 	if (inner_w <= 0)
 		inner_w = 800;
 	if (inner_h <= 0)
