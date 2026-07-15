@@ -1,7 +1,7 @@
 # 12 — wl_keyboard delivery to native Wayland and XWayland clients
 
-**Acceptance criterion:** keystrokes injected via `virsh send-key
---codeset linux KEY_*` reach both a native-Wayland focused toplevel
+**Acceptance criterion:** keystrokes injected as discrete QMP
+`input-send-event` key transitions reach both a native-Wayland focused toplevel
 and an XWayland focused toplevel and produce visible characters.
 Tests qdwin's `set_keyboard_focus` path (the bystander uses the v14
 form, see `test-client/qdwin-bystander.c`) plus libweston's

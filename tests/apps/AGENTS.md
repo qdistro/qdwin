@@ -68,7 +68,9 @@ The helper provides:
   `qdwin_apps_ctl maxlast` / `restorelast` after launching one app, or pass an
   explicit handle such as `qdwin_apps_ctl "max 7"`.
 - `qdwin_apps_screenshot <path>` — `virsh screenshot` to host path.
-- `qdwin_apps_send_key KEY_*` / `qdwin_apps_type "string"`.
+- `qdwin_apps_send_key KEY_*` / `qdwin_apps_type "string"` for discrete
+  keys, and `qdwin_apps_chord alt -- f` for real modifier-held chords. These
+  use QMP `input-send-event`; do not substitute `virsh send-key` for a chord.
 - `qdwin_apps_kill_all` — `pkill -u admin -9` everything we might have
   started; for Cleanup blocks.
 - `qdwin_apps_log_grep <pattern>` — pull and grep

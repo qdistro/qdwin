@@ -52,7 +52,7 @@ an XWayland-spawned modal.
 ### Step 3 — open File menu via Alt+F
 
 ```bash
-virsh send-key "$VMNAME" --codeset linux KEY_LEFTALT KEY_F
+qdwin_apps_chord alt -- f
 sleep 1
 qdwin_apps_screenshot /tmp/09-step3-menu.png
 ```

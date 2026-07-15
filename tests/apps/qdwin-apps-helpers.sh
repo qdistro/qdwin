@@ -228,7 +228,78 @@ qdwin_apps_screenshot() {
 
 qdwin_apps_send_key() {
     qdwin_apps_require_vm || return 1
-    $QDWIN_VIRSH send-key "$VMNAME" --codeset linux "$@"
+    local key qcode
+    for key in "$@"; do
+        case "$key" in
+            KEY_LEFTCTRL) qcode=ctrl ;;
+            KEY_RIGHTCTRL) qcode=ctrl_r ;;
+            KEY_LEFTALT) qcode=alt ;;
+            KEY_RIGHTALT) qcode=alt_r ;;
+            KEY_LEFTSHIFT) qcode=shift ;;
+            KEY_RIGHTSHIFT) qcode=shift_r ;;
+            KEY_LEFTMETA) qcode=meta_l ;;
+            KEY_RIGHTMETA) qcode=meta_r ;;
+            KEY_TAB) qcode=tab ;;
+            KEY_ESC) qcode=esc ;;
+            KEY_ENTER|KEY_KPENTER) qcode=ret ;;
+            KEY_SPACE) qcode=spc ;;
+            KEY_BACKSPACE) qcode=backspace ;;
+            KEY_DOT) qcode=dot ;;
+            KEY_MINUS) qcode=minus ;;
+            KEY_UP) qcode=up ;;
+            KEY_DOWN) qcode=down ;;
+            KEY_LEFT) qcode=left ;;
+            KEY_RIGHT) qcode=right ;;
+            KEY_[A-Z]) qcode=$(printf '%s' "${key#KEY_}" | tr A-Z a-z) ;;
+            KEY_[0-9]) qcode=${key#KEY_} ;;
+            *) echo "qdwin-apps: no qcode for $key" >&2; return 1 ;;
+        esac
+        qdwin_apps_qmp_key "$qcode" down || return 1
+        sleep 0.03
+        qdwin_apps_qmp_key "$qcode" up || return 1
+        sleep 0.03
+    done
+}
+
+# Emit one atomic key transition.  Unlike `virsh send-key`, this lets a chord
+# hold its modifier while the non-modifier key is pressed and released.
+qdwin_apps_qmp_key() {
+    qdwin_apps_require_vm || return 1
+    local qcode="$1" direction="$2" down=true
+    [ "$direction" = up ] && down=false
+    $QDWIN_VIRSH qemu-monitor-command "$VMNAME" \
+        "{\"execute\": \"input-send-event\", \"arguments\": {\"events\": [{\"type\": \"key\", \"data\": {\"down\": $down, \"key\": {\"type\": \"qcode\", \"data\": \"$qcode\"}}}]}}" \
+        >/dev/null
+}
+
+# Real keyboard sequence: hold modifiers, tap keys, release modifiers in
+# reverse order. Usage: qdwin_apps_chord alt -- f
+qdwin_apps_chord() {
+    qdwin_apps_require_vm || return 1
+    local -a holds=() taps=()
+    local phase=hold key index
+    for key in "$@"; do
+        if [ "$key" = -- ]; then phase=tap; continue; fi
+        if [ "$phase" = hold ]; then holds+=("$key"); else taps+=("$key"); fi
+    done
+    [ "${#holds[@]}" -gt 0 ] && [ "${#taps[@]}" -gt 0 ] || {
+        echo "qdwin-apps: chord requires <holds> -- <taps>" >&2
+        return 1
+    }
+    for key in "${holds[@]}"; do
+        qdwin_apps_qmp_key "$key" down || return 1
+        sleep 0.03
+    done
+    for key in "${taps[@]}"; do
+        qdwin_apps_qmp_key "$key" down || return 1
+        sleep 0.05
+        qdwin_apps_qmp_key "$key" up || return 1
+        sleep 0.05
+    done
+    for ((index=${#holds[@]} - 1; index >= 0; index--)); do
+        qdwin_apps_qmp_key "${holds[index]}" up || return 1
+        sleep 0.03
+    done
 }
 
 # Type a lowercase ASCII string one character at a time. Avoids the

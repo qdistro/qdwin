@@ -1103,6 +1103,19 @@ test('xwayland-window-policy',
   ],
 )
 
+# Application scenarios must inject ordered key transitions. A simultaneous
+# virsh send-key chord previously produced screenshots with no open menu while
+# a visual runner incorrectly reported PASS.
+test('app-input-policy',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_app_input_policy.py'),
+    files('tests/apps/qdwin-apps-helpers.sh'),
+    files('tests/apps/09-wxwidgets-audacity.md'),
+  ],
+)
+
 # R8/A4 return-home invariants: the output-destroy callback drains transient
 # input/data authority before publishing removal, relocates all shell + app
 # surface classes, repairs restore slots, and never selects a destroying output.
