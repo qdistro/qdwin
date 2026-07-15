@@ -318,21 +318,27 @@ static void test_inset_inner_extent(void)
  * maximize/restore configure round-trip. */
 static void test_client_extent_for_geometry(void)
 {
-	CHECK(qdwin_client_extent_for_geometry(1009, 1073, 1009) == 945,
+	CHECK(qdwin_client_extent_for_geometry(1009, 1073, 1009, 0) == 945,
 	      "Chromium visible 1009 with 64px surface delta configures 945: got %d",
-	      qdwin_client_extent_for_geometry(1009, 1073, 1009));
-	CHECK(qdwin_client_extent_for_geometry(1332, 1384, 1332) == 1280,
+	      qdwin_client_extent_for_geometry(1009, 1073, 1009, 0));
+	CHECK(qdwin_client_extent_for_geometry(1332, 1384, 1332, 0) == 1280,
 	      "Firefox visible 1332 with 52px surface delta configures 1280: got %d",
-	      qdwin_client_extent_for_geometry(1332, 1384, 1332));
-	CHECK(qdwin_client_extent_for_geometry(800, 800, 800) == 800,
+	      qdwin_client_extent_for_geometry(1332, 1384, 1332, 0));
+	CHECK(qdwin_client_extent_for_geometry(800, 800, 800, 0) == 800,
 	      "native Wayland zero-delta extent passes through: got %d",
-	      qdwin_client_extent_for_geometry(800, 800, 800));
-	CHECK(qdwin_client_extent_for_geometry(32, 96, 32) == 1,
+	      qdwin_client_extent_for_geometry(800, 800, 800, 0));
+	CHECK(qdwin_client_extent_for_geometry(32, 96, 32, 0) == 1,
 	      "oversize frame delta clamps configure to one pixel: got %d",
-	      qdwin_client_extent_for_geometry(32, 96, 32));
-	CHECK(qdwin_client_extent_for_geometry(640, 600, 640) == 640,
+	      qdwin_client_extent_for_geometry(32, 96, 32, 0));
+	CHECK(qdwin_client_extent_for_geometry(640, 600, 640, 0) == 640,
 	      "negative/stale delta is ignored: got %d",
-	      qdwin_client_extent_for_geometry(640, 600, 640));
+	      qdwin_client_extent_for_geometry(640, 600, 640, 0));
+	CHECK(qdwin_client_extent_for_geometry(1280, 1114, 1114, 64) == 1216,
+	      "learned Chromium frame delta corrects an otherwise invisible extent: got %d",
+	      qdwin_client_extent_for_geometry(1280, 1114, 1114, 64));
+	CHECK(qdwin_client_extent_for_geometry(1280, 1332, 1280, 64) == 1216,
+	      "larger learned delta wins over a smaller live geometry delta: got %d",
+	      qdwin_client_extent_for_geometry(1280, 1332, 1280, 64));
 }
 
 static void test_rehome_outer_rect(void)

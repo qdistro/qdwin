@@ -32,8 +32,9 @@ qdwin_apps_screenshot /tmp/09-step1-launched.png
 titlebar "Audacity", menu bar (File / Edit / Select / View /
 Transport / Tracks / Generate / Effect / Analyze / Tools / Help),
 playback transport buttons (pause / play / stop), and a "Welcome to
-Audacity!" first-run popup with "Watch video" / "View tutorials" /
-"Visit our forum" links.
+Audacity!" first-run popup with "Try the new Audacity 4 Beta release",
+the "Test the Beta release" action, and the "View tutorials" / "Visit our
+forum" links.
 **Assert (1.2):** bystander log records `xwayland=1` for the audacity
 toplevel.
 

@@ -122,11 +122,14 @@ qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead, int32_t inset_trail)
 int32_t
 qdwin_client_extent_for_geometry(int32_t desired_geometry,
 				 int32_t surface_extent,
-				 int32_t geometry_extent)
+				 int32_t geometry_extent,
+				 int32_t learned_delta)
 {
 	int64_t frame_delta = (int64_t)surface_extent - geometry_extent;
 	if (frame_delta < 0)
 		frame_delta = 0;
+	if (learned_delta > frame_delta)
+		frame_delta = learned_delta;
 	int64_t configure = (int64_t)desired_geometry - frame_delta;
 	if (configure < 1)
 		return 1;

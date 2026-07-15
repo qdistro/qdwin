@@ -99,11 +99,14 @@ int32_t qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead,
  * client needs. XWayland surfaces may have a larger wl_surface buffer than
  * their desktop geometry because of CSD shadows. Its configure path applies
  * that delta again, so subtract it here to make maximize/restore idempotent.
- * Native Wayland surfaces normally have surface == geometry and pass through.
- * The result is always at least one pixel. */
+ * Some XWayland clients (notably Chromium) expose no surface/geometry delta;
+ * `learned_delta` is the response delta measured from a prior configure. Use
+ * whichever signal is larger. Native Wayland callers pass zero. The result is
+ * always at least one pixel. */
 int32_t qdwin_client_extent_for_geometry(int32_t desired_geometry,
 					 int32_t surface_extent,
-					 int32_t geometry_extent);
+					 int32_t geometry_extent,
+					 int32_t learned_delta);
 
 /* Relocate a chrome-inclusive toplevel rectangle into a surviving output's
  * work area after its previous output disappears. Windows which fit are

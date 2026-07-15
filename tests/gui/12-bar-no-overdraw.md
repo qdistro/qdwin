@@ -34,7 +34,7 @@ qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
 
 **Assert (1.1):** both `qdshell-bar-content-Virtual-1` and
 `qdshell-bar-exclusion-top-Virtual-1` log lines report the same
-`1920xH` height (default density: H=31). If they differ by ≥1, the
+`1280xH` height (the fixed GUI-CI output; default density: H=31). If they differ by ≥1, the
 fix has regressed — see `Settings.data.bar.exclusionZoneBleed`.
 
 ### Step 2 — maximize a base weston-terminal and observe its outer geometry
@@ -108,14 +108,14 @@ done
 [ -n "$MAXLINE" ] || { echo "ERROR: Super+Up did not maximize handle=$HANDLE (no set_maximized after the chord — WM shortcut not registered/dispatched?)"; exit 1; }
 echo "set_maximized (this run): $MAXLINE"
 case "$MAXLINE" in
-  *"outer=1920x1049 at (0,31)"*) ;;
-  *) echo "FAIL(2.1): set_maximized geometry wrong — expected outer=1920x1049 at (0,31), got: $MAXLINE"; exit 1;;
+  *"outer=1280x769 at (0,31)"*) ;;
+  *) echo "FAIL(2.1): set_maximized geometry wrong — expected outer=1280x769 at (0,31), got: $MAXLINE"; exit 1;;
 esac
 qdwin_screenshot /tmp/12-step2-maximized.png
 ```
 
 **Assert (2.1):** the `set_maximized` line reports
-`outer=1920x1049 at (0,31)` (bar height 31 → work area 1080-31=1049,
+`outer=1280x769 at (0,31)` (bar height 31 → work area 800-31=769,
 window y-origin = 31). **Not** `(0,30)` — that's the overdraw bug.
 
 **Assert (2.2):** the screenshot shows the bar's bottom edge flush
@@ -156,11 +156,11 @@ for _ in $(seq 1 20); do
     "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
      systemctl --user is-active --quiet qdshell.service" || continue
   EXCL=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
-    grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1920x[0-9]+' | tail -1")
-  [ "$EXCL" = "1920x30" ] && break
+    grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1280x[0-9]+' | tail -1")
+  [ "$EXCL" = "1280x30" ] && break
 done
 echo "exclusion-top height after bleed=true restart: ${EXCL:-<none>}"
-[ "$EXCL" = "1920x30" ] || { echo "FAIL(3.1): exclusionZoneBleed=true did not produce 1920x30 after qdshell restart"; exit 1; }
+[ "$EXCL" = "1280x30" ] || { echo "FAIL(3.1): exclusionZoneBleed=true did not produce 1280x30 after qdshell restart"; exit 1; }
 ```
 
 **Assert (3.1):** with the bleed toggled on, the exclusion-top height
@@ -190,11 +190,11 @@ for _ in $(seq 1 20); do
     "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
      systemctl --user is-active --quiet qdshell.service" || continue
   EXCL=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
-    grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1920x[0-9]+' | tail -1")
-  [ "$EXCL" = "1920x31" ] && break
+    grep 'qdshell-bar-exclusion-top-Virtual-1' | grep -oE '1280x[0-9]+' | tail -1")
+  [ "$EXCL" = "1280x31" ] && break
 done
 echo "exclusion-top height after bleed=false restart: ${EXCL:-<none>}"
-[ "$EXCL" = "1920x31" ] || { echo "FAIL: exclusionZoneBleed=false did not restore 1920x31 after qdshell restart"; exit 1; }
+[ "$EXCL" = "1280x31" ] || { echo "FAIL: exclusionZoneBleed=false did not restore 1280x31 after qdshell restart"; exit 1; }
 ```
 
 ## Cleanup
@@ -216,7 +216,7 @@ longer paints into the work area by default and that the
   the setting default flipped, or `BarExclusionZone.qml` lost the
   conditional. Diff against
   `qdshell/Modules/MainScreen/BarExclusionZone.qml`.
-- Step 2 shows `outer=1920x1050 at (0,30)` → work-area math in qdwin
+- Step 2 shows `outer=1280x770 at (0,30)` → work-area math in qdwin
   is still subtracting the bleed instead of the full bar. Check
   `qdwin_compute_work_area` (or the equivalent panel helper) in
   `qdwin/qdwin.c`.

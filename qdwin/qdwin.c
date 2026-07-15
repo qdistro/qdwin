@@ -517,6 +517,17 @@ struct qdwin_toplevel {
 	 * attach_decoration calls don't ratchet the window smaller. */
 	int outer_width;
 	int outer_height;
+	/* XWayland configure feedback. Some clients add their CSD/frame extent
+	 * after every WM resize while libweston reports surface == geometry, so
+	 * the extent cannot be inferred before the first resize. Remember the
+	 * observed response delta and converge a mismatched configure at most
+	 * three times. */
+	int xwayland_frame_w, xwayland_frame_h;
+	int xwayland_target_w, xwayland_target_h;
+	int xwayland_sent_w, xwayland_sent_h;
+	int xwayland_before_w, xwayland_before_h;
+	unsigned int xwayland_corrections;
+	bool xwayland_configure_pending;
 	/* toplevel_state bitmask (QDWIN_TS_*). */
 	uint32_t state;
 	/* v24: which workspace this toplevel lives on. Set to the active
@@ -1963,6 +1974,94 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 		}
 	}
 
+	/* XWayland configure feedback. Chromium and some Electron clients add a
+	 * 64px CSD/frame extent to every WM resize while libweston reports
+	 * surface == desktop geometry. That makes the extent invisible at send
+	 * time. Once the post-configure commit changes size, learn
+	 * (observed - sent) and issue a bounded corrective configure. The prior
+	 * dimensions distinguish the actual response from an unrelated frame
+	 * commit queued before the configure request. */
+	if (tl->xwayland_configure_pending &&
+	    qdwin_toplevel_is_xwayland(qdwin, tl)) {
+		struct weston_geometry geometry =
+			weston_desktop_surface_get_geometry(tl->desktop_surface);
+		int actual_w = geometry.width > 0 ? geometry.width : surface->width;
+		int actual_h = geometry.height > 0 ? geometry.height : surface->height;
+		bool changed = actual_w != tl->xwayland_before_w ||
+			actual_h != tl->xwayland_before_h;
+
+		if (changed) {
+			if (actual_w != tl->xwayland_before_w) {
+				int delta = actual_w - tl->xwayland_sent_w;
+				if (delta >= 0)
+					tl->xwayland_frame_w = delta;
+			}
+			if (actual_h != tl->xwayland_before_h) {
+				int delta = actual_h - tl->xwayland_sent_h;
+				if (delta >= 0)
+					tl->xwayland_frame_h = delta;
+			}
+
+			if (actual_w == tl->xwayland_target_w &&
+			    actual_h == tl->xwayland_target_h) {
+				tl->xwayland_configure_pending = false;
+				weston_log("qdwin: xwayland_configure_converged "
+					   "handle=%u actual=%dx%d frame=%dx%d "
+					   "corrections=%u\n",
+					   tl->handle, actual_w, actual_h,
+					   tl->xwayland_frame_w,
+					   tl->xwayland_frame_h,
+					   tl->xwayland_corrections);
+			} else if (tl->xwayland_corrections < 3) {
+				int configure_w = qdwin_client_extent_for_geometry(
+					tl->xwayland_target_w, surface->width,
+					geometry.width, tl->xwayland_frame_w);
+				int configure_h = qdwin_client_extent_for_geometry(
+					tl->xwayland_target_h, surface->height,
+					geometry.height, tl->xwayland_frame_h);
+				tl->xwayland_before_w = actual_w;
+				tl->xwayland_before_h = actual_h;
+				tl->xwayland_sent_w = configure_w;
+				tl->xwayland_sent_h = configure_h;
+				tl->xwayland_corrections++;
+				weston_log("qdwin: xwayland_configure_correct "
+					   "handle=%u target=%dx%d actual=%dx%d "
+					   "frame=%dx%d -> client=%dx%d attempt=%u\n",
+					   tl->handle, tl->xwayland_target_w,
+					   tl->xwayland_target_h, actual_w, actual_h,
+					   tl->xwayland_frame_w,
+					   tl->xwayland_frame_h, configure_w,
+					   configure_h, tl->xwayland_corrections);
+				weston_desktop_surface_set_size(tl->desktop_surface,
+							configure_w, configure_h);
+			} else {
+				tl->xwayland_configure_pending = false;
+				weston_log("qdwin: xwayland_configure_gave_up "
+					   "handle=%u target=%dx%d actual=%dx%d "
+					   "after=%u\n",
+					   tl->handle, tl->xwayland_target_w,
+					   tl->xwayland_target_h, actual_w, actual_h,
+					   tl->xwayland_corrections);
+			}
+		}
+	}
+
+	/* Keep the restore source synchronized with what the client actually
+	 * committed while floating. outer_* used to retain the 800x600 seed
+	 * forever, so a later maximize saved stale geometry. During XWayland
+	 * convergence the target remains authoritative until the response lands. */
+	if (!(tl->state & (QDWIN_TS_MAXIMIZED | QDWIN_TS_FULLSCREEN)) &&
+	    tl->tiled == 0 && !tl->xwayland_configure_pending) {
+		struct weston_geometry geometry =
+			weston_desktop_surface_get_geometry(tl->desktop_surface);
+		int inner_w = geometry.width > 0 ? geometry.width : surface->width;
+		int inner_h = geometry.height > 0 ? geometry.height : surface->height;
+		if (inner_w > 0 && inner_h > 0) {
+			tl->outer_width = inner_w + tl->inset_w + tl->inset_e;
+			tl->outer_height = inner_h + tl->inset_n + tl->inset_s;
+		}
+	}
+
 	/* First-commit map path. S3 decides whether to migrate to
 	 * the normal layer; S2 leaves it held. */
 	if (!weston_surface_is_mapped(surface)) {
@@ -2693,17 +2792,29 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 	int configure_w = xwayland
 		? qdwin_client_extent_for_geometry(
 			inner_w, surface ? surface->width : geometry.width,
-			geometry.width)
+			geometry.width, tl->xwayland_frame_w)
 		: inner_w;
 	int configure_h = xwayland
 		? qdwin_client_extent_for_geometry(
 			inner_h, surface ? surface->height : geometry.height,
-			geometry.height)
+			geometry.height, tl->xwayland_frame_h)
 		: inner_h;
 	weston_log("qdwin: configure_extent handle=%u xwayland=%d desired=%dx%d surface=%dx%d geometry=%dx%d -> client=%dx%d\n",
 		   tl->handle, xwayland, inner_w, inner_h,
 		   surface ? surface->width : 0, surface ? surface->height : 0,
 		   geometry.width, geometry.height, configure_w, configure_h);
+	if (xwayland) {
+		tl->xwayland_target_w = inner_w;
+		tl->xwayland_target_h = inner_h;
+		tl->xwayland_sent_w = configure_w;
+		tl->xwayland_sent_h = configure_h;
+		tl->xwayland_before_w = geometry.width > 0
+			? geometry.width : (surface ? surface->width : 0);
+		tl->xwayland_before_h = geometry.height > 0
+			? geometry.height : (surface ? surface->height : 0);
+		tl->xwayland_corrections = 0;
+		tl->xwayland_configure_pending = true;
+	}
 	weston_desktop_surface_set_size(tl->desktop_surface,
 					configure_w, configure_h);
 }
@@ -19205,6 +19316,18 @@ qdwin_activation_perform(struct qdwin *qdwin,
 			 struct qdwin_activation_token *t)
 {
 	struct weston_seat *seat = NULL;
+	/* A broker answer can race a lock transition. Never restack or focus a
+	 * normal toplevel after lock entry: normal_layer is deliberately hidden,
+	 * and moving the authorized locker out of lock_layer would leave only the
+	 * black fail-secure curtain visible. Input during lock is owned by the
+	 * locker overlay grab, not xdg-activation. */
+	if (qdwin->locked) {
+		weston_log("qdwin: xdg-activation blocked while locked handle=%u\n",
+			   tl->handle);
+		if (t)
+			qdwin_activation_token_free(t);
+		return;
+	}
 	if (tl->decorated) {
 		weston_view_move_to_layer(tl->view,
 					  &qdwin->normal_layer.view_list);
@@ -19277,6 +19400,15 @@ qdwin_activation_activate(struct wl_client *client,
 	tl = qdwin_toplevel_from_wl_surface(qdwin, surface);
 	if (!tl) {
 		weston_log("qdwin: xdg-activation target surface has no toplevel\n");
+		qdwin_activation_token_free(t);
+		return;
+	}
+	/* Reject requests made after lock entry before they reach the shell
+	 * broker. qdwin_activation_perform repeats this check because a request
+	 * already pending at the broker can race set_locked(1). */
+	if (qdwin->locked) {
+		weston_log("qdwin: xdg-activation request blocked while locked "
+			   "handle=%u\n", tl->handle);
 		qdwin_activation_token_free(t);
 		return;
 	}

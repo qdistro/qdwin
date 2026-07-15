@@ -35,6 +35,7 @@ def main() -> int:
         identity = body(source, "qdwin_toplevel_effective_app_id")
         announce = body(source, "qdwin_send_toplevel_added")
         seed = body(source, "qdwin_toplevel_seed_outer_from_committed")
+        committed = body(source, "qdwin_surface_committed")
         maximize = body(source, "qdwin_toplevel_set_maximized")
         fullscreen = body(source, "qdwin_toplevel_set_fullscreen")
         tile = body(source, "qdwin_toplevel_set_tiled")
@@ -65,6 +66,13 @@ def main() -> int:
     ):
         if "qdwin_toplevel_seed_outer_from_committed(tl);" not in function_body:
             return fail(f"{scope} does not use the geometry-stable restore seed")
+
+    if "tl->xwayland_configure_pending" not in committed or \
+            "xwayland_configure_correct" not in committed:
+        return fail("XWayland commits do not feed hidden frame extents back into configure")
+    if "tl->outer_width = inner_w + tl->inset_w" not in committed or \
+            "QDWIN_TS_MAXIMIZED | QDWIN_TS_FULLSCREEN" not in committed:
+        return fail("floating commits do not refresh restore geometry outside special states")
 
     print("PASS: XWayland identity and special-state restore invariants hold")
     return 0
