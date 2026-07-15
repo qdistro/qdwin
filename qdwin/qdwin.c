@@ -2355,13 +2355,17 @@ qdwin_toplevel_autofocus_if_ready(struct qdwin_toplevel *tl)
 			/* RDP-headless: the backend can swap the wl_keyboard
 			 * after we registered our focus_signal listener, so
 			 * the listener may be sitting on a stale keyboard and
-			 * never fire for this set_focus. Reconcile it onto the
+			 * never fire for this activation. Reconcile it onto the
 			 * live keyboard first; then the focus_signal emitted by
-			 * weston_keyboard_set_focus reaches our listener and
+			 * weston_view_activate_input reaches our listener and
 			 * focus propagates organically (the DRM path already
-			 * had a live binding, so this is a no-op there). */
+			 * had a live binding, so this is a no-op there). Use the
+			 * activation path rather than bare keyboard focus: XWayland
+			 * consumes libweston's activate_signal to transfer real X11
+			 * input focus. */
 			qdwin_seat_tracker_rebind_focus_listener(tr);
-			weston_keyboard_set_focus(kbd, tl->view->surface);
+			weston_view_activate_input(tl->view, seat,
+						   WESTON_ACTIVATE_FLAG_CONFIGURE);
 			/* Immediate-emit backstop for any case where the
 			 * focus_signal still doesn't reach us. Dedupe-safe:
 			 * qdwin_seat_emit_focus_now short-circuits on
@@ -2675,20 +2679,29 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 
 	/* XWayland's set_size path configures the client extent, while
 	 * weston_desktop_surface_get_geometry() describes the visible window.
-	 * Chromium/Firefox CSD shadows make surface->width exceed geometry.width
-	 * (64/52 px in the regression images). Feeding the visible extent back as
-	 * the client extent adds that delta on every restore. Remove the current
-	 * surface-vs-geometry delta; native Wayland is normally a zero-delta pass. */
+	 * Chromium CSD shadows make surface->width exceed geometry.width (64 px in
+	 * the regression image). Feeding the visible extent back as the client
+	 * extent adds that delta on every restore. Remove the current surface-vs-
+	 * geometry delta only for XWayland: native Wayland clients such as Firefox
+	 * can also publish a non-zero buffer/geometry delta, but their set_size()
+	 * contract already takes the visible geometry. */
 	struct weston_surface *surface =
 		weston_desktop_surface_get_surface(tl->desktop_surface);
 	struct weston_geometry geometry =
 		weston_desktop_surface_get_geometry(tl->desktop_surface);
-	int configure_w = qdwin_client_extent_for_geometry(
-		inner_w, surface ? surface->width : geometry.width, geometry.width);
-	int configure_h = qdwin_client_extent_for_geometry(
-		inner_h, surface ? surface->height : geometry.height, geometry.height);
-	weston_log("qdwin: configure_extent handle=%u desired=%dx%d surface=%dx%d geometry=%dx%d -> client=%dx%d\n",
-		   tl->handle, inner_w, inner_h,
+	bool xwayland = qdwin_toplevel_is_xwayland(tl->qdwin, tl);
+	int configure_w = xwayland
+		? qdwin_client_extent_for_geometry(
+			inner_w, surface ? surface->width : geometry.width,
+			geometry.width)
+		: inner_w;
+	int configure_h = xwayland
+		? qdwin_client_extent_for_geometry(
+			inner_h, surface ? surface->height : geometry.height,
+			geometry.height)
+		: inner_h;
+	weston_log("qdwin: configure_extent handle=%u xwayland=%d desired=%dx%d surface=%dx%d geometry=%dx%d -> client=%dx%d\n",
+		   tl->handle, xwayland, inner_w, inner_h,
 		   surface ? surface->width : 0, surface ? surface->height : 0,
 		   geometry.width, geometry.height, configure_w, configure_h);
 	weston_desktop_surface_set_size(tl->desktop_surface,
@@ -10178,7 +10191,11 @@ qdwin_seat_focus_recover_idle_cb(void *data)
 		}
 	}
 	if (succ)
-		weston_keyboard_set_focus(kbd, succ->view->surface);
+		/* Unlike bare weston_keyboard_set_focus(), activation also emits
+		 * libweston's activate_signal. XWayland uses that signal to move
+		 * real X11 input focus back from a dismissed transient. */
+		weston_view_activate_input(succ->view, tr->seat,
+					   WESTON_ACTIVATE_FLAG_CONFIGURE);
 }
 
 /* ==================================================================
@@ -10261,7 +10278,11 @@ qdwin_workspace_refocus_seats(struct qdwin *qdwin)
 		cur = qdwin_toplevel_by_surface(qdwin, kbd->focus);
 		if (cur && qdwin_toplevel_is_visible(cur))
 			continue;  /* still valid on the active workspace */
-		weston_keyboard_set_focus(kbd, want ? want->view->surface : NULL);
+		if (want)
+			weston_view_activate_input(want->view, seat,
+						   WESTON_ACTIVATE_FLAG_CONFIGURE);
+		else
+			weston_keyboard_set_focus(kbd, NULL);
 		qdwin_seat_emit_focus_now(qdwin_seat_tracker_for_seat(qdwin, seat));
 	}
 }

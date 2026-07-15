@@ -14,8 +14,9 @@ meson test `rdp-focus-rebind`). Covers, in `qdwin/qdwin.c`:
   at once — the weston-rdp re-init wedge), clears the tracked keyboard on
   removal;
 - `qdwin_toplevel_autofocus_if_ready` rebinds the listener **before**
-  `weston_keyboard_set_focus` (so the emitted `focus_signal` reaches a live
-  listener), then calls the dedupe-safe immediate-emit backstop **after**;
+  `weston_view_activate_input` (so the emitted `focus_signal` reaches a live
+  listener and XWayland receives real X11 focus), then calls the dedupe-safe
+  immediate-emit backstop **after**;
 - `qdwin_seat_emit_focus_now` keeps its `last_focused_handle` dedupe so the
   immediate-emit and the listener never both emit `seat_focus_changed` for the
   same handle (no double-emit on DRM or RDP);

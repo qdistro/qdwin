@@ -21,6 +21,12 @@ qdwin_apps_kill_all
 ```bash
 qdwin_apps_launch firefox "firefox --no-remote --new-instance about:blank"
 sleep 12
+# Current Firefox releases can choose a maximised initial state even with a
+# clean profile. Normalise that dependency-controlled state before recording
+# the floating baseline; this keeps the compositor round-trip assertion
+# deterministic without relaxing its size or edge checks.
+qdwin_apps_ctl "restorelast"
+sleep 2
 qdwin_apps_screenshot /tmp/01-step1-launched.png
 ```
 
@@ -83,7 +89,6 @@ qdwin_apps_ctl "close" || qdwin_apps_kill_all
 - **Pre-fix regression (bug #1)** — step 3 shows Firefox at 1150×780
   (or near-maximised dimensions) at saved x/y. Means the
   `qdwin_handle_request_maximize` fix at `qdwin.c:1534` regressed.
-- **Window decoration drift on Firefox restart** — Firefox occasionally
-  remembers the maximised state across launches. If step 1 already
-  shows Firefox maximised, the test is meaningless. Delete
-  `~/.mozilla/firefox/*.default*/sessionstore.*` in Setup if needed.
+- **No floating baseline after normalisation** — if `restorelast` still leaves
+  step 1 maximised, the test is meaningless and must fail before step 2. Check
+  the bystander state events and Firefox's profile/session restore policy.

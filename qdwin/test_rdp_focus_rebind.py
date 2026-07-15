@@ -10,14 +10,14 @@ the RDP backend brings its seat up lazily inside rdp_peer_activate() —
 weston_seat_init() fires seat_created_signal (qdwin installs / tries to
 install the kbd focus_signal listener) BEFORE weston_seat_init_keyboard()
 exists, and the backend can later swap the wl_keyboard. If qdwin's
-focus_signal listener stays on a stale keyboard object, weston_keyboard_set_focus
-from autofocus never reaches it, so `qdwin: focus handle=` never logs and the
+focus_signal listener stays on a stale keyboard object, the focus change from
+autofocus never reaches it, so `qdwin: focus handle=` never logs and the
 shell's focusedHandle never updates from autofocus alone.
 
 The proper fix makes the focus_signal binding self-healing: qdwin tracks the
 keyboard object its listener is bound to and reconciles it against the seat's
 live keyboard (qdwin_seat_tracker_rebind_focus_listener), both on
-updated_caps_signal AND right before set_focus in the autofocus path. The
+updated_caps_signal AND right before activation in the autofocus path. The
 immediate-emit remains a dedupe-safe backstop.
 
 The live multi-keyboard-swap scenario needs a running RDP-headless VM and is
@@ -163,11 +163,13 @@ def check_rebind_helper(source):
     return 0
 
 
-def check_autofocus_rebinds_before_set_focus(source):
+def check_autofocus_rebinds_before_activate(source):
     """The autofocus path must reconcile the listener onto the live keyboard
-    BEFORE weston_keyboard_set_focus, so the focus_signal it emits reaches a
+    BEFORE weston_view_activate_input, so the focus_signal it emits reaches a
     live listener; and it must still call the dedupe-safe immediate-emit
-    backstop AFTER. Order matters: rebind, then set_focus, then emit."""
+    backstop AFTER. Activation (not bare keyboard focus) is required so
+    XWayland transfers real X11 input focus. Order matters: rebind, then
+    activate, then emit."""
     body, err = _function_body(
         source,
         r"static void\s+qdwin_toplevel_autofocus_if_ready\s*\(",
@@ -177,18 +179,19 @@ def check_autofocus_rebinds_before_set_focus(source):
         return fail(err)
     body = _strip_comments(body)
     rebind = body.find("qdwin_seat_tracker_rebind_focus_listener")
-    set_focus = body.find("weston_keyboard_set_focus")
+    activate = body.find("weston_view_activate_input")
     emit = body.find("qdwin_seat_emit_focus_now")
     if rebind < 0:
         return fail("autofocus does not rebind the focus listener onto the "
                     "live keyboard (RDP swap would leave it stale)")
-    if set_focus < 0:
-        return fail("autofocus no longer calls weston_keyboard_set_focus")
+    if activate < 0:
+        return fail("autofocus no longer activates the view (XWayland would "
+                    "not receive real X11 input focus)")
     if emit < 0:
         return fail("autofocus dropped the immediate-emit backstop")
-    if not (rebind < set_focus < emit):
-        return fail("autofocus ordering wrong: must rebind, then set_focus, "
-                    f"then emit (got rebind={rebind} set_focus={set_focus} "
+    if not (rebind < activate < emit):
+        return fail("autofocus ordering wrong: must rebind, then activate, "
+                    f"then emit (got rebind={rebind} activate={activate} "
                     f"emit={emit})")
     return 0
 
@@ -242,7 +245,7 @@ def main():
         check_tracker_records_bound_keyboard,
         check_install_records_keyboard,
         check_rebind_helper,
-        check_autofocus_rebinds_before_set_focus,
+        check_autofocus_rebinds_before_activate,
         check_emit_now_dedupes,
         check_caps_path_uses_rebind,
     )
@@ -253,7 +256,7 @@ def main():
 
     print("PASS: RDP focus rebind (tracker records bound keyboard, rebind "
           "helper self-heals on swap and is dedupe-idempotent, autofocus "
-          "rebinds-before-set_focus with dedupe-safe immediate-emit backstop, "
+          "rebinds-before-activate with dedupe-safe immediate-emit backstop, "
           "updated_caps routes through the same helper)")
     return 0
 
