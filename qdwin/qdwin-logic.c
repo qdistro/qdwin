@@ -119,6 +119,22 @@ qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead, int32_t inset_trail)
 	return inner;
 }
 
+int32_t
+qdwin_client_extent_for_geometry(int32_t desired_geometry,
+				 int32_t surface_extent,
+				 int32_t geometry_extent)
+{
+	int64_t frame_delta = (int64_t)surface_extent - geometry_extent;
+	if (frame_delta < 0)
+		frame_delta = 0;
+	int64_t configure = (int64_t)desired_geometry - frame_delta;
+	if (configure < 1)
+		return 1;
+	if (configure > INT32_MAX)
+		return INT32_MAX;
+	return (int32_t)configure;
+}
+
 static int32_t
 qdwin_i64_to_i32(int64_t value)
 {

@@ -314,6 +314,27 @@ static void test_inset_inner_extent(void)
 	      qdwin_inset_inner_extent(0, 0, 0));
 }
 
+/* Ensures XWayland CSD/shadow deltas do not grow a window on every
+ * maximize/restore configure round-trip. */
+static void test_client_extent_for_geometry(void)
+{
+	CHECK(qdwin_client_extent_for_geometry(1009, 1073, 1009) == 945,
+	      "Chromium visible 1009 with 64px surface delta configures 945: got %d",
+	      qdwin_client_extent_for_geometry(1009, 1073, 1009));
+	CHECK(qdwin_client_extent_for_geometry(1332, 1384, 1332) == 1280,
+	      "Firefox visible 1332 with 52px surface delta configures 1280: got %d",
+	      qdwin_client_extent_for_geometry(1332, 1384, 1332));
+	CHECK(qdwin_client_extent_for_geometry(800, 800, 800) == 800,
+	      "native Wayland zero-delta extent passes through: got %d",
+	      qdwin_client_extent_for_geometry(800, 800, 800));
+	CHECK(qdwin_client_extent_for_geometry(32, 96, 32) == 1,
+	      "oversize frame delta clamps configure to one pixel: got %d",
+	      qdwin_client_extent_for_geometry(32, 96, 32));
+	CHECK(qdwin_client_extent_for_geometry(640, 600, 640) == 640,
+	      "negative/stale delta is ignored: got %d",
+	      qdwin_client_extent_for_geometry(640, 600, 640));
+}
+
 static void test_rehome_outer_rect(void)
 {
 	int32_t x = 0, y = 0;
@@ -664,6 +685,7 @@ int main(void)
 	test_compute_box();
 	test_fractional_scale();
 	test_inset_inner_extent();
+	test_client_extent_for_geometry();
 	test_rehome_outer_rect();
 	test_global_visibility();
 	test_nested_secctx_publisher_identity();

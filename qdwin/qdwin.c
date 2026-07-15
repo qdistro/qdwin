@@ -2665,7 +2665,26 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 		   tl->inset_n, tl->inset_e, tl->inset_s, tl->inset_w,
 		   inner_w, inner_h);
 
-	weston_desktop_surface_set_size(tl->desktop_surface, inner_w, inner_h);
+	/* XWayland's set_size path configures the client extent, while
+	 * weston_desktop_surface_get_geometry() describes the visible window.
+	 * Chromium/Firefox CSD shadows make surface->width exceed geometry.width
+	 * (64/52 px in the regression images). Feeding the visible extent back as
+	 * the client extent adds that delta on every restore. Remove the current
+	 * surface-vs-geometry delta; native Wayland is normally a zero-delta pass. */
+	struct weston_surface *surface =
+		weston_desktop_surface_get_surface(tl->desktop_surface);
+	struct weston_geometry geometry =
+		weston_desktop_surface_get_geometry(tl->desktop_surface);
+	int configure_w = qdwin_client_extent_for_geometry(
+		inner_w, surface ? surface->width : geometry.width, geometry.width);
+	int configure_h = qdwin_client_extent_for_geometry(
+		inner_h, surface ? surface->height : geometry.height, geometry.height);
+	weston_log("qdwin: configure_extent handle=%u desired=%dx%d surface=%dx%d geometry=%dx%d -> client=%dx%d\n",
+		   tl->handle, inner_w, inner_h,
+		   surface ? surface->width : 0, surface ? surface->height : 0,
+		   geometry.width, geometry.height, configure_w, configure_h);
+	weston_desktop_surface_set_size(tl->desktop_surface,
+					configure_w, configure_h);
 }
 
 static void
@@ -5914,9 +5933,9 @@ qdwin_panels_on_output_change(struct qdwin *qdwin)
 			.c = weston_coord(wx, wy),
 		};
 		weston_view_set_position(tl->view, pos);
-		weston_desktop_surface_set_size(tl->desktop_surface,
-			qdwin_inset_inner_extent(ww, tl->inset_w, tl->inset_e),
-			qdwin_inset_inner_extent(wh, tl->inset_n, tl->inset_s));
+		/* Keep panel-driven maximize reflow on the same shadow-aware path
+		 * as ordinary maximize/restore. */
+		qdwin_toplevel_apply_inset(tl);
 		qdwin_toplevel_position_chrome(tl);
 	}
 	weston_compositor_schedule_repaint(qdwin->compositor);
@@ -10129,8 +10148,15 @@ qdwin_seat_focus_recover_idle_cb(void *data)
 	if (!tr->seat || !tr->qdwin || tr->qdwin->locked)
 		return;
 	struct weston_keyboard *kbd = weston_seat_get_keyboard(tr->seat);
-	if (!kbd || kbd->focus != NULL)
-		return;  /* focus already moved elsewhere, nothing to do */
+	if (!kbd)
+		return;
+	/* A dismissed popup can remain as keyboard->focus for the event-loop
+	 * turn in which its wl_surface becomes unmapped.  Treat that stale focus
+	 * exactly like NULL so closing a modal returns input to a live sibling.
+	 * A genuinely mapped popup or toplevel still owns focus and must not be
+	 * pre-empted by recovery. */
+	if (kbd->focus && weston_surface_is_mapped(kbd->focus))
+		return;
 	struct qdwin_toplevel *succ = NULL;
 	struct qdwin_toplevel *cand;
 	wl_list_for_each(cand, &tr->qdwin->toplevels, link) {

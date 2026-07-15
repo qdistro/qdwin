@@ -95,6 +95,16 @@ void qdwin_layer_compute_box(uint32_t anchor,
 int32_t qdwin_inset_inner_extent(int32_t outer, int32_t inset_lead,
 				 int32_t inset_trail);
 
+/* Convert a desired visible desktop-window extent to the configure extent a
+ * client needs. XWayland surfaces may have a larger wl_surface buffer than
+ * their desktop geometry because of CSD shadows. Its configure path applies
+ * that delta again, so subtract it here to make maximize/restore idempotent.
+ * Native Wayland surfaces normally have surface == geometry and pass through.
+ * The result is always at least one pixel. */
+int32_t qdwin_client_extent_for_geometry(int32_t desired_geometry,
+					 int32_t surface_extent,
+					 int32_t geometry_extent);
+
 /* Relocate a chrome-inclusive toplevel rectangle into a surviving output's
  * work area after its previous output disappears. Windows which fit are
  * fully clamped inside the work area; oversize windows are anchored at the
