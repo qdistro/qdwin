@@ -1543,6 +1543,35 @@ qdwin_toplevel_is_xwayland(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 	return qdwin->xwayland_surface_api->is_xwayland_surface(surface) ? 1 : 0;
 }
 
+/* libweston-desktop may not have copied WM_CLASS into app_id yet when its
+ * surface_added callback fires.  XWayland already owns the property at that
+ * point, so use its surface API as the authoritative fallback.  This keeps
+ * the one-shot toplevel_added event useful for shells without inventing an
+ * update event that older qdwin-shell protocol versions cannot consume. */
+static const char *
+qdwin_toplevel_effective_app_id(struct qdwin *qdwin,
+				 struct qdwin_toplevel *tl)
+{
+	const char *app_id;
+	struct weston_surface *surface;
+
+	if (!tl || tl->is_nested_proxy || !tl->desktop_surface)
+		return NULL;
+	app_id = weston_desktop_surface_get_app_id(tl->desktop_surface);
+	if (app_id && *app_id)
+		return app_id;
+	if (!qdwin_toplevel_is_xwayland(qdwin, tl) ||
+	    !qdwin->xwayland_surface_api ||
+	    !qdwin->xwayland_surface_api->get_xwayland_window_name)
+		return app_id;
+	surface = weston_desktop_surface_get_surface(tl->desktop_surface);
+	if (!surface)
+		return app_id;
+	const char *wm_class = qdwin->xwayland_surface_api->
+		get_xwayland_window_name(surface, WM_CLASS);
+	return wm_class && *wm_class ? wm_class : app_id;
+}
+
 static void
 qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
@@ -1556,7 +1585,7 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 		title  = tl->proxy_title  ? tl->proxy_title  : "";
 		uid    = tl->proxy_origin_uid;
 	} else {
-		app_id = weston_desktop_surface_get_app_id(tl->desktop_surface);
+		app_id = qdwin_toplevel_effective_app_id(qdwin, tl);
 		title  = weston_desktop_surface_get_title(tl->desktop_surface);
 		uid    = qdwin_client_uid(tl->desktop_surface);
 	}
@@ -1916,7 +1945,7 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 	 * is log-only — but the diff path is in place for when a
 	 * toplevel_app_id event lands. */
 	{
-		const char *cur = weston_desktop_surface_get_app_id(tl->desktop_surface);
+		const char *cur = qdwin_toplevel_effective_app_id(qdwin, tl);
 		const char *cur_safe = cur ? cur : "";
 		if (!tl->cached_app_id || strcmp(tl->cached_app_id, cur_safe) != 0) {
 			free(tl->cached_app_id);
@@ -2546,6 +2575,40 @@ qdwin_chrome_attach_side(struct qdwin_toplevel *tl, int side,
 }
 
 static void
+qdwin_toplevel_seed_outer_from_committed(struct qdwin_toplevel *tl)
+{
+	int inner_w, inner_h;
+
+	if (tl->outer_width > 0 && tl->outer_height > 0)
+		return;
+	if (tl->is_nested_proxy) {
+		inner_w = tl->last_width;
+		inner_h = tl->last_height;
+	} else {
+		struct weston_surface *surface =
+			weston_desktop_surface_get_surface(tl->desktop_surface);
+		struct weston_geometry geometry =
+			weston_desktop_surface_get_geometry(tl->desktop_surface);
+
+		/* set_size() takes the desktop window geometry, not the full
+		 * wl_surface buffer.  XWayland CSD/shadows make those differ (52px
+		 * for Firefox and 64px for Chromium in the regression VMs).  Saving
+		 * surface->width here and later feeding it to set_size() made every
+		 * maximise/restore cycle grow the window by exactly that extent. */
+		inner_w = geometry.width > 0 ? geometry.width
+			: (surface ? surface->width : 0);
+		inner_h = geometry.height > 0 ? geometry.height
+			: (surface ? surface->height : 0);
+	}
+	if (inner_w <= 0)
+		inner_w = 800;
+	if (inner_h <= 0)
+		inner_h = 600;
+	tl->outer_width = inner_w + tl->inset_w + tl->inset_e;
+	tl->outer_height = inner_h + tl->inset_n + tl->inset_s;
+}
+
+static void
 qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 {
 	int outer_w, outer_h;
@@ -2571,11 +2634,8 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 		return;
 	}
 
-	struct weston_surface *surface =
-		weston_desktop_surface_get_surface(tl->desktop_surface);
-
 	/* Outer size = whatever we previously asked the client for, or
-	 * (first time through) the current content size it sent us. This
+	 * (first time through) its current desktop geometry plus our chrome. This
 	 * keeps repeated attach_decoration calls stable — we only shrink
 	 * from outer to inner once per outer size.
 	 *
@@ -2591,10 +2651,7 @@ qdwin_toplevel_apply_inset(struct qdwin_toplevel *tl)
 	 * 400+insets) closely enough that the first repaint after the
 	 * client commits a real size produces a stable window.
 	 */
-	if (tl->outer_width == 0 || tl->outer_height == 0) {
-		tl->outer_width  = surface->width  > 0 ? surface->width  : 800;
-		tl->outer_height = surface->height > 0 ? surface->height : 600;
-	}
+	qdwin_toplevel_seed_outer_from_committed(tl);
 	outer_w = tl->outer_width;
 	outer_h = tl->outer_height;
 
@@ -2837,17 +2894,7 @@ qdwin_toplevel_set_fullscreen(struct qdwin *qdwin,
 			weston_view_get_pos_offset_global(tl->view);
 		tl->saved_x = pos.c.x;
 		tl->saved_y = pos.c.y;
-		if (tl->outer_width == 0 || tl->outer_height == 0) {
-			struct weston_surface *surface = tl->is_nested_proxy
-				? NULL
-				: weston_desktop_surface_get_surface(tl->desktop_surface);
-			int sw = surface ? surface->width  : tl->last_width;
-			int sh = surface ? surface->height : tl->last_height;
-			if (sw <= 0) sw = 800;
-			if (sh <= 0) sh = 600;
-			tl->outer_width  = sw;
-			tl->outer_height = sh;
-		}
+		qdwin_toplevel_seed_outer_from_committed(tl);
 		tl->saved_outer_w = tl->outer_width;
 		tl->saved_outer_h = tl->outer_height;
 
@@ -2951,19 +2998,10 @@ qdwin_toplevel_set_maximized(struct qdwin *qdwin,
 		 * which by then is the *maximised* size the client just
 		 * committed, not the pre-max size. Result: "restore" leaves
 		 * the window at maximised dimensions at the saved (top-left)
-		 * position. Seed outer_* from the real committed surface size
-		 * so the saved-restore round-trip is symmetric. */
-		if (tl->outer_width == 0 || tl->outer_height == 0) {
-			struct weston_surface *surface = tl->is_nested_proxy
-				? NULL
-				: weston_desktop_surface_get_surface(tl->desktop_surface);
-			int sw = surface ? surface->width  : tl->last_width;
-			int sh = surface ? surface->height : tl->last_height;
-			if (sw <= 0) sw = 800;
-			if (sh <= 0) sh = 600;
-			tl->outer_width  = sw;
-			tl->outer_height = sh;
-		}
+		 * position. Seed outer_* from the committed desktop geometry
+		 * (rather than a CSD/shadow-inflated buffer size) so the
+		 * saved-restore round-trip is symmetric. */
+		qdwin_toplevel_seed_outer_from_committed(tl);
 		tl->saved_outer_w = tl->outer_width;
 		tl->saved_outer_h = tl->outer_height;
 
@@ -7835,14 +7873,7 @@ qdwin_toplevel_set_tiled(struct qdwin *qdwin, struct qdwin_toplevel *tl,
 	/* Save the pre-tile geometry only on the first tile (so left↔right
 	 * re-tiling keeps the original floating geometry to restore to). */
 	if (tl->tiled == QDWIN_TILE_NONE) {
-		if (tl->outer_width == 0 || tl->outer_height == 0) {
-			struct weston_surface *surface = tl->view ?
-				tl->view->surface : NULL;
-			int sw = surface ? surface->width  : tl->last_width;
-			int sh = surface ? surface->height : tl->last_height;
-			tl->outer_width  = sw > 0 ? sw : 800;
-			tl->outer_height = sh > 0 ? sh : 600;
-		}
+		qdwin_toplevel_seed_outer_from_committed(tl);
 		tl->tile_saved_outer_w = tl->outer_width;
 		tl->tile_saved_outer_h = tl->outer_height;
 		tl->tile_saved_x = cur.c.x;

@@ -1091,6 +1091,18 @@ test('nested-identity-policy',
   ],
 )
 
+# XWayland windows may expose WM_CLASS before libweston copies app_id, and
+# their wl_surface buffer can include CSD/shadow extents that set_size() must
+# not consume.  Pin both sides of that compatibility boundary.
+test('xwayland-window-policy',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_xwayland_window_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # R8/A4 return-home invariants: the output-destroy callback drains transient
 # input/data authority before publishing removal, relocates all shell + app
 # surface classes, repairs restore slots, and never selects a destroying output.
