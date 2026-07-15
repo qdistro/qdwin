@@ -148,8 +148,13 @@ def check_d7_show_popup_serial_source(source):
         return fail(err)
     if "qdwin_seat_grab_serial_matches" not in lbody:
         return fail("D7: layer-popup grab handler does not share the helper")
-    if not re.search(r"\b29,\s*qdwin,\s*bind_qdwin_shell", code):
-        return fail("D7: shell global is not advertised at version 29")
+    advertised = re.search(
+        r"&qdwin_shell_v1_interface,\s*(\d+),\s*qdwin,\s*"
+        r"bind_qdwin_shell",
+        code,
+    )
+    if not advertised or int(advertised.group(1)) < 29:
+        return fail("D7: shell global is not advertised at version >= 29")
     # The chrome_button/popup_button emits must forward the CURRENT button
     # serial (wl_display_get_serial), NOT the stale pointer->grab_serial that
     # notify_button only assigns AFTER the grab callback returns — otherwise a

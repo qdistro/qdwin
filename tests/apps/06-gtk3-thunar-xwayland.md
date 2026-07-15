@@ -19,7 +19,7 @@ qdwin_apps_kill_all
 ### Step 1 — launch
 
 ```bash
-qdwin_apps_launch thunar "thunar"
+qdwin_apps_launch thunar "env GDK_BACKEND=x11 thunar"
 sleep 8
 qdwin_apps_screenshot /tmp/06-step1-launched.png
 ```
