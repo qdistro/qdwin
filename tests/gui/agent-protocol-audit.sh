@@ -167,11 +167,17 @@ pass "no crash/protocol-error evidence in journal"
 
 # coredumpctl (if present) is the authoritative crash record.
 if vm_exec "command -v coredumpctl >/dev/null 2>&1"; then
-    if vm_exec "coredumpctl --no-pager list 2>/dev/null | grep -qE 'weston|qs|quickshell'"; then
-        vm_exec "coredumpctl --no-pager list 2>/dev/null | grep -E 'weston|qs|quickshell'" >&2 || true
+    # coredumpctl's default list spans retained journals from older boots. The
+    # assertion is explicitly about this boot, matching the journal scan above,
+    # so bind it to the guest's current boot ID rather than flagging historical
+    # crashes on a preserved/reused CI VM.
+    boot_id=$(vm_exec "cat /proc/sys/kernel/random/boot_id")
+    [ -n "$boot_id" ] || fail "could not read current boot ID for coredump audit"
+    if vm_exec "coredumpctl --no-pager list _BOOT_ID=$boot_id 2>/dev/null | grep -qE 'weston|qs|quickshell'"; then
+        vm_exec "coredumpctl --no-pager list _BOOT_ID=$boot_id 2>/dev/null | grep -E 'weston|qs|quickshell'" >&2 || true
         fail "coredumpctl recorded a weston/quickshell crash this boot"
     fi
-    pass "no weston/quickshell coredumps recorded"
+    pass "no weston/quickshell coredumps recorded for boot $boot_id"
 fi
 
 # ---- Vendored-libweston escalation -------------------------------------
