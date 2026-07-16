@@ -6616,9 +6616,33 @@ qdwin_overlay_grab_end(struct qdwin *qdwin)
 	if (!qdwin->overlay_grab_active)
 		return;
 	struct weston_keyboard *kb = qdwin->overlay_grab.keyboard;
+	uint32_t role = qdwin->overlay_grab_role;
 	qdwin->overlay_grab_active = 0;
-	if (kb)
+	if (kb) {
 		weston_keyboard_end_grab(kb);
+
+		/* The locker grab deliberately suppresses wl_keyboard.modifiers
+		 * while locked so Ctrl/Alt/Shift state cannot leak to the hidden
+		 * desktop client. libweston still updates kb->modifiers internally,
+		 * but ending a grab does not replay that current state to the focused
+		 * client. Without this snapshot the client retains the Ctrl+Alt from
+		 * the lock chord and ordinary post-unlock typing becomes terminal
+		 * control sequences. Resynchronise only after a normal unlock. A
+		 * locker crash ends the grab while qdwin->locked remains true; sending
+		 * there would violate the fail-secure input-containment contract. */
+		if (role == 2 && !qdwin->locked) {
+			uint32_t serial = wl_display_next_serial(
+				qdwin->compositor->wl_display);
+			weston_keyboard_send_modifiers(
+				kb, serial,
+				kb->modifiers.mods_depressed,
+				kb->modifiers.mods_latched,
+				kb->modifiers.mods_locked,
+				kb->modifiers.group);
+			weston_log("qdwin: locker modifier state resynchronized "
+				   "after unlock\n");
+		}
+	}
 }
 
 static void
