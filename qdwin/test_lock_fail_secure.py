@@ -212,6 +212,45 @@ def check_overlay_modifiers_contained_for_locker(source):
     return 0
 
 
+def check_locker_unlock_resyncs_modifiers(source):
+    """Ending the locker grab after a normal unlock must publish the current
+    modifier snapshot to the focused desktop client. Modifier callbacks are
+    intentionally suppressed while locked, so without this explicit replay the
+    client retains stale Ctrl+Alt state from the lock chord. The replay must be
+    guarded by !qdwin->locked: locker-crash teardown ends the grab while the
+    compositor remains locked and must not leak input state to the desktop.
+    """
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_overlay_grab_end\s*\(",
+        "qdwin_overlay_grab_end")
+    if err:
+        return fail(err)
+    code = _strip_comments(body)
+    guard = re.search(
+        r"if\s*\(\s*role\s*==\s*2\s*&&\s*!\s*qdwin->locked\s*\)\s*\{",
+        code)
+    if not guard:
+        return fail("qdwin_overlay_grab_end does not guard locker modifier "
+                    "resync with `role == 2 && !qdwin->locked`; post-unlock "
+                    "clients can retain stale Ctrl+Alt, or crash teardown can "
+                    "leak modifier state while still locked")
+    send = code.find("weston_keyboard_send_modifiers", guard.end())
+    if send == -1:
+        return fail("qdwin_overlay_grab_end does not send the current modifier "
+                    "snapshot after normal locker unlock")
+    guard_close = code.find("}", guard.end())
+    if guard_close != -1 and send > guard_close:
+        return fail("locker modifier resync is outside the unlocked-only guard")
+    for field in ("mods_depressed", "mods_latched", "mods_locked", "group"):
+        if f"kb->modifiers.{field}" not in code[send:]:
+            return fail(f"locker modifier resync omits current {field}")
+    if "wl_display_next_serial" not in code[guard.end():send]:
+        return fail("locker modifier resync does not allocate a fresh Wayland "
+                    "serial before sending wl_keyboard.modifiers")
+    return 0
+
+
 def check_locker_disconnect_holds_and_audits(source):
     """The PRIMARY locker-death path — qdwin_locker_resource_destroy (the
     wl_client disconnect when qdlocker dies) — must hold the lock fail-secure
@@ -254,6 +293,7 @@ def main():
             check_default_modifiers_drop_while_locked,
             check_bind_rearms_grab_when_locked,
             check_overlay_modifiers_contained_for_locker,
+            check_locker_unlock_resyncs_modifiers,
             check_locker_disconnect_holds_and_audits):
         rc = check(source)
         if rc:
