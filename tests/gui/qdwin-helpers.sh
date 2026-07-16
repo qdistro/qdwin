@@ -147,6 +147,21 @@ qdwin_qmp_key() {
         >/dev/null
 }
 
+# Force every modifier into the released state. A compositor lock transition
+# can happen between a chord's key-down and key-up events; QEMU has delivered
+# the releases, but the newly promoted lock surface may consume them before
+# libweston's normal seat state observes them. Releasing is idempotent, so GUI
+# scenarios should call this after an unlock/restart boundary before asserting
+# ordinary text input.
+qdwin_release_modifiers() {
+    qdwin_require_vm
+    local k
+    for k in ctrl ctrl_r alt alt_r shift shift_r meta_l meta_r; do
+        qdwin_qmp_key "$k" up || return $?
+        sleep 0.02
+    done
+}
+
 # Real-keyboard chord: hold modifier(s), tap key(s), release modifier(s).
 # Args: <hold-key1> [hold-key2 ...] -- <tap-key1> [tap-key2 ...]
 # Example: qdwin_chord alt -- tab           # hold Alt, tap Tab, release Alt
