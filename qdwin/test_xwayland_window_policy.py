@@ -48,11 +48,11 @@ def main() -> int:
         return fail("toplevel_added does not publish the effective XWayland app id")
 
     geometry_at = seed.find("weston_desktop_surface_get_geometry")
-    geometry_width_at = seed.find("geometry.width > 0")
-    surface_width_at = seed.find("surface ? surface->width")
-    if min(geometry_at, geometry_width_at, surface_width_at) < 0 or not (
-            geometry_at < geometry_width_at < surface_width_at):
-        return fail("restore seed must prefer desktop geometry over CSD-inflated buffer size")
+    restore_extent_at = seed.find("qdwin_committed_restore_extent")
+    xwayland_at = seed.find("qdwin_toplevel_is_xwayland")
+    if min(geometry_at, restore_extent_at, xwayland_at) < 0 or not (
+            geometry_at < xwayland_at < restore_extent_at):
+        return fail("restore seed does not select native/XWayland committed extents")
     nested_at = seed.find("if (tl->is_nested_proxy)")
     nested_return_at = seed.find("return;", nested_at)
     inset_add_at = seed.find("tl->outer_width = inner_w + tl->inset_w")
@@ -70,6 +70,8 @@ def main() -> int:
     if "tl->xwayland_configure_pending" not in committed or \
             "xwayland_configure_correct" not in committed:
         return fail("XWayland commits do not feed hidden frame extents back into configure")
+    if "surface->width > 0 ? surface->width : geometry.width" not in committed:
+        return fail("XWayland convergence does not compare shell-visible surface extents")
     if "tl->outer_width = inner_w + tl->inset_w" not in committed or \
             "QDWIN_TS_MAXIMIZED | QDWIN_TS_FULLSCREEN" not in committed:
         return fail("floating commits do not refresh restore geometry outside special states")

@@ -108,6 +108,14 @@ int32_t qdwin_client_extent_for_geometry(int32_t desired_geometry,
 					 int32_t geometry_extent,
 					 int32_t learned_delta);
 
+/* Choose the committed extent used as a floating-window restore source.
+ * Native Wayland uses desktop geometry. XWayland geometry may exclude the
+ * client's own frame/shadow, while its wl_surface extent is the outer size
+ * reported through qdwin_shell_v1 and must survive maximize/restore. */
+int32_t qdwin_committed_restore_extent(bool xwayland,
+				       int32_t surface_extent,
+				       int32_t geometry_extent);
+
 /* Relocate a chrome-inclusive toplevel rectangle into a surviving output's
  * work area after its previous output disappears. Windows which fit are
  * fully clamped inside the work area; oversize windows are anchored at the

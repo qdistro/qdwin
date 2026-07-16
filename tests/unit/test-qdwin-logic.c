@@ -341,6 +341,22 @@ static void test_client_extent_for_geometry(void)
 	      qdwin_client_extent_for_geometry(1280, 1332, 1280, 64));
 }
 
+static void test_committed_restore_extent(void)
+{
+	CHECK(qdwin_committed_restore_extent(true, 676, 612) == 676,
+	      "XWayland restore preserves the shell-visible outer extent: got %d",
+	      qdwin_committed_restore_extent(true, 676, 612));
+	CHECK(qdwin_committed_restore_extent(false, 676, 612) == 612,
+	      "native Wayland restore uses desktop geometry: got %d",
+	      qdwin_committed_restore_extent(false, 676, 612));
+	CHECK(qdwin_committed_restore_extent(true, 0, 612) == 612,
+	      "XWayland restore falls back to geometry before its first buffer: got %d",
+	      qdwin_committed_restore_extent(true, 0, 612));
+	CHECK(qdwin_committed_restore_extent(false, 676, 0) == 676,
+	      "native restore falls back to surface without geometry: got %d",
+	      qdwin_committed_restore_extent(false, 676, 0));
+}
+
 static void test_rehome_outer_rect(void)
 {
 	int32_t x = 0, y = 0;
@@ -692,6 +708,7 @@ int main(void)
 	test_fractional_scale();
 	test_inset_inner_extent();
 	test_client_extent_for_geometry();
+	test_committed_restore_extent();
 	test_rehome_outer_rect();
 	test_global_visibility();
 	test_nested_secctx_publisher_identity();

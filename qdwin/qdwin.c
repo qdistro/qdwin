@@ -1985,8 +1985,11 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 	    qdwin_toplevel_is_xwayland(qdwin, tl)) {
 		struct weston_geometry geometry =
 			weston_desktop_surface_get_geometry(tl->desktop_surface);
-		int actual_w = geometry.width > 0 ? geometry.width : surface->width;
-		int actual_h = geometry.height > 0 ? geometry.height : surface->height;
+		/* qdwin_shell_v1 reports XWayland's outer wl_surface extent.
+		 * Desktop geometry can exclude a toolkit frame/shadow, so comparing
+		 * that inner extent with an outer target prevents convergence. */
+		int actual_w = surface->width > 0 ? surface->width : geometry.width;
+		int actual_h = surface->height > 0 ? surface->height : geometry.height;
 		bool changed = actual_w != tl->xwayland_before_w ||
 			actual_h != tl->xwayland_before_h;
 
@@ -2054,8 +2057,11 @@ qdwin_surface_committed(struct weston_desktop_surface *dsurf,
 	    tl->tiled == 0 && !tl->xwayland_configure_pending) {
 		struct weston_geometry geometry =
 			weston_desktop_surface_get_geometry(tl->desktop_surface);
-		int inner_w = geometry.width > 0 ? geometry.width : surface->width;
-		int inner_h = geometry.height > 0 ? geometry.height : surface->height;
+		bool xwayland = qdwin_toplevel_is_xwayland(qdwin, tl);
+		int inner_w = qdwin_committed_restore_extent(
+			xwayland, surface->width, geometry.width);
+		int inner_h = qdwin_committed_restore_extent(
+			xwayland, surface->height, geometry.height);
 		if (inner_w > 0 && inner_h > 0) {
 			tl->outer_width = inner_w + tl->inset_w + tl->inset_e;
 			tl->outer_height = inner_h + tl->inset_n + tl->inset_s;
@@ -2704,15 +2710,15 @@ qdwin_toplevel_seed_outer_from_committed(struct qdwin_toplevel *tl)
 	struct weston_geometry geometry =
 		weston_desktop_surface_get_geometry(tl->desktop_surface);
 
-	/* set_size() takes the desktop window geometry, not the full wl_surface
-	 * buffer.  XWayland CSD/shadows make those differ (52px for Firefox and
-	 * 64px for Chromium in the regression VMs).  Saving surface->width here
-	 * and later feeding it to set_size() made every maximise/restore cycle
-	 * grow the window by exactly that extent. */
-	inner_w = geometry.width > 0 ? geometry.width
-		: (surface ? surface->width : 0);
-	inner_h = geometry.height > 0 ? geometry.height
-		: (surface ? surface->height : 0);
+	/* Native set_size() uses desktop geometry. XWayland's shell-visible outer
+	 * rectangle is its wl_surface extent: desktop geometry can omit the
+	 * client's own frame/shadow. The configure conversion below translates
+	 * that saved outer target back to the client extent. */
+	bool xwayland = qdwin_toplevel_is_xwayland(tl->qdwin, tl);
+	inner_w = qdwin_committed_restore_extent(
+		xwayland, surface ? surface->width : 0, geometry.width);
+	inner_h = qdwin_committed_restore_extent(
+		xwayland, surface ? surface->height : 0, geometry.height);
 	if (inner_w <= 0)
 		inner_w = 800;
 	if (inner_h <= 0)

@@ -40,6 +40,15 @@ struct ctx {
 	struct xdg_wm_base *xdg_wm_base;
 };
 
+struct window {
+	struct ctx *ctx;
+	struct wl_surface *surface;
+	struct wl_buffer *buffer;
+	int width, height;
+	int pending_width, pending_height;
+	uint32_t fill;
+};
+
 static void
 xdg_wm_base_ping(void *data, struct xdg_wm_base *base, uint32_t serial)
 {
@@ -95,11 +104,40 @@ make_solid_buffer(struct wl_shm *shm, int w, int h, uint32_t argb)
 	return buf;
 }
 
+static int
+window_redraw(struct window *win, int width, int height)
+{
+	struct wl_buffer *old = win->buffer;
+	struct wl_buffer *next = make_solid_buffer(win->ctx->shm,
+						 width, height, win->fill);
+	if (!next)
+		return -1;
+
+	win->buffer = next;
+	win->width = width;
+	win->height = height;
+	wl_surface_attach(win->surface, next, 0, 0);
+	wl_surface_damage_buffer(win->surface, 0, 0, width, height);
+	wl_surface_commit(win->surface);
+	if (old)
+		wl_buffer_destroy(old);
+	return 0;
+}
+
 static void
 xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial)
 {
-	(void)data;
+	struct window *win = data;
 	xdg_surface_ack_configure(xs, serial);
+	int width = win->pending_width > 0 ? win->pending_width : win->width;
+	int height = win->pending_height > 0 ? win->pending_height : win->height;
+	if (window_redraw(win, width, height) < 0) {
+		fprintf(stderr, "make_solid_buffer failed for %dx%d\n",
+			width, height);
+		running = 0;
+	}
+	win->pending_width = 0;
+	win->pending_height = 0;
 }
 static const struct xdg_surface_listener xdg_surface_impl = {
 	.configure = xdg_surface_configure,
@@ -108,7 +146,16 @@ static const struct xdg_surface_listener xdg_surface_impl = {
 static void
 xdg_toplevel_configure(void *d, struct xdg_toplevel *t,
 		       int32_t w, int32_t h, struct wl_array *states)
-{ (void)d; (void)t; (void)w; (void)h; (void)states; }
+{
+	struct window *win = d;
+	(void)t;
+	(void)states;
+	/* A zero axis means the client chooses its current/preferred extent. */
+	if (w > 0)
+		win->pending_width = w;
+	if (h > 0)
+		win->pending_height = h;
+}
 static void
 xdg_toplevel_close(void *d, struct xdg_toplevel *t)
 { (void)d; (void)t; running = 0; }
@@ -173,20 +220,21 @@ int main(int argc, char **argv)
 	}
 
 	struct wl_surface *surf = wl_compositor_create_surface(c.compositor);
+	struct window win = {
+		.ctx = &c,
+		.surface = surf,
+		.width = width,
+		.height = height,
+		.fill = fill,
+	};
 	struct xdg_surface *xsurf = xdg_wm_base_get_xdg_surface(c.xdg_wm_base, surf);
-	xdg_surface_add_listener(xsurf, &xdg_surface_impl, NULL);
+	xdg_surface_add_listener(xsurf, &xdg_surface_impl, &win);
 	struct xdg_toplevel *top = xdg_surface_get_toplevel(xsurf);
-	xdg_toplevel_add_listener(top, &xdg_toplevel_impl, NULL);
+	xdg_toplevel_add_listener(top, &xdg_toplevel_impl, &win);
 	xdg_toplevel_set_title(top, title);
 	xdg_toplevel_set_app_id(top, "qdistro-test-window");
 	wl_surface_commit(surf);
 	wl_display_roundtrip(c.display);
-
-	struct wl_buffer *buf = make_solid_buffer(c.shm, width, height, fill);
-	if (!buf) { fprintf(stderr, "make_solid_buffer failed\n"); return 1; }
-	wl_surface_attach(surf, buf, 0, 0);
-	wl_surface_damage_buffer(surf, 0, 0, width, height);
-	wl_surface_commit(surf);
 
 	while (running && wl_display_dispatch(c.display) != -1) {
 		/* idle on events; SIGTERM flips running */
@@ -195,7 +243,8 @@ int main(int argc, char **argv)
 	xdg_toplevel_destroy(top);
 	xdg_surface_destroy(xsurf);
 	wl_surface_destroy(surf);
-	wl_buffer_destroy(buf);
+	if (win.buffer)
+		wl_buffer_destroy(win.buffer);
 	wl_display_disconnect(c.display);
 	return 0;
 }

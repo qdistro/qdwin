@@ -138,6 +138,17 @@ qdwin_client_extent_for_geometry(int32_t desired_geometry,
 	return (int32_t)configure;
 }
 
+int32_t
+qdwin_committed_restore_extent(bool xwayland, int32_t surface_extent,
+				 int32_t geometry_extent)
+{
+	if (xwayland && surface_extent > 0)
+		return surface_extent;
+	if (geometry_extent > 0)
+		return geometry_extent;
+	return surface_extent > 0 ? surface_extent : 0;
+}
+
 static int32_t
 qdwin_i64_to_i32(int64_t value)
 {
