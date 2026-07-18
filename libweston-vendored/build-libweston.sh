@@ -29,6 +29,10 @@ SRC="$HERE/src"
 
 PROFILE="${QDWIN_LIBWESTON_PROFILE:-headless}"
 
+# J29: single source of truth for the libweston major/soname (from ./VERSION).
+# shellcheck source=lib-major.sh
+. "$HERE/lib-major.sh"
+
 prepare_pinned_git_subproject() {
     local name="$1"
     local wrap="$SRC/subprojects/$name.wrap"
@@ -79,7 +83,7 @@ headless)
         -Dcolor-management-lcms=false
     )
     NINJA_TARGETS=(
-        libweston/libweston-14.so.0.0.2
+        libweston/${LIBWESTON_SONAME}.so.${LIBWESTON_LIBVER}
         libweston/backend-headless/headless-backend.so
     )
     ;;
@@ -199,19 +203,19 @@ DESTDIR= ninja -C "$BUILD" install >/dev/null
 # multiarch dir (lib/x86_64-linux-gnu) on Debian/Ubuntu. We deliberately do
 # NOT force --libdir, so locate whichever directory the install actually used
 # rather than assuming lib64.
-CORE_SO=$(ls "$PREFIX"/lib64/libweston-14.so.0.0.2 \
-             "$PREFIX"/lib/*/libweston-14.so.0.0.2 \
-             "$PREFIX"/lib/libweston-14.so.0.0.2 2>/dev/null | head -n1 || true)
-[[ -n "$CORE_SO" ]] || { echo "error: no libweston-14.so under $PREFIX after install" >&2; exit 1; }
+CORE_SO=$(ls "$PREFIX"/lib64/${LIBWESTON_SONAME}.so.0* \
+             "$PREFIX"/lib/*/${LIBWESTON_SONAME}.so.0* \
+             "$PREFIX"/lib/${LIBWESTON_SONAME}.so.0* 2>/dev/null | head -n1 || true)
+[[ -n "$CORE_SO" ]] || { echo "error: no ${LIBWESTON_SONAME}.so under $PREFIX after install" >&2; exit 1; }
 LIBDIR=$(dirname "$CORE_SO")
 
 echo
 echo "Profile:         $PROFILE"
-echo "Built libweston: $BUILD/libweston/libweston-14.so.0.0.2"
+echo "Built libweston: $BUILD/libweston/${LIBWESTON_SONAME}.so.${LIBWESTON_LIBVER}"
 echo "Installed under: $PREFIX (libdir: ${LIBDIR#$PREFIX/})"
-ls -la "$LIBDIR/libweston-14.so"*
+ls -la "$LIBDIR/${LIBWESTON_SONAME}.so"*
 echo "Backends:"
-ls -1 "$LIBDIR/libweston-14/"*.so 2>/dev/null | sed 's/^/  /'
+ls -1 "$LIBDIR/${LIBWESTON_SONAME}/"*.so 2>/dev/null | sed 's/^/  /'
 echo
 if [[ "$PROFILE" == production ]]; then
     echo "Stage into a VM/image with:"

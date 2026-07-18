@@ -47,7 +47,15 @@ if get_option('enable_test_place')
   add_project_arguments('-DQDWIN_ENABLE_TEST_PLACE=1', language: 'c')
 endif
 
-dep_libweston = dependency('libweston-14', required: false)
+# J29: derive the libweston major from the vendored VERSION file (single
+# source of truth) so a version bump (14 -> 16) is one edit. Behaviour is
+# unchanged at 14.0.2 — the primary dependency name still resolves to
+# 'libweston-14', with the legacy 13 fallback preserved. fs.read() (not
+# run_command) so meson registers VERSION as a configure dependency and
+# reconfigures when it is bumped.
+fs = import('fs')
+libweston_major = fs.read('libweston-vendored/VERSION').strip().split('.')[0]
+dep_libweston = dependency('libweston-' + libweston_major, required: false)
 if not dep_libweston.found()
   dep_libweston = dependency('libweston-13')
 endif
