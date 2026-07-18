@@ -539,6 +539,17 @@ struct qdwin_toplevel {
 	char *proxy_app_id;
 	char *proxy_title;
 	uint32_t proxy_origin_uid;
+	/* J12 Fix B: secctx tag of the *advertising* container connection (the
+	 * tier-2 nested compositor, tagged via wp_security_context_v1),
+	 * captured at advertise_toplevel time. A proxy has desktop_surface ==
+	 * NULL, so qdwin_send_toplevel_security_context cannot resolve a backing
+	 * wl_client — it reads these instead. proxy_secctx_set stays false for an
+	 * untagged advertiser, so nothing is emitted (absence == not sandboxed,
+	 * the v13 contract). */
+	char *proxy_secctx_engine;
+	char *proxy_secctx_app_id;
+	char *proxy_secctx_instance;
+	bool proxy_secctx_set;
 	/* §6.8 S2b: when the admin shell calls bind_proxy_pixels, the
 	 * compositor swaps the placeholder curtain view for a view of the
 	 * bound surface. proxy_pixel_view is the active view (== tl->view),
@@ -1520,15 +1531,15 @@ qdwin_demote_lock_toplevel(struct qdwin *qdwin, const char *cause)
  * whose client has no tag (unsandboxed) emit nothing — absence == not
  * sandboxed, which is the v13 contract.
  *
- * Nested proxies (is_nested_proxy=1) synthesise their metadata from the
- * outer's qdwin_nested_manager_v1.advertise_toplevel call; the proxy's
- * own wl_client is the shell that drove advertise, not the inner app's
- * client, so qdwin_secctx_for_client on the proxy would either return
- * NULL or, worse, the shell's own secctx in pathological reuse.
- * Skip nested proxies for now — when the nested-mode publisher learns
- * to forward inner-client secctx tags through advertise_toplevel
- * (separate task; needs an XML bump on qdwin-nested-v1) we can plumb
- * it back here. */
+ * Nested proxies (is_nested_proxy=1) have no backing app wl_client — the
+ * proxy synthesises its metadata from the outer's
+ * qdwin_nested_manager_v1.advertise_toplevel call and desktop_surface is
+ * NULL — so a client-based lookup on the proxy can't resolve the app's tag.
+ * J12 Fix B: rather than forward the *inner* app's tag (which would need an
+ * XML bump on qdwin-nested-v1), we use the *advertising* container's own
+ * secctx tag, captured onto the proxy at advertise_toplevel time
+ * (qdwin_nested_proxy_create). For the per-uid tier-2 model the advertiser
+ * IS the sandboxed silo, so its tag is the correct silo/app identity. */
 static void
 qdwin_send_toplevel_security_context(struct qdwin *qdwin,
 				     struct qdwin_toplevel *tl)
@@ -1537,8 +1548,36 @@ qdwin_send_toplevel_security_context(struct qdwin *qdwin,
 		return;
 	if (wl_resource_get_version(qdwin->shell_resource) < 13)
 		return;
-	if (tl->is_nested_proxy)
+	if (tl->is_nested_proxy) {
+		/* J12 Fix B: a nested proxy has no backing wl_client
+		 * (desktop_surface == NULL), so its secctx was captured from the
+		 * *advertising* container connection at advertise_toplevel time
+		 * (see qdwin_nested_proxy_create). Emit that tag — the silo/app
+		 * identity the launcher badge + placeholder resolution key on.
+		 * Untagged advertiser => proxy_secctx_set is false => emit
+		 * nothing, preserving the absence==not-sandboxed v13 contract.
+		 * The v22 peer-identity sidecar is intentionally NOT sent for
+		 * proxies: their peer is the container compositor, not the app
+		 * process, so it would mislead broker re-verification. */
+		if (!tl->proxy_secctx_set)
+			return;
+		/* Parity with the non-proxy path, which forwards the accessor
+		 * results (guaranteed non-NULL ""). The stash is strdup'd, so a
+		 * field could be NULL only on OOM; normalise to "" so the wire
+		 * arg is never NULL. */
+		qdwin_shell_v1_send_toplevel_security_context(
+			qdwin->shell_resource, tl->handle,
+			tl->proxy_secctx_engine   ? tl->proxy_secctx_engine   : "",
+			tl->proxy_secctx_app_id   ? tl->proxy_secctx_app_id   : "",
+			tl->proxy_secctx_instance ? tl->proxy_secctx_instance : "");
+		weston_log("qdwin: toplevel_security_context (nested proxy) "
+			   "handle=%u engine=%s app_id=%s instance=%s\n",
+			   tl->handle,
+			   tl->proxy_secctx_engine ? tl->proxy_secctx_engine : "",
+			   tl->proxy_secctx_app_id ? tl->proxy_secctx_app_id : "",
+			   tl->proxy_secctx_instance ? tl->proxy_secctx_instance : "");
 		return;
+	}
 	struct weston_desktop_client *dclient =
 		weston_desktop_surface_get_client(tl->desktop_surface);
 	struct wl_client *client =
@@ -20835,6 +20874,29 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 		   title ? title : "(null)", w, h, cx, cy,
 		   tl->nested_proxy_pending_decision ? 1 : 0);
 
+	/* J12 Fix B: capture the advertising container's secctx tag BEFORE the
+	 * first toplevel_added (which triggers qdwin_send_toplevel_security_
+	 * context) so the shell gets toplevel_security_context for this proxy on
+	 * the initial advertise, not only on a later shell rebind. owner->
+	 * resource's client is the tier-2 nested compositor, tagged via
+	 * wp_security_context_v1 when spawned through a root launcher; that tag
+	 * is the silo/app identity. An untagged advertiser (dev / un-tagged
+	 * spawn) leaves proxy_secctx_set false, so nothing is emitted. */
+	if (owner && owner->resource) {
+		struct wl_client *adv = wl_resource_get_client(owner->resource);
+		struct qdwin_secctx_client *sc =
+			qdwin_secctx_client_lookup(qdwin, adv);
+		if (sc) {
+			tl->proxy_secctx_engine =
+				qdwin_xstrdup_or_null(qdwin_secctx_client_engine(sc));
+			tl->proxy_secctx_app_id =
+				qdwin_xstrdup_or_null(qdwin_secctx_client_app_id(sc));
+			tl->proxy_secctx_instance =
+				qdwin_xstrdup_or_null(qdwin_secctx_client_instance_id(sc));
+			tl->proxy_secctx_set = true;
+		}
+	}
+
 	qdwin_send_toplevel_added(qdwin, tl);
 	if (qdwin->shell_bound && qdwin->shell_resource) {
 		qdwin_shell_v1_send_toplevel_geometry(
@@ -21296,6 +21358,9 @@ qdwin_nested_proxy_destroy(struct qdwin_toplevel *tl)
 	wl_list_remove(&tl->link);
 	free(tl->proxy_app_id);
 	free(tl->proxy_title);
+	free(tl->proxy_secctx_engine);
+	free(tl->proxy_secctx_app_id);
+	free(tl->proxy_secctx_instance);
 	free(tl);
 }
 

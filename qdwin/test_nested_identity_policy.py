@@ -828,6 +828,91 @@ def check_stream_input_helper_bound(source):
     return 0
 
 
+def check_nested_proxy_forwards_secctx(source):
+    """J12 Fix B: a nested tier-2 proxy has no backing app wl_client
+    (desktop_surface == NULL), so qdwin_send_toplevel_security_context cannot
+    resolve the app's tag from the proxy itself. Instead the *advertising*
+    container's own secctx tag (it is the sandboxed silo in the per-uid
+    tier-2 model) is captured onto the proxy at advertise time and forwarded
+    to the shell as toplevel_security_context. Lock both halves so a
+    regression that reverts to the old unconditional skip — which left tier-2
+    windows with no silo/app identity for the launcher badge + placeholder
+    resolution — fails host CI without a VM."""
+    # (1) proxy_create captures the advertiser's tag BEFORE the first
+    #     qdwin_send_toplevel_added (which drives the emit), keyed off the
+    #     advertising client's kernel-resolved secctx, not client-asserted data.
+    create, err = _function_body(
+        source,
+        r"static struct qdwin_toplevel \*\s+qdwin_nested_proxy_create\s*\(",
+        "qdwin_nested_proxy_create",
+    )
+    if err:
+        return fail(err)
+    if "qdwin_secctx_client_lookup" not in create:
+        return fail("qdwin_nested_proxy_create does not look up the "
+                    "advertising client's secctx tag (J12 Fix B)")
+    # The looked-up client MUST be the advertiser (owner->resource's client),
+    # not some other in-scope client — otherwise the proxy could be stamped
+    # with the wrong identity.
+    if "wl_resource_get_client(owner->resource)" not in create:
+        return fail("qdwin_nested_proxy_create does not derive the secctx "
+                    "lookup client from owner->resource (the advertiser) — "
+                    "the tag could be the wrong client's identity")
+    if "proxy_secctx_set" not in create:
+        return fail("qdwin_nested_proxy_create does not stash the advertiser "
+                    "secctx tag on the proxy (proxy_secctx_set)")
+    lookup_pos = create.find("qdwin_secctx_client_lookup")
+    added_pos = create.find("qdwin_send_toplevel_added")
+    if added_pos < 0 or lookup_pos < 0 or lookup_pos > added_pos:
+        return fail("qdwin_nested_proxy_create must capture the advertiser "
+                    "secctx BEFORE qdwin_send_toplevel_added so the tag is "
+                    "sent on the first advertise, not only on a shell rebind")
+    # (2) The secctx sender emits the stashed tag for nested proxies instead
+    #     of unconditionally skipping them.
+    send, err = _function_body(
+        source,
+        r"static void\s+qdwin_send_toplevel_security_context\s*\(",
+        "qdwin_send_toplevel_security_context",
+    )
+    if err:
+        return fail(err)
+    m = re.search(r"if\s*\(\s*tl->is_nested_proxy\s*\)\s*\{", send)
+    if not m:
+        return fail("qdwin_send_toplevel_security_context no longer has an "
+                    "explicit nested-proxy branch (J12 Fix B regressed to an "
+                    "unconditional skip)")
+    open_brace = send.index("{", m.start())
+    depth = 0
+    branch = None
+    for i in range(open_brace, len(send)):
+        c = send[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                branch = send[open_brace:i + 1]
+                break
+    if branch is None:
+        return fail("nested-proxy branch has unbalanced braces")
+    if "qdwin_shell_v1_send_toplevel_security_context" not in branch:
+        return fail("nested-proxy branch does not forward the secctx tag to "
+                    "the shell (still skips proxies — J12 Fix B regressed)")
+    if "proxy_secctx_set" not in branch:
+        return fail("nested-proxy branch does not gate on proxy_secctx_set "
+                    "(an untagged advertiser must emit nothing — the "
+                    "absence==not-sandboxed contract)")
+    # The emit must forward the *stashed* tag (proxy_secctx_*), not some other
+    # in-scope strings — otherwise the shell could receive a wrong/empty tag.
+    send_call = branch[branch.find("qdwin_shell_v1_send_toplevel_security_context"):]
+    for field in ("proxy_secctx_engine", "proxy_secctx_app_id",
+                  "proxy_secctx_instance"):
+        if field not in send_call:
+            return fail("nested-proxy secctx emit does not pass the stashed "
+                        f"{field} to the shell (J12 Fix B)")
+    return 0
+
+
 def main():
     if len(sys.argv) != 2:
         return fail("usage: test_nested_identity_policy.py <qdwin.c>")
@@ -854,6 +939,7 @@ def main():
         check_pixel_destroy_preserves_position,
         check_generic_raise_paths_preserve_pending_gate,
         check_stream_input_helper_bound,
+        check_nested_proxy_forwards_secctx,
     )
     for check in checks:
         rc = check(source)
