@@ -100,21 +100,64 @@ int  weston_seat_init_touch(struct weston_seat *seat);
 void weston_seat_release_pointer(struct weston_seat *seat);
 void weston_seat_release_keyboard(struct weston_seat *seat);
 void weston_seat_release_touch(struct weston_seat *seat);
-void notify_motion_absolute(struct weston_seat *seat,
-			    const struct timespec *time,
-			    struct weston_coord_global pos);
-void notify_button(struct weston_seat *seat,
-		   const struct timespec *time,
-		   int32_t button,
-		   enum wl_pointer_button_state state);
-void notify_axis(struct weston_seat *seat,
-		 const struct timespec *time,
-		 struct weston_pointer_axis_event *event);
-void notify_key(struct weston_seat *seat,
-		const struct timespec *time,
-		uint32_t key,
-		enum wl_keyboard_key_state state,
-		enum weston_key_state_update update_state);
+/* J29 14->16: the synthetic-input producers changed shape. Each now takes a
+ * single pre-initialized event object (seat + timestamp live in event->base),
+ * and notify_motion_absolute() was REMOVED — absolute motion is notify_motion()
+ * with WESTON_POINTER_MOTION_ABS in the event mask. These are still not in the
+ * installed plugin header, so declare the 16 forms locally. */
+void notify_motion(const struct weston_pointer_motion_event *event);
+void notify_button(const struct weston_pointer_button_event *event);
+void notify_axis(const struct weston_pointer_axis_event *event);
+void notify_key(const struct weston_key_event *key_event);
+
+/* Thin wrappers that keep the old (seat, time, ...) call shape used by the
+ * per-stream / nested / IME injection sites and build the 16 event via the
+ * public weston_*_event_init() helpers (which populate event->base.{seat,ts}).
+ * Without these the sites would pass a weston_seat* where 16 expects an event
+ * pointer — a runtime crash on first injected input — and notify_motion_absolute
+ * would be an undefined symbol that fails the shell's RTLD_NOW dlopen. */
+static inline void
+qdwin_notify_motion_absolute(struct weston_seat *seat,
+			     const struct timespec *time,
+			     struct weston_coord_global pos)
+{
+	struct weston_pointer_motion_event event;
+	struct timespec ts = *time;
+	weston_pointer_motion_event_init(&event, &ts, seat,
+					 WESTON_POINTER_MOTION_ABS,
+					 &pos, NULL, NULL);
+	notify_motion(&event);
+}
+static inline void
+qdwin_notify_button(struct weston_seat *seat, const struct timespec *time,
+		    int32_t button, enum wl_pointer_button_state state)
+{
+	struct weston_pointer_button_event event;
+	struct timespec ts = *time;
+	weston_pointer_button_event_init(&event, &ts, seat,
+					 (uint32_t)button, state);
+	notify_button(&event);
+}
+static inline void
+qdwin_notify_axis(struct weston_seat *seat, const struct timespec *time,
+		  const struct weston_pointer_axis_event *in)
+{
+	struct weston_pointer_axis_event event;
+	struct timespec ts = *time;
+	weston_pointer_axis_event_init(&event, &ts, seat, in->axis, in->value,
+				       in->has_discrete, in->discrete);
+	notify_axis(&event);
+}
+static inline void
+qdwin_notify_key(struct weston_seat *seat, const struct timespec *time,
+		 uint32_t key, enum wl_keyboard_key_state state,
+		 enum weston_key_state_update update_state)
+{
+	struct weston_key_event event;
+	struct timespec ts = *time;
+	weston_key_event_init(&event, &ts, seat, key, state, update_state);
+	notify_key(&event);
+}
 struct qdwin;
 
 enum qdwin_side {
@@ -5530,7 +5573,7 @@ qdwin_stream_input_inject_pointer_motion(
 		weston_coord_surface_to_global(s->tl->view, cs);
 
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
-	notify_motion_absolute(&s->stream_seat, &ts, gpos);
+	qdwin_notify_motion_absolute(&s->stream_seat, &ts, gpos);
 
 	if (getenv("QDWIN_STREAM_INPUT_DEBUG"))
 		weston_log("qdwin: notify_motion_absolute stream=%u "
@@ -5555,7 +5598,7 @@ qdwin_stream_input_inject_pointer_button(
 					  * the default grab would route this to an
 					  * UNRELATED window (mm-merge review HIGH) */
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
-	notify_button(&s->stream_seat, &ts, (int32_t)button,
+	qdwin_notify_button(&s->stream_seat, &ts, (int32_t)button,
 		      state ? WL_POINTER_BUTTON_STATE_PRESSED
 			    : WL_POINTER_BUTTON_STATE_RELEASED);
 	if (getenv("QDWIN_STREAM_INPUT_DEBUG"))
@@ -5584,7 +5627,7 @@ qdwin_stream_input_inject_pointer_axis(
 		.discrete = 0,
 	};
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
-	notify_axis(&s->stream_seat, &ts, &ev);
+	qdwin_notify_axis(&s->stream_seat, &ts, &ev);
 }
 
 static void
@@ -5605,7 +5648,7 @@ qdwin_stream_input_inject_key(
 	qdwin_stream_seat_assert_focus(s);
 
 	struct timespec ts = qdwin_ts_from_msec(time_msec);
-	notify_key(&s->stream_seat, &ts, key,
+	qdwin_notify_key(&s->stream_seat, &ts, key,
 		   state ? WL_KEYBOARD_KEY_STATE_PRESSED
 			 : WL_KEYBOARD_KEY_STATE_RELEASED,
 		   STATE_UPDATE_AUTOMATIC);
@@ -17236,7 +17279,7 @@ qdwin_vk_req_key(struct wl_client *client, struct wl_resource *resource,
 	 * seat's xkb modifier state just like a hardware key — the focused app
 	 * then sees correct modifiers on subsequent keys. The explicit
 	 * modifiers request below complements this for latched/locked/group. */
-	notify_key(vk->seat, &ts, key,
+	qdwin_notify_key(vk->seat, &ts, key,
 		   state ? WL_KEYBOARD_KEY_STATE_PRESSED
 			 : WL_KEYBOARD_KEY_STATE_RELEASED,
 		   STATE_UPDATE_AUTOMATIC);
@@ -18701,9 +18744,9 @@ qdwin_s3d_route_test_fire(void *data)
 				weston_pointer_set_focus(ptr, picked);
 				qdwin_proxy_pointer_track_focus(qdwin, ptr);
 				matched = (qdwin->active_input_proxy == tl);
-				notify_button(seat, &ts, 0x110 /*BTN_LEFT*/,
+				qdwin_notify_button(seat, &ts, 0x110 /*BTN_LEFT*/,
 					      WL_POINTER_BUTTON_STATE_PRESSED);
-				notify_button(seat, &ts, 0x110,
+				qdwin_notify_button(seat, &ts, 0x110,
 					      WL_POINTER_BUTTON_STATE_RELEASED);
 				qdwin->active_input_proxy = saved_proxy;
 				weston_pointer_set_focus(ptr, saved_focus);
@@ -18920,11 +18963,11 @@ qdwin_nested_manager_advertise_toplevel(struct wl_client *client,
 							weston_seat_get_keyboard(seat);
 						if (!kb)
 							continue;
-						notify_key(seat, &ts,
+						qdwin_notify_key(seat, &ts,
 							31 /*KEY_S*/,
 							WL_KEYBOARD_KEY_STATE_PRESSED,
 							STATE_UPDATE_AUTOMATIC);
-						notify_key(seat, &ts,
+						qdwin_notify_key(seat, &ts,
 							31,
 							WL_KEYBOARD_KEY_STATE_RELEASED,
 							STATE_UPDATE_AUTOMATIC);
@@ -19941,7 +19984,7 @@ qdwin_nested_dispatch_motion(struct qdwin_toplevel *tl,
 	struct weston_coord_global gpos =
 		weston_coord_surface_to_global(tl->view, cs);
 	struct timespec ts = qdwin_nested_ts_from_msec(p->time_msec);
-	notify_motion_absolute(&tl->nested_inner_seat, &ts, gpos);
+	qdwin_notify_motion_absolute(&tl->nested_inner_seat, &ts, gpos);
 }
 
 static void
@@ -19951,7 +19994,7 @@ qdwin_nested_dispatch_button(struct qdwin_toplevel *tl,
 	qdwin_nested_inner_seat_init(tl);
 	qdwin_nested_inner_seat_assert_focus(tl);
 	struct timespec ts = qdwin_nested_ts_from_msec(p->time_msec);
-	notify_button(&tl->nested_inner_seat, &ts, (int32_t)p->button,
+	qdwin_notify_button(&tl->nested_inner_seat, &ts, (int32_t)p->button,
 		      p->state ? WL_POINTER_BUTTON_STATE_PRESSED
 			       : WL_POINTER_BUTTON_STATE_RELEASED);
 }
@@ -19963,7 +20006,7 @@ qdwin_nested_dispatch_key(struct qdwin_toplevel *tl,
 	qdwin_nested_inner_seat_init(tl);
 	qdwin_nested_inner_seat_assert_focus(tl);
 	struct timespec ts = qdwin_nested_ts_from_msec(p->time_msec);
-	notify_key(&tl->nested_inner_seat, &ts, p->key,
+	qdwin_notify_key(&tl->nested_inner_seat, &ts, p->key,
 		   p->state ? WL_KEYBOARD_KEY_STATE_PRESSED
 			    : WL_KEYBOARD_KEY_STATE_RELEASED,
 		   STATE_UPDATE_AUTOMATIC);
@@ -19981,7 +20024,7 @@ qdwin_nested_dispatch_axis(struct qdwin_toplevel *tl,
 		.discrete = 0,
 	};
 	struct timespec ts = qdwin_nested_ts_from_msec(p->time_msec);
-	notify_axis(&tl->nested_inner_seat, &ts, &ev);
+	qdwin_notify_axis(&tl->nested_inner_seat, &ts, &ev);
 }
 
 /* §6.8 S3/S3b: peer-fd readable callback — drain one packet at a time.
