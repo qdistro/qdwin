@@ -18743,15 +18743,23 @@ qdwin_s3d_route_test_fire(void *data)
 			 * Re-dirty the proxy view (sets view_list_needs_rebuild +
 			 * schedules a repaint) and re-arm rather than failing on a
 			 * transient stale list. Bounded so a truly-absent view fails. */
-			if (!picked && ctx->pick_retries < 6) {
+			if (!picked && ctx->pick_retries < 12) {
 				ctx->pick_retries++;
-				weston_log("qdwin/nested-proxy: S3d route-test "
+				/* Distinct prefix ("route-retry", NOT "route-test")
+				 * so the probe's head -1 grep for the RESULT line
+				 * ("S3d route-test") is never satisfied by a retry
+				 * message. weston_compositor_damage_all() forces a
+				 * real output repaint (which rebuilds view_list);
+				 * bare schedule_repaint may not paint in headless
+				 * without pending damage, leaving the list stale and
+				 * the pick perpetually null. */
+				weston_log("qdwin/nested-proxy: S3d route-retry "
 					   "handle=%u pick null — re-arming "
-					   "(retry %d/6)\n",
+					   "(retry %d/12)\n",
 					   ctx->handle, ctx->pick_retries);
 				weston_view_geometry_dirty(tl->view);
-				weston_compositor_schedule_repaint(qdwin->compositor);
-				wl_event_source_timer_update(ctx->timer, 500);
+				weston_compositor_damage_all(qdwin->compositor);
+				wl_event_source_timer_update(ctx->timer, 300);
 				return 0;
 			}
 			pick_matched = (picked == tl->view);
