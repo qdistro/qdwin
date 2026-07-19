@@ -48,11 +48,11 @@ if get_option('enable_test_place')
 endif
 
 # J29: derive the libweston major from the vendored VERSION file (single
-# source of truth) so a version bump (14 -> 16) is one edit. Behaviour is
-# unchanged at 14.0.2 — the primary dependency name still resolves to
-# 'libweston-14', with the legacy 13 fallback preserved. fs.read() (not
-# run_command) so meson registers VERSION as a configure dependency and
-# reconfigures when it is bumped.
+# source of truth) so a version bump is one edit. VERSION now pins 16.0.0, so
+# the primary dependency name resolves to 'libweston-16' (the legacy 13
+# fallback below is retained for old hosts). fs.read() (not run_command) so
+# meson registers VERSION as a configure dependency and reconfigures when it
+# is bumped.
 fs = import('fs')
 libweston_major = fs.read('libweston-vendored/VERSION').strip().split('.')[0]
 dep_libweston = dependency('libweston-' + libweston_major, required: false)
@@ -286,7 +286,7 @@ input_method_protocol_code = custom_target(
 # IME re-injects the keys it does not compose through zwp_virtual_keyboard_v1
 # so they reach the focused app. Like input-method-v2 this is a wlr-protocols
 # extension (NOT wayland-protocols), so the xml is vendored under qdwin/qdwin/.
-# libweston-14 has no implementation. Bind is identity-gated EXACTLY like
+# libweston-16 has no implementation. Bind is identity-gated EXACTLY like
 # input-method-v2 (allowed_ime_uid + sandbox/secctx deny) because it grants
 # arbitrary keystroke injection. See todo/open-followups.md +
 # todo/issues/qdwin/app-compat-protocol-gaps.md P1.
@@ -1344,7 +1344,7 @@ test('s13-failopen-pins',
 # are absent. The two vendored-libweston discriminators
 # (layer_popup_grab_handler_registered, layer_popup_reposition) SKIP unless
 # QDWIN_USE_VENDORED_LIBWESTON=1 points at an installed vendored
-# libweston-14 (stock lacks weston_desktop_xdg_popup_set_layer_grab_handler).
+# libweston-16 (stock lacks weston_desktop_xdg_popup_set_layer_grab_handler).
 # Run just this suite with:  meson test --suite protocol
 test('layer-shell-protocol',
   find_program('tests/protocol/run-layer-shell-protocol-test.sh'),

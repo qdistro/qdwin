@@ -9,7 +9,7 @@
 # This is the IN-VM full-session variant: it runs as `admin` against a
 # fixed wayland-77 socket under /run/user/1000 with a bootstrap-provided
 # /home/admin/weston.ini, and is the path to exercise all 12 sub-tests
-# against the qdistro-vendored libweston-14 (QDWIN_USE_VENDORED_LIBWESTON=1).
+# against the qdistro-vendored libweston-16 (QDWIN_USE_VENDORED_LIBWESTON=1).
 # For headless host / CI use, prefer the self-contained meson harness
 # `tests/protocol/run-layer-shell-protocol-test.sh`, wired as
 # `meson test --suite protocol` — it stages the pywayland bindings and a
@@ -20,7 +20,7 @@
 set -u
 set +e
 
-# Opt-in: load the qdistro-vendored libweston-14 (NULL-parent xdg_popup
+# Opt-in: load the qdistro-vendored libweston-16 (NULL-parent xdg_popup
 # patch) for this run. See compositor/run-noctalia-smoke.sh for the
 # same knob; the test client reads QDWIN_USE_VENDORED_LIBWESTON to
 # flip its expected outcome on test_null_parent_popup.
@@ -28,7 +28,7 @@ QDWIN_USE_VENDORED_LIBWESTON="${QDWIN_USE_VENDORED_LIBWESTON:-0}"
 QDWIN_VENDORED_LIBWESTON_PREFIX="${QDWIN_VENDORED_LIBWESTON_PREFIX:-/usr/libexec/qdistro/qdwin-libweston}"
 WESTON_LD_PREFIX=""
 if [ "$QDWIN_USE_VENDORED_LIBWESTON" = "1" ]; then
-    if [ ! -f "$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64/libweston-14.so.0.0.2" ]; then
+    if [ ! -f "$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64/libweston-16.so.0.0.0" ]; then
         echo "ERROR: QDWIN_USE_VENDORED_LIBWESTON=1 but no vendored .so at $QDWIN_VENDORED_LIBWESTON_PREFIX/lib64" >&2
         exit 2
     fi

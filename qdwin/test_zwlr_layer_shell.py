@@ -43,7 +43,7 @@ except Exception:
 
 def _vendored_libweston_active():
     """True iff the compositor was launched against the qdistro-vendored
-    libweston-14 (the NULL-parent xdg_popup / layer-popup-grab patch).
+    libweston-16 (the NULL-parent xdg_popup / layer-popup-grab patch).
 
     The harness that boots weston (run-protocol-tests.sh in a VM, or
     tests/protocol/run-layer-shell-protocol-test.sh headless) exports
@@ -51,7 +51,7 @@ def _vendored_libweston_active():
     client's env when it LD_LIBRARY_PATH-prefixes the vendored .so, so
     the two agree. The grab-handler and layer-popup-reposition tests are
     discriminators that are only meaningful against the patched
-    libweston; against stock libweston-14 (which lacks
+    libweston; against stock libweston-16 (which lacks
     weston_desktop_xdg_popup_set_layer_grab_handler) they SKIP rather
     than FAIL, so the protocol suite stays green on a stock host.
     """
@@ -273,9 +273,9 @@ def test_invalid_layer_set_layer(display_name):
 
 def test_null_parent_popup(display_name):
     """xdg_surface.get_popup(parent=NULL) gating for the vendored
-    libweston-14 NULL-parent xdg_popup patch.
+    libweston-16 NULL-parent xdg_popup patch.
 
-    Stock libweston-14 unconditionally posts xdg_wm_base#3
+    Stock libweston-16 unconditionally posts xdg_wm_base#3
     (invalid_popup_parent) at construction time. The qdistro patch
     accepts NULL at construction and only enforces the spec error if
     commit happens with parent still NULL.
@@ -586,7 +586,7 @@ def test_layer_popup_grab_handler_registered(display_name):
     """
     label = "layer_popup_grab_handler_registered"
     if not _vendored_libweston_active():
-        print(f"  SKIP [{label}] stock libweston-14 has no layer-popup grab "
+        print(f"  SKIP [{label}] stock libweston-16 has no layer-popup grab "
               f"handler symbol; set QDWIN_USE_VENDORED_LIBWESTON=1 against "
               f"the vendored .so to exercise this")
         return True

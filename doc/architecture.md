@@ -88,7 +88,7 @@ forwards pixels and input via the `qdwin_nested_v1` protocol. See
 
 ## Vendored libweston
 
-qdwin ships a vendored copy of libweston-14 in `libweston-vendored/`
+qdwin ships a vendored copy of libweston-16 in `libweston-vendored/`
 with a single patch that allows `xdg_popup` with a NULL parent
 surface. The shell client uses this in two places where Wayland's
 strict parent-popup model gets in the way (Quickshell-style

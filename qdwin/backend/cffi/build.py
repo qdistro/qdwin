@@ -1,7 +1,7 @@
 """
 qdwin internal CFFI binding — Phase 6.0 spike, Day 3.
 
-Install-time binding against /usr/lib64/libweston-14.so. NOT a public
+Install-time binding against /usr/lib64/libweston-16.so. NOT a public
 SDK: consumers are qdwin internals only. The module is regenerated on
 every install so the generated glue tracks whatever libweston version
 the distro ships — no vendored .so, no committed generated code.
@@ -33,7 +33,7 @@ from pathlib import Path
 from cffi import FFI
 
 
-def _pkgconf(flag: str, pkg: str = "libweston-14") -> list[str]:
+def _pkgconf(flag: str, pkg: str = "libweston-16") -> list[str]:
     out = subprocess.check_output(["pkg-config", flag, pkg], text=True)
     return out.split()
 
@@ -61,7 +61,7 @@ def build() -> Path:
         """
     )
 
-    # API-mode set_source links against libweston-14 via pkg-config.
+    # API-mode set_source links against libweston-16 via pkg-config.
     cflags = _pkgconf("--cflags")
     libs = _pkgconf("--libs")
 

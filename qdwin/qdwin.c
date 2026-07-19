@@ -84,7 +84,7 @@ int screenshooter_create(struct weston_compositor *ec);
  * and delegate the actual arithmetic to these kernels. */
 #include "qdwin/qdwin-logic.h"
 
-/* §6.5 S5c: libweston-14 exports these from libweston-14.so but does not
+/* §6.5 S5c: libweston-16 exports these from libweston-16.so but does not
  * declare them in the installed plugin header (they're backend-facing).
  * Declare locally so qdwin-shell can act as a virtual input backend for
  * per-stream seats. Signatures tracked against weston 15.0.0 source
@@ -3403,10 +3403,9 @@ qdwin_move_grab_focus(struct weston_pointer_grab *grab)
 
 static void
 qdwin_move_grab_motion(struct weston_pointer_grab *grab,
-		       const struct timespec *time,
-		       struct weston_pointer_motion_event *event)
+		       const struct weston_pointer_motion_event *event)
 {
-	(void)time;
+	/* J29: 14->16 dropped `time` param (folded into event->base.ts). */
 	struct weston_pointer *pointer = grab->pointer;
 	weston_pointer_move(pointer, event);
 
@@ -3432,10 +3431,10 @@ qdwin_move_grab_motion(struct weston_pointer_grab *grab,
 
 static void
 qdwin_move_grab_button(struct weston_pointer_grab *grab,
-		       const struct timespec *time,
-		       uint32_t button, uint32_t state)
+		       const struct weston_pointer_button_event *button_event)
 {
-	(void)time; (void)button;
+	/* J29: 14->16 button/state now come from the event struct. */
+	uint32_t state = button_event->button_state;
 	struct weston_pointer *pointer = grab->pointer;
 	struct qdwin *qd = wl_container_of(grab, qd, move_grab);
 
@@ -3472,10 +3471,10 @@ qdwin_move_grab_button(struct weston_pointer_grab *grab,
 
 static void
 qdwin_move_grab_axis(struct weston_pointer_grab *grab,
-		     const struct timespec *time,
-		     struct weston_pointer_axis_event *event)
+		     const struct weston_pointer_axis_event *event)
 {
-	(void)grab; (void)time; (void)event;
+	/* J29: 14->16 dropped `time` param. */
+	(void)grab; (void)event;
 }
 
 static void
@@ -3658,9 +3657,9 @@ qdwin_popup_grab_focus(struct weston_pointer_grab *grab)
 
 static void
 qdwin_popup_grab_motion(struct weston_pointer_grab *grab,
-			const struct timespec *time,
-			struct weston_pointer_motion_event *event)
+			const struct weston_pointer_motion_event *event)
 {
+	/* J29: 14->16 dropped `time` param. */
 	struct weston_pointer *pointer = grab->pointer;
 	weston_pointer_move(pointer, event);
 
@@ -3672,14 +3671,17 @@ qdwin_popup_grab_motion(struct weston_pointer_grab *grab,
 	if (view != pointer->focus)
 		weston_pointer_set_focus(pointer, view);
 
-	weston_pointer_send_motion(pointer, time, event);
+	/* J29: 14->16 send_motion dropped `time` (now in event->base.ts). */
+	weston_pointer_send_motion(pointer, event);
 }
 
 static void
 qdwin_popup_grab_button(struct weston_pointer_grab *grab,
-			const struct timespec *time,
-			uint32_t button, uint32_t state)
+			const struct weston_pointer_button_event *button_event)
 {
+	/* J29: 14->16 button/state now come from the event struct. */
+	uint32_t button = button_event->button;
+	uint32_t state = button_event->button_state;
 	struct qdwin_popup *p = wl_container_of(grab, p, grab);
 	struct weston_pointer *pointer = grab->pointer;
 
@@ -3703,7 +3705,8 @@ qdwin_popup_grab_button(struct weston_pointer_grab *grab,
 			qdwin_popup_v1_send_dismissed(p->resource);
 		return;
 	}
-	weston_pointer_send_button(pointer, time, button, state);
+	/* J29: 14->16 send_button now takes the event struct. */
+	weston_pointer_send_button(pointer, button_event);
 
 	/* qdwin_shell_v1@v21 popup_button — forward the click to the
 	 * shell as a typed event with popup-local coords. Same fix as
@@ -3740,10 +3743,10 @@ qdwin_popup_grab_button(struct weston_pointer_grab *grab,
 
 static void
 qdwin_popup_grab_axis(struct weston_pointer_grab *grab,
-		      const struct timespec *time,
-		      struct weston_pointer_axis_event *event)
+		      const struct weston_pointer_axis_event *event)
 {
-	weston_pointer_send_axis(grab->pointer, time, event);
+	/* J29: 14->16 dropped `time`; send_axis takes (pointer, event). */
+	weston_pointer_send_axis(grab->pointer, event);
 }
 
 static void
@@ -3858,9 +3861,10 @@ qdwin_proxy_default_grab_focus(struct weston_pointer_grab *grab)
 
 static void
 qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
-				const struct timespec *time,
-				struct weston_pointer_motion_event *event)
+				const struct weston_pointer_motion_event *event)
 {
+	/* J29: 14->16 dropped `time` param; read it from the event struct. */
+	const struct timespec *time = &event->base.ts;
 	struct weston_pointer *pointer = grab->pointer;
 	qdwin_idle_note_activity(qdwin_singleton);
 	weston_pointer_move(pointer, event);
@@ -3868,7 +3872,7 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 		struct weston_view *lv = qdwin_singleton->lock_view;
 		if (pointer->focus != lv)
 			weston_pointer_set_focus(pointer, lv);
-		weston_pointer_send_motion(pointer, time, event);
+		weston_pointer_send_motion(pointer, event);
 		return;
 	}
 	struct weston_view *view = weston_compositor_pick_view(
@@ -3901,7 +3905,7 @@ qdwin_proxy_default_grab_motion(struct weston_pointer_grab *grab,
 	 * owns the cursor over the focused area), install our default. */
 	if (!pointer->sprite && qdwin_singleton)
 		qdwin_install_default_cursor_on_pointer(qdwin_singleton, pointer);
-	weston_pointer_send_motion(pointer, time, event);
+	weston_pointer_send_motion(pointer, event);
 
 	/* v25: focus-follows-mouse. Retarget keyboard focus to the toplevel
 	 * under the pointer (immediately or after the settle delay) when the
@@ -4018,16 +4022,19 @@ qdwin_toplevel_at_pos(struct qdwin *qdwin, struct weston_coord_global pos)
 
 static void
 qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
-				const struct timespec *time,
-				uint32_t button, uint32_t state)
+				const struct weston_pointer_button_event *button_event)
 {
+	/* J29: 14->16 time/button/state now come from the event struct. */
+	const struct timespec *time = &button_event->base.ts;
+	uint32_t button = button_event->button;
+	uint32_t state = button_event->button_state;
 	struct weston_pointer *pointer = grab->pointer;
 	qdwin_idle_note_activity(qdwin_singleton);
 	if (qdwin_singleton && qdwin_singleton->locked) {
 		struct weston_view *lv = qdwin_singleton->lock_view;
 		if (pointer->focus != lv)
 			weston_pointer_set_focus(pointer, lv);
-		weston_pointer_send_button(pointer, time, button, state);
+		weston_pointer_send_button(pointer, button_event);
 		return;
 	}
 	struct qdwin_layer_surface *layer_surface =
@@ -4117,7 +4124,8 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 				qdwin_singleton->compositor);
 		}
 	}
-	weston_pointer_send_button(pointer, time, button, state);
+	/* J29: 14->16 send_button now takes the event struct. */
+	weston_pointer_send_button(pointer, button_event);
 
 	/* qdwin_shell_v1@v20 chrome_button — forward button events on
 	 * shell-owned chrome surfaces to the shell directly, bypassing two
@@ -4184,15 +4192,16 @@ qdwin_proxy_default_grab_button(struct weston_pointer_grab *grab,
 
 static void
 qdwin_proxy_default_grab_axis(struct weston_pointer_grab *grab,
-			      const struct timespec *time,
-			      struct weston_pointer_axis_event *event)
+			      const struct weston_pointer_axis_event *event)
 {
+	/* J29: 14->16 dropped `time` param; read it from the event struct. */
+	const struct timespec *time = &event->base.ts;
 	qdwin_idle_note_activity(qdwin_singleton);
 	if (qdwin_singleton && qdwin_singleton->locked) {
-		weston_pointer_send_axis(grab->pointer, time, event);
+		weston_pointer_send_axis(grab->pointer, event);
 		return;
 	}
-	weston_pointer_send_axis(grab->pointer, time, event);
+	weston_pointer_send_axis(grab->pointer, event);
 	struct qdwin_toplevel *tl = qdwin_singleton ?
 		qdwin_singleton->active_input_proxy : NULL;
 	if (tl && tl->proxy_input_sink_fd >= 0)
@@ -4259,9 +4268,12 @@ qdwin_proxy_default_pointer_grab_iface = {
 
 static void
 qdwin_proxy_default_grab_key(struct weston_keyboard_grab *grab,
-			     const struct timespec *time,
-			     uint32_t key, uint32_t state)
+			     const struct weston_key_event *key_event)
 {
+	/* J29: 14->16 time/key/state now come from the event struct. */
+	const struct timespec *time = &key_event->base.ts;
+	uint32_t key = key_event->key;
+	uint32_t state = key_event->key_state;
 	struct weston_keyboard *kb = grab->keyboard;
 	/* Fail-secure: while the compositor is locked, no key may reach a
 	 * client through the default grab. During a normal lock the role=2
@@ -4278,7 +4290,8 @@ qdwin_proxy_default_grab_key(struct weston_keyboard_grab *grab,
 	if (qdwin_singleton && qdwin_singleton->locked)
 		return;
 	qdwin_idle_note_activity(qdwin_singleton);
-	weston_keyboard_send_key(kb, time, key, state);
+	/* J29: 14->16 send_key now takes the event struct. */
+	weston_keyboard_send_key(kb, key_event);
 
 	struct qdwin_toplevel *tl = qdwin_singleton ?
 		qdwin_singleton->active_input_proxy : NULL;
@@ -4324,7 +4337,7 @@ qdwin_proxy_default_keyboard_grab_iface = {
 
 /* Swap the keyboard's default-grab interface for ours. Idempotent
  * (calling repeatedly is a no-op once the iface ptr matches). The
- * field is part of weston_keyboard's public ABI; libweston-14 has
+ * field is part of weston_keyboard's public ABI; libweston-16 has
  * carried it stable across the 14.x point releases. */
 static void
 qdwin_install_default_keyboard_grab(struct weston_seat *seat)
@@ -4652,11 +4665,14 @@ qdwin_view_stream_pin(struct qdwin_view_stream *s)
 	 * PipeWire frame can be the pre-pin empty framebuffer of the
 	 * pipewire output, which the consumer captures and shows as
 	 * mostly black. */
+	/* J29: 14->16 weston_surface_damage() removed. weston_view_geometry_dirty()
+	 * dirties the view's paint nodes + schedules a repaint, forcing the moved
+	 * view (and chrome) to recomposite on the pipewire output. */
 	if (tl->view->surface)
-		weston_surface_damage(tl->view->surface);
+		weston_view_geometry_dirty(tl->view);
 	for (int side = 0; side < QDWIN_SIDES; side++)
 		if (tl->chrome[side].view && tl->chrome[side].view->surface)
-			weston_surface_damage(tl->chrome[side].view->surface);
+			weston_view_geometry_dirty(tl->chrome[side].view);
 	weston_output_schedule_repaint(pw);
 	s->pinned = 1;
 }
@@ -5246,9 +5262,9 @@ qdwin_stream_confine_focus(struct weston_pointer_grab *grab)
 
 static void
 qdwin_stream_confine_motion(struct weston_pointer_grab *grab,
-			    const struct timespec *time,
-			    struct weston_pointer_motion_event *event)
+			    const struct weston_pointer_motion_event *event)
 {
+	/* J29: 14->16 dropped `time` param. */
 	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
 	struct weston_pointer *pointer = grab->pointer;
 	weston_pointer_move(pointer, event);
@@ -5257,14 +5273,14 @@ qdwin_stream_confine_motion(struct weston_pointer_grab *grab,
 		return;                  /* source view gone: drop, don't re-pick */
 	if (pointer->focus != v)
 		weston_pointer_set_focus(pointer, v);
-	weston_pointer_send_motion(pointer, time, event);
+	weston_pointer_send_motion(pointer, event);
 }
 
 static void
 qdwin_stream_confine_button(struct weston_pointer_grab *grab,
-			    const struct timespec *time,
-			    uint32_t button, uint32_t state)
+			    const struct weston_pointer_button_event *button_event)
 {
+	/* J29: 14->16 button/state now come from the event struct. */
 	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
 	struct weston_pointer *pointer = grab->pointer;
 	struct weston_view *v = qdwin_stream_confine_target(s);
@@ -5272,14 +5288,14 @@ qdwin_stream_confine_button(struct weston_pointer_grab *grab,
 		return;
 	if (pointer->focus != v)
 		weston_pointer_set_focus(pointer, v);
-	weston_pointer_send_button(pointer, time, button, state);
+	weston_pointer_send_button(pointer, button_event);
 }
 
 static void
 qdwin_stream_confine_axis(struct weston_pointer_grab *grab,
-			  const struct timespec *time,
-			  struct weston_pointer_axis_event *event)
+			  const struct weston_pointer_axis_event *event)
 {
+	/* J29: 14->16 dropped `time` param. */
 	struct qdwin_view_stream *s = wl_container_of(grab, s, confine_grab);
 	struct weston_pointer *pointer = grab->pointer;
 	struct weston_view *v = qdwin_stream_confine_target(s);
@@ -5287,7 +5303,7 @@ qdwin_stream_confine_axis(struct weston_pointer_grab *grab,
 		return;
 	if (pointer->focus != v)
 		weston_pointer_set_focus(pointer, v);
-	weston_pointer_send_axis(pointer, time, event);
+	weston_pointer_send_axis(pointer, event);
 }
 
 static void
@@ -5636,12 +5652,15 @@ qdwin_stream_input_handle_request_frame(
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
 	if (!s || !s->pinned || !s->pw_output)
 		return;
+	/* J29: 14->16 weston_surface_damage() removed; weston_view_geometry_dirty()
+	 * re-dirties the view's paint nodes so the next pipewire-output repaint
+	 * pulls a fresh frame (drives continuous frame flow for the shadow encoder). */
 	if (s->tl && s->tl->view && s->tl->view->surface)
-		weston_surface_damage(s->tl->view->surface);
+		weston_view_geometry_dirty(s->tl->view);
 	for (int side = 0; side < QDWIN_SIDES; side++) {
 		struct weston_view *cv = s->tl ? s->tl->chrome[side].view : NULL;
 		if (cv && cv->surface)
-			weston_surface_damage(cv->surface);
+			weston_view_geometry_dirty(cv);
 	}
 	weston_output_schedule_repaint(s->pw_output);
 }
@@ -6405,11 +6424,12 @@ static void qdwin_switcher_grab_end(struct qdwin *qdwin);
 
 static void
 qdwin_switcher_grab_key(struct weston_keyboard_grab *grab,
-			const struct timespec *t,
-			uint32_t key, uint32_t state_w)
+			const struct weston_key_event *ke)
 {
+	/* J29: 14->16 key/state now come from the event struct (time dropped). */
+	uint32_t key = ke->key;
+	uint32_t state_w = ke->key_state;
 	struct qdwin *qdwin = wl_container_of(grab, qdwin, switcher_grab);
-	(void)t;
 	if (!qdwin->shell_resource)
 		return;
 	if (state_w != WL_KEYBOARD_KEY_STATE_PRESSED)
@@ -6502,11 +6522,12 @@ qdwin_switcher_grab_end(struct qdwin *qdwin)
  */
 static void
 qdwin_overlay_grab_key(struct weston_keyboard_grab *grab,
-		       const struct timespec *t,
-		       uint32_t key, uint32_t state_w)
+		       const struct weston_key_event *ke)
 {
+	/* J29: 14->16 key/state now come from the event struct (time dropped). */
+	uint32_t key = ke->key;
+	uint32_t state_w = ke->key_state;
 	struct qdwin *qdwin = wl_container_of(grab, qdwin, overlay_grab);
-	(void)t;
 	if (state_w != WL_KEYBOARD_KEY_STATE_PRESSED)
 		return;     /* releases absorbed; v17 forwards press only */
 	struct weston_keyboard *kb = grab->keyboard;
@@ -9483,7 +9504,9 @@ qdwin_lock_curtain_to_bottom(struct qdwin *qdwin)
 		       &view->layer_link.link);
 	view->layer_link.layer = &qdwin->lock_layer;
 	qdwin->compositor->view_list_needs_rebuild = true;
-	weston_surface_damage(view->surface);
+	/* J29: 14->16 weston_surface_damage() removed; dirty the view to force the
+	 * relayered lock curtain to recomposite. */
+	weston_view_geometry_dirty(view);
 }
 
 static void
@@ -9897,7 +9920,7 @@ qdwin_emit_selection_set(struct qdwin *qdwin, struct weston_seat *seat,
  * destination) pair against the rules engine while leaving other
  * mime types denied.
  *
- * Mechanism (no clean upstream hook in libweston-14): when
+ * Mechanism (no clean upstream hook in libweston-16): when
  * selection_signal fires we wrap the new data_source's `send` callback
  * with our shim. libweston later invokes `send(source, mime, fd)` on
  * every wl_data_offer.receive call from a destination. The shim
@@ -11045,7 +11068,7 @@ bind_ext_workspace_manager(struct wl_client *client, void *data,
  * manager resource lists, full re-sync on output hotplug, inert objects on
  * teardown.
  *
- * Live-apply surface (what weston-14 can enact on the running backend):
+ * Live-apply surface (what weston-16 can enact on the running backend):
  *   - position   weston_output_move()
  *   - scale      weston_output_set_scale()
  *   - transform  weston_output_set_transform()  (rotation/flip)
@@ -11544,7 +11567,7 @@ static void
 qdwin_om_cfg_head_set_adaptive_sync(struct wl_client *client,
 				    struct wl_resource *res, uint32_t state)
 {
-	/* weston-14 has no per-output VRR toggle we can drive live; accept the
+	/* weston-16 has no per-output VRR toggle we can drive live; accept the
 	 * request but treat it as a no-op (the layout still applies). We do not
 	 * pretend it took effect — the next done re-reports the real state. */
 	(void)client; (void)res; (void)state;
@@ -11775,7 +11798,7 @@ qdwin_om_config_realize(struct qdwin_om_config *cfg, bool test_only)
 	 *    already-disabled output is a no-op.
 	 *  - a set_mode mode must belong to the head (re-checked here)
 	 *  - a custom mode must match some advertised mode (we do not support
-	 *    truly arbitrary modelines on weston-14; reject otherwise)
+	 *    truly arbitrary modelines on weston-16; reject otherwise)
 	 *  - at least one head must remain enabled. */
 	bool any_enabled = false;
 	wl_list_for_each(ch, &cfg->cfg_heads, link) {
@@ -11816,7 +11839,7 @@ qdwin_om_config_realize(struct qdwin_om_config *cfg, bool test_only)
 	wl_list_for_each(ch, &cfg->cfg_heads, link) {
 		struct weston_output *out = ch->output;
 		if (!ch->enabled) {
-			/* Disable requested. weston-14's headless/most backends
+			/* Disable requested. weston-16's headless/most backends
 			 * keep a single output; disabling the only output is
 			 * already excluded by the any_enabled check. A head that is
 			 * already disabled has no output → nothing to do. */
@@ -13754,22 +13777,23 @@ qdwin_layer_popup_grab_focus(struct weston_pointer_grab *grab)
 
 static void
 qdwin_layer_popup_grab_motion(struct weston_pointer_grab *grab,
-			      const struct timespec *time,
-			      struct weston_pointer_motion_event *event)
+			      const struct weston_pointer_motion_event *event)
 {
+	/* J29: 14->16 dropped `time` param. */
 	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
 	struct weston_pointer *pointer = grab->pointer;
 	weston_pointer_move(pointer, event);
 	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
 	if (pointer->focus)
-		weston_pointer_send_motion(pointer, time, event);
+		weston_pointer_send_motion(pointer, event);
 }
 
 static void
 qdwin_layer_popup_grab_button(struct weston_pointer_grab *grab,
-			      const struct timespec *time,
-			      uint32_t button, uint32_t state)
+			      const struct weston_pointer_button_event *button_event)
 {
+	/* J29: 14->16 button/state now come from the event struct. */
+	uint32_t state = button_event->button_state;
 	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
 	struct weston_pointer *pointer = grab->pointer;
 
@@ -13807,19 +13831,19 @@ qdwin_layer_popup_grab_button(struct weston_pointer_grab *grab,
 	 * use stale focus. send_button is a no-op when focus is NULL. */
 	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
 	if (pointer->focus)
-		weston_pointer_send_button(pointer, time, button, state);
+		weston_pointer_send_button(pointer, button_event);
 }
 
 static void
 qdwin_layer_popup_grab_axis(struct weston_pointer_grab *grab,
-			    const struct timespec *time,
-			    struct weston_pointer_axis_event *event)
+			    const struct weston_pointer_axis_event *event)
 {
+	/* J29: 14->16 dropped `time` param. */
 	struct qdwin_layer_popup *lp = wl_container_of(grab, lp, grab);
 	struct weston_pointer *pointer = grab->pointer;
 	qdwin_layer_popup_grab_refilter_focus(lp, pointer);
 	if (pointer->focus)
-		weston_pointer_send_axis(pointer, time, event);
+		weston_pointer_send_axis(pointer, event);
 }
 
 static void
@@ -14694,7 +14718,7 @@ qdwin_on_wake_signal(struct wl_listener *listener, void *data)
  *
  * §6.6 follow-up research finding (2026-04-25):
  *
- *   Surveyed libweston-14 public headers for a server-side set-sprite
+ *   Surveyed libweston-16 public headers for a server-side set-sprite
  *   API. weston_surface_create(compositor) exists, but does NOT
  *   create a weston_buffer — weston_buffer_create_solid_rgba only
  *   produces solid colors, and weston_buffer_from_resource requires
@@ -14835,7 +14859,7 @@ qdwin_cursor_theme_destroy(struct qdwin *qdwin)
 /* §6.6 follow-up 2026-04-25: sprite install via solid-color proxy.
  *
  * Gated on QDWIN_CURSOR_SPRITE_SOLID=1 and `qdwin_cursor_solid_enabled`
- * below. Uses public libweston-14 API (weston_buffer_create_solid_rgba
+ * below. Uses public libweston-16 API (weston_buffer_create_solid_rgba
  * + weston_surface_attach_solid + weston_view_create + direct
  * assignment to weston_pointer::sprite, which IS a public field in the
  * version-14 header contrary to the earlier §6.7(b) finding). Per-
@@ -14925,7 +14949,9 @@ qdwin_pointer_unmap_sprite(struct weston_pointer *pointer)
 		if (surface->committed_private == pointer) {
 			surface->committed = NULL;
 			surface->committed_private = NULL;
-			weston_surface_set_label_func(surface, NULL);
+			/* J29: 14->16 set_label_func (callback form) removed;
+			 * clear the label to the static default. */
+			weston_surface_set_label_static(surface, NULL);
 		}
 	}
 	if (pointer->sprite_destroy_listener.link.next)
@@ -15003,7 +15029,9 @@ qdwin_cursor_device_install_solid_sprite(struct qdwin_cursor_shape_device *dev,
 
 	const int size = 24;
 	struct weston_surface *surface =
-		weston_surface_create(dev->qdwin->compositor);
+		/* J29: 14->16 added client arg; NULL = compositor-internal
+		 * cursor sprite (no owning wl_client), matching shell-utils. */
+		weston_surface_create(dev->qdwin->compositor, NULL);
 	if (!surface)
 		return;
 	struct weston_buffer_reference *ref =
@@ -16497,8 +16525,12 @@ qdwin_im_popup_impl = {
  * an event after forwarding it to the grab holder). */
 static void
 qdwin_im_grab_key(struct weston_keyboard_grab *grab,
-		  const struct timespec *time, uint32_t key, uint32_t state)
+		  const struct weston_key_event *ke)
 {
+	/* J29: 14->16 time/key/state now come from the event struct. */
+	const struct timespec *time = &ke->base.ts;
+	uint32_t key = ke->key;
+	uint32_t state = ke->key_state;
 	struct qdwin_im_keyboard_grab *g =
 		wl_container_of(grab, g, base);
 	struct qdwin *qdwin = qdwin_singleton;
@@ -16516,8 +16548,8 @@ qdwin_im_grab_key(struct weston_keyboard_grab *grab,
 	    qdwin->vk_injecting_client == g->im->client) {
 		struct weston_keyboard *kbd = grab->keyboard;
 		if (kbd)
-			kbd->default_grab.interface->key(&kbd->default_grab,
-							 time, key, state);
+			/* J29: 14->16 grab->key op takes the event struct. */
+			kbd->default_grab.interface->key(&kbd->default_grab, ke);
 		return;
 	}
 	if (!g->resource)
@@ -20106,7 +20138,7 @@ qdwin_nested_on_focus_changed(void *userdata, uint32_t focused)
  * weston_pipewire_output_api_v2 doesn't expose dynamic create_output
  * via an external-friendly pointer (the head_create entry takes a
  * weston_backend* that isn't reachable from a shell plugin), so static
- * pre-allocation is the LLM-friendly path for libweston-14.
+ * pre-allocation is the LLM-friendly path for libweston-16.
  *
  * Returns NULL if all pipewire outputs are already pinned to other
  * nested toplevels — caller advertises with pw_node="...:none" in
@@ -20159,8 +20191,10 @@ qdwin_nested_publish_toplevel(struct qdwin_toplevel *tl)
 		weston_view_set_position(tl->view, pos);
 		weston_view_set_output(tl->view, pw);
 		weston_view_update_transform(tl->view);
+		/* J29: 14->16 weston_surface_damage() removed; dirty the view to
+		 * force the pipewire output to composite the pinned view's bytes. */
 		if (tl->view->surface)
-			weston_surface_damage(tl->view->surface);
+			weston_view_geometry_dirty(tl->view);
 		weston_output_schedule_repaint(pw);
 	}
 
@@ -22642,7 +22676,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_signal_add(&ec->wake_signal, &qdwin->wake_signal_listener);
 	/* §6.7(a) follow-up: enable internal idle tracker if weston's own
 	 * idle timer is disabled. Read once at init — ec->idle_time doesn't
-	 * change post-init in weston-14. */
+	 * change post-init in weston-16. */
 	qdwin->idle_internal_mode = (ec->idle_time == 0);
 	weston_log("qdwin: ext-idle-notify idle_time=%d internal_mode=%d\n",
 		   ec->idle_time, qdwin->idle_internal_mode);

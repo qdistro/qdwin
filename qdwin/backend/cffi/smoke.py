@@ -2,7 +2,7 @@
 qdwin CFFI smoke test — Phase 6.0 spike, Day 3.
 
 Proves the generated binding loads and can round-trip a real call into
-libweston-14. Not a unit test; runs once at install time to fail loud
+libweston-16. Not a unit test; runs once at install time to fail loud
 if the generated .so is broken.
 
 Expected output:

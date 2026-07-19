@@ -187,7 +187,7 @@ fi
 # live discriminator; here we just escalate the DEGRADED check from soft
 # to hard whenever the vendored tree is the loaded library.
 vendored_prefix=${QDWIN_VENDORED_LIBWESTON_PREFIX:-/usr/libexec/qdistro/qdwin-libweston}
-loaded_lw=$(vm_exec "pmap \$(pgrep -x weston | head -n1) 2>/dev/null | grep -o '/[^ ]*libweston-14\.so[^ ]*' | sort -u | head -n1" || true)
+loaded_lw=$(vm_exec "pmap \$(pgrep -x weston | head -n1) 2>/dev/null | grep -o '/[^ ]*libweston-[0-9]*\.so[^ ]*' | sort -u | head -n1" || true)
 case "$loaded_lw" in
     "$vendored_prefix"/*)
         if vm_exec "journalctl _UID=1000 -b --no-pager | grep -q 'layer-popup grab handler NOT registered'"; then
@@ -197,7 +197,7 @@ case "$loaded_lw" in
         echo "INFO: run tests/gui/agent-vendored-libweston-verify.sh for the full live grab/dismiss discriminators"
         ;;
     "")
-        echo "WARN: could not determine the loaded libweston-14.so path"
+        echo "WARN: could not determine the loaded libweston-16.so path"
         ;;
     *)
         echo "GAP: session running NON-vendored libweston ($loaded_lw) — layer-popup grab paths are N/A; install-vendored-libweston.sh not applied or unit not restarted"

@@ -25,12 +25,12 @@
 #
 # Env knobs:
 #   QDWIN_USE_VENDORED_LIBWESTON=1
-#       LD_LIBRARY_PATH-prefix the qdistro-vendored libweston-14 (NULL-parent
+#       LD_LIBRARY_PATH-prefix the qdistro-vendored libweston-16 (NULL-parent
 #       xdg_popup / layer-popup-grab patch) so the two grab/reposition
 #       discriminator tests run instead of SKIP. Requires the vendored .so to
 #       be installed (see QDWIN_VENDORED_LIBWESTON_PREFIX).
 #   QDWIN_VENDORED_LIBWESTON_PREFIX  (default /usr/libexec/qdistro/qdwin-libweston)
-#       prefix whose lib64/ holds the vendored libweston-14.so.
+#       prefix whose lib64/ holds the vendored libweston-16.so.
 #
 # Phase 1.6 / fable-testing p2-qdwin-compiled-tests.md item 2.
 
@@ -73,11 +73,11 @@ python3 -c 'import pywayland, pywayland.scanner' 2>/dev/null \
 [ -f "$CLIENT" ] || die "test client not found at $CLIENT"
 
 # Headless backend: weston resolves --backend=headless-backend.so from its
-# module dir, which libweston-14 keeps at <libdir>/libweston-14/.
-LIBWESTON_LIBDIR="$(pkg-config --variable=libdir libweston-14 2>/dev/null || true)"
+# module dir, which libweston-16 keeps at <libdir>/libweston-16/.
+LIBWESTON_LIBDIR="$(pkg-config --variable=libdir libweston-16 2>/dev/null || true)"
 HEADLESS_SO=""
-for d in "$LIBWESTON_LIBDIR/libweston-14" /usr/lib64/libweston-14 \
-         /usr/lib/libweston-14 /usr/lib/x86_64-linux-gnu/libweston-14; do
+for d in "$LIBWESTON_LIBDIR/libweston-16" /usr/lib64/libweston-16 \
+         /usr/lib/libweston-16 /usr/lib/x86_64-linux-gnu/libweston-16; do
     if [ -f "$d/headless-backend.so" ]; then HEADLESS_SO="$d/headless-backend.so"; break; fi
 done
 [ -n "$HEADLESS_SO" ] || skip "headless-backend.so not found (no headless weston)"
@@ -99,12 +99,12 @@ for f in "$WP_DATADIR/stable/xdg-shell/xdg-shell.xml" \
 done
 [ -n "$XDG_SHELL_XML" ] || skip "xdg-shell.xml not found (wayland-protocols missing)"
 
-# --- optional vendored libweston-14 -------------------------------------
+# --- optional vendored libweston-16 -------------------------------------
 QDWIN_USE_VENDORED_LIBWESTON="${QDWIN_USE_VENDORED_LIBWESTON:-0}"
 QDWIN_VENDORED_LIBWESTON_PREFIX="${QDWIN_VENDORED_LIBWESTON_PREFIX:-/usr/libexec/qdistro/qdwin-libweston}"
 VENDORED_LD=""
 if [ "$QDWIN_USE_VENDORED_LIBWESTON" = "1" ]; then
-    vso="$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64/libweston-14.so.0.0.2"
+    vso="$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64/libweston-16.so.0.0.0"
     [ -f "$vso" ] || die "QDWIN_USE_VENDORED_LIBWESTON=1 but no vendored .so at $vso"
     VENDORED_LD="$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64"
     echo "protocol-suite: using vendored libweston at $QDWIN_VENDORED_LIBWESTON_PREFIX" >&2

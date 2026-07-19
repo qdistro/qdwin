@@ -83,13 +83,13 @@ Built-in, registered unconditionally:
   wl_shm / wl_data_device_manager**, **wp_viewporter**,
   **wp_presentation**, **zxdg_output_manager_v1** (v2) — libweston
   defaults. Note `wl_compositor` is pinned at v5 by vendored
-  libweston-14 (no v6 `preferred_buffer_*` events).
+  libweston-16 (no v6 `preferred_buffer_*` events).
 - **zwp_linux_dmabuf_v1** — libweston default; advertised at v5 (with
   dma-buf feedback) when a GL renderer is active, else v3.
 - **relative-pointer-v1**, **pointer-constraints-v1** (pointer
   lock/confine), **zwp_input_timestamps_manager_v1**,
   **wp_single_pixel_buffer_v1**, **wp_tearing_control_v1**,
-  **tablet-v2** — all registered *ungated* by libweston-14's
+  **tablet-v2** — all registered *ungated* by libweston-16's
   `weston_compositor_create` for every client (i.e. not curated by
   qdwin; games / drawing tablets / VRR work without qdwin involvement).
 

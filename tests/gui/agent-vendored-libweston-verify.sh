@@ -7,7 +7,7 @@ set -euo pipefail
 # /usr/libexec/qdistro/qdwin-libweston/ (see
 # qdwin/doc/decisions/0001-vendored-libweston-packaging.md and
 # scripts/install/install-vendored-libweston.sh). These discriminators
-# CANNOT be exercised headless — stock libweston-14 has no
+# CANNOT be exercised headless — stock libweston-16 has no
 # weston_desktop_xdg_popup_* helper symbols, so the get_popup / grab
 # paths fail closed. This script is the codification of the "Plan3 live
 # verification" follow-up (qdistro todo/open-followups.md).
@@ -60,12 +60,12 @@ vm_exec "test -S /run/user/1000/wayland-1" >/dev/null \
     || setup_fail "qdwin Wayland socket is not up"
 
 # ---- 1. Vendored library actually loaded -------------------------------
-# The system `weston` binary; its libweston-14.so mapping must resolve
+# The system `weston` binary; its libweston-16.so mapping must resolve
 # under the vendored prefix, proving LD_LIBRARY_PATH took effect. If it
 # resolves under /usr/lib64 the session is running stock libweston and
 # every popup discriminator below is moot.
-mapped=$(vm_exec "pmap \$(pgrep -x weston | head -n1) 2>/dev/null | grep -o '/[^ ]*libweston-14\.so[^ ]*' | sort -u | head -n1" || true)
-[ -n "$mapped" ] || fail "could not read weston's libweston-14.so mapping (is weston running?)"
+mapped=$(vm_exec "pmap \$(pgrep -x weston | head -n1) 2>/dev/null | grep -o '/[^ ]*libweston-[0-9]*\.so[^ ]*' | sort -u | head -n1" || true)
+[ -n "$mapped" ] || fail "could not read weston's libweston-16.so mapping (is weston running?)"
 case "$mapped" in
     "$VENDORED_PREFIX"/*)
         pass "weston loaded vendored libweston: $mapped" ;;

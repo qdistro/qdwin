@@ -1,4 +1,4 @@
-# 0001 — Ship qdwin against qdistro's vendored, patched libweston-14
+# 0001 — Ship qdwin against qdistro's vendored, patched libweston-16
 
 - Status: ACCEPTED (2026-05-29)
 - Scope: qdwin (libweston-vendored), qdistro (packaging/install/bootstrap)
@@ -9,7 +9,7 @@
 
 qdwin's layer-shell popup parenting (`zwlr_layer_surface_v1.get_popup`
 + `xdg_popup`) and the layer-popup pointer grab depend on four helper
-symbols that do **not** exist in upstream / distro libweston-14:
+symbols that do **not** exist in upstream / distro libweston-16:
 
 - `weston_desktop_xdg_popup_attach_layer_parent`
 - `weston_desktop_xdg_popup_get_geometry`
@@ -23,28 +23,28 @@ paths closed (`get_popup` →
 `xdg_popup.grab` → `XDG_POPUP_ERROR_INVALID_GRAB`) and logs a DEGRADED
 warning at startup. Quickshell popups anchored to layer-shell surfaces
 (menus, the launcher, tray popups) therefore do not work on stock
-libweston-14. See `doc/REBASE-WATCHPOINTS.md` entries 2–6.
+libweston-16. See `doc/REBASE-WATCHPOINTS.md` entries 2–6.
 
 The protocol handler that needed patching
 (`weston_desktop_xdg_surface_protocol_get_popup`) is `static` and the
 desktop subdir is compiled directly into the single
-`libweston-14.so`; there is no separate `libweston-desktop.so`. So the
+`libweston-16.so`; there is no separate `libweston-desktop.so`. So the
 symbol address never crosses a public boundary and **cannot be
 LD_PRELOAD-interposed**. The whole library must be replaced.
 
 ## Decision
 
-Ship a privately-built, patched **libweston-14** as a self-contained
+Ship a privately-built, patched **libweston-16** as a self-contained
 tree and have only qdwin's `weston` session load it. Do not touch the
-distro's `/usr/lib64/libweston-14*` (other consumers keep the stock
+distro's `/usr/lib64/libweston-16*` (other consumers keep the stock
 library).
 
 ### Install vehicle
 
 ```
 /usr/libexec/qdistro/qdwin-libweston/
-  lib64/libweston-14.so.0[.0.2]        # patched core (+ symlinks)
-  lib64/libweston-14/                   # backends from the SAME build
+  lib64/libweston-16.so.0[.0.0]        # patched core (+ symlinks)
+  lib64/libweston-16/                   # backends from the SAME build
     drm-backend.so  pipewire-backend.so  rdp-backend.so
     wayland-backend.so  x11-backend.so  headless-backend.so
     gl-renderer.so  color-lcms.so  [xwayland.so]
@@ -52,7 +52,7 @@ library).
 
 `/usr/libexec/` is chosen over `/usr/lib64/` deliberately: it is
 outside the default linker search path, so the patched `.so` can never
-shadow the distro `libweston-14` for any other process. Only qdwin's
+shadow the distro `libweston-16` for any other process. Only qdwin's
 unit opts in via `LD_LIBRARY_PATH`. It is also outside the Tumbleweed
 targeted-policy `lib_t` glob, matching the broker/pwd precedent.
 
@@ -62,14 +62,14 @@ targeted-policy `lib_t` glob, matching the broker/pwd precedent.
 
 ```
 Environment=LD_LIBRARY_PATH=/usr/libexec/qdistro/qdwin-libweston/lib64
-Environment=WESTON_MODULE_MAP=drm-backend.so=/usr/libexec/qdistro/qdwin-libweston/lib64/libweston-14/drm-backend.so;...
+Environment=WESTON_MODULE_MAP=drm-backend.so=/usr/libexec/qdistro/qdwin-libweston/lib64/libweston-16/drm-backend.so;...
 ```
 
 **Core and backends must come from one build.** libweston's
 core↔backend interface is an internal (unversioned) ABI. If the unit
 loaded the patched core but distro backends (the old bug — the unit
 set `LD_LIBRARY_PATH` to the qdistro tree but `WESTON_MODULE_MAP` still
-pointed at `/usr/lib64/libweston-14/`), a libweston ABI bump within the
+pointed at `/usr/lib64/libweston-16/`), a libweston ABI bump within the
 same SONAME would crash the backend at load. The install script now
 maps every module to the vendored tree and only falls back to the
 distro path module-by-module if the vendored tree is absent.
@@ -89,15 +89,15 @@ and a guard that refuses a headless-only (non-shippable) prefix.
 ### Version pinning
 
 The vendored tree is pinned to the same upstream release the distro
-ships (`libweston-vendored/VERSION` = 14.0.2, matching Tumbleweed's
-`libweston-14` 14.0.2). On a distro libweston bump, rebase per
+ships (`libweston-vendored/VERSION` = 16.0.0, matching Tumbleweed's
+`libweston-16` 16.0.0). On a distro libweston bump, rebase per
 `libweston-vendored/README.md` "Bumping to a new weston version" and
 re-verify `doc/REBASE-WATCHPOINTS.md`. The SONAME-major ABI check in
 the install script catches a mismatched-major rebase early.
 
 ## Fallback / degradation
 
-If `/usr/libexec/qdistro/qdwin-libweston/lib64/libweston-14/drm-backend.so`
+If `/usr/libexec/qdistro/qdwin-libweston/lib64/libweston-16/drm-backend.so`
 is absent at session-install time, the unit is written against the
 distro libweston. qdwin still starts (toplevels, cursor, bar) but the
 soft-linked layer-popup paths fail closed and log DEGRADED. The CI gate
@@ -110,7 +110,7 @@ loaded library actually lives under `/usr/libexec/qdistro/`.
 1. **LD_PRELOAD a shim** — impossible; the patched handler is `static`
    and not a public symbol (see Context).
 2. **Patch the distro package / build an OBS RPM that replaces
-   `libweston-14`** — would change libweston for every consumer
+   `libweston-16`** — would change libweston for every consumer
    (greetd's fallback weston, any other weston user) and couples the
    image to an OBS pipeline qdistro does not otherwise use. Rejected to
    keep the patch blast-radius to qdwin only.
@@ -127,7 +127,7 @@ loaded library actually lives under `/usr/libexec/qdistro/`.
   (drm + wayland + x11 + headless + lcms link; GL/pipewire/rdp gated by
   host devel availability and covered by the VM dep list).
 - All four soft-linked helper symbols are exported by the production
-  `libweston-14.so.0.0.2` (`nm -D`).
+  `libweston-16.so.0.0.0` (`nm -D`).
 - `install-vendored-libweston.sh` stages the tree with symlinks intact
   and passes the SONAME ABI check against the host `weston`.
 

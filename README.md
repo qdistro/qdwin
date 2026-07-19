@@ -38,7 +38,7 @@ the canonical 3-repo checkout layout.
   testing), nested-compositor client glue, the protocol XML, the
   `backend/cffi` Python subpackage, and the `test_*.py` source-invariant
   checks that grep `qdwin.c` for policy call-site shape.
-- `libweston-vendored/` — libweston 14 with a single local patch
+- `libweston-vendored/` — libweston 16 with a single local patch
   (`0001-allow-null-parent-xdg-popup.patch`) that lifts the assertion
   blocking root-level popups. Vendored because the patch hasn't
   landed upstream.
@@ -143,7 +143,7 @@ protocols supported: xdg-shell, xdg-decoration, xdg-activation,
 ext-idle-notify, idle-inhibit-unstable-v1, cursor-shape-v1,
 fractional-scale-v1, primary-selection-unstable-v1, security-context-v1,
 zwlr-layer-shell-v1, wlr-output-management-unstable-v1, ext-workspace-v1.
-(libweston-14 also contributes the core globals and, ungated,
+(libweston-16 also contributes the core globals and, ungated,
 relative-pointer, pointer-constraints, tablet-v2, tearing-control,
 single-pixel-buffer and dmabuf — see doc/protocol.md.)
 

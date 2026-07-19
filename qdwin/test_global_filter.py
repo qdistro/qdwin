@@ -991,6 +991,21 @@ LIBWESTON_INHERITED_GLOBALS = {
     "zwp_pointer_constraints_v1": ("VISIBLE", "pointer lock/confine (games)"),
     "zwp_input_timestamps_manager_v1": ("VISIBLE", "high-res input timestamps"),
     "zwp_tablet_manager_v2": ("VISIBLE", "drawing-tablet input"),
+    # weston-16 (J29) new core per-surface rendering protocols. Each binds a
+    # manager whose only role() is get_<object>(wl_surface) on the CALLING
+    # client's own surface — no cross-client reach, no privileged/global query,
+    # no output-global state. Same unprivileged class as wp_viewporter /
+    # wp_tearing_control (per-surface presentation hints), so visible by design.
+    "wp_alpha_modifier_v1": ("VISIBLE",
+        "weston-16: per-surface constant alpha multiplier (client's own surface)"),
+    "wp_color_representation_manager_v1": ("VISIBLE",
+        "weston-16: per-surface YUV/RGB coefficients + chroma siting (video "
+        "playback on the client's own surface)"),
+    "wp_commit_timing_manager_v1": ("VISIBLE",
+        "weston-16: per-surface commit timestamp for presentation pacing "
+        "(client's own surface)"),
+    "wp_fifo_manager_v1": ("VISIBLE",
+        "weston-16: per-surface FIFO presentation constraint (client's own surface)"),
     "wl_data_device_manager": ("VISIBLE",
         "core clipboard/DnD — cross-silo transfer is mediated by the shell's "
         "ClipboardGate paste broker, not by the visibility filter"),
@@ -1018,10 +1033,13 @@ LIBWESTON_INHERITED_GLOBALS = {
         "RESIDUAL: weston debug-scope dump — advertised only when the compositor "
         "enables the debug protocol; global lives behind the opaque "
         "weston_log_context, no reachable pointer to gate; pending VM/B1"),
-    "xx_color_manager_v4": ("VISIBLE",
-        "RESIDUAL: experimental colour-management — advertised only when "
-        "colour management is enabled; create result is not stored, no reachable "
-        "pointer to gate; pending VM/B1"),
+    "wp_color_manager_v1": ("VISIBLE",
+        "RESIDUAL: weston-16 STABLE colour-management (supersedes the "
+        "xx_color_manager_v4 staging draft). Surface image-description feedback "
+        "can expose the output colour volume/primaries — the same mild cross-silo "
+        "output-fingerprinting vector as xx_color_manager_v4. Advertised only "
+        "when colour management is enabled; create result is discarded "
+        "(if (!wl_global_create(...))), no reachable pointer to gate; pending VM/B1"),
 }
 
 

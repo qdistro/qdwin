@@ -25,7 +25,7 @@ Legend:
 
 | Protocol | Ver | Source | qdshell / Quickshell use | qdwin status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `wl_compositor` | 5 | libweston | every QML surface | OK | vendored libweston-14 pins v5 (`compositor.c` `wl_compositor_interface, 5`); v6 `preferred_buffer_scale`/`preferred_buffer_transform` events not emitted — toolkits fall back |
+| `wl_compositor` | 5 | libweston | every QML surface | OK | vendored libweston-16 pins v5 (`compositor.c` `wl_compositor_interface, 5`); v6 `preferred_buffer_scale`/`preferred_buffer_transform` events not emitted — toolkits fall back |
 | `wl_shm` | 1+ | libweston | software buffers (pixman path) | OK | |
 | `wl_seat` | — | libweston | pointer / keyboard input | OK | single-seat per session |
 | `wl_output` | — | libweston | `Quickshell.screens`, per-monitor panels | OK | |
@@ -41,7 +41,7 @@ Legend:
 | --- | --- | --- | --- | --- | --- |
 | `zwlr_layer_shell_v1` | 5 | qdwin | `WlrLayershell` / `PanelWindow` — bar, OSD, notifications, menus, overlays (56 QML refs) | OK | configure/map/stacking, exclusive zones, `exclusionMode` |
 | `zwlr_layer_surface_v1` keyboard interactivity | — | qdwin | `WlrKeyboardFocus` (`None`/`OnDemand`/`Exclusive`) — launcher/menus take text input | OK | EXCLUSIVE unconditional at map; ON_DEMAND focus transfer on button (plan3 M4); journal `qdwin: layer-shell ON_DEMAND focus` |
-| `zwlr_layer_surface_v1.get_popup` + `xdg_popup` | — | qdwin + libweston | `PopupWindow` anchored to a `PanelWindow` (menus, launcher, tray popups) | **VENDORED** | attaches layer-surface parent at popup commit via `weston_desktop_xdg_popup_attach_layer_parent` (xdg-shell.c:1207). Stock libweston-14 → `INVALID_SURFACE_STATE` |
+| `zwlr_layer_surface_v1.get_popup` + `xdg_popup` | — | qdwin + libweston | `PopupWindow` anchored to a `PanelWindow` (menus, launcher, tray popups) | **VENDORED** | attaches layer-surface parent at popup commit via `weston_desktop_xdg_popup_attach_layer_parent` (xdg-shell.c:1207). Stock libweston-16 → `INVALID_SURFACE_STATE` |
 | `xdg_popup.grab` on layer-parented popup | — | qdwin + libweston | popup grab → outside-click dismiss | **VENDORED** | `weston_desktop_xdg_popup_set_layer_grab_handler` / `..._dismiss_layer_grab`; journal `qdwin: layer-popup grab started`. Stock → `INVALID_GRAB` |
 | `xdg_popup.reposition` on layer-parented popup | — | qdwin | menu re-anchor | VENDORED | geometry from positioner alone (plan3 M1); no new symbol but only meaningful on layer-parented popups |
 | `xdg_toplevel` (ordinary local apps) | — | libweston-desktop + qdwin | terminals/apps launched from the shell | OK | qdwin releases holding by default (`default_toplevel_policy`); qdshell does NOT attach qdwin SSD chrome to make a normal app visible. Nested/proxy keep explicit allow/deny (GATED) |
