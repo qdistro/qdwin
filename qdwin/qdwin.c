@@ -18584,6 +18584,15 @@ struct qdwin_s3d_ctx {
 	 * for the probe's bind_proxy_pixels to STASH a surface before applying
 	 * allow. Bounded so a never-binding test can't spin forever. */
 	int allow_poll_tries;
+	/* J29 14->16: weston_compositor_pick_view() walks compositor->view_list,
+	 * which is rebuilt ONLY inside an output repaint (build_view_list is
+	 * static — not callable here). On 16-headless a single schedule_repaint
+	 * may not land a repaint within one 500ms window, so the pick can read a
+	 * stale list and return null on a view that IS present. Retry the fire a
+	 * bounded number of times (re-dirtying + re-scheduling a repaint each
+	 * round) before asserting, so a transient stale list is not a failure but
+	 * a genuinely-absent view still fails. */
+	int pick_retries;
 };
 
 static int qdwin_s3d_route_test_fire(void *data);
@@ -18729,6 +18738,22 @@ qdwin_s3d_route_test_fire(void *data)
 			}
 		} else {
 			/* Visible/approved: drive the real routing path. */
+			/* J29 14->16: if the pick came back null, the view_list may
+			 * simply be stale (rebuilt only at repaint; see pick_retries).
+			 * Re-dirty the proxy view (sets view_list_needs_rebuild +
+			 * schedules a repaint) and re-arm rather than failing on a
+			 * transient stale list. Bounded so a truly-absent view fails. */
+			if (!picked && ctx->pick_retries < 6) {
+				ctx->pick_retries++;
+				weston_log("qdwin/nested-proxy: S3d route-test "
+					   "handle=%u pick null — re-arming "
+					   "(retry %d/6)\n",
+					   ctx->handle, ctx->pick_retries);
+				weston_view_geometry_dirty(tl->view);
+				weston_compositor_schedule_repaint(qdwin->compositor);
+				wl_event_source_timer_update(ctx->timer, 500);
+				return 0;
+			}
 			pick_matched = (picked == tl->view);
 			struct weston_seat *seat;
 			struct timespec ts = {0, 0};
