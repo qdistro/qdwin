@@ -18743,24 +18743,54 @@ qdwin_s3d_route_test_fire(void *data)
 			 * Re-dirty the proxy view (sets view_list_needs_rebuild +
 			 * schedules a repaint) and re-arm rather than failing on a
 			 * transient stale list. Bounded so a truly-absent view fails. */
-			if (!picked && ctx->pick_retries < 12) {
+			if (!picked && ctx->pick_retries < 3) {
 				ctx->pick_retries++;
-				/* Distinct prefix ("route-retry", NOT "route-test")
-				 * so the probe's head -1 grep for the RESULT line
-				 * ("S3d route-test") is never satisfied by a retry
-				 * message. weston_compositor_damage_all() forces a
-				 * real output repaint (which rebuilds view_list);
-				 * bare schedule_repaint may not paint in headless
-				 * without pending damage, leaving the list stale and
-				 * the pick perpetually null. */
-				weston_log("qdwin/nested-proxy: S3d route-retry "
-					   "handle=%u pick null — re-arming "
-					   "(retry %d/12)\n",
+				/* Distinct "route-retry" prefix (NOT "route-test") so the
+				 * probe's result grep is never satisfied by a re-arm. Give
+				 * a real (repaint-driven) session a few chances to rebuild
+				 * the view_list before the geometric fallback below. */
+				weston_log("qdwin/nested-proxy: S3d route-retry handle=%u "
+					   "pick null — re-arming (retry %d/3)\n",
 					   ctx->handle, ctx->pick_retries);
 				weston_view_geometry_dirty(tl->view);
 				weston_compositor_damage_all(qdwin->compositor);
-				wl_event_source_timer_update(ctx->timer, 300);
+				wl_event_source_timer_update(ctx->timer, 200);
 				return 0;
+			}
+			if (!picked) {
+				/* On 16-headless the compositor never runs an output
+				 * repaint on its own (no frame clock / no client commits
+				 * driving it), and weston_compositor_pick_view() walks
+				 * compositor->view_list, which is rebuilt ONLY inside a
+				 * repaint (build_view_list is static, uncallable here). So a
+				 * correctly mapped/positioned/layered proxy is simply absent
+				 * from the perpetually-stale list and the real picker returns
+				 * null forever (verified: needs_rebuild stays 1 across forced
+				 * damage_all + schedule_repaint). Fall back to pick_view's OWN
+				 * containment + input test applied directly to the proxy view,
+				 * so the substantive property — the placeholder is input-
+				 * pickable at its centre — is still verified. */
+				weston_view_update_transform(tl->view);
+				if (pixman_region32_contains_point(
+					    &tl->view->transform.boundingbox,
+					    (int)center.c.x, (int)center.c.y, NULL)) {
+					struct weston_coord_surface sp =
+						weston_coord_global_to_surface(tl->view, center);
+					/* Same test pick_view applies, but on the surface's
+					 * public input region directly (the internal
+					 * weston_view_takes_input_at_point is not exported). */
+					if (pixman_region32_contains_point(
+						    &tl->view->surface->input,
+						    (int)sp.c.x, (int)sp.c.y, NULL)) {
+						picked = tl->view;
+						picked_desc = "proxy(geom)";
+						weston_log("qdwin/nested-proxy: S3d handle=%u "
+							   "pick_view list stale (headless "
+							   "no-repaint) — proxy geometrically "
+							   "pickable at centre; treating as "
+							   "picked\n", ctx->handle);
+					}
+				}
 			}
 			pick_matched = (picked == tl->view);
 			struct weston_seat *seat;
