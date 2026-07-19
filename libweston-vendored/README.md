@@ -1,6 +1,6 @@
-# libweston-vendored — patched libweston-14 for qdwin
+# libweston-vendored — patched libweston-16 for qdwin
 
-A privately-built copy of `libweston-14.so.0` carrying the
+A privately-built copy of `libweston-16.so.0` carrying the
 **NULL-parent xdg_popup** patch
 (`0001-allow-null-parent-xdg-popup.patch`). The patch lifts an
 assertion that prevents popup surfaces from being attached without
@@ -10,7 +10,7 @@ Quickshell-style floating menus.
 ## Why a private libweston instead of LD_PRELOADing libweston-desktop?
 
 There is no separate `libweston-desktop.so`. The desktop subdir is
-`subdir()`'d into the single `lib_weston = shared_library('weston-14',
+`subdir()`'d into the single `lib_weston = shared_library('weston-16',
 ...)`, and the protocol handler we need to patch
 (`weston_desktop_xdg_surface_protocol_get_popup`) is `static` — its
 address never crosses a public symbol boundary, so it cannot be
@@ -20,9 +20,9 @@ shape that works. See the design note for full reasoning.
 ## Layout
 
 ```
-VERSION                              # "14.0.2" (must match Tumbleweed package)
+VERSION                              # "16.0.0" (must match Tumbleweed package)
 0001-allow-null-parent-xdg-popup.patch
-src/                                 # weston @ tag 14.0.2 with desktop/xdg-shell.c patched in-place
+src/                                 # weston @ tag 16.0.0 with desktop/xdg-shell.c patched in-place
 build-libweston.sh                   # one-shot build wrapper
 README.md                            # this file
 ```
@@ -39,8 +39,8 @@ cd ${QDWIN_REPO}/libweston-vendored
 ./build-libweston.sh
 ```
 
-Output: `src/build/libweston/libweston-14.so.0.0.2` (~1.7 MB).
-SONAME `libweston-14.so.0` — the LD_LIBRARY_PATH trick relies on this
+Output: `src/build/libweston/libweston-16.so.0.0.0` (~1.7 MB).
+SONAME `libweston-16.so.0` — the LD_LIBRARY_PATH trick relies on this
 matching the system library exactly.
 
 Required system devel packages:
@@ -57,14 +57,14 @@ LD_LIBRARY_PATH=${QDWIN_REPO}/libweston-vendored/src/build/libweston${LD_LIBRARY
 ```
 
 For an installed-tree layout (Phase 7+), copy
-`src/build/libweston/libweston-14.so.0.0.2` plus its symlinks to
+`src/build/libweston/libweston-16.so.0.0.0` plus its symlinks to
 `/usr/libexec/qdistro/qdwin-libweston/` and have the qdwin systemd
 unit set `Environment=LD_LIBRARY_PATH=/usr/libexec/qdistro/qdwin-libweston`.
 
 Verify the right copy is loaded after start with:
 
 ```sh
-pmap $(pgrep qdwin) | grep libweston-14.so
+pmap $(pgrep qdwin) | grep libweston-16.so
 # expect path under qdistro/, NOT /usr/lib64/
 ```
 
@@ -83,9 +83,9 @@ with message `popup parent must be set before commit`.
 
 ## Bumping to a new weston version
 
-1. `cd $HOME/doc/weston && git fetch && git tag --list "14.*"`
+1. `cd $HOME/doc/weston && git fetch && git tag --list "16.*"`
 2. Update `VERSION` in this directory.
-3. Re-extract: `cd src && rm -rf * && git -C $HOME/doc/weston archive 14.0.X | tar -x`
+3. Re-extract: `cd src && rm -rf * && git -C $HOME/doc/weston archive 16.0.X | tar -x`
 4. Strip again: `rm -rf clients data desktop-shell doc fullscreen-shell ivi-shell kiosk-shell man notes.txt pipewire remoting tests pam wcap weston.ini.in` (keep tools/, frontend/include/ if needed)
 5. Apply patch: `patch -p1 < ../0001-allow-null-parent-xdg-popup.patch`
 6. Rebuild: `./build-libweston.sh`

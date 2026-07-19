@@ -37,6 +37,7 @@
 
 #include <libweston/desktop.h>
 #include "internal.h"
+#include "libweston-internal.h"
 #include "shared/helpers.h"
 #include "qdwin-xdg-constrain.h"	/* qdistro: popup constraint kernel */
 
@@ -75,6 +76,7 @@ struct weston_desktop_xdg_surface {
 	struct weston_desktop *desktop;
 	struct weston_surface *surface;
 	struct weston_desktop_surface *desktop_surface;
+	bool committed;
 	bool configured;
 	struct wl_event_source *configure_idle;
 	struct wl_list configure_list; /* weston_desktop_xdg_surface_configure::link */
@@ -128,7 +130,6 @@ struct weston_desktop_xdg_popup {
 	struct weston_desktop_xdg_surface base;
 
 	struct wl_resource *resource;
-	bool committed;
 	struct weston_desktop_xdg_surface *parent;
 	struct weston_surface *layer_parent_surface;
 	struct weston_desktop_seat *seat;
@@ -158,11 +159,40 @@ struct weston_desktop_xdg_popup {
 	    sizeof(struct weston_desktop_xdg_popup))
 #define weston_desktop_surface_configure_biggest_size weston_desktop_surface_role_biggest_size
 
+static bool
+intersect_rectangles(struct weston_geometry *dst,
+		     const struct weston_geometry *src1,
+		     const struct weston_geometry *src2)
+{
+	int dst_x, dst_y;
+	int dst_w, dst_h;
+
+	dst_x = MAX(src1->x, src2->x);
+	dst_y = MAX(src1->y, src2->y);
+	dst_w = MIN(src1->x + src1->width, src2->x + src2->width) - dst_x;
+	dst_h = MIN(src1->y + src1->height, src2->y + src2->height) - dst_y;
+
+	if (dst_w > 0 && dst_h > 0) {
+		*dst = (struct weston_geometry) {
+			.x = dst_x,
+			.y = dst_y,
+			.width = dst_w,
+			.height = dst_h,
+		};
+		return true;
+	} else {
+		*dst = (struct weston_geometry) {
+			.x = 0,
+			.y = 0,
+			.width = 0,
+			.height = 0,
+		};
+		return false;
+	}
+}
 
 static struct weston_geometry
-weston_desktop_xdg_positioner_get_geometry(struct weston_desktop_xdg_positioner *positioner,
-					   struct weston_desktop_surface *dsurface,
-					   struct weston_desktop_surface *parent)
+process_positioner(struct weston_desktop_xdg_positioner *positioner)
 {
 	struct weston_geometry geometry = {
 		.x = positioner->offset.x,
@@ -231,16 +261,339 @@ weston_desktop_xdg_positioner_get_geometry(struct weston_desktop_xdg_positioner 
 		geometry.x -= geometry.width / 2;
 	}
 
-	/* qdistro security patch: this returns the UNCONSTRAINED base
-	 * placement (anchor + gravity + offset). constraint_adjustment is
-	 * applied later, at popup placement time, by
-	 * weston_desktop_xdg_popup_constrain_geometry() — which has the
-	 * parent's mapped output and so can clamp the popup to it (see
-	 * qdwin-xdg-constrain.h). Constraining here is not possible: at
-	 * positioner-eval time the parent may not be mapped/positioned yet,
-	 * and the layer-shell popup path calls this with a NULL parent. The
-	 * upstream "TODO: add compositor policy configuration" is therefore
-	 * intentionally resolved out-of-band rather than inline. */
+	return geometry;
+}
+
+static void
+positioner_flip_vertically(struct weston_desktop_xdg_positioner *positioner)
+{
+	switch (positioner->anchor) {
+	case XDG_POSITIONER_ANCHOR_TOP:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_BOTTOM;
+		break;
+	case XDG_POSITIONER_ANCHOR_BOTTOM:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_TOP;
+		break;
+	case XDG_POSITIONER_ANCHOR_TOP_LEFT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+		break;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_TOP_LEFT;
+		break;
+	case XDG_POSITIONER_ANCHOR_TOP_RIGHT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+		break;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+		break;
+	case XDG_POSITIONER_ANCHOR_NONE:
+	case XDG_POSITIONER_ANCHOR_LEFT:
+	case XDG_POSITIONER_ANCHOR_RIGHT:
+		break;
+	}
+
+	switch (positioner->gravity) {
+	case XDG_POSITIONER_GRAVITY_TOP:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_BOTTOM;
+		break;
+	case XDG_POSITIONER_GRAVITY_BOTTOM:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_TOP;
+		break;
+	case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_BOTTOM_LEFT;
+		break;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_TOP_LEFT;
+		break;
+	case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+		break;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_TOP_RIGHT;
+		break;
+	case XDG_POSITIONER_GRAVITY_NONE:
+	case XDG_POSITIONER_GRAVITY_LEFT:
+	case XDG_POSITIONER_GRAVITY_RIGHT:
+		break;
+	}
+}
+
+static void
+positioner_flip_horizontally(struct weston_desktop_xdg_positioner *positioner)
+{
+	switch (positioner->anchor) {
+	case XDG_POSITIONER_ANCHOR_NONE:
+	case XDG_POSITIONER_ANCHOR_TOP:
+	case XDG_POSITIONER_ANCHOR_BOTTOM:
+		break;
+	case XDG_POSITIONER_ANCHOR_TOP_LEFT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+		break;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+		break;
+	case XDG_POSITIONER_ANCHOR_TOP_RIGHT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_TOP_LEFT;
+		break;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+		break;
+	case XDG_POSITIONER_ANCHOR_LEFT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_RIGHT;
+		break;
+	case XDG_POSITIONER_ANCHOR_RIGHT:
+		positioner->anchor = XDG_POSITIONER_ANCHOR_LEFT;
+		break;
+	}
+
+	switch (positioner->gravity) {
+	case XDG_POSITIONER_GRAVITY_NONE:
+	case XDG_POSITIONER_GRAVITY_TOP:
+	case XDG_POSITIONER_GRAVITY_BOTTOM:
+		break;
+	case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_TOP_RIGHT;
+		break;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+		break;
+	case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_TOP_LEFT;
+		break;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_BOTTOM_LEFT;
+		break;
+	case XDG_POSITIONER_GRAVITY_LEFT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_RIGHT;
+		break;
+	case XDG_POSITIONER_GRAVITY_RIGHT:
+		positioner->gravity = XDG_POSITIONER_GRAVITY_LEFT;
+		break;
+	}
+}
+
+static bool
+is_constraint_satisfied(struct weston_geometry *surface_geometry,
+			struct weston_geometry *output_geometry,
+			struct weston_geometry *intersection)
+{
+	intersect_rectangles(intersection, surface_geometry, output_geometry);
+	return (intersection->width == surface_geometry->width &&
+		intersection->height == surface_geometry->height);
+}
+
+static void
+local_geometry_to_global(struct weston_geometry *geometry,
+			 struct weston_view *parent_view,
+			 struct weston_geometry *global_geometry)
+{
+	pixman_box32_t geometry_rect;
+	pixman_box32_t global_rect;
+
+	geometry_rect = (pixman_box32_t) {
+		.x1 = geometry->x,
+		.y1 = geometry->y,
+		.x2 = geometry->x + geometry->width,
+		.y2 = geometry->y + geometry->height,
+	};
+	global_rect = weston_matrix_transform_rect(&parent_view->transform.matrix,
+						   geometry_rect);
+	global_geometry->x = global_rect.x1;
+	global_geometry->y = global_rect.y1;
+	global_geometry->width = global_rect.x2 - global_rect.x1;
+	global_geometry->height = global_rect.y2 - global_rect.y1;
+}
+
+static bool
+is_geometry_satisfied(struct weston_view *parent_view,
+		      struct weston_geometry *geometry,
+		      struct weston_output *output,
+		      struct weston_geometry *intersection)
+{
+	struct weston_geometry global_geometry;
+	struct weston_geometry output_geometry;
+	struct weston_geometry global_intersection;
+	struct weston_coord_surface surface_coord;
+	struct weston_coord_global tmp_g;
+	bool is_satisfied;
+
+	local_geometry_to_global(geometry, parent_view, &global_geometry);
+
+	output_geometry = (struct weston_geometry) {
+		.x = output->pos.c.x,
+		.y = output->pos.c.y,
+		.width = output->width,
+		.height = output->height,
+	};
+
+	is_satisfied = is_constraint_satisfied(&global_geometry,
+					       &output_geometry,
+					       &global_intersection);
+
+	tmp_g.c = weston_coord(global_intersection.x,
+			       global_intersection.y);
+	surface_coord = weston_coord_global_to_surface(parent_view, tmp_g);
+	intersection->x = round(surface_coord.c.x);
+	intersection->y = round(surface_coord.c.y);
+
+	tmp_g.c = weston_coord(global_intersection.x +
+			       global_intersection.width,
+			       global_intersection.y +
+			       global_intersection.height);
+	surface_coord = weston_coord_global_to_surface(parent_view, tmp_g);
+
+	intersection->width = round(surface_coord.c.x) - intersection->x;
+	intersection->height = round(surface_coord.c.y) - intersection->y;
+
+	return is_satisfied;
+}
+
+static void
+try_flip_position(struct weston_desktop_surface *surface,
+		  struct weston_view *parent_view,
+		  struct weston_output *output,
+		  struct weston_geometry *geometry,
+		  struct weston_desktop_xdg_positioner *positioner,
+		  enum xdg_positioner_constraint_adjustment constraint_adjustment)
+{
+	struct weston_desktop_xdg_positioner flipped_positioner = *positioner;
+	struct weston_geometry flipped_geometry;
+	struct weston_geometry flipped_intersection;
+
+	switch (constraint_adjustment) {
+	case XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X:
+		positioner_flip_horizontally(&flipped_positioner);
+		break;
+	case XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y:
+		positioner_flip_vertically(&flipped_positioner);
+		break;
+	default:
+		assert(!"Invalid constraint adjustment");
+	}
+
+	flipped_geometry = process_positioner(&flipped_positioner);
+	is_geometry_satisfied(parent_view, &flipped_geometry, output,
+			      &flipped_intersection);
+
+	if (constraint_adjustment ==
+	    XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X) {
+		*positioner = flipped_positioner;
+		geometry->x = flipped_geometry.x;
+	} else if (constraint_adjustment ==
+		   XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y) {
+		*positioner = flipped_positioner;
+		geometry->y = flipped_geometry.y;
+	}
+}
+
+static void
+constrain_to_output(struct weston_desktop_surface *surface,
+		    struct weston_view *parent_view,
+		    struct weston_output *output,
+		    struct weston_geometry *geometry,
+		    struct weston_desktop_xdg_positioner *positioner)
+{
+	struct weston_geometry global_geometry;
+	int output_x2;
+	int output_y2;
+	struct weston_geometry intersection;
+
+	local_geometry_to_global(geometry, parent_view, &global_geometry);
+	output_x2 = output->pos.c.x + output->width;
+	output_y2 = output->pos.c.y + output->height;
+
+	if (is_geometry_satisfied(parent_view, geometry, output, &intersection))
+		return;
+
+	if (geometry->width != intersection.width &&
+	    (positioner->constraint_adjustment &
+	     XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X)) {
+		try_flip_position(surface,
+				  parent_view,
+				  output,
+				  geometry,
+				  positioner,
+				  XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X);
+	}
+	if (geometry->height != intersection.height &&
+	    (positioner->constraint_adjustment &
+	     XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y)) {
+		try_flip_position(surface,
+				  parent_view,
+				  output,
+				  geometry,
+				  positioner,
+				  XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y);
+	}
+
+	if (is_geometry_satisfied(parent_view, geometry, output, &intersection))
+		return;
+
+	if (positioner->constraint_adjustment &
+	    XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X &&
+	    global_geometry.x + global_geometry.width > output_x2) {
+		if (geometry->x < intersection.x)
+			geometry->x = intersection.x;
+		else
+			geometry->x -= geometry->width - intersection.width;
+	}
+	if (positioner->constraint_adjustment &
+	    XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y &&
+	    global_geometry.y + global_geometry.height > output_y2) {
+		if (geometry->y < intersection.y)
+			geometry->y = intersection.y;
+		else
+			geometry->y -= geometry->height - intersection.height;
+	}
+
+	if (is_geometry_satisfied(parent_view, geometry, output, &intersection))
+		return;
+
+	if (positioner->constraint_adjustment &
+	    XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X) {
+		geometry->x = intersection.x;
+		geometry->width = intersection.width;
+	}
+	if (positioner->constraint_adjustment &
+	    XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y) {
+		geometry->y = intersection.y;
+		geometry->height = intersection.height;
+	}
+}
+
+static struct weston_geometry
+weston_desktop_xdg_positioner_get_geometry(struct weston_desktop_xdg_positioner *positioner,
+					   struct weston_desktop_surface *dsurface,
+					   struct weston_desktop_surface *parent)
+{
+	struct weston_geometry geometry;
+	struct weston_surface *surface;
+	struct weston_view *parent_view;
+
+	geometry = process_positioner(positioner);
+
+	if (positioner->constraint_adjustment ==
+	    XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE)
+		return geometry;
+
+	/* qdistro patch: weston 16's upstream output-constrain dereferences
+	 * `parent`. qdistro's NULL-parent popup paths (layer-shell popups,
+	 * deferred-parent popups) call this with parent == NULL to obtain the
+	 * base placement only; the authoritative security clamp is applied
+	 * separately by weston_desktop_xdg_popup_constrain_geometry() once a
+	 * real parent exists. Return the unconstrained base placement here
+	 * rather than crash. */
+	if (parent == NULL)
+		return geometry;
+
+	surface = weston_desktop_surface_get_surface(parent);
+	wl_list_for_each(parent_view, &surface->views, surface_link) {
+		struct weston_output *output = parent_view->output;
+
+		constrain_to_output(dsurface, parent_view,
+				    output, &geometry, positioner);
+	}
+
 	return geometry;
 }
 
@@ -279,7 +632,14 @@ weston_desktop_xdg_round_i32(double v)
  * parent window-geometry frame that popup->geometry lives in. Fail-closed:
  * if the parent has no output/view yet we clamp to the parent's own window
  * geometry rather than emit the unconstrained base geometry (which would
- * reach the client via the next configure). */
+ * reach the client via the next configure).
+ *
+ * NOTE (weston 16): upstream now implements client-requested constraint
+ * adjustments (FLIP/SLIDE/RESIZE) in constrain_to_output(), but only when
+ * the client sets a non-NONE constraint_adjustment. A hostile client can
+ * send NONE and escape the output; this fail-closed clamp is the security
+ * bound and remains authoritative — it recomputes geometry from the
+ * snapshot regardless of the client's adjustment request. */
 static void
 weston_desktop_xdg_popup_constrain_geometry(struct weston_desktop_xdg_popup *popup)
 {
@@ -410,6 +770,13 @@ weston_desktop_xdg_positioner_protocol_set_anchor(struct wl_client *wl_client,
 	struct weston_desktop_xdg_positioner *positioner =
 		wl_resource_get_user_data(resource);
 
+	if (anchor > XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT) {
+		wl_resource_post_error(resource,
+				       XDG_POSITIONER_ERROR_INVALID_INPUT,
+				       "anchor must be in the anchor enum");
+		return;
+	}
+
 	positioner->anchor = anchor;
 }
 
@@ -420,6 +787,13 @@ weston_desktop_xdg_positioner_protocol_set_gravity(struct wl_client *wl_client,
 {
 	struct weston_desktop_xdg_positioner *positioner =
 		wl_resource_get_user_data(resource);
+
+	if (gravity > XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT) {
+		wl_resource_post_error(resource,
+				       XDG_POSITIONER_ERROR_INVALID_INPUT,
+				       "gravity must be in the gravity enum");
+		return;
+	}
 
 	positioner->gravity = gravity;
 }
@@ -873,6 +1247,10 @@ weston_desktop_xdg_toplevel_committed(struct weston_desktop_xdg_toplevel *toplev
 {
 	struct weston_surface *wsurface =
 		weston_desktop_surface_get_surface(toplevel->base.desktop_surface);
+	struct weston_desktop_client *client =
+		weston_desktop_surface_get_client(toplevel->base.desktop_surface);
+	struct wl_resource *client_resource =
+		weston_desktop_client_get_resource(client);
 
 	if (!weston_surface_has_content(wsurface) && !toplevel->added) {
 		weston_desktop_xdg_toplevel_ensure_added(toplevel);
@@ -892,36 +1270,28 @@ weston_desktop_xdg_toplevel_committed(struct weston_desktop_xdg_toplevel *toplev
 	if (toplevel->next.state.maximized &&
 	    (toplevel->next.size.width != geometry.width ||
 	     toplevel->next.size.height != geometry.height)) {
-		struct weston_desktop_client *client =
-			weston_desktop_surface_get_client(toplevel->base.desktop_surface);
-		struct wl_resource *client_resource =
-			weston_desktop_client_get_resource(client);
-
-		wl_resource_post_error(client_resource,
-				       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
-				       "xdg_surface geometry (%" PRIi32 " x %" PRIi32 ") "
-				       "does not match the configured maximized state (%" PRIi32 " x %" PRIi32 ")",
-				       geometry.width, geometry.height,
-				       toplevel->next.size.width,
-				       toplevel->next.size.height);
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+					       "xdg_surface geometry (%" PRIi32 " x %" PRIi32 ") "
+					       "does not match the configured maximized state (%" PRIi32 " x %" PRIi32 ")",
+					       geometry.width, geometry.height,
+					       toplevel->next.size.width,
+					       toplevel->next.size.height);
 		return;
 	}
 
 	if (toplevel->next.state.fullscreen &&
 	    (toplevel->next.size.width < geometry.width ||
 	     toplevel->next.size.height < geometry.height)) {
-		struct weston_desktop_client *client =
-			weston_desktop_surface_get_client(toplevel->base.desktop_surface);
-		struct wl_resource *client_resource =
-			weston_desktop_client_get_resource(client);
-
-		wl_resource_post_error(client_resource,
-				       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
-				       "xdg_surface geometry (%" PRIi32 " x %" PRIi32 ") "
-				       "is larger than the configured fullscreen state (%" PRIi32 " x %" PRIi32 ")",
-				       geometry.width, geometry.height,
-				       toplevel->next.size.width,
-				       toplevel->next.size.height);
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+					       "xdg_surface geometry (%" PRIi32 " x %" PRIi32 ") "
+					       "is larger than the configured fullscreen state (%" PRIi32 " x %" PRIi32 ")",
+					       geometry.width, geometry.height,
+					       toplevel->next.size.width,
+					       toplevel->next.size.height);
 		return;
 	}
 
@@ -1077,7 +1447,6 @@ weston_desktop_xdg_popup_protocol_grab(struct wl_client *wl_client,
 	struct weston_seat *wseat = wl_resource_get_user_data(seat_resource);
 	struct weston_desktop_seat *seat = weston_desktop_seat_from_seat(wseat);
 	struct weston_desktop_surface *topmost;
-	bool parent_is_toplevel;
 
 	/* qdistro patch: a NULL-parent popup cannot be grabbed via the
 	 * desktop seat machinery (it requires a weston_desktop_surface
@@ -1110,8 +1479,6 @@ weston_desktop_xdg_popup_protocol_grab(struct wl_client *wl_client,
 				       "xdg_popup grab requires a parent set before grab");
 		return;
 	}
-	parent_is_toplevel =
-		popup->parent->role == WESTON_DESKTOP_XDG_SURFACE_ROLE_TOPLEVEL;
 
 	/* Check that if we have a valid wseat we also got a valid desktop seat */
 	if (wseat != NULL && seat == NULL) {
@@ -1119,33 +1486,24 @@ weston_desktop_xdg_popup_protocol_grab(struct wl_client *wl_client,
 		return;
 	}
 
-	if (popup->committed) {
+	if (popup->base.committed) {
 		wl_resource_post_error(popup->resource,
 				       XDG_POPUP_ERROR_INVALID_GRAB,
 				       "xdg_popup already is mapped");
 		return;
 	}
 
-	/* If seat is NULL then get_topmost_surface will return NULL. In
-	 * combination with setting parent_is_toplevel to TRUE here we will
-	 * avoid posting an error, and we will instead gracefully fail the
-	 * grab and dismiss the surface.
-	 * FIXME: this is a hack because currently we cannot check the topmost
-	 * parent with a destroyed weston_seat */
-	if (seat == NULL)
-		parent_is_toplevel = true;
-
 	topmost = weston_desktop_seat_popup_grab_get_topmost_surface(seat);
-	if ((topmost == NULL && !parent_is_toplevel) ||
-	    (topmost != NULL && topmost != popup->parent->desktop_surface)) {
+	if (topmost != NULL && topmost != popup->parent->desktop_surface) {
 		struct weston_desktop_client *client =
 			weston_desktop_surface_get_client(dsurface);
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
 
-		wl_resource_post_error(client_resource,
-				       XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
-				       "xdg_popup was not created on the topmost popup");
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
+					       "xdg_popup was not created on the topmost popup");
 		return;
 	}
 
@@ -1195,11 +1553,11 @@ weston_desktop_xdg_popup_protocol_reposition(struct wl_client *wl_client,
 	 * Two sub-cases:
 	 * 1. layer_parent_surface set (plan3 M1): the popup is parented to a
 	 *    layer-shell surface. weston_desktop_xdg_positioner_get_geometry
-	 *    only uses positioner state (parent/dsurface args are unused), so
-	 *    we can compute the same anchored geometry, schedule a configure,
-	 *    and let the compositor's commit listener reposition the popup
-	 *    view relative to its layer parent. Quickshell tooltips that
-	 *    re-anchor on hover require this.
+	 *    only uses positioner state (parent/dsurface args are unused for
+	 *    the base placement), so we can compute the same anchored
+	 *    geometry, schedule a configure, and let the compositor's commit
+	 *    listener reposition the popup view relative to its layer parent.
+	 *    Quickshell tooltips that re-anchor on hover require this.
 	 * 2. No parent at all: reposition before parent attachment is
 	 *    meaningless; stash the rect for a later attach + commit. */
 	if (popup->parent == NULL) {
@@ -1209,7 +1567,7 @@ weston_desktop_xdg_popup_protocol_reposition(struct wl_client *wl_client,
 					positioner, dsurface, NULL);
 			popup->pending_reposition = true;
 			popup->pending_reposition_token = token;
-			if (popup->committed)
+			if (popup->base.committed)
 				weston_desktop_xdg_surface_schedule_configure(
 					&popup->base);
 			return;
@@ -1234,8 +1592,7 @@ weston_desktop_xdg_popup_protocol_reposition(struct wl_client *wl_client,
 	weston_desktop_xdg_popup_constrain_geometry(popup);
 	popup->pending_reposition = true;
 	popup->pending_reposition_token = token;
-	if (popup->committed)
-		weston_desktop_xdg_surface_schedule_configure(&popup->base);
+	weston_desktop_xdg_surface_schedule_configure(&popup->base);
 }
 
 static void
@@ -1277,9 +1634,6 @@ weston_desktop_xdg_popup_committed(struct weston_desktop_xdg_popup *popup)
 	wl_list_for_each(view, &wsurface->views, surface_link)
 		weston_view_update_transform(view);
 
-	if (!popup->committed)
-		weston_desktop_xdg_surface_schedule_configure(&popup->base);
-	popup->committed = true;
 	weston_desktop_xdg_popup_update_position(popup->base.desktop_surface,
 						 popup);
 
@@ -1418,9 +1772,10 @@ weston_desktop_xdg_popup_destroy(struct weston_desktop_xdg_popup *popup)
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
 
-		wl_resource_post_error(client_resource,
-				       XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
-				       "xdg_popup was destroyed while it was not the topmost popup.");
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
+					       "xdg_popup was destroyed while it was not the topmost popup.");
 	}
 
 	weston_desktop_surface_popup_ungrab(popup->base.desktop_surface,
@@ -1443,6 +1798,25 @@ static const struct xdg_popup_interface weston_desktop_xdg_popup_implementation 
 	.reposition          = weston_desktop_xdg_popup_protocol_reposition,
 };
 
+static bool
+weston_destop_xdg_surface_resource_available(struct weston_desktop_xdg_surface *surface)
+{
+	bool resource_available = false;
+
+	switch (surface->role) {
+	case WESTON_DESKTOP_XDG_SURFACE_ROLE_NONE:
+		break;
+	case WESTON_DESKTOP_XDG_SURFACE_ROLE_TOPLEVEL:
+		resource_available = !!((struct weston_desktop_xdg_toplevel *) surface)->resource;
+		break;
+	case WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP:
+		resource_available = !!((struct weston_desktop_xdg_popup *) surface)->resource;
+		break;
+	}
+
+	return resource_available;
+}
+
 static void
 weston_desktop_xdg_surface_send_configure(void *user_data)
 {
@@ -1450,6 +1824,9 @@ weston_desktop_xdg_surface_send_configure(void *user_data)
 	struct weston_desktop_xdg_surface_configure *configure;
 
 	surface->configure_idle = NULL;
+
+	if (!weston_destop_xdg_surface_resource_available(surface))
+		return;
 
 	configure = zalloc(weston_desktop_surface_configure_biggest_size);
 	if (configure == NULL) {
@@ -1534,6 +1911,9 @@ weston_desktop_xdg_surface_schedule_configure(struct weston_desktop_xdg_surface 
 	struct wl_display *display = weston_desktop_get_display(surface->desktop);
 	struct wl_event_loop *loop = wl_display_get_event_loop(display);
 	bool pending_same = false;
+
+	if (!surface->committed)
+		return;
 
 	switch (surface->role) {
 	case WESTON_DESKTOP_XDG_SURFACE_ROLE_NONE:
@@ -1715,10 +2095,10 @@ weston_desktop_xdg_surface_protocol_get_popup(struct wl_client *wl_client,
 		/* Defer set_relative_to until the parent is set via a side-
 		 * channel protocol (e.g. zwlr_layer_surface_v1.get_popup)
 		 * before commit. positioner_get_geometry only uses positioner
-		 * state, so we can still compute the anchored rect now —
-		 * qdwin's layer-popup commit listener reads it via
-		 * weston_desktop_xdg_popup_get_geometry to place the view
-		 * relative to its layer-shell parent.
+		 * state for the base placement, so we can still compute the
+		 * anchored rect now — qdwin's layer-popup commit listener reads
+		 * it via weston_desktop_xdg_popup_get_geometry to place the
+		 * view relative to its layer-shell parent.
 		 *
 		 * qdistro security note: a popup with a NULL desktop parent is
 		 * NOT run through the output clamp (constrain_geometry requires
@@ -1818,9 +2198,11 @@ weston_desktop_xdg_surface_protocol_ack_configure(struct wl_client *wl_client,
 			weston_desktop_surface_get_client(dsurface);
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
-		wl_resource_post_error(client_resource,
-				       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
-				       "Wrong configure serial: %u", serial);
+
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+					       "Wrong configure serial: %u", serial);
 		return;
 	}
 
@@ -1847,9 +2229,13 @@ weston_desktop_xdg_surface_ping(struct weston_desktop_surface *dsurface,
 {
 	struct weston_desktop_client *client =
 		weston_desktop_surface_get_client(dsurface);
+	struct wl_resource *client_resource =
+		weston_desktop_client_get_resource(client);
 
-	xdg_wm_base_send_ping(weston_desktop_client_get_resource(client),
-			      serial);
+	if (!client_resource)
+		return;
+
+	xdg_wm_base_send_ping(client_resource, serial);
 }
 
 static void
@@ -1860,6 +2246,9 @@ weston_desktop_xdg_surface_committed(struct weston_desktop_surface *dsurface,
 	struct weston_desktop_xdg_surface *surface = user_data;
 	struct weston_surface *wsurface =
 		weston_desktop_surface_get_surface (dsurface);
+
+	if (!weston_destop_xdg_surface_resource_available(surface))
+		return;
 
 	if (weston_surface_has_content(wsurface) && !surface->configured) {
 		wl_resource_post_error(surface->resource,
@@ -1872,6 +2261,11 @@ weston_desktop_xdg_surface_committed(struct weston_desktop_surface *dsurface,
 		surface->has_next_geometry = false;
 		weston_desktop_surface_set_geometry(surface->desktop_surface,
 						    surface->next_geometry);
+	}
+
+	if (!surface->committed) {
+		surface->committed = true;
+		weston_desktop_xdg_surface_schedule_configure(surface);
 	}
 
 	switch (surface->role) {
@@ -2067,8 +2461,11 @@ weston_desktop_xdg_shell_protocol_get_xdg_surface(struct wl_client *wl_client,
 						    &xdg_surface_interface,
 						    &weston_desktop_xdg_surface_implementation,
 						    id, weston_desktop_xdg_surface_resource_destroy);
-	if (surface->resource == NULL)
+	if (surface->resource == NULL) {
+		weston_desktop_surface_destroy(surface->desktop_surface);
+		free(surface);
 		return;
+	}
 }
 
 static void
@@ -2082,8 +2479,27 @@ weston_desktop_xdg_shell_protocol_pong(struct wl_client *wl_client,
 	weston_desktop_client_pong(client, serial);
 }
 
+static void
+weston_desktop_xdg_shell_protocol_destroy(struct wl_client *wl_client,
+					  struct wl_resource *resource)
+{
+	struct weston_desktop_client *client =
+		wl_resource_get_user_data(resource);
+	struct wl_list *surface_list =
+		weston_desktop_client_get_surface_list(client);
+
+	if (!wl_list_empty(surface_list)) {
+		wl_resource_post_error(resource,
+				       XDG_WM_BASE_ERROR_DEFUNCT_SURFACES,
+				       "xdg_wm_base being destroyed before child surfaces");
+		return;
+	}
+
+	weston_desktop_destroy_request(wl_client, resource);
+}
+
 static const struct xdg_wm_base_interface weston_desktop_xdg_shell_implementation = {
-	.destroy = weston_desktop_destroy_request,
+	.destroy = weston_desktop_xdg_shell_protocol_destroy,
 	.create_positioner = weston_desktop_xdg_shell_protocol_create_positioner,
 	.get_xdg_surface = weston_desktop_xdg_shell_protocol_get_xdg_surface,
 	.pong = weston_desktop_xdg_shell_protocol_pong,

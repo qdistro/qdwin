@@ -90,7 +90,7 @@ struct weston_hdr_metadata_type1 {
 	float maxFALL;
 };
 
-/** Output properties derived from its color characteristics and profile
+/** Output properties derived from its color profile
  *
  * These are constructed by a color manager.
  *
@@ -123,8 +123,24 @@ struct weston_color_profile {
 	int ref_count;
 	char *description;
 
-	/* Unique id to be used by the CM&HDR protocol extension. */
+	/* Unique id to be used by the CM&HDR protocol extension. Should not
+	 * be confused with the protocol object id. */
 	uint32_t id;
+};
+
+/**
+ * Color transfer function
+ *
+ * Includes any parameter values the enumerated transfer function might need.
+ */
+struct weston_color_tf {
+	/** Encoding transfer characteristic by enumeration; always set. */
+	const struct weston_color_tf_info *info;
+
+	/** TF parameters, specific to TF. */
+	float params[1];
+
+	char padding[4];
 };
 
 /** Parameters that define a parametric color profile */
@@ -136,29 +152,24 @@ struct weston_color_profile_params {
 	const struct weston_color_primaries_info *primaries_info;
 
 	/* Encoding transfer characteristic by enumeration; always set. */
-	const struct weston_color_tf_info *tf_info;
+	struct weston_color_tf tf;
 
-	/* Transfer characteristic's parameters; depends on tf_info. */
-	float tf_params[10];
+	/* Primary color volume luminance parameters cd/m²; always set. */
+	float min_luminance, max_luminance;
+	float reference_white_luminance;
 
 	/* Target color volume; always set. */
 	struct weston_color_gamut target_primaries;
 
-	/* Luminance parameters cd/m²; negative when not set */
+	/* Target luminance parameters cd/m²; negative when not set */
+	float target_min_luminance, target_max_luminance;
+	float maxCLL, maxFALL;
 
-	float min_luminance, max_luminance;
-	float maxCLL;
-	float maxFALL;
+	char padding[4];
 };
 
-/** Type or formula for a curve */
-enum weston_color_curve_type {
-	/** Identity function, no-op */
-	WESTON_COLOR_CURVE_TYPE_IDENTITY = 0,
-
-	/** Three-channel, one-dimensional look-up table */
-	WESTON_COLOR_CURVE_TYPE_LUT_3x1D,
-
+/** Type for parametric curves */
+enum weston_color_curve_parametric_type {
 	/** Transfer function named LINPOW
 	 *
 	 * y = (a * x + b) ^ g | x >= d
@@ -179,7 +190,7 @@ enum weston_color_curve_type {
 	 * If the input is not clamped and LINPOW needs to evaluate a negative
 	 * input value, it uses mirroring (i.e. -f(-x)).
 	 */
-	WESTON_COLOR_CURVE_TYPE_LINPOW,
+	WESTON_COLOR_CURVE_PARAMETRIC_TYPE_LINPOW,
 
 	/** Transfer function named POWLIN
 	 *
@@ -201,7 +212,22 @@ enum weston_color_curve_type {
 	 * If the input is not clamped and POWLIN needs to evaluate a negative
 	 * input value, it uses mirroring (i.e. -f(-x)).
 	 */
-	WESTON_COLOR_CURVE_TYPE_POWLIN,
+	WESTON_COLOR_CURVE_PARAMETRIC_TYPE_POWLIN,
+};
+
+/** Type or formula for a curve */
+enum weston_color_curve_type {
+	/** Identity function, no-op */
+	WESTON_COLOR_CURVE_TYPE_IDENTITY = 0,
+
+	/** Three-channel, one-dimensional look-up table */
+	WESTON_COLOR_CURVE_TYPE_LUT_3x1D,
+
+	/** Enumerated color curve */
+	WESTON_COLOR_CURVE_TYPE_ENUM,
+
+	/** Parametric color curve */
+	WESTON_COLOR_CURVE_TYPE_PARAMETRIC,
 };
 
 /** LUT_3x1D parameters */
@@ -219,23 +245,60 @@ struct weston_color_curve_lut_3x1d {
 	 *
 	 * \param xform This color transformation object.
 	 * \param len The number of elements in each 1D LUT.
-	 * \param values Array of 3 x len elements. First R channel
-	 * LUT, immediately followed by G channel LUT, and then B channel LUT.
+	 * \param values The destination array of length \c len for
+	 * receiving the three 1D LUTs.
 	 */
 	void
 	(*fill_in)(struct weston_color_transform *xform,
-		   float *values, unsigned len);
+		   struct weston_vec3f *values, unsigned len);
 
 	/** Optimal 1D LUT length for storage vs. precision */
 	unsigned optimal_len;
 };
 
+/** Direct or inverse of a tf. */
+enum weston_tf_direction {
+	WESTON_FORWARD_TF,
+	WESTON_INVERSE_TF,
+};
+
+/** Enumerated color curve */
+struct weston_color_curve_enum {
+	struct weston_color_tf tf;
+
+	/* Determines if the direct or inverse of the tf should be used. */
+	enum weston_tf_direction tf_direction;
+};
+
+/**
+ * The only params curve we have are WESTON_COLOR_CURVE_PARAMETRIC_TYPE_LINPOW
+ * and WESTON_COLOR_CURVE_PARAMETRIC_TYPE_POWLIN, and they have exactly 5
+ * params.
+ */
+union weston_color_curve_parametric_chan_data {
+	struct {
+		float g, a, b, c, d;
+	};
+	float data[5];
+};
+
+union weston_color_curve_parametric_data {
+	/** Channels in RGB order. */
+	union weston_color_curve_parametric_chan_data chan[3];
+	float array[15];
+};
+
+static_assert(sizeof (union weston_color_curve_parametric_data){}.array ==
+	      sizeof (union weston_color_curve_parametric_data){}.chan,
+	      "union size error");
+
 /** Parametric color curve parameters */
 struct weston_color_curve_parametric {
-	/* For each color channel we may have different curves. For each of
-	 * them, we can have up to 10 params, depending on the curve type. The
+	enum weston_color_curve_parametric_type type;
+
+	/* For each color channel we may have curves with different params. The
 	 * channels are in RGB order. */
-	float params[3][10];
+	union weston_color_curve_parametric_data params;
 
 	/* The input of the curve should be clamped from 0.0 to 1.0? */
 	bool clamped_input;
@@ -260,6 +323,7 @@ struct weston_color_curve {
 	union {
 		/* identity: no parameters */
 		struct weston_color_curve_lut_3x1d lut_3x1d;
+		struct weston_color_curve_enum enumerated;
 		struct weston_color_curve_parametric parametric;
 	} u;
 };
@@ -269,65 +333,16 @@ enum weston_color_mapping_type {
 	/** Identity function, no-op */
 	WESTON_COLOR_MAPPING_TYPE_IDENTITY = 0,
 
-	/** 3D-dimensional look-up table */
-	WESTON_COLOR_MAPPING_TYPE_3D_LUT,
-
 	/** matrix */
 	WESTON_COLOR_MAPPING_TYPE_MATRIX,
-};
-
-/**
- * A three-dimensional look-up table
- *
- * A 3D LUT is a three-dimensional array where each element is an RGB triplet.
- * A 3D LUT is usually an approximation of some arbitrary color mapping
- * function that cannot be represented in any simpler form. The array contains
- * samples from the approximated function, and values between samples are
- * estimated by interpolation. The array is accessed with three indices, one
- * for each input dimension (color channel).
- *
- * Color channel values in the range [0.0, 1.0] are mapped linearly to
- * 3D LUT indices such that 0.0 maps exactly to the first element and 1.0 maps
- * exactly to the last element in each dimension.
- *
- * This object represents a 3D LUT and offers an interface for realizing it
- * as a data array with a custom size.
- */
-struct weston_color_mapping_3dlut {
-	/**
-	 * Create a 3D LUT data array
-	 *
-	 * \param xform This color transformation object.
-	 * \param values Memory to hold the resulting data array.
-	 * \param len The number of elements in each dimension.
-	 *
-	 * The array \c values must be at least 3 * len * len * len elements
-	 * in size.
-	 *
-	 * Given the red index ri, green index gi and blue index bi, the
-	 * corresponding array element index
-	 *
-	 *     i = 3 * (len * len * bi + len * gi + ri) + c
-	 *
-	 * where
-	 *
-	 *     c = 0 for red output value,
-	 *     c = 1 for green output value, and
-	 *     c = 2 for blue output value
-	 */
-	void
-	(*fill_in)(struct weston_color_transform *xform,
-		   float *values, unsigned len);
-
-	/** Optimal 3D LUT size along each dimension */
-	unsigned optimal_len;
 };
 
 /**
  * A 3x3 matrix and data is arranged as column major
  */
 struct weston_color_mapping_matrix {
-	float matrix[9];
+	struct weston_mat3f matrix;
+	struct weston_vec3f offset;
 };
 
 /**
@@ -343,7 +358,6 @@ struct weston_color_mapping {
 	/** Parameters for the color mapping function */
 	union {
 		/* identity: no parameters */
-		struct weston_color_mapping_3dlut lut3d;
 		struct weston_color_mapping_matrix mat;
 	} u;
 };
@@ -366,6 +380,14 @@ struct weston_color_transform {
 	/* for renderer or backend to attach their own cached objects */
 	struct wl_signal destroy_signal;
 
+	/**
+	 * When this is true, users are allowed to use the steps described below
+	 * (pre curve, color mapping and post curve) and implement the color
+	 * transformation themselves. Otherwise this is forbidden and to_clut()
+	 * must be used.
+	 */
+	bool steps_valid;
+
 	/* Color transform is the series of steps: */
 
 	/** Step 1: color model change */
@@ -379,6 +401,44 @@ struct weston_color_transform {
 
 	/** Step 4: color curve after color mapping */
 	struct weston_color_curve post_curve;
+
+	/**
+	 * Decompose the color transformation into a shaper (3x1D LUT) followed
+	 * by a 3D cLUT.
+	 *
+	 * \param xform_base The color transformation to decompose.
+	 * \param len_shaper Number of taps in each of the 1D LUT.
+	 * \param shaper Where the shaper is saved, caller's responsibility to
+	 * allocate.
+	 * \param len_clut The 3D cLUT's length for each dimension.
+	 * \param clut Where the 3D cLUT is saved, caller's responsibility to
+	 * allocate. Its layout on memory is: clut[B][G][R], i.e. R is the
+	 * innermost and its index grow faster, followed by G and then B.
+	 * \return True on success, false otherwise.
+	 */
+	bool
+	(*to_clut)(struct weston_color_transform *xform_base,
+		   uint32_t len_shaper, float *shaper,
+		   uint32_t len_clut, float *clut);
+};
+
+struct weston_cvd_correction {
+	enum weston_cvd_correction_type type;
+	struct weston_mat3f correction;
+};
+
+struct weston_output_color_effect {
+	struct weston_compositor *compositor;
+	struct wl_signal destroy_signal;
+
+	/** Which member of 'u' defines the effect. */
+	enum weston_output_color_effect_type type;
+
+	union {
+		/* color inversion: no parameters */
+		/* color grayscale: no parameters */
+		struct weston_cvd_correction cvd;
+	} u;
 };
 
 /**
@@ -462,6 +522,10 @@ struct weston_color_manager {
 	void
 	(*destroy_color_profile)(struct weston_color_profile *cprof);
 
+	/** Print detailed description of the color profile */
+	char *
+	(*print_color_profile_details)(const struct weston_color_profile *cprof);
+
 	/** Gets a new reference to the stock sRGB color profile
 	 *
 	 * \param cm The color manager.
@@ -535,6 +599,21 @@ struct weston_color_manager {
 	(*send_image_desc_info)(struct cm_image_desc_info *cm_image_desc_info,
 				struct weston_color_profile *cprof_base);
 
+	/** Given a color profile, returns a reference to a profile that is
+	 * guaranteed to be parametric and which is equivalent to the given
+	 * profile.
+	 *
+	 * \param cprof_base The color profile.
+	 * \param errmsg On success, untouched. On failure, a pointer to a
+	 * string describing the error is stored here. The string must be
+	 * free()'d.
+	 * \return A reference to an equivalent parametric color profile, or
+	 * NULL on failure.
+	 */
+	struct weston_color_profile *
+	(*get_parametric_color_profile)(struct weston_color_profile *cprof_base,
+					char **errmsg);
+
 	/** Destroy a color transform after refcount fell to zero */
 	void
 	(*destroy_color_transform)(struct weston_color_transform *xform);
@@ -575,6 +654,40 @@ void
 weston_color_profile_init(struct weston_color_profile *cprof,
 			  struct weston_color_manager *cm);
 
+char *
+weston_color_profile_params_to_str(const struct weston_color_profile_params *params,
+				   const char *ident);
+
+bool
+weston_color_curve_enum_get_parametric(struct weston_compositor *compositor,
+				       const struct weston_color_curve_enum *curve,
+				       struct weston_color_curve_parametric *out);
+
+enum weston_color_curve_step {
+	WESTON_COLOR_CURVE_STEP_PRE,
+	WESTON_COLOR_CURVE_STEP_POST,
+};
+
+enum weston_color_precision {
+	WESTON_COLOR_PRECISION_CARELESS,
+	WESTON_COLOR_PRECISION_CAREFUL,
+};
+
+struct weston_vec3f *
+weston_color_curve_to_3x1D_LUT(struct weston_compositor *compositor,
+			       struct weston_color_transform *xform,
+			       enum weston_color_curve_step step,
+			       enum weston_color_precision precision_mode,
+			       size_t lut_size, char **err_msg);
+
+void
+find_neighbors(struct weston_compositor *compositor, uint32_t len, const float *array,
+	       float val, uint32_t *neigh_A_index, uint32_t *neigh_B_index);
+
+float
+weston_inverse_evaluate_lut1d(struct weston_compositor *compositor,
+			      uint32_t len_lut, const float *lut, float input);
+
 struct weston_color_transform *
 weston_color_transform_ref(struct weston_color_transform *xform);
 
@@ -587,6 +700,10 @@ weston_color_transform_init(struct weston_color_transform *xform,
 
 char *
 weston_color_transform_string(const struct weston_color_transform *xform);
+
+char *
+weston_color_transform_details_string(int indent,
+				      const struct weston_color_transform *xform);
 
 void
 weston_surface_color_transform_copy(struct weston_surface_color_transform *dst,
@@ -606,9 +723,6 @@ weston_color_manager_noop_create(struct weston_compositor *compositor);
 /* DSO module entrypoint */
 struct weston_color_manager *
 weston_color_manager_create(struct weston_compositor *compositor);
-
-const char *
-weston_eotf_mode_to_str(enum weston_eotf_mode e);
 
 char *
 weston_eotf_mask_to_str(uint32_t eotf_mask);
@@ -630,13 +744,19 @@ weston_colorimetry_mode_info_get(enum weston_colorimetry_mode c);
 const struct weston_colorimetry_mode_info *
 weston_colorimetry_mode_info_get_by_wdrm(enum wdrm_colorspace cs);
 
-const char *
-weston_colorimetry_mode_to_str(enum weston_colorimetry_mode c);
-
 char *
 weston_colorimetry_mask_to_str(uint32_t colorimetry_mask);
 
 void
 weston_output_color_outcome_destroy(struct weston_output_color_outcome **pco);
+
+const char *
+weston_color_format_to_str(enum weston_color_format c);
+
+char *
+weston_color_format_mask_to_str(uint32_t color_format_mask);
+
+struct weston_vec3f
+weston_CIExy_to_XYZ(struct weston_CIExy c);
 
 #endif /* WESTON_COLOR_H */

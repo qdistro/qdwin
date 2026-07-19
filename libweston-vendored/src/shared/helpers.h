@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef  __cplusplus
 extern "C" {
@@ -244,6 +245,20 @@ do {                        \
 #define FALLTHROUGH do {} while(0)
 #endif
 
+/** Return the value with only bit b set. */
+static inline uint64_t
+bit(unsigned b)
+{
+	return ((uint64_t)1) << b;
+}
+
+/** Return whether bit b is set in value. */
+static inline bool
+has_bit(uint64_t value, unsigned b)
+{
+	return value & bit(b);
+}
+
 /**
  * Returns number of bits set in 32-bit value x.
  *
@@ -282,6 +297,18 @@ bswap32(uint32_t x)
 		((x << 8) & 0x00ff0000) |
 		(x << 24);
 #endif
+}
+
+/**
+ * Returns whether 64-bit value x is a power of 2.
+ *
+ * @param x a 64-bit value.
+ * @return true if x is a power of 2.
+ */
+static inline bool
+is_pow2_64(uint64_t x)
+{
+	return (x & (x - 1)) == 0;
 }
 
 /**

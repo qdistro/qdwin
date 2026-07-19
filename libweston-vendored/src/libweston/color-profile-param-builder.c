@@ -36,10 +36,11 @@
 enum weston_color_profile_params_set {
 	WESTON_COLOR_PROFILE_PARAMS_PRIMARIES = 0x01,
 	WESTON_COLOR_PROFILE_PARAMS_TF = 0x02,
-	WESTON_COLOR_PROFILE_PARAMS_TARGET_PRIMARIES = 0x04,
-	WESTON_COLOR_PROFILE_PARAMS_LUMINANCE = 0x08,
-	WESTON_COLOR_PROFILE_PARAMS_MAXCLL = 0x10,
-	WESTON_COLOR_PROFILE_PARAMS_MAXFALL = 0x20,
+	WESTON_COLOR_PROFILE_PARAMS_PRIMARY_LUMINANCE = 0x04,
+	WESTON_COLOR_PROFILE_PARAMS_TARGET_PRIMARIES = 0x08,
+	WESTON_COLOR_PROFILE_PARAMS_TARGET_LUMINANCE = 0x10,
+	WESTON_COLOR_PROFILE_PARAMS_MAXCLL = 0x20,
+	WESTON_COLOR_PROFILE_PARAMS_MAXFALL = 0x40,
 };
 
 /** Builder object to create color profiles with parameters. */
@@ -89,7 +90,7 @@ struct weston_color_profile_param_builder {
  * \param compositor The weston compositor.
  * \return The struct weston_color_profile_param_builder object created.
 */
-struct weston_color_profile_param_builder *
+WL_EXPORT struct weston_color_profile_param_builder *
 weston_color_profile_param_builder_create(struct weston_compositor *compositor)
 {
 	struct weston_color_profile_param_builder *builder;
@@ -100,7 +101,7 @@ weston_color_profile_param_builder_create(struct weston_compositor *compositor)
 
 	builder->err_fp = open_memstream(&builder->err_msg,
 					 &builder->err_msg_size);
-	weston_assert_ptr(compositor, builder->err_fp);
+	weston_assert_ptr_not_null(compositor, builder->err_fp);
 
 	return builder;
 }
@@ -110,7 +111,7 @@ weston_color_profile_param_builder_create(struct weston_compositor *compositor)
  *
  * \param builder The object that should be destroyed.
  */
-void
+WL_EXPORT void
 weston_color_profile_param_builder_destroy(struct weston_color_profile_param_builder *builder)
 {
 	fclose(builder->err_fp);
@@ -157,7 +158,7 @@ log_msg:
  * a new line character.
  * \return true if there's an error, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_get_error(struct weston_color_profile_param_builder *builder,
 					     enum weston_color_profile_param_builder_error *err,
 					     char **err_msg)
@@ -171,6 +172,99 @@ weston_color_profile_param_builder_get_error(struct weston_color_profile_param_b
 	*err_msg = strdup(builder->err_msg);
 
 	return true;
+}
+
+static float
+triangle_area(float x1, float y1, float x2, float y2, float x3, float y3)
+{
+	/* Based on the shoelace formula, also known as Gauss's area formula. */
+	return fabs((x1 - x3) * (y2 - y1) - (x1 - x2) * (y3 - y1)) / 2.0f;
+}
+
+static bool
+is_point_inside_triangle(float point_x, float point_y,
+			 float x1, float y1, float x2, float y2, float x3, float y3)
+{
+	float A1, A2, A3;
+	float A;
+	const float PRECISION = 1e-5;
+
+	A = triangle_area(x1, y1, x2, y2, x3, y3);
+
+	/* Bail out if something that is not a triangle was given. */
+	if (A <= PRECISION)
+		return false;
+
+	A1 = triangle_area(point_x, point_y, x1, y1, x2, y2);
+	A2 = triangle_area(point_x, point_y, x1, y1, x3, y3);
+	A3 = triangle_area(point_x, point_y, x2, y2, x3, y3);
+
+	if (fabs(A - (A1 + A2 + A3)) <= PRECISION)
+		return true;
+
+	return false;
+}
+
+static void
+validate_CIE_value(struct weston_color_profile_param_builder *builder,
+		   const char *gamut_name,
+		   const char *chan_name,
+		   const char *elem_name,
+		   float v)
+{
+	/*
+	 * We choose the legal range [-1.0, 2.0] for CIE xy values. It is
+	 * probably more than we'd ever need, but tight enough to not cause
+	 * mathematical issues. If wasn't for the ACES AP0 color space, we'd
+	 * probably choose the range [0.0, 1.0].
+	 */
+	if (v >= -1.0f && v <= 2.0f)
+		return;
+
+	store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_CIE_XY_OUT_OF_RANGE,
+		    "invalid %s color volume, the %s CIE %s value %f is out of range [-1.0, 2.0]",
+		    gamut_name, chan_name, elem_name, v);
+}
+
+static void
+validate_color_gamut(struct weston_color_profile_param_builder *builder,
+		     const struct weston_color_gamut *gamut,
+		     const char *gamut_name)
+{
+	const char *chan_name[4] = {
+		"red primary",
+		"green primary",
+		"blue primary",
+		"white point"
+	};
+	struct weston_CIExy xy[4] = {
+		gamut->primary[0],
+		gamut->primary[1],
+		gamut->primary[2],
+		gamut->white_point,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_LENGTH(xy); i++) {
+		validate_CIE_value(builder, gamut_name, chan_name[i], "x", xy[i].x);
+		validate_CIE_value(builder, gamut_name, chan_name[i], "y", xy[i].y);
+	}
+
+	/*
+	 * That is not sufficient. There are points inside the triangle that
+	 * would not be valid white points. But for now that's good enough.
+	 */
+	if (!is_point_inside_triangle(gamut->white_point.x,
+				      gamut->white_point.y,
+				      gamut->primary[0].x,
+				      gamut->primary[0].y,
+				      gamut->primary[1].x,
+				      gamut->primary[1].y,
+				      gamut->primary[2].x,
+				      gamut->primary[2].y)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_CIE_XY_OUT_OF_RANGE,
+			    "white point out of %s volume", gamut_name);
+	}
 }
 
 /**
@@ -189,7 +283,7 @@ weston_color_profile_param_builder_get_error(struct weston_color_profile_param_b
  * \param primaries The object containing the primaries.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_primaries(struct weston_color_profile_param_builder *builder,
 						 const struct weston_color_gamut *primaries)
 {
@@ -197,7 +291,7 @@ weston_color_profile_param_builder_set_primaries(struct weston_color_profile_par
 	bool success = true;
 
 	if (!((cm->supported_color_features >> WESTON_COLOR_FEATURE_SET_PRIMARIES) & 1)) {
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_PRIMARIES,
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_UNSUPPORTED,
 			    "set_primaries not supported by the color manager");
 		success = false;
 	}
@@ -235,18 +329,21 @@ weston_color_profile_param_builder_set_primaries(struct weston_color_profile_par
  * \param primaries The enum representing the primaries.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_primaries_named(struct weston_color_profile_param_builder *builder,
 						       enum weston_color_primaries primaries)
 {
 	struct weston_compositor *compositor = builder->compositor;
 	struct weston_color_manager *cm = compositor->color_manager;
+	const struct weston_color_primaries_info *info;
 	bool success = true;
 
+	info = weston_color_primaries_info_from(compositor, primaries);
+
 	if (!((cm->supported_primaries_named >> primaries) & 1)) {
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_PRIMARIES,
-			    "named primaries %u not supported by the color manager",
-			    primaries);
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_PRIMARIES_NAMED,
+			    "primaries named %s not supported by the color manager",
+			    info->desc);
 		success = false;
 	}
 
@@ -259,11 +356,8 @@ weston_color_profile_param_builder_set_primaries_named(struct weston_color_profi
 	if (!success)
 		return false;
 
-	builder->params.primaries_info =
-		weston_color_primaries_info_from(compositor, primaries);
-
+	builder->params.primaries_info = info;
 	builder->params.primaries = builder->params.primaries_info->color_gamut;
-
 	builder->group_mask |= WESTON_COLOR_PROFILE_PARAMS_PRIMARIES;
 
 	return true;
@@ -286,17 +380,20 @@ weston_color_profile_param_builder_set_primaries_named(struct weston_color_profi
  * \param tf The enum representing the transfer function.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_tf_named(struct weston_color_profile_param_builder *builder,
 						enum weston_transfer_function tf)
 {
 	struct weston_compositor *compositor = builder->compositor;
 	struct weston_color_manager *cm = compositor->color_manager;
+	const struct weston_color_tf_info *info;
 	bool success = true;
+
+	info = weston_color_tf_info_from(compositor, tf);
 
 	if (!((cm->supported_tf_named >> tf) & 1)) {
 		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_TF,
-			    "named tf %u not supported by the color manager", tf);
+			    "%s not supported by the color manager", info->desc);
 		success = false;
 	}
 
@@ -309,9 +406,9 @@ weston_color_profile_param_builder_set_tf_named(struct weston_color_profile_para
 	if (!success)
 		return false;
 
-	builder->params.tf_info = weston_color_tf_info_from(compositor, tf);
-	weston_assert_false(builder->compositor,
-			    builder->params.tf_info->has_parameters);
+	builder->params.tf.info = info;
+	weston_assert_uint_eq(builder->compositor,
+			      builder->params.tf.info->count_parameters, 0);
 
 	builder->group_mask |= WESTON_COLOR_PROFILE_PARAMS_TF;
 
@@ -336,7 +433,7 @@ weston_color_profile_param_builder_set_tf_named(struct weston_color_profile_para
  * \param power_exponent The power law function exponent.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_tf_power_exponent(struct weston_color_profile_param_builder *builder,
 							 float power_exponent)
 {
@@ -345,7 +442,7 @@ weston_color_profile_param_builder_set_tf_power_exponent(struct weston_color_pro
 	bool success = true;
 
 	if (!((cm->supported_color_features >> WESTON_COLOR_FEATURE_SET_TF_POWER) & 1)) {
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_TF,
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_UNSUPPORTED,
 			    "set_tf_power not supported by the color manager");
 		success = false;
 	}
@@ -367,10 +464,70 @@ weston_color_profile_param_builder_set_tf_power_exponent(struct weston_color_pro
 	if (!success)
 		return false;
 
-	builder->params.tf_info = weston_color_tf_info_from(compositor, WESTON_TF_POWER);
-	builder->params.tf_params[0] = power_exponent;
+	builder->params.tf.info = weston_color_tf_info_from(compositor, WESTON_TF_POWER);
+	builder->params.tf.params[0] = power_exponent;
 
 	builder->group_mask |= WESTON_COLOR_PROFILE_PARAMS_TF;
+
+	return true;
+}
+
+/**
+ * Sets primary luminance for struct weston_color_profile_param_builder object.
+ *
+ * If the primary luminance is already set, this should fail. Setting a
+ * parameter twice is forbidden.
+ *
+ * If this fails, users can call weston_color_profile_param_builder_get_error()
+ * to get the error details.
+ *
+ * \param builder The builder object whose parameters will be set.
+ * \param ref_lum The white point reference luminance.
+ * \param min_lum The minimum luminance.
+ * \param max_lum The maximum luminance.
+ * \return true on success, false otherwise.
+ */
+WL_EXPORT bool
+weston_color_profile_param_builder_set_primary_luminance(struct weston_color_profile_param_builder *builder,
+							 float ref_lum, float min_lum, float max_lum)
+{
+	struct weston_color_manager *cm = builder->compositor->color_manager;
+	bool success = true;
+
+	if (!((cm->supported_color_features >> WESTON_COLOR_FEATURE_SET_LUMINANCES) & 1)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_UNSUPPORTED,
+			    "set_primary_luminance not supported by the color manager");
+		success = false;
+	}
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_PRIMARY_LUMINANCE) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_ALREADY_SET,
+			    "primary luminance was already set");
+		success = false;
+	}
+
+	if (min_lum >= ref_lum) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "reference luminance (%f) must be greater than primary minimum luminance (%f)",
+			    ref_lum, min_lum);
+		success = false;
+	}
+
+	if (min_lum >= max_lum) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "primary minimum luminance (%f) must be less than primary maximum luminance (%f)",
+			    min_lum, max_lum);
+		success = false;
+	}
+
+	if (!success)
+		return false;
+
+	builder->params.reference_white_luminance = ref_lum;
+	builder->params.min_luminance = min_lum;
+	builder->params.max_luminance = max_lum;
+
+	builder->group_mask |= WESTON_COLOR_PROFILE_PARAMS_PRIMARY_LUMINANCE;
 
 	return true;
 }
@@ -389,7 +546,7 @@ weston_color_profile_param_builder_set_tf_power_exponent(struct weston_color_pro
  * \param target_primaries The object containing the target primaries.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_target_primaries(struct weston_color_profile_param_builder *builder,
 							const struct weston_color_gamut *target_primaries)
 {
@@ -397,7 +554,7 @@ weston_color_profile_param_builder_set_target_primaries(struct weston_color_prof
 	bool success = true;
 
 	if (!((cm->supported_color_features >> WESTON_COLOR_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES) & 1)) {
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_TARGET_PRIMARIES,
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_UNSUPPORTED,
 			    "set_mastering_display_primaries not supported by " \
 			    "the color manager");
 		success = false;
@@ -420,6 +577,31 @@ weston_color_profile_param_builder_set_target_primaries(struct weston_color_prof
 }
 
 /**
+ * Sets target primaries for struct weston_color_profile_param_builder object
+ * from the given enumerated primaries.
+ *
+ * If the target primaries are already set, this should fail. Setting a
+ * parameter twice is forbidden.
+ *
+ * If this fails, users can call weston_color_profile_param_builder_get_error()
+ * to get the error details.
+ *
+ * \param builder The builder object whose parameters will be set.
+ * \param target_primaries The entry from the enumeration to use.
+ * \return true on success, false otherwise.
+ */
+WL_EXPORT bool
+weston_color_profile_param_builder_set_target_primaries_named(struct weston_color_profile_param_builder *builder,
+							      enum weston_color_primaries target_primaries)
+{
+	const struct weston_color_primaries_info *info;
+
+	info = weston_color_primaries_info_from(builder->compositor, target_primaries);
+
+	return weston_color_profile_param_builder_set_target_primaries(builder, &info->color_gamut);
+}
+
+/**
  * Sets target luminance for struct weston_color_profile_param_builder object.
  *
  * If the target luminance is already set, this should fail. Setting a parameter
@@ -429,36 +611,44 @@ weston_color_profile_param_builder_set_target_primaries(struct weston_color_prof
  * to get the error details.
  *
  * \param builder The builder object whose parameters will be set.
- * \param min_luminance The minimum luminance.
- * \param max_luminance The maximum luminance.
+ * \param min_lum The target minimum luminance.
+ * \param max_lum The target maximum luminance.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_target_luminance(struct weston_color_profile_param_builder *builder,
-							float min_luminance, float max_luminance)
+							float min_lum, float max_lum)
 {
+	struct weston_color_manager *cm = builder->compositor->color_manager;
 	bool success = true;
 
-	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_LUMINANCE) {
+	if (!((cm->supported_color_features >> WESTON_COLOR_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES) & 1)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_UNSUPPORTED,
+			    "set_mastering_display_primaries not supported by " \
+			    "the color manager, so setting target luminance is not allowed");
+		success = false;
+	}
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TARGET_LUMINANCE) {
 		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_ALREADY_SET,
 			    "target luminance was already set");
 		success = false;
 	}
 
-	if (min_luminance >= max_luminance) {
+	if (min_lum >= max_lum) {
 		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
-			    "min luminance %f shouldn't be greater than or equal to max %f",
-			    min_luminance, max_luminance);
+			    "target min luminance (%f) must be less than target max luminance (%f)",
+			    min_lum, max_lum);
 		success = false;
 	}
 
 	if (!success)
 		return false;
 
-	builder->params.min_luminance = min_luminance;
-	builder->params.max_luminance = max_luminance;
+	builder->params.target_min_luminance = min_lum;
+	builder->params.target_max_luminance = max_lum;
 
-	builder->group_mask |= WESTON_COLOR_PROFILE_PARAMS_LUMINANCE;
+	builder->group_mask |= WESTON_COLOR_PROFILE_PARAMS_TARGET_LUMINANCE;
 
 	return true;
 }
@@ -476,7 +666,7 @@ weston_color_profile_param_builder_set_target_luminance(struct weston_color_prof
  * \param maxFALL The maxFALL.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_maxFALL(struct weston_color_profile_param_builder *builder,
 					       float maxFALL)
 {
@@ -506,7 +696,7 @@ weston_color_profile_param_builder_set_maxFALL(struct weston_color_profile_param
  * \param maxCLL The maxCLL.
  * \return true on success, false otherwise.
  */
-bool
+WL_EXPORT bool
 weston_color_profile_param_builder_set_maxCLL(struct weston_color_profile_param_builder *builder,
 					      float maxCLL)
 {
@@ -535,138 +725,124 @@ builder_validate_params_set(struct weston_color_profile_param_builder *builder)
 	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TF))
 		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INCOMPLETE_SET,
 			    "transfer function not set");
-
-	/* If luminance values were given, tf must be PQ. */
-	if (builder->params.tf_info->tf != WESTON_TF_ST2084_PQ &&
-	    (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_LUMINANCE ||
-	     builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXCLL ||
-	     builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXFALL))
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INCONSISTENT_SET,
-			    "luminance values were given but transfer function " \
-			    "is not Rec. ITU-R BT.2100-2 (PQ)");
-}
-
-static float
-triangle_area(float x1, float y1, float x2, float y2, float x3, float y3)
-{
-	/* Based on the shoelace formula, also known as Gauss's area formula. */
-	return fabs((x1 - x3) * (y2 - y1) - (x1 - x2) * (y3 - y1)) / 2.0f;
-}
-
-static bool
-is_point_inside_triangle(float point_x, float point_y,
-			 float x1, float y1, float x2, float y2, float x3, float y3)
-{
-	float A1, A2, A3;
-	float A;
-	const float PRECISION = 1e-5;
-
-	A = triangle_area(x1, y1, x2, y2, x3, y3);
-
-	/* Bail out if something that is not a triangle was given. */
-	if (A <= PRECISION)
-		return false;
-
-	A1 = triangle_area(point_x, point_y, x1, y1, x2, y2);
-	A2 = triangle_area(point_x, point_y, x1, y1, x3, y3);
-	A3 = triangle_area(point_x, point_y, x2, y2, x3, y3);
-
-	if (fabs(A - (A1 + A2 + A3)) <= PRECISION)
-		return true;
-
-	return false;
 }
 
 static void
-validate_color_gamut(struct weston_color_profile_param_builder *builder,
-		     const struct weston_color_gamut *gamut,
-		     const char *gamut_name)
+builder_validate_primary_luminances(struct weston_color_profile_param_builder *builder)
 {
-	/*
-	 * We choose the legal range [-1.0, 2.0] for CIE xy values. It is
-	 * probably more than we'd ever need, but tight enough to not cause
-	 * mathematical issues. If wasn't for the ACES AP0 color space, we'd
-	 * probably choose the range [0.0, 1.0].
-	 */
-	if (gamut->white_point.x < -1.0f || gamut->white_point.x > 2.0f ||
-	    gamut->white_point.y < -1.0f || gamut->white_point.y > 2.0f ||
-	    gamut->primary[0].x < -1.0f || gamut->primary[0].x > 2.0f ||
-	    gamut->primary[0].y < -1.0f || gamut->primary[0].y > 2.0f ||
-	    gamut->primary[1].x < -1.0f || gamut->primary[1].x > 2.0f ||
-	    gamut->primary[1].y < -1.0f || gamut->primary[1].y > 2.0f ||
-	    gamut->primary[2].x < -1.0f || gamut->primary[2].x > 2.0f ||
-	    gamut->primary[2].y < -1.0f || gamut->primary[2].y > 2.0f) {
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_CIE_XY_OUT_OF_RANGE,
-			    "invalid %s", gamut_name);
-		return;
+	float min_lum = builder->params.min_luminance;
+	float ref_lum = builder->params.reference_white_luminance;
+	float max_lum = builder->params.max_luminance;
+
+	if (!(ref_lum > 0.0f && ref_lum <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "reference luminance (%f) must be in the range (0.0, 1e+6]",
+			    ref_lum);
 	}
 
-	/*
-	 * That is not sufficient. There are points inside the triangle that
-	 * would not be valid white points. But for now that's good enough.
-	 */
-	if (!is_point_inside_triangle(gamut->white_point.x,
-				      gamut->white_point.y,
-				      gamut->primary[0].x,
-				      gamut->primary[0].y,
-				      gamut->primary[1].x,
-				      gamut->primary[1].y,
-				      gamut->primary[2].x,
-				      gamut->primary[2].y))
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_CIE_XY_OUT_OF_RANGE,
-			    "white point out of %s volume", gamut_name);
+	if (!(min_lum >= 0.0f && min_lum <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "primary minimum luminance (%f) must be in the range [0.0, 1e+6]",
+			    min_lum);
+	}
+
+	if (!(max_lum > 0.0f && max_lum <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "primary maximum luminance (%f) must be in the range (0.0, 1e+6]",
+			    max_lum);
+	}
+}
+
+static void
+builder_validate_target_luminances(struct weston_color_profile_param_builder *builder)
+{
+	float min_lum = builder->params.target_min_luminance;
+	float max_lum = builder->params.target_max_luminance;
+
+	if (!(min_lum >= 0.0f && min_lum <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "target minimum luminance (%f) must be in the range [0.0, 1e+6]",
+			    min_lum);
+	}
+
+	if (!(max_lum > 0.0f && max_lum <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "target maximum luminance (%f) must be in the range (0.0, 1e+6]",
+			    max_lum);
+	}
 }
 
 static void
 validate_maxcll(struct weston_color_profile_param_builder *builder)
 {
-	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_LUMINANCE))
-		return;
+	float maxCLL = builder->params.maxCLL;
 
-	if (builder->params.min_luminance >= builder->params.maxCLL)
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INCONSISTENT_LUMINANCES,
-			    "maxCLL (%f) should be greater or equal to min luminance (%f)",
-			    builder->params.maxCLL, builder->params.min_luminance);
+	if (!(maxCLL > 0.0f && maxCLL <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxCLL (%f) must be in the range (0.0, 1e+6]",
+			    maxCLL);
+	}
 
-	if (builder->params.max_luminance < builder->params.maxCLL)
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INCONSISTENT_LUMINANCES,
-			    "maxCLL (%f) should not be greater than max luminance (%f)",
-			    builder->params.maxCLL, builder->params.max_luminance);
+	if (builder->params.target_min_luminance >= maxCLL)
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxCLL (%f) should be greater than target min luminance (%f)",
+			    maxCLL, builder->params.target_min_luminance);
+
+	if (builder->params.target_max_luminance < maxCLL)
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxCLL (%f) should not be greater than target max luminance (%f)",
+			    maxCLL, builder->params.target_max_luminance);
 }
 
 static void
 validate_maxfall(struct weston_color_profile_param_builder *builder)
 {
-	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_LUMINANCE))
-		return;
+	float maxFALL = builder->params.maxFALL;
 
-	if (builder->params.min_luminance >= builder->params.maxFALL)
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INCONSISTENT_LUMINANCES,
-			    "maxFALL (%f) should be greater or equal to min luminance (%f)",
-			    builder->params.maxFALL, builder->params.min_luminance);
+	if (!(maxFALL > 0.0f && maxFALL <= 1e6f)) {
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxFALL (%f) must be in the range (0.0, 1e+6]",
+			    maxFALL);
+	}
 
-	if (builder->params.max_luminance < builder->params.maxFALL)
-		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INCONSISTENT_LUMINANCES,
-			    "maxFALL (%f) should not be greater than max luminance (%f)",
-			    builder->params.maxFALL, builder->params.max_luminance);
+	if (builder->params.target_min_luminance >= maxFALL)
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxFALL (%f) must be greater than min luminance (%f)",
+			    maxFALL, builder->params.target_min_luminance);
+
+	if (builder->params.target_max_luminance < maxFALL)
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxFALL (%f) must be less than or equal to target max luminance (%f)",
+			    maxFALL, builder->params.target_max_luminance);
 }
 
 static void
 builder_validate_params(struct weston_color_profile_param_builder *builder)
 {
-	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_PRIMARIES)
-		validate_color_gamut(builder, &builder->params.primaries,
-				     "primaries");
-
-	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TARGET_PRIMARIES)
-		validate_color_gamut(builder, &builder->params.target_primaries,
-				     "target primaries");
-
 	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXCLL)
 		validate_maxcll(builder);
 
 	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXFALL)
 		validate_maxfall(builder);
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXCLL &&
+	    builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXFALL &&
+	    builder->params.maxFALL > builder->params.maxCLL)
+		store_error(builder, WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_INVALID_LUMINANCE,
+			    "maxFALL (%f) must be less than or equal to maxCLL (%f)",
+			    builder->params.maxFALL,  builder->params.maxCLL);
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_PRIMARIES)
+		validate_color_gamut(builder, &builder->params.primaries, "primary");
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TARGET_PRIMARIES)
+		validate_color_gamut(builder, &builder->params.target_primaries, "target");
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_PRIMARY_LUMINANCE)
+		builder_validate_primary_luminances(builder);
+
+	if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TARGET_LUMINANCE)
+		builder_validate_target_luminances(builder);
 }
 
 static void
@@ -676,19 +852,56 @@ builder_complete_params(struct weston_color_profile_param_builder *builder)
 	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TARGET_PRIMARIES))
 		builder->params.target_primaries = builder->params.primaries;
 
-	/*
-	 * If luminance is not set, set it to negative. Same applies to maxCLL
-	 * and maxFALL.
-	 */
+	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_PRIMARY_LUMINANCE)) {
+		/* If primary luminance is not set, set it to default values.
+		 * These values comes from the CM&HDR protocol. */
+		builder->params.reference_white_luminance = 80.0;
+		builder->params.min_luminance = 0.2;
+		builder->params.max_luminance = 80.0;
 
-	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_LUMINANCE)) {
-		builder->params.min_luminance = -1.0f;
-		builder->params.max_luminance = -1.0f;
+		/* Some TF's override the default. Values comes from the CM&HDR
+		 * protocol as well. */
+		if (builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TF) {
+			switch(builder->params.tf.info->tf) {
+			case WESTON_TF_BT1886:
+				builder->params.reference_white_luminance = 100.0;
+				builder->params.min_luminance = 0.01;
+				builder->params.max_luminance = 100.0;
+				break;
+			case WESTON_TF_ST2084_PQ:
+				builder->params.reference_white_luminance = 203.0;
+				builder->params.min_luminance = 0.005;
+				builder->params.max_luminance = 10000.0;
+				break;
+			case WESTON_TF_HLG:
+				builder->params.reference_white_luminance = 203.0;
+				builder->params.min_luminance = 0.005;
+				builder->params.max_luminance = 1000.0;
+				break;
+			default:
+				break;
+			}
+		}
+	} else {
+		/* Primary luminance is set, but the CM&HDR protocol states that
+		 * PQ TF should override max_lum with min_lum + 10000 cd/m². */
+		if ((builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TF) &&
+		    builder->params.tf.info->tf == WESTON_TF_ST2084_PQ)
+			builder->params.max_luminance =
+				builder->params.min_luminance + 10000.0;
 	}
 
+	/* CM&HDR protocol states that if target luminance is not set, the
+	 * target min and max luminances should have the same values as the
+	 * primary min and max luminances. */
+	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_TARGET_LUMINANCE)) {
+		builder->params.target_min_luminance = builder->params.min_luminance;
+		builder->params.target_max_luminance = builder->params.max_luminance;
+	}
+
+	/* If maxCLL and maxFALL are not set, set them to negative. */
 	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXCLL))
 		builder->params.maxCLL = -1.0f;
-
 	if (!(builder->group_mask & WESTON_COLOR_PROFILE_PARAMS_MAXFALL))
 		builder->params.maxFALL = -1.0f;
 }
@@ -712,7 +925,7 @@ builder_complete_params(struct weston_color_profile_param_builder *builder)
  * a new line character.
  * \return The color profile created, or NULL on failure.
  */
-struct weston_color_profile *
+WL_EXPORT struct weston_color_profile *
 weston_color_profile_param_builder_create_color_profile(struct weston_color_profile_param_builder *builder,
 							const char *name_part,
 							enum weston_color_profile_param_builder_error *err,
@@ -748,7 +961,7 @@ weston_color_profile_param_builder_create_color_profile(struct weston_color_prof
 	ret = cm->get_color_profile_from_params(cm, params, name_part,
 						&cprof, err_msg);
 	if (!ret)
-		*err = WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_UNSUPPORTED;
+		*err = WESTON_COLOR_PROFILE_PARAM_BUILDER_ERROR_CREATE_FAILED;
 
 out:
 	weston_color_profile_param_builder_destroy(builder);

@@ -88,6 +88,9 @@ void
 weston_log_scope_write(struct weston_log_scope *scope,
 			 const char *data, size_t len);
 
+FILE *
+weston_log_scope_stream(struct weston_log_scope *scope);
+
 int
 weston_log_scope_vprintf(struct weston_log_scope *scope,
 			   const char *fmt, va_list ap);
@@ -96,6 +99,14 @@ int
 weston_log_scope_printf(struct weston_log_scope *scope,
 			  const char *fmt, ...)
 			  __attribute__ ((format (printf, 2, 3)));
+
+void
+weston_log_scope_puts(struct weston_log_scope *scope, const char *str);
+
+void
+weston_log_subscription_write(struct weston_log_subscription *sub,
+			      const char *data, size_t len);
+
 void
 weston_log_subscription_printf(struct weston_log_subscription *sub,
 				const char *fmt, ...)
@@ -145,6 +156,12 @@ weston_log_scope_get_name(struct weston_log_scope *scope);
 struct weston_log_scope *
 weston_log_scopes_iterate(struct weston_log_context *log_ctx,
                           struct weston_log_scope *nscope);
+
+void
+weston_add_scope_to_advertised_list(struct weston_log_context *ctx,
+				      const char *name);
+bool
+weston_log_scope_to_be_advertised(struct weston_log_context *ctx, const char *name);
 
 #ifdef  __cplusplus
 }

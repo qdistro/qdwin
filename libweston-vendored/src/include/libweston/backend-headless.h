@@ -49,6 +49,16 @@ struct weston_headless_backend_config {
 	 * mHz to 1,000,000 mHz. 0 is a special value that triggers repaints
 	 * only on capture requests, not on damages. */
 	int refresh;
+
+	/** Create a fake seat, some clients may complain without a wl_seat.
+	 * The default is not to create a wl_seat.
+	 */
+	bool fake_seat;
+
+	/** Defines if renderers must produce straight or premultiplied alpha
+	 * framebuffers for headless-backend outputs.
+	 */
+	enum weston_output_fb_alpha_encoding output_fb_alpha_encoding;
 };
 
 #ifdef  __cplusplus

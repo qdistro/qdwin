@@ -1,6 +1,6 @@
 /*
  * Copyright 2019 Sebastian Wick
- * Copyright 2021 Collabora, Ltd.
+ * Copyright 2021-2025 Collabora, Ltd.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -26,7 +26,6 @@
 
 #include "config.h"
 
-#include <libweston/libweston.h>
 #include <assert.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -36,12 +35,20 @@
 #include <errno.h>
 #include <string.h>
 
+#include <libweston/libweston.h>
+#include <libweston/weston-log.h>
+#include <libweston/linalg-3.h>
+
 #include "color.h"
+#include "color-operations.h"
+#include "color-properties.h"
 #include "id-number-allocator.h"
 #include "libweston-internal.h"
-#include <libweston/weston-log.h>
+#include "shared/string-helpers.h"
 #include "shared/helpers.h"
+#include "shared/weston-assert.h"
 #include "shared/xalloc.h"
+#include "shared/weston-assert.h"
 
 /**
  * Increase reference count of the color profile object
@@ -100,6 +107,27 @@ weston_color_profile_get_description(struct weston_color_profile *cprof)
 }
 
 /**
+ * Get color profile detailed description
+ *
+ * A detailed, multi-line description of the profile is meant for
+ * human readable logs.
+ *
+ * \param cprof The color profile, NULL is accepted too.
+ * \returns The detailed description. Must be free()'d.
+ */
+WL_EXPORT char *
+weston_color_profile_get_details(struct weston_color_profile *cprof)
+{
+	if (!cprof)
+		return xstrdup("NULL profile.\n");
+
+	if (cprof->cm->print_color_profile_details)
+		return cprof->cm->print_color_profile_details(cprof);
+	else
+		return xstrdup("No details.\n");
+}
+
+/**
  * Initializes a newly allocated color profile object
  *
  * This is used only by color managers. They sub-class weston_color_profile.
@@ -115,6 +143,375 @@ weston_color_profile_init(struct weston_color_profile *cprof,
 	cprof->cm = cm;
 	cprof->ref_count = 1;
 	cprof->id = weston_idalloc_get_id(cm->compositor->color_profile_id_generator);
+}
+
+/**
+ * Initialize gamut from protocol integer-encoded values
+ *
+ * The color_management_v1 Wayland protocol encodes colorimetric coordinates
+ * into integers by multiplying them with one million. This function does the
+ * decoding.
+ *
+ * \param[out] dst Gamut record to initialize.
+ * \param r_x,r_y Red primary
+ * \param g_x,g_y Green primary
+ * \param b_x,b_y Blue primary
+ * \param w_x,w_y White point
+ */
+WL_EXPORT void
+weston_color_gamut_from_protocol(struct weston_color_gamut *dst,
+				 int32_t r_x, int32_t r_y,
+				 int32_t g_x, int32_t g_y,
+				 int32_t b_x, int32_t b_y,
+				 int32_t w_x, int32_t w_y)
+{
+	dst->primary[0].x = r_x / 1000000.0f;
+	dst->primary[0].y = r_y / 1000000.0f;
+	dst->primary[1].x = g_x / 1000000.0f;
+	dst->primary[1].y = g_y / 1000000.0f;
+	dst->primary[2].x = b_x / 1000000.0f;
+	dst->primary[2].y = b_y / 1000000.0f;
+	dst->white_point.x = w_x / 1000000.0f;
+	dst->white_point.y = w_y / 1000000.0f;
+}
+
+static void
+weston_color_gamut_fprint(FILE *fp,
+			  const char *indent,
+			  const struct weston_color_gamut *g)
+{
+	static const char *chan[] = { "R", "G", "B" };
+	unsigned i;
+
+	for (i = 0; i < 3; i++) {
+		fprintf(fp, "%s    %s  = (%.4f, %.4f)\n",
+			indent, chan[i], g->primary[i].x, g->primary[i].y);
+	}
+
+	fprintf(fp, "%s    WP = (%.4f, %.4f)\n",
+		indent, g->white_point.x, g->white_point.y);
+}
+
+/**
+ * Print color profile parameters to string.
+ *
+ * \param params The parameters of the color profile.
+ * \param ident Indentation to add before each line of the return'ed string.
+ * \returns The color profile parameters as string. Callers must free() it.
+ */
+WL_EXPORT char *
+weston_color_profile_params_to_str(const struct weston_color_profile_params *params,
+				   const char *ident)
+{
+	FILE *fp;
+	char *str;
+	size_t size;
+	unsigned int i;
+
+	fp = open_memstream(&str, &size);
+	abort_oom_if_null(fp);
+
+	fprintf(fp, "%sprimaries (CIE xy):\n", ident);
+	weston_color_gamut_fprint(fp, ident, &params->primaries);
+
+	if (params->primaries_info)
+		fprintf(fp, "%sprimaries named: %s\n", ident, params->primaries_info->desc);
+
+	fprintf(fp, "%stransfer function: %s\n", ident, params->tf.info->desc);
+
+	if (params->tf.info->count_parameters > 0) {
+		fprintf(fp, "%s    params:", ident);
+		for (i = 0; i < params->tf.info->count_parameters; i++)
+			fprintf(fp, " %.4f", params->tf.params[i]);
+		fprintf(fp, "\n");
+	}
+
+	fprintf(fp, "%sluminance: [%.3f, %.2f], ref white %.2f (cd/m²)\n", ident, params->min_luminance,
+										  params->max_luminance,
+										  params->reference_white_luminance);
+
+	fprintf(fp, "%starget primaries (CIE xy):\n", ident);
+	weston_color_gamut_fprint(fp, ident, &params->target_primaries);
+
+	if (params->target_min_luminance >= 0.0f && params->target_max_luminance >= 0.0f)
+		fprintf(fp, "%starget luminance: [%.3f, %.2f] (cd/m²)\n", ident, params->target_min_luminance,
+										 params->target_max_luminance);
+
+	if (params->maxCLL >= 0.0f)
+		fprintf(fp, "%smax cll: %.2f (cd/m²)\n", ident, params->maxCLL);
+
+	if (params->maxFALL >= 0.0f)
+		fprintf(fp, "%smax fall: %.2f (cd/m²)\n", ident, params->maxFALL);
+
+	fclose(fp);
+	return str;
+}
+
+/**
+ * Given an enumerated color curve, returns an equivalent parametric curve.
+ *
+ * \param compositor The compositor instance.
+ * \param curve The enumerated color curve.
+ * \param out Where this stores the parametric curve.
+ * \return True on success, false otherwise.
+ */
+WL_EXPORT bool
+weston_color_curve_enum_get_parametric(struct weston_compositor *compositor,
+				       const struct weston_color_curve_enum *curve,
+				       struct weston_color_curve_parametric *out)
+{
+	unsigned int i;
+
+	memset(out, 0, sizeof(*out));
+
+	/* This one is special, the only parametric TF we currently have. */
+	if (curve->tf.info->tf == WESTON_TF_POWER) {
+		out->type = WESTON_COLOR_CURVE_PARAMETRIC_TYPE_LINPOW;
+		out->clamped_input = false;
+		for (i = 0; i < 3; i++) {
+			float exp = curve->tf.params[0];
+			/* LINPOW with such params matches pure power-law */
+			out->params.chan[i].g = (curve->tf_direction == WESTON_FORWARD_TF) ?
+						exp : 1.0f / exp;
+			out->params.chan[i].a = 1.0;
+			out->params.chan[i].b = 0.0;
+			out->params.chan[i].c = 1.0;
+			out->params.chan[i].d = 0.0;
+		}
+		return true;
+	}
+
+	/* No other TF's have params. */
+	weston_assert_uint_eq(compositor, curve->tf.info->count_parameters, 0);
+
+	if (!curve->tf.info->curve_params_valid)
+		return false;
+
+	if (curve->tf_direction == WESTON_FORWARD_TF)
+		*out = curve->tf.info->curve;
+	else
+		*out = curve->tf.info->inverse_curve;
+
+	return true;
+}
+
+static bool
+curve_to_lut_has_good_precision(struct weston_color_curve *curve)
+{
+	struct weston_color_curve_enum *e = &curve->u.enumerated;
+	struct weston_color_curve_parametric *p = &curve->u.parametric;
+	float g;
+	unsigned int i;
+
+	if (curve->type == WESTON_COLOR_CURVE_TYPE_ENUM) {
+		if (e->tf_direction == WESTON_INVERSE_TF) {
+			if (e->tf.info->tf == WESTON_TF_ST2084_PQ ||
+			    e->tf.info->tf == WESTON_TF_GAMMA22 ||
+			    e->tf.info->tf == WESTON_TF_GAMMA28) {
+				/**
+				 * These have bad precision in the indirect
+				 * direction.
+				 */
+				return false;
+			}
+
+			if (e->tf.info->tf == WESTON_TF_POWER) {
+				/**
+				 * Same as the above, but for parametric
+				 * power-law transfer function. If g > 1.0
+				 * it would result in bad precision.
+				 */
+				g = e->tf.params[0];
+				if (g > 1.0f)
+					return false;
+			}
+		} else {
+			if (e->tf.info->tf == WESTON_TF_POWER) {
+				/**
+				 * For parametric power-law transfer function
+				 * in the forward direction, g < 1.0 would
+				 * result in bad precision.
+				 */
+				g = e->tf.params[0];
+				if (g < 1.0f)
+					return false;
+			}
+		}
+	} else if (curve->type == WESTON_COLOR_CURVE_TYPE_PARAMETRIC) {
+		switch(p->type) {
+		case WESTON_COLOR_CURVE_PARAMETRIC_TYPE_LINPOW:
+		case WESTON_COLOR_CURVE_PARAMETRIC_TYPE_POWLIN:
+			/**
+			 * Both LINPOW and POWLIN have bad precision if g < 1.0.
+			 */
+			for (i = 0; i < 3; i++) {
+				if (p->params.chan[i].g < 1.0f)
+					return false;
+			}
+			break;
+		}
+	}
+
+	return true;
+}
+
+/**
+ * Given a xform and an enum corresponding to one of its curves (pre or post),
+ * returns a 3x1D LUT that corresponds to such curve. This only works for
+ * transformations such that xform->steps_valid.
+ *
+ * The 3x1D LUT is returned as an array of vec3, where each 1D LUT occupies
+ * one channel of each vector. The first element corresponds to input value
+ * 0.0, and the last element corresponds to input value 1.0.
+ *
+ * @param compositor The Weston compositor.
+ * @param xform The color transformation that owns the curve.
+ * @param step The curve step (pre or post) from the xform.
+ * @param precision_mode If WESTON_COLOR_PRECISION_CAREFUL, this fails if we
+ * detect that we can't create a LUT from the curve without resulting in
+ * precision issues. If WESTON_COLOR_PRECISION_CARELESS, we simply log a warning.
+ * @param lut_size The length of each LUT, that is,
+ * the number of vec3 in the returned array.
+ * @param err_msg Set on failure, untouched otherwise. Must be free()'d by caller.
+ * @return NULL on failure, newly allocate array of vec3 on success. Caller must
+ * free the array.
+ */
+WL_EXPORT struct weston_vec3f *
+weston_color_curve_to_3x1D_LUT(struct weston_compositor *compositor,
+			       struct weston_color_transform *xform,
+			       enum weston_color_curve_step step,
+			       enum weston_color_precision precision_mode,
+			       size_t lut_size, char **err_msg)
+{
+	struct weston_color_curve *curve;
+	float divider = lut_size - 1;
+	const char *step_str;
+	struct weston_vec3f *lut;
+	size_t i;
+
+	switch(step) {
+	case WESTON_COLOR_CURVE_STEP_PRE:
+		curve = &xform->pre_curve;
+		step_str = "pre";
+		break;
+	case WESTON_COLOR_CURVE_STEP_POST:
+		curve = &xform->post_curve;
+		step_str = "post";
+		break;
+	default:
+		weston_assert_not_reached(compositor, "unknown curve step");
+	}
+
+	if (!xform->steps_valid) {
+		str_printf(err_msg, "can't create LUT from xform (id %u) %s-curve, as the " \
+				    "xform don't have valid steps",
+				    xform->id, step_str);
+		return NULL;
+	}
+
+	if (!curve_to_lut_has_good_precision(curve)) {
+		if (precision_mode == WESTON_COLOR_PRECISION_CAREFUL) {
+			str_printf(err_msg, "can't create color LUT from xform (id %u) " \
+					    "%s-curve, it would result in bad precision",
+					    xform->id, step_str);
+			return NULL;
+		}
+		weston_log("WARNING: converting xform (id %u) %s-curve to 3x1D LUT should probably " \
+			   "result in bad precision\n", xform->id, step_str);
+	}
+
+	lut = calloc(lut_size, sizeof *lut);
+	if (!lut) {
+		/* lut_size could be big. */
+		str_printf(err_msg, "Out of memory");
+		return NULL;
+	}
+
+	switch(curve->type) {
+	case WESTON_COLOR_CURVE_TYPE_LUT_3x1D:
+		curve->u.lut_3x1d.fill_in(xform, lut, lut_size);
+		return lut;
+	case WESTON_COLOR_CURVE_TYPE_ENUM:
+	case WESTON_COLOR_CURVE_TYPE_PARAMETRIC:
+		for (i = 0; i < lut_size; i++) {
+			float x = (float)i / divider;
+			lut[i] = WESTON_VEC3F(x, x, x);
+		}
+		weston_color_curve_sample(compositor, curve, lut, lut, lut_size);
+		return lut;
+	case WESTON_COLOR_CURVE_TYPE_IDENTITY:
+		weston_assert_not_reached(compositor,
+					  "no reason to create LUT for identity curve");
+	}
+
+	weston_assert_not_reached(compositor, "unkown color curve");
+}
+
+static float
+linear_interpolation(float x, float x0, float y0, float x1, float y1)
+{
+	float delta = x1 - x0;
+
+	/* x0 == x1, 5 digits precision. */
+	if (fabs(delta) < 1e-5)
+		return (y0 + y1) / 2.0f;
+
+	return y0 * ((x1 - x) / delta) + y1 * ((x - x0) / delta);
+}
+
+WESTON_EXPORT_FOR_TESTS void
+find_neighbors(struct weston_compositor *compositor, uint32_t len, const float *array,
+	       float val, uint32_t *neigh_A_index, uint32_t *neigh_B_index)
+{
+	bool ascendent = (array[0] <= array[len - 1]);
+	int32_t left = 0;
+	int32_t right = len - 1;
+	int32_t mid;
+
+	/* We need at least 2 elements in the array. */
+	weston_assert_u32_gt(compositor, len, 1);
+
+	while (right - left > 1) {
+		mid = left + ((right - left) / 2);
+
+		if ((ascendent && array[mid] < val) ||
+		    (!ascendent && array[mid] > val))
+			left = mid;
+		else
+			right = mid;
+	}
+
+	*neigh_A_index = left;
+	*neigh_B_index = right;
+}
+
+/**
+ * Given a 1D LUT, this evaluates a given input using the inverse of the LUT.
+ *
+ * If the input is out of the LUT range, this extrapolates using the two closest
+ * elements present in the LUT.
+ *
+ * \param compositor The compositor instance.
+ * \param len_lut The size of the 1D LUT.
+ * \param lut The 1D lut.
+ * \param input The input to evaluate
+ * \return The evaluation result.
+ */
+WL_EXPORT float
+weston_inverse_evaluate_lut1d(struct weston_compositor *compositor,
+			      uint32_t len_lut, const float *lut, float input)
+{
+	float divider = len_lut - 1;
+	uint32_t neighbor_A_index, neighbor_B_index;
+
+	find_neighbors(compositor, len_lut, lut, input,
+		       &neighbor_A_index, &neighbor_B_index);
+
+	return linear_interpolation(input,
+				    lut[neighbor_A_index],
+				    (float)neighbor_A_index / divider,
+				    lut[neighbor_B_index],
+				    (float)neighbor_B_index / divider);
 }
 
 /**
@@ -176,16 +573,12 @@ weston_color_transform_init(struct weston_color_transform *xform,
 }
 
 static const char *
-curve_type_to_str(enum weston_color_curve_type curve_type)
+param_curve_type_to_str(enum weston_color_curve_parametric_type type)
 {
-	switch (curve_type) {
-	case WESTON_COLOR_CURVE_TYPE_IDENTITY:
-		return "identity";
-	case WESTON_COLOR_CURVE_TYPE_LUT_3x1D:
-		return "3x1D LUT";
-	case WESTON_COLOR_CURVE_TYPE_LINPOW:
+	switch(type) {
+	case WESTON_COLOR_CURVE_PARAMETRIC_TYPE_LINPOW:
 		return "linpow";
-	case WESTON_COLOR_CURVE_TYPE_POWLIN:
+	case WESTON_COLOR_CURVE_PARAMETRIC_TYPE_POWLIN:
 		return "powlin";
 	}
 	return "???";
@@ -197,12 +590,137 @@ mapping_type_to_str(enum weston_color_mapping_type mapping_type)
 	switch (mapping_type) {
 	case WESTON_COLOR_MAPPING_TYPE_IDENTITY:
 		return "identity";
-	case WESTON_COLOR_MAPPING_TYPE_3D_LUT:
-		return "3D LUT";
 	case WESTON_COLOR_MAPPING_TYPE_MATRIX:
 		return "matrix";
 	}
 	return "???";
+}
+
+static void
+weston_color_curve_details_fprint(FILE *fp,
+				  int indent,
+				  const char *step,
+				  const struct weston_color_curve *curve)
+{
+	static const char *chan[] = { "R", "G", "B" };
+	const struct weston_color_curve_enum *en;
+	const struct weston_color_curve_parametric *par;
+	unsigned ch;
+	unsigned i;
+
+	switch (curve->type) {
+	case WESTON_COLOR_CURVE_TYPE_IDENTITY:
+		break;
+	case WESTON_COLOR_CURVE_TYPE_LUT_3x1D:
+		break;
+	case WESTON_COLOR_CURVE_TYPE_ENUM:
+		en = &curve->u.enumerated;
+		if (en->tf.info->count_parameters == 0)
+			break;
+
+		fprintf(fp, "%*s%s, %s:\n", indent, "", step, en->tf.info->desc);
+		fprintf(fp, "%*s  R,G,B", indent, "");
+		for (i = 0; i < en->tf.info->count_parameters; i++)
+			fprintf(fp, " % .4f", en->tf.params[i]);
+		fprintf(fp, "\n");
+		break;
+	case WESTON_COLOR_CURVE_TYPE_PARAMETRIC:
+		par = &curve->u.parametric;
+		fprintf(fp, "%*s%s, %s %s:\n", indent, "", step,
+			par->clamped_input ? "clamped" : "unlimited",
+			param_curve_type_to_str(par->type));
+		for (ch = 0; ch < 3; ch++) {
+			fprintf(fp, "%*s  %s", indent, "", chan[ch]);
+			for (i = 0; i < ARRAY_LENGTH(par->params.chan[0].data); i++)
+				fprintf(fp, " % .4f", par->params.chan[ch].data[i]);
+			fprintf(fp, "\n");
+		}
+		break;
+	}
+}
+
+static void
+weston_color_mapping_details_fprint(FILE *fp,
+				    int indent,
+				    const char *step,
+				    const struct weston_color_mapping *map)
+{
+	const struct weston_color_mapping_matrix *mat;
+	unsigned r, c;
+
+	switch (map->type) {
+	case WESTON_COLOR_MAPPING_TYPE_IDENTITY:
+		break;
+	case WESTON_COLOR_MAPPING_TYPE_MATRIX:
+		mat = &map->u.mat;
+		fprintf(fp, "%*s%s matrix:\n", indent, "", step);
+		for (r = 0; r < 3; r++) {
+			fprintf(fp, "%*s", indent + 1, "");
+			for (c = 0; c < 3; c++)
+				fprintf(fp, " %8.4f", mat->matrix.col[c].el[r]);
+			fprintf(fp, " %8.4f\n", mat->offset.el[r]);
+		}
+		break;
+	}
+}
+
+/**
+ * Print details of the elements of the color transform pipeline to a string
+ *
+ * \param indent Count of spaces to use for indenting every line.
+ * \param xform The color transform.
+ * \return The string in which the pipeline is printed, or NULL if there is
+ * nothing to print.
+ */
+WL_EXPORT char *
+weston_color_transform_details_string(int indent,
+				      const struct weston_color_transform *xform)
+{
+	FILE *fp;
+	char *str = NULL;
+	size_t size = 0;
+
+	if (!xform->steps_valid)
+		return NULL;
+
+	fp = open_memstream(&str, &size);
+	abort_oom_if_null(fp);
+
+	if (xform->pre_curve.type != WESTON_COLOR_CURVE_TYPE_IDENTITY)
+		weston_color_curve_details_fprint(fp, indent, "pre-curve", &xform->pre_curve);
+
+	if (xform->mapping.type != WESTON_COLOR_MAPPING_TYPE_IDENTITY)
+		weston_color_mapping_details_fprint(fp, indent, "mapping", &xform->mapping);
+
+	if (xform->post_curve.type != WESTON_COLOR_CURVE_TYPE_IDENTITY)
+		weston_color_curve_details_fprint(fp, indent, "post-curve", &xform->post_curve);
+
+	fclose(fp);
+	abort_oom_if_null(str);
+
+	return str;
+}
+
+static void
+weston_color_curve_fprint(FILE *fp, const struct weston_color_curve *curve)
+{
+	switch (curve->type) {
+	case WESTON_COLOR_CURVE_TYPE_IDENTITY:
+		fprintf(fp, "identity");
+		break;
+	case WESTON_COLOR_CURVE_TYPE_LUT_3x1D:
+		fprintf(fp, "3x1D LUT [%u]", curve->u.lut_3x1d.optimal_len);
+		break;
+	case WESTON_COLOR_CURVE_TYPE_ENUM:
+		fprintf(fp, "(enum) %s%s",
+			curve->u.enumerated.tf_direction == WESTON_INVERSE_TF ? "inverse " : "",
+			curve->u.enumerated.tf.info->desc);
+		break;
+	case WESTON_COLOR_CURVE_TYPE_PARAMETRIC:
+		fprintf(fp, "(parametric) %s",
+			param_curve_type_to_str(curve->u.parametric.type));
+		break;
+	}
 }
 
 /**
@@ -223,29 +741,28 @@ weston_color_transform_string(const struct weston_color_transform *xform)
 	char *str = NULL;
 	size_t size = 0;
 
+	if (!xform->steps_valid)
+		return xstrdup("Pipeline: uses shaper + 3D LUT\n");
+
 	fp = open_memstream(&str, &size);
 	abort_oom_if_null(fp);
 
-	fprintf(fp, "pipeline: ");
+	fprintf(fp, "Pipeline: ");
 
 	if (pre_type != WESTON_COLOR_CURVE_TYPE_IDENTITY) {
-		fprintf(fp, "%spre %s", sep, curve_type_to_str(pre_type));
-		if (pre_type == WESTON_COLOR_CURVE_TYPE_LUT_3x1D)
-			fprintf(fp, " [%u]", xform->pre_curve.u.lut_3x1d.optimal_len);
+		fprintf(fp, "%spre = ", sep);
+		weston_color_curve_fprint(fp, &xform->pre_curve);
 		sep = ", ";
 	}
 
 	if (mapping_type != WESTON_COLOR_MAPPING_TYPE_IDENTITY) {
-		fprintf(fp, "%smapping %s", sep, mapping_type_to_str(mapping_type));
-		if (mapping_type == WESTON_COLOR_MAPPING_TYPE_3D_LUT)
-			fprintf(fp, " [%u]", xform->mapping.u.lut3d.optimal_len);
+		fprintf(fp, "%smapping = %s", sep, mapping_type_to_str(mapping_type));
 		sep = ", ";
 	}
 
 	if (post_type != WESTON_COLOR_CURVE_TYPE_IDENTITY) {
-		fprintf(fp, "%spost %s", sep, curve_type_to_str(post_type));
-		if (post_type == WESTON_COLOR_CURVE_TYPE_LUT_3x1D)
-			fprintf(fp, " [%u]", xform->post_curve.u.lut_3x1d.optimal_len);
+		fprintf(fp, "%spost = ", sep);
+		weston_color_curve_fprint(fp, &xform->post_curve);
 		sep = ", ";
 	}
 
@@ -393,9 +910,9 @@ out_close:
 	return cprof;
 }
 
-/** Get a string naming the EOTF mode
+/** Get a string naming the EOTF mode for logs
  *
- * \internal
+ * \return Static string. "???" for unknown mode.
  */
 WL_EXPORT const char *
 weston_eotf_mode_to_str(enum weston_eotf_mode e)
@@ -408,34 +925,6 @@ weston_eotf_mode_to_str(enum weston_eotf_mode e)
 	case WESTON_EOTF_MODE_HLG:		return "HLG";
 	}
 	return "???";
-}
-
-static char *
-bits_to_str(uint32_t bits, const char *(*map)(uint32_t))
-{
-	FILE *fp;
-	char *str = NULL;
-	size_t size = 0;
-	unsigned i;
-	const char *sep = "";
-
-	fp = open_memstream(&str, &size);
-	if (!fp)
-		return NULL;
-
-	for (i = 0; bits; i++) {
-		uint32_t bitmask = 1u << i;
-
-		if (bits & bitmask) {
-			fprintf(fp, "%s%s", sep, map(bitmask));
-			sep = ", ";
-		}
-
-		bits &= ~bitmask;
-	}
-	fclose(fp);
-
-	return str;
 }
 
 /** A list of EOTF modes as a string
@@ -493,9 +982,9 @@ weston_colorimetry_mode_info_get_by_wdrm(enum wdrm_colorspace cs)
 	return NULL;
 }
 
-/** Get a string naming the colorimetry mode
+/** Get a string naming the colorimetry mode for logs
  *
- * \internal
+ * \return Static string. "???" for unknown mode.
  */
 WL_EXPORT const char *
 weston_colorimetry_mode_to_str(enum weston_colorimetry_mode c)
@@ -517,4 +1006,134 @@ WL_EXPORT char *
 weston_colorimetry_mask_to_str(uint32_t colorimetry_mask)
 {
 	return bits_to_str(colorimetry_mask, weston_colorimetry_mode_to_str);
+}
+
+static float
+CIExy_to_z(struct weston_CIExy c)
+{
+	return 1.0f - (c.x + c.y);
+}
+
+WL_EXPORT struct weston_vec3f
+weston_CIExy_to_XYZ(struct weston_CIExy c)
+{
+	return WESTON_VEC3F(c.x / c.y, 1.0f, CIExy_to_z(c) / c.y);
+}
+
+/** Compute normalized primary matrix (NPM) from primaries and white point
+ *
+ * \param[out] npm The resulting NPM or inverse NPM.
+ * \param[in] gamut Primaries and white point in CIE 1931 xy.
+ * \param dir Choose NPM (forward) or its inverse.
+ * \return True for success. False for failure: either white point y < 0.01, or
+ * an intermediate matrix from the primaries is not invertible.
+ *
+ * The NPM converts device RGB to CIE 1931 XYZ.
+ *
+ * Based on SMPTE RP 177-1993, "Derivation of Basic Television Color Equations".
+ */
+WL_EXPORT bool
+weston_normalized_primary_matrix_init(struct weston_mat3f *npm,
+				      const struct weston_color_gamut *gamut,
+				      enum weston_npm_direction dir)
+{
+	struct weston_CIExy r = gamut->primary[0];
+	struct weston_CIExy g = gamut->primary[1];
+	struct weston_CIExy b = gamut->primary[2];
+	struct weston_CIExy w = gamut->white_point;
+	struct weston_mat3f P = WESTON_MAT3F(
+		r.x, g.x, b.x,
+		r.y, g.y, b.y,
+		CIExy_to_z(r), CIExy_to_z(g), CIExy_to_z(b)
+	);
+	struct weston_mat3f Pinv;
+
+	if (w.y < 0.01f)
+		return false;
+
+	if (!weston_m3f_invert(&Pinv, P))
+		return false;
+
+	struct weston_vec3f c = weston_m3f_mul_v3f(Pinv, weston_CIExy_to_XYZ(w));
+
+	switch (dir) {
+	case WESTON_NPM_FORWARD:
+		/* NPM = P * diag(c) */
+		*npm = weston_m3f_mul_m3f(P, weston_m3f_diag(c));
+		break;
+	case WESTON_NPM_INVERSE:
+		/* NPM⁻¹ = (P * diag(c))⁻¹ = diag(c)⁻¹ * P⁻¹ */
+		c = WESTON_VEC3F(1.0f / c.x, 1.0f / c.y, 1.0f / c.z);
+		*npm = weston_m3f_mul_m3f(weston_m3f_diag(c), Pinv);
+		break;
+	}
+
+	return true;
+}
+
+/** Compute linearized Bradford transformation
+ *
+ * \param from Source adapted white point.
+ * \param to Destination adapted white point.
+ * \return Full adaptation matrix.
+ *
+ * Based on ICC.1:2022 (ICC v4.4), annex E.
+ */
+WL_EXPORT struct weston_mat3f
+weston_bradford_adaptation(struct weston_CIExy from, struct weston_CIExy to)
+{
+	static const struct weston_mat3f bradford = WESTON_MAT3F(
+		 0.8951,  0.2664, -0.1614,
+		-0.7502,  1.7135,  0.0367,
+		 0.0389, -0.0685,  1.0296
+	);
+	struct weston_mat3f inv;
+	struct weston_vec3f from_cr;
+	struct weston_vec3f to_cr;
+	struct weston_vec3f r;
+	struct weston_mat3f tmp;
+
+	weston_m3f_invert(&inv, bradford);
+	from_cr = weston_m3f_mul_v3f(bradford, weston_CIExy_to_XYZ(from));
+	to_cr = weston_m3f_mul_v3f(bradford, weston_CIExy_to_XYZ(to));
+	r = WESTON_VEC3F(to_cr.x / from_cr.x,
+			 to_cr.y / from_cr.y,
+			 to_cr.z / from_cr.z);
+	tmp = weston_m3f_mul_m3f(weston_m3f_diag(r), bradford);
+	return weston_m3f_mul_m3f(inv, tmp);
+}
+
+/** Get a string naming the color format
+ *
+ * \internal
+ */
+WL_EXPORT const char *
+weston_color_format_to_str(enum weston_color_format c)
+{
+	switch (c) {
+	case WESTON_COLOR_FORMAT_AUTO:
+		return "AUTO";
+	case WESTON_COLOR_FORMAT_RGB:
+		return "RGB";
+	case WESTON_COLOR_FORMAT_YUV444:
+		return "YUV 4:4:4";
+	case WESTON_COLOR_FORMAT_YUV422:
+		return "YUV 4:2:2";
+	case WESTON_COLOR_FORMAT_YUV420:
+		return "YUV 4:2:0";
+	}
+
+	return "???";
+}
+
+/** A list of color formats as a string
+ *
+ * \param color_format_mask Bitwise-or'd enum weston_color_format values.
+ * \return Comma separated names of the listed color formats.
+ * Must be free()'d by the caller.
+ */
+WL_EXPORT char *
+weston_color_format_mask_to_str(uint32_t color_format_mask)
+{
+	return bits_to_str(color_format_mask, weston_color_format_to_str);
 }

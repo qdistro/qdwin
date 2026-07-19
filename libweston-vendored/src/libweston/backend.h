@@ -134,6 +134,12 @@ struct weston_backend {
 	 * defined in weston_compositor_backend.
 	 */
 	enum weston_compositor_backend backend_type;
+
+	/** The backend is incapable of painting right now, but will
+	 *  call weston_backend_clear_deferred() at some point to
+	 *  exit deferred state.
+	 */
+	bool deferred;
 };
 
 /* weston_head */
@@ -144,29 +150,29 @@ weston_head_init(struct weston_head *head, const char *name);
 void
 weston_head_release(struct weston_head *head);
 
-void
+bool
 weston_head_set_connection_status(struct weston_head *head, bool connected);
 
 void
 weston_head_set_internal(struct weston_head *head);
 
-void
+bool
 weston_head_set_monitor_strings(struct weston_head *head,
 				const char *make,
 				const char *model,
 				const char *serialno);
-void
+bool
 weston_head_set_non_desktop(struct weston_head *head, bool non_desktop);
 
-void
+bool
 weston_head_set_physical_size(struct weston_head *head,
 			      int32_t mm_width, int32_t mm_height);
 
-void
+bool
 weston_head_set_subpixel(struct weston_head *head,
 			 enum wl_output_subpixel sp);
 
-void
+bool
 weston_head_set_transform(struct weston_head *head, uint32_t transform);
 
 void
@@ -177,6 +183,16 @@ void
 weston_head_set_supported_colorimetry_mask(struct weston_head *head,
 					   uint32_t colorimetry_mask);
 
+void
+weston_head_set_supported_vrr_modes_mask(struct weston_head *head,
+					 uint32_t vrr_modes_mask);
+
+void
+weston_head_set_supported_underscan(struct weston_head *head,
+				    uint32_t hborder, uint32_t vborder);
+void
+weston_head_set_supported_color_format_mask(struct weston_head *head,
+					    uint32_t color_format_mask);
 /* weston_output */
 
 void
@@ -223,19 +239,16 @@ weston_output_finish_frame_from_timer(struct weston_output *output);
 /* weston_seat */
 
 void
-notify_axis(struct weston_seat *seat, const struct timespec *time,
-	    struct weston_pointer_axis_event *event);
+notify_axis(const struct weston_pointer_axis_event *event);
 void
 notify_axis_source(struct weston_seat *seat, uint32_t source);
 
 void
-notify_button(struct weston_seat *seat, const struct timespec *time,
-	      int32_t button, enum wl_pointer_button_state state);
+notify_button(const struct weston_pointer_button_event *b_event);
 
 void
-notify_key(struct weston_seat *seat, const struct timespec *time, uint32_t key,
-	   enum wl_keyboard_key_state state,
-	   enum weston_key_state_update update_state);
+notify_key(const struct weston_key_event *key_event);
+
 void
 notify_keyboard_focus_in(struct weston_seat *seat, struct wl_array *keys,
 			 enum weston_key_state_update update_state);
@@ -243,11 +256,8 @@ void
 notify_keyboard_focus_out(struct weston_seat *seat);
 
 void
-notify_motion(struct weston_seat *seat, const struct timespec *time,
-	      struct weston_pointer_motion_event *event);
-void
-notify_motion_absolute(struct weston_seat *seat, const struct timespec *time,
-		       struct weston_coord_global pos);
+notify_motion(const struct weston_pointer_motion_event *event);
+
 void
 notify_modifiers(struct weston_seat *seat, uint32_t serial);
 
@@ -264,22 +274,17 @@ clear_pointer_focus(struct weston_seat *seat);
 /* weston_touch_device */
 
 void
-notify_touch_normalized(struct weston_touch_device *device,
-			const struct timespec *time,
-			int touch_id,
-			const struct weston_coord_global *pos,
-			const struct weston_point2d_device_normalized *norm,
-			int touch_type);
+notify_touch_normalized(const struct weston_touch_event *event,
+			const struct weston_point2d_device_normalized *norm);
 
 /** Feed in touch down, motion, and up events, non-calibratable device.
  *
  * @sa notify_touch_cal
  */
 static inline void
-notify_touch(struct weston_touch_device *device, const struct timespec *time,
-	     int touch_id, const struct weston_coord_global *pos, int touch_type)
+notify_touch(const struct weston_touch_event *event)
 {
-	notify_touch_normalized(device, time, touch_id, pos, NULL, touch_type);
+	notify_touch_normalized(event, NULL);
 }
 
 void
@@ -289,10 +294,8 @@ void
 notify_touch_cancel(struct weston_touch_device *device);
 
 void
-notify_touch_calibrator(struct weston_touch_device *device,
-			const struct timespec *time, int32_t slot,
-			const struct weston_point2d_device_normalized *norm,
-			int touch_type);
+notify_touch_calibrator(const struct weston_touch_event *event,
+			const struct weston_point2d_device_normalized *norm);
 void
 notify_touch_calibrator_cancel(struct weston_touch_device *device);
 void
@@ -340,7 +343,7 @@ void
 notify_tablet_tool_frame(struct weston_tablet_tool *tool,
 			 const struct timespec *time);
 
-bool
+struct weston_paint_node *
 weston_output_flush_damage_for_plane(struct weston_output *output,
 				     struct weston_plane *plane,
 				     pixman_region32_t *damage);

@@ -1,5 +1,5 @@
 /*
- * Copyright © 2013 Intel Corporation
+ * Copyright 2025 Collabora, Ltd.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -23,16 +23,21 @@
  * SOFTWARE.
  */
 
-#ifndef _VAAPI_RECORDER_H_
-#define _VAAPI_RECORDER_H_
+#pragma once
 
-struct vaapi_recorder;
+#include "config.h"
 
-struct vaapi_recorder *
-vaapi_recorder_create(int drm_fd, int width, int height, const char *filename);
-void
-vaapi_recorder_destroy(struct vaapi_recorder *r);
+#include "commit-timing-v1-server-protocol.h"
+
 int
-vaapi_recorder_frame(struct vaapi_recorder *r, int fd, int stride);
+commit_timing_setup(struct weston_compositor *compositor);
 
-#endif /* _VAAPI_RECORDER_H_ */
+bool
+weston_commit_timing_surface_state_ready(struct weston_surface *surface,
+                                         struct weston_surface_state *state);
+
+void
+weston_commit_timing_update_output_targets(struct weston_compositor *compositor);
+
+void
+weston_commit_timing_clear_target(struct weston_commit_timing_target *target);

@@ -83,6 +83,7 @@ struct weston_rdp_backend_config {
 	char *rdp_key;
 	char *server_cert;
 	char *server_key;
+	int vmconnect;
 	int env_socket;
 	bool resizeable;
 	int force_no_compression;
@@ -93,6 +94,7 @@ struct weston_rdp_backend_config {
 	rdp_audio_in_teardown audio_in_teardown;
 	rdp_audio_out_setup audio_out_setup;
 	rdp_audio_out_teardown audio_out_teardown;
+	char *nla_ntlm_db;
 };
 
 #ifdef  __cplusplus

@@ -57,11 +57,9 @@ static void weston_desktop_seat_popup_grab_end(struct weston_desktop_seat *seat)
 
 static void
 weston_desktop_seat_popup_grab_keyboard_key(struct weston_keyboard_grab *grab,
-					    const struct timespec *time,
-					    uint32_t key,
-					    enum wl_keyboard_key_state state)
+					    const struct weston_key_event *key_event)
 {
-	weston_keyboard_send_key(grab->keyboard, time, key, state);
+	weston_keyboard_send_key(grab->keyboard, key_event);
 }
 
 static void
@@ -119,40 +117,38 @@ weston_desktop_seat_popup_grab_pointer_focus(struct weston_pointer_grab *grab)
 
 static void
 weston_desktop_seat_popup_grab_pointer_motion(struct weston_pointer_grab *grab,
-					      const struct timespec *time,
-					      struct weston_pointer_motion_event *event)
+					      const struct weston_pointer_motion_event *event)
 {
-	weston_pointer_send_motion(grab->pointer, time, event);
+	weston_pointer_send_motion(grab->pointer, event);
 }
 
 static void
 weston_desktop_seat_popup_grab_pointer_button(struct weston_pointer_grab *grab,
-					      const struct timespec *time,
-					      uint32_t button,
-					      enum wl_pointer_button_state state)
+					      const struct weston_pointer_button_event *button_event)
 {
 	struct weston_desktop_seat *seat =
 		wl_container_of(grab, seat, popup_grab.pointer);
 	struct weston_pointer *pointer = grab->pointer;
 	bool initial_up = seat->popup_grab.initial_up;
+	enum wl_pointer_button_state state = button_event->button_state;
+	struct timespec time = button_event->base.ts;
 
 	if (state == WL_POINTER_BUTTON_STATE_RELEASED)
 		seat->popup_grab.initial_up = true;
 
 	if (weston_pointer_has_focus_resource(pointer))
-		weston_pointer_send_button(pointer, time, button, state);
+		weston_pointer_send_button(pointer, button_event);
 	else if (state == WL_POINTER_BUTTON_STATE_RELEASED &&
 		 (initial_up ||
-		  (timespec_sub_to_msec(time, &grab->pointer->grab_time) > 500)))
+		  (timespec_sub_to_msec(&time, &grab->pointer->grab_time) > 500)))
 		weston_desktop_seat_popup_grab_end(seat);
 }
 
 static void
 weston_desktop_seat_popup_grab_pointer_axis(struct weston_pointer_grab *grab,
-					    const struct timespec *time,
-					    struct weston_pointer_axis_event *event)
+					    const struct weston_pointer_axis_event *event)
 {
-	weston_pointer_send_axis(grab->pointer, time, event);
+	weston_pointer_send_axis(grab->pointer, event);
 }
 
 static void
@@ -189,28 +185,23 @@ static const struct weston_pointer_grab_interface weston_desktop_seat_pointer_po
 
 static void
 weston_desktop_seat_popup_grab_touch_down(struct weston_touch_grab *grab,
-					  const struct timespec *time,
-					  int touch_id,
-					  struct weston_coord_global pos)
+					  const struct weston_touch_event *event)
 {
-	weston_touch_send_down(grab->touch, time, touch_id, pos);
+	weston_touch_send_down(event);
 }
 
 static void
 weston_desktop_seat_popup_grab_touch_up(struct weston_touch_grab *grab,
-					const struct timespec *time,
-					int touch_id)
+					const struct weston_touch_event *event)
 {
-	weston_touch_send_up(grab->touch, time, touch_id);
+	weston_touch_send_up(event);
 }
 
 static void
 weston_desktop_seat_popup_grab_touch_motion(struct weston_touch_grab *grab,
-					    const struct timespec *time,
-					    int touch_id,
-					    struct weston_coord_global pos)
+					    const struct weston_touch_event *event)
 {
-	weston_touch_send_motion(grab->touch, time, touch_id, pos);
+	weston_touch_send_motion(event);
 }
 
 static void

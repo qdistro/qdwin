@@ -1,5 +1,5 @@
 /*
- * Copyright © 2012 Intel Corporation
+ * Copyright 2025 Collabora, Ltd.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -23,46 +23,16 @@
  * SOFTWARE.
  */
 
-#ifndef _WCAP_DECODE_
-#define _WCAP_DECODE_
+#pragma once
 
-#include <stdint.h>
+#ifdef  __cplusplus
+extern "C" {
+#endif
 
-#define WCAP_HEADER_MAGIC	0x57434150
+#include <libweston/linalg-types.h>
+#include <libweston/linalg-3.h>
+#include <libweston/linalg-4.h>
 
-#define WCAP_FORMAT_XRGB8888	0x34325258
-#define WCAP_FORMAT_XBGR8888	0x34324258
-#define WCAP_FORMAT_RGBX8888	0x34325852
-#define WCAP_FORMAT_BGRX8888	0x34325842
-
-struct wcap_header {
-	uint32_t magic;
-	uint32_t format;
-	uint32_t width, height;
-};
-
-struct wcap_frame_header {
-	uint32_t msecs;
-	uint32_t nrects;
-};
-
-struct wcap_rectangle {
-	int32_t x1, y1, x2, y2;
-};
-
-struct wcap_decoder {
-	int fd;
-	size_t size;
-	void *map, *p, *end;
-	uint32_t *frame;
-	uint32_t format;
-	uint32_t msecs;
-	uint32_t count;
-	int width, height;
-};
-
-int wcap_decoder_get_frame(struct wcap_decoder *decoder);
-struct wcap_decoder *wcap_decoder_create(const char *filename);
-void wcap_decoder_destroy(struct wcap_decoder *decoder);
-
+#ifdef  __cplusplus
+}
 #endif

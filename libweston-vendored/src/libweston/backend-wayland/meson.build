@@ -6,8 +6,6 @@ config_h.set('BUILD_WAYLAND_COMPOSITOR', '1')
 
 srcs_wlwl = [
 	'wayland.c',
-	fullscreen_shell_unstable_v1_client_protocol_h,
-	fullscreen_shell_unstable_v1_protocol_c,
 	presentation_time_protocol_c,
 	presentation_time_server_protocol_h,
 	xdg_shell_client_protocol_h,
@@ -21,7 +19,7 @@ deps_wlwl = [
 	dep_libweston_private,
 	dep_libdrm_headers,
 	dep_lib_cairo_shared,
-	dep_lib_gl_borders,
+	dep_lib_renderer_borders,
 ]
 
 if get_option('renderer-gl')
@@ -31,6 +29,10 @@ if get_option('renderer-gl')
 	endif
 	deps_wlwl += d
 	deps_wlwl += dep_egl # for gl-renderer.h
+endif
+
+if get_option('renderer-vulkan')
+	deps_wlwl += dep_vulkan # for vulkan-renderer.h
 endif
 
 plugin_wlwl = shared_library(

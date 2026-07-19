@@ -216,13 +216,14 @@ struct binding_keyboard_grab {
 };
 
 static void
-binding_key(struct weston_keyboard_grab *grab,
-	    const struct timespec *time, uint32_t key, uint32_t state_w)
+binding_key(struct weston_keyboard_grab *grab, const struct weston_key_event *key_event)
 {
 	struct binding_keyboard_grab *b =
 		container_of(grab, struct binding_keyboard_grab, grab);
 	struct wl_resource *resource;
-	enum wl_keyboard_key_state state = state_w;
+	enum wl_keyboard_key_state state = key_event->key_state;
+	struct timespec time = key_event->base.ts;
+	uint32_t key = key_event->key;
 	uint32_t serial;
 	struct weston_keyboard *keyboard = grab->keyboard;
 	struct wl_display *display = keyboard->seat->compositor->wl_display;
@@ -241,7 +242,7 @@ binding_key(struct weston_keyboard_grab *grab,
 	}
 	if (!wl_list_empty(&keyboard->focus_resource_list)) {
 		serial = wl_display_next_serial(display);
-		msecs = timespec_to_msec(time);
+		msecs = timespec_to_msec(&time);
 		wl_resource_for_each(resource, &keyboard->focus_resource_list) {
 			wl_keyboard_send_key(resource,
 					     serial,
@@ -441,7 +442,7 @@ int
 weston_compositor_run_axis_binding(struct weston_compositor *compositor,
 				   struct weston_pointer *pointer,
 				   const struct timespec *time,
-				   struct weston_pointer_axis_event *event)
+				   const struct weston_pointer_axis_event *event)
 {
 	struct weston_binding *b, *tmp;
 
@@ -491,8 +492,8 @@ struct debug_binding_grab {
 };
 
 static void
-debug_binding_key(struct weston_keyboard_grab *grab, const struct timespec *time,
-		  uint32_t key, uint32_t state)
+debug_binding_key(struct weston_keyboard_grab *grab,
+		  const struct weston_key_event *key_event)
 {
 	struct debug_binding_grab *db = (struct debug_binding_grab *) grab;
 	struct weston_compositor *ec = db->seat->compositor;
@@ -501,6 +502,9 @@ debug_binding_key(struct weston_keyboard_grab *grab, const struct timespec *time
 	uint32_t serial;
 	int send = 0, terminate = 0;
 	int check_binding = 1;
+	struct timespec time = key_event->base.ts;
+	uint32_t key = key_event->key;
+	uint32_t state = key_event->key_state;
 	int i;
 	struct wl_list *resource_list;
 	uint32_t msecs;
@@ -535,7 +539,7 @@ debug_binding_key(struct weston_keyboard_grab *grab, const struct timespec *time
 
 	if (check_binding) {
 		if (weston_compositor_run_debug_binding(ec, grab->keyboard,
-							time, key, state)) {
+							&time, key, state)) {
 			/* We ran a binding so swallow the press and keep the
 			 * grab to swallow the released too. */
 			send = 0;
@@ -552,7 +556,7 @@ debug_binding_key(struct weston_keyboard_grab *grab, const struct timespec *time
 	if (send) {
 		serial = wl_display_next_serial(display);
 		resource_list = &grab->keyboard->focus_resource_list;
-		msecs = timespec_to_msec(time);
+		msecs = timespec_to_msec(&time);
 		wl_resource_for_each(resource, resource_list) {
 			wl_keyboard_send_key(resource, serial, msecs, key, state);
 		}

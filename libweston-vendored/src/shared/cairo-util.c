@@ -45,16 +45,6 @@
 #include <pango/pangocairo.h>
 #endif
 
-void
-surface_flush_device(cairo_surface_t *surface)
-{
-	cairo_device_t *device;
-
-	device = cairo_surface_get_device(surface);
-	if (device)
-		cairo_device_flush(device);
-}
-
 static int
 blur_surface(cairo_surface_t *surface, int margin)
 {
@@ -556,6 +546,8 @@ theme_render_frame(struct theme *t,
 
 	if (flags & THEME_FRAME_MAXIMIZED)
 		margin = 0;
+	else if (flags & THEME_FRAME_NO_SHADOW)
+		margin = t->margin;
 	else {
 		render_shadow(cr, t->shadow,
 			      2, 2, width + 8, height + 8,

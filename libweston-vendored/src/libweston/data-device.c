@@ -445,13 +445,6 @@ drag_surface_configure(struct weston_drag *drag,
 	weston_view_set_position_with_offset(drag->icon, pos, drag->offset);
 }
 
-static int
-pointer_drag_surface_get_label(struct weston_surface *surface,
-			       char *buf, size_t len)
-{
-	return snprintf(buf, len, "pointer drag icon");
-}
-
 static void
 pointer_drag_surface_committed(struct weston_surface *es,
 			       struct weston_coord_surface new_origin)
@@ -462,13 +455,6 @@ pointer_drag_surface_committed(struct weston_surface *es,
 	assert(es->committed == pointer_drag_surface_committed);
 
 	drag_surface_configure(&drag->base, pointer, NULL, es, new_origin);
-}
-
-static int
-touch_drag_surface_get_label(struct weston_surface *surface,
-			     char *buf, size_t len)
-{
-	return snprintf(buf, len, "touch drag icon");
 }
 
 static void
@@ -605,8 +591,7 @@ drag_grab_focus(struct weston_pointer_grab *grab)
 
 static void
 drag_grab_motion(struct weston_pointer_grab *grab,
-		 const struct timespec *time,
-		 struct weston_pointer_motion_event *event)
+		 const struct weston_pointer_motion_event *event)
 {
 	struct weston_pointer_drag *drag =
 		container_of(grab, struct weston_pointer_drag, grab);
@@ -624,7 +609,7 @@ drag_grab_motion(struct weston_pointer_grab *grab,
 	if (drag->base.focus_resource) {
 		struct weston_coord_surface surf_pos;
 
-		msecs = timespec_to_msec(time);
+		msecs = timespec_to_msec(&event->base.ts);
 		surf_pos = weston_coord_global_to_surface(drag->base.focus,
 							  pointer->pos);
 
@@ -643,7 +628,7 @@ data_device_end_drag_grab(struct weston_drag *drag,
 			weston_view_unmap(drag->icon);
 
 		drag->icon->surface->committed = NULL;
-		weston_surface_set_label_func(drag->icon->surface, NULL);
+		weston_surface_set_label(drag->icon->surface, NULL);
 		pixman_region32_clear(&drag->icon->surface->pending.input);
 		wl_list_remove(&drag->icon_destroy_listener.link);
 		weston_view_destroy(drag->icon);
@@ -667,17 +652,16 @@ data_device_end_pointer_drag_grab(struct weston_pointer_drag *drag)
 
 static void
 drag_grab_button(struct weston_pointer_grab *grab,
-		 const struct timespec *time,
-		 uint32_t button, uint32_t state_w)
+		 const struct weston_pointer_button_event *button_event)
 {
 	struct weston_pointer_drag *drag =
 		container_of(grab, struct weston_pointer_drag, grab);
 	struct weston_pointer *pointer = drag->grab.pointer;
-	enum wl_pointer_button_state state = state_w;
+	enum wl_pointer_button_state state = button_event->button_state;
 	struct weston_data_source *data_source = drag->base.data_source;
 
 	if (data_source &&
-	    pointer->grab_button == button &&
+	    pointer->grab_button == button_event->button &&
 	    state == WL_POINTER_BUTTON_STATE_RELEASED) {
 		if (drag->base.focus_resource &&
 		    data_source->accepted &&
@@ -709,8 +693,7 @@ drag_grab_button(struct weston_pointer_grab *grab,
 
 static void
 drag_grab_axis(struct weston_pointer_grab *grab,
-	       const struct timespec *time,
-	       struct weston_pointer_axis_event *event)
+	       const struct weston_pointer_axis_event *event)
 {
 }
 
@@ -747,9 +730,7 @@ static const struct weston_pointer_grab_interface pointer_drag_grab_interface = 
 };
 
 static void
-drag_grab_touch_down(struct weston_touch_grab *grab,
-		     const struct timespec *time, int touch_id,
-		     struct weston_coord_global c)
+drag_grab_touch_down(struct weston_touch_grab *grab, const struct weston_touch_event *event)
 {
 }
 
@@ -767,14 +748,13 @@ data_device_end_touch_drag_grab(struct weston_touch_drag *drag)
 }
 
 static void
-drag_grab_touch_up(struct weston_touch_grab *grab,
-		   const struct timespec *time, int touch_id)
+drag_grab_touch_up(struct weston_touch_grab *grab, const struct weston_touch_event *event)
 {
+	struct weston_touch *touch = grab->touch;
 	struct weston_touch_drag *touch_drag =
 		container_of(grab, struct weston_touch_drag, grab);
-	struct weston_touch *touch = grab->touch;
 
-	if (touch_id != touch->grab_touch_id)
+	if (event->touch_id != touch->grab_touch_id)
 		return;
 
 	if (touch_drag->base.focus_resource)
@@ -795,16 +775,14 @@ drag_grab_touch_focus(struct weston_touch_drag *drag)
 }
 
 static void
-drag_grab_touch_motion(struct weston_touch_grab *grab,
-		       const struct timespec *time,
-		       int touch_id, struct weston_coord_global unused)
+drag_grab_touch_motion(struct weston_touch_grab *grab, const struct weston_touch_event *event)
 {
+	struct weston_touch *touch = grab->touch;
 	struct weston_touch_drag *touch_drag =
 		container_of(grab, struct weston_touch_drag, grab);
-	struct weston_touch *touch = grab->touch;
 	uint32_t msecs;
 
-	if (touch_id != touch->grab_touch_id)
+	if (event->touch_id != touch->grab_touch_id)
 		return;
 
 	drag_grab_touch_focus(touch_drag);
@@ -816,7 +794,7 @@ drag_grab_touch_motion(struct weston_touch_grab *grab,
 	if (touch_drag->base.focus_resource) {
 		struct weston_coord_surface surf_pos;
 
-		msecs = timespec_to_msec(time);
+		msecs = timespec_to_msec(&event->base.ts);
 		surf_pos = weston_coord_global_to_surface(touch_drag->base.focus,
 							  touch->grab_pos);
 		wl_data_device_send_motion(touch_drag->base.focus_resource,
@@ -852,7 +830,7 @@ static const struct weston_touch_grab_interface touch_drag_grab_interface = {
 
 static void
 drag_grab_keyboard_key(struct weston_keyboard_grab *grab,
-		       const struct timespec *time, uint32_t key, uint32_t state)
+		       const struct weston_key_event *key_event)
 {
 }
 
@@ -955,8 +933,7 @@ weston_pointer_start_drag(struct weston_pointer *pointer,
 
 		icon->committed = pointer_drag_surface_committed;
 		icon->committed_private = drag;
-		weston_surface_set_label_func(icon,
-					pointer_drag_surface_get_label);
+		weston_surface_set_label_static(icon, "pointer drag icon");
 		drag->base.offset = weston_coord_surface(0, 0, icon);
 	} else {
 		drag->base.icon = NULL;
@@ -1019,8 +996,7 @@ weston_touch_start_drag(struct weston_touch *touch,
 
 		icon->committed = touch_drag_surface_committed;
 		icon->committed_private = drag;
-		weston_surface_set_label_func(icon,
-					touch_drag_surface_get_label);
+		weston_surface_set_label_static(icon, "touch drag icon");
 		drag->base.offset = weston_coord_surface(0, 0, icon);
 	} else {
 		drag->base.icon = NULL;

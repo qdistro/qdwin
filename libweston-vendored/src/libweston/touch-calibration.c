@@ -64,7 +64,7 @@ struct weston_touch_calibrator {
 };
 
 static struct weston_touch_calibrator *
-calibrator_from_device(struct weston_touch_device *device)
+calibrator_from_device(const struct weston_touch_device *device)
 {
 	return device->aggregate->seat->compositor->touch_calibrator;
 }
@@ -86,10 +86,8 @@ normalized_is_valid(const struct weston_point2d_device_normalized *p)
 }
 
 WL_EXPORT void
-notify_touch_calibrator(struct weston_touch_device *device,
-			const struct timespec *time, int32_t slot,
-			const struct weston_point2d_device_normalized *norm,
-			int touch_type)
+notify_touch_calibrator(const struct weston_touch_event *event,
+			const struct weston_point2d_device_normalized *norm)
 {
 	struct weston_touch_calibrator *calibrator;
 	struct wl_resource *res;
@@ -97,15 +95,15 @@ notify_touch_calibrator(struct weston_touch_device *device,
 	uint32_t x = 0;
 	uint32_t y = 0;
 
-	calibrator = calibrator_from_device(device);
+	calibrator = calibrator_from_device(event->device);
 	if (!calibrator)
 		return;
 
 	res = calibrator->resource;
 
 	/* Ignore any touch events coming from another device */
-	if (device != calibrator->device) {
-		if (touch_type == WL_TOUCH_DOWN)
+	if (event->device != calibrator->device) {
+		if (event->touch_type == WL_TOUCH_DOWN)
 			weston_touch_calibrator_send_invalid_touch(res);
 		return;
 	}
@@ -115,20 +113,20 @@ notify_touch_calibrator(struct weston_touch_device *device,
 	 */
 	if (calibrator->touch_cancelled) {
 		if (calibrator->device->aggregate->num_tp == 0) {
-			assert(touch_type == WL_TOUCH_UP);
+			assert(event->touch_type == WL_TOUCH_UP);
 			calibrator->touch_cancelled = false;
 		}
 		return;
 	}
 
-	msecs = timespec_to_msec(time);
-	if (touch_type != WL_TOUCH_UP) {
+	msecs = timespec_to_msec(&event->base.ts);
+	if (event->touch_type != WL_TOUCH_UP) {
 		if (normalized_is_valid(norm)) {
 			x = wire_uint_from_double(norm->x);
 			y = wire_uint_from_double(norm->y);
 		} else {
 			/* Coordinates are out of bounds */
-			if (touch_type == WL_TOUCH_MOTION) {
+			if (event->touch_type == WL_TOUCH_MOTION) {
 				weston_touch_calibrator_send_cancel(res);
 				calibrator->touch_cancelled = true;
 			}
@@ -137,15 +135,15 @@ notify_touch_calibrator(struct weston_touch_device *device,
 		}
 	}
 
-	switch (touch_type) {
+	switch (event->touch_type) {
 	case WL_TOUCH_UP:
-		weston_touch_calibrator_send_up(res, msecs, slot);
+		weston_touch_calibrator_send_up(res, msecs, event->touch_id);
 		break;
 	case WL_TOUCH_DOWN:
-		weston_touch_calibrator_send_down(res, msecs, slot, x, y);
+		weston_touch_calibrator_send_down(res, msecs, event->touch_id, x, y);
 		break;
 	case WL_TOUCH_MOTION:
-		weston_touch_calibrator_send_motion(res, msecs, slot, x, y);
+		weston_touch_calibrator_send_motion(res, msecs, event->touch_id, x, y);
 		break;
 	default:
 		return;

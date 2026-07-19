@@ -413,6 +413,10 @@ clipboard_process_html(struct rdp_clipboard_data_source *source, bool is_send)
 		strcat(buf, rdp_clipboard_html_fragment_end);
 		strcat(buf, cur);
 
+		if (fragment_start >= 100000000u ||
+		    fragment_end   >= 100000000u)
+			goto error_return;
+
 		cur = buf + RDP_CLIPBOARD_FRAGMENT_START_OFFSET;
 		sprintf(cur, "%08u", fragment_start);
 		*(cur+8) = '\r';

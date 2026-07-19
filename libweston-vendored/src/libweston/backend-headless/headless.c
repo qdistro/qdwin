@@ -42,7 +42,8 @@
 #include "pixel-formats.h"
 #include "pixman-renderer.h"
 #include "renderer-gl/gl-renderer.h"
-#include "gl-borders.h"
+#include "renderer-vulkan/vulkan-renderer.h"
+#include "renderer-borders.h"
 #include "shared/weston-drm-fourcc.h"
 #include "shared/weston-egl-ext.h"
 #include "shared/cairo-util.h"
@@ -69,6 +70,9 @@ struct headless_backend {
 
 	int refresh;
 	bool repaint_only_on_capture;
+	enum weston_output_fb_alpha_encoding output_fb_alpha_encoding;
+
+	bool use_fake_seat;
 };
 
 struct headless_head {
@@ -81,12 +85,10 @@ struct headless_output {
 
 	struct weston_mode mode;
 	struct wl_event_source *finish_frame_timer;
-	struct weston_renderbuffer *renderbuffer;
+	weston_renderbuffer_t renderbuffer;
 
 	struct frame *frame;
-	struct {
-		struct weston_gl_borders borders;
-	} gl;
+	struct weston_renderer_borders borders;
 };
 
 static const uint32_t headless_formats[] = {
@@ -144,15 +146,15 @@ finish_frame_handler(void *data)
 }
 
 static void
-headless_output_update_gl_border(struct headless_output *output)
+headless_output_update_renderer_border(struct headless_output *output)
 {
 	if (!output->frame)
 		return;
 	if (!(frame_status(output->frame) & FRAME_STATUS_REPAINT))
 		return;
 
-	weston_gl_borders_update(&output->gl.borders, output->frame,
-				 &output->base);
+	weston_renderer_borders_update(&output->borders, output->frame,
+				       &output->base);
 }
 
 static int
@@ -161,13 +163,12 @@ headless_output_repaint(struct weston_output *output_base)
 	struct headless_output *output = to_headless_output(output_base);
 	struct weston_compositor *ec;
 	pixman_region32_t damage;
-	int delay_msec;
 
 	assert(output);
 
 	ec = output->base.compositor;
 
-	headless_output_update_gl_border(output);
+	headless_output_update_renderer_border(output);
 
 	pixman_region32_init(&damage);
 
@@ -178,8 +179,7 @@ headless_output_repaint(struct weston_output *output_base)
 
 	pixman_region32_fini(&damage);
 
-	delay_msec = millihz_to_nsec(output->mode.refresh) / 1000000;
-	wl_event_source_timer_update(output->finish_frame_timer, delay_msec);
+	weston_output_arm_frame_timer(output_base, output->finish_frame_timer);
 
 	return 0;
 }
@@ -190,11 +190,29 @@ headless_output_disable_gl(struct headless_output *output)
 	struct weston_compositor *compositor = output->base.compositor;
 	const struct weston_renderer *renderer = compositor->renderer;
 
-	weston_gl_borders_fini(&output->gl.borders, &output->base);
+	weston_renderer_borders_fini(&output->borders, &output->base);
 
-	weston_renderbuffer_unref(output->renderbuffer);
+	renderer->destroy_renderbuffer(output->renderbuffer);
 	output->renderbuffer = NULL;
 	renderer->gl->output_destroy(&output->base);
+
+	if (output->frame) {
+		frame_destroy(output->frame);
+		output->frame = NULL;
+	}
+}
+
+static void
+headless_output_disable_vulkan(struct headless_output *output)
+{
+	struct weston_compositor *compositor = output->base.compositor;
+	const struct weston_renderer *renderer = compositor->renderer;
+
+	weston_renderer_borders_fini(&output->borders, &output->base);
+
+	renderer->destroy_renderbuffer(output->renderbuffer);
+	output->renderbuffer = NULL;
+	renderer->vulkan->output_destroy(&output->base);
 
 	if (output->frame) {
 		frame_destroy(output->frame);
@@ -207,7 +225,7 @@ headless_output_disable_pixman(struct headless_output *output)
 {
 	struct weston_renderer *renderer = output->base.compositor->renderer;
 
-	weston_renderbuffer_unref(output->renderbuffer);
+	renderer->destroy_renderbuffer(output->renderbuffer);
 	output->renderbuffer = NULL;
 	renderer->pixman->output_destroy(&output->base);
 }
@@ -230,6 +248,9 @@ headless_output_disable(struct weston_output *base)
 	switch (b->compositor->renderer->type) {
 	case WESTON_RENDERER_GL:
 		headless_output_disable_gl(output);
+		break;
+	case WESTON_RENDERER_VULKAN:
+		headless_output_disable_vulkan(output);
 		break;
 	case WESTON_RENDERER_PIXMAN:
 		headless_output_disable_pixman(output);
@@ -301,9 +322,8 @@ headless_output_enable_gl(struct headless_output *output)
 	}
 
 	output->renderbuffer =
-		renderer->gl->create_fbo(&output->base, b->formats[0],
-					 options.fb_size.width,
-					 options.fb_size.height, NULL);
+		renderer->create_renderbuffer(&output->base, b->formats[0],
+					      NULL, 0, NULL, NULL);
 	if (!output->renderbuffer)
 		goto err_renderbuffer;
 
@@ -316,9 +336,66 @@ err_renderbuffer:
 }
 
 static int
+headless_output_enable_vulkan(struct headless_output *output)
+{
+	struct headless_backend *b = output->backend;
+	const struct weston_renderer *renderer = b->compositor->renderer;
+	const struct weston_mode *mode = output->base.current_mode;
+	struct vulkan_renderer_surfaceless_options options = { 0 };
+
+	if (b->decorate) {
+		/*
+		 * Start with a dummy exterior size and then resize, because
+		 * there is no frame_create() with interior size.
+		 */
+		output->frame = frame_create(b->theme, 100, 100,
+					     FRAME_BUTTON_CLOSE, NULL, NULL);
+		if (!output->frame) {
+			weston_log("failed to create frame for output\n");
+			return -1;
+		}
+		frame_resize_inside(output->frame, mode->width, mode->height);
+
+		options.fb_size.width = frame_width(output->frame);
+		options.fb_size.height = frame_height(output->frame);
+		frame_interior(output->frame, &options.area.x, &options.area.y,
+			       &options.area.width, &options.area.height);
+	} else {
+		options.area.x = 0;
+		options.area.y = 0;
+		options.area.width = mode->width;
+		options.area.height = mode->height;
+		options.fb_size.width = mode->width;
+		options.fb_size.height = mode->height;
+	}
+
+	if (renderer->vulkan->output_surfaceless_create(&output->base, &options) < 0) {
+		weston_log("failed to create vulkan renderer output state\n");
+		if (output->frame) {
+			frame_destroy(output->frame);
+			output->frame = NULL;
+		}
+		return -1;
+	}
+
+	output->renderbuffer =
+		renderer->create_renderbuffer(&output->base, b->formats[0],
+					      NULL, 0, NULL, NULL);
+	if (!output->renderbuffer)
+		goto err_renderbuffer;
+
+	return 0;
+
+err_renderbuffer:
+	renderer->vulkan->output_destroy(&output->base);
+
+	return -1;
+}
+
+static int
 headless_output_enable_pixman(struct headless_output *output)
 {
-	const struct pixman_renderer_interface *pixman;
+	struct weston_renderer *renderer = output->base.compositor->renderer;
 	const struct pixman_renderer_output_options options = {
 		.use_shadow = true,
 		.fb_size = {
@@ -328,22 +405,19 @@ headless_output_enable_pixman(struct headless_output *output)
 		.format = pixel_format_get_info(headless_formats[0])
 	};
 
-	pixman = output->base.compositor->renderer->pixman;
-
-	if (pixman->output_create(&output->base, &options) < 0)
+	if (renderer->pixman->output_create(&output->base, &options) < 0)
 		return -1;
 
 	output->renderbuffer =
-		pixman->create_image(&output->base, options.format,
-				     output->base.current_mode->width,
-				     output->base.current_mode->height);
+		renderer->create_renderbuffer(&output->base, options.format,
+					      NULL, 0, NULL, NULL);
 	if (!output->renderbuffer)
 		goto err_renderer;
 
 	return 0;
 
 err_renderer:
-	pixman->output_destroy(&output->base);
+	renderer->pixman->output_destroy(&output->base);
 
 	return -1;
 }
@@ -373,6 +447,9 @@ headless_output_enable(struct weston_output *base)
 	case WESTON_RENDERER_GL:
 		ret = headless_output_enable_gl(output);
 		break;
+	case WESTON_RENDERER_VULKAN:
+		ret = headless_output_enable_vulkan(output);
+		break;
 	case WESTON_RENDERER_PIXMAN:
 		ret = headless_output_enable_pixman(output);
 		break;
@@ -388,6 +465,19 @@ headless_output_enable(struct weston_output *base)
 	}
 
 	return 0;
+}
+
+static void
+headless_set_dpms(struct weston_output *base, enum dpms_enum level)
+{
+	struct headless_output *output = to_headless_output(base);
+
+	if (level == WESTON_DPMS_ON)
+		weston_output_schedule_repaint(base);
+	else if (output->base.repaint_status == REPAINT_AWAITING_COMPLETION) {
+		wl_event_source_timer_update(output->finish_frame_timer, 0);
+		weston_output_schedule_repaint_reset(base);
+	}
 }
 
 static int
@@ -438,7 +528,7 @@ headless_output_set_size(struct weston_output *base,
 	output->base.repaint = headless_output_repaint;
 	output->base.assign_planes = NULL;
 	output->base.set_backlight = NULL;
-	output->base.set_dpms = NULL;
+	output->base.set_dpms = headless_set_dpms;
 	output->base.switch_mode = NULL;
 
 	return 0;
@@ -465,6 +555,7 @@ headless_output_create(struct weston_backend *backend, const char *name)
 	output->base.enable = headless_output_enable;
 	output->base.attach_head = NULL;
 	output->base.repaint_only_on_capture = b->repaint_only_on_capture;
+	output->base.fb_alpha_encoding = b->output_fb_alpha_encoding;
 
 	output->backend = b;
 
@@ -518,6 +609,25 @@ headless_head_destroy(struct weston_head *base)
 	free(head);
 }
 
+static bool
+headless_input_create(struct headless_backend *b)
+{
+	weston_seat_init(&b->fake_seat, b->compositor, "default");
+
+	weston_seat_init_pointer(&b->fake_seat);
+
+	if (weston_seat_init_keyboard(&b->fake_seat, NULL) < 0)
+		return false;
+
+	return true;
+}
+
+static void
+headless_input_destroy(struct headless_backend *b)
+{
+	weston_seat_release(&b->fake_seat);
+}
+
 static void
 headless_destroy(struct weston_backend *backend)
 {
@@ -535,8 +645,8 @@ headless_destroy(struct weston_backend *backend)
 	if (b->theme)
 		theme_destroy(b->theme);
 
-	/* qdistro patch: release the inert seat created in headless_backend_create. */
-	weston_seat_release(&b->fake_seat);
+	if (b->use_fake_seat)
+		headless_input_destroy(b);
 
 	free(b->formats);
 	free(b);
@@ -569,10 +679,17 @@ headless_backend_create(struct weston_compositor *compositor,
 	b->base.supported_presentation_clocks =
 			WESTON_PRESENTATION_CLOCKS_SOFTWARE;
 
+	if (config->fake_seat) {
+		b->use_fake_seat = headless_input_create(b);
+		if (!b->use_fake_seat)
+			goto err_free;
+	}
+
 	b->base.destroy = headless_destroy;
 	b->base.create_output = headless_output_create;
 
 	b->decorate = config->decorate;
+	b->output_fb_alpha_encoding = config->output_fb_alpha_encoding;
 	if (b->decorate) {
 		b->theme = theme_create();
 		if (!b->theme) {
@@ -583,12 +700,6 @@ headless_backend_create(struct weston_compositor *compositor,
 
 	b->formats_count = ARRAY_LENGTH(headless_formats);
 	b->formats = pixel_format_get_array(headless_formats, b->formats_count);
-
-	/* qdistro patch: synthesize an inert wl_seat so toolkit clients
-	 * (GTK 3+, Qt) don't crash on a missing seat global in headless
-	 * test runs. No input devices are wired up, so capabilities stay
-	 * zero — the seat exists for protocol-conformance only. */
-	weston_seat_init(&b->fake_seat, compositor, "default");
 
 	/* Wayland event source's timeout has a granularity of the order of
 	 * milliseconds so the highest supported rate is 1 kHz. 0 is a special
@@ -613,6 +724,16 @@ headless_backend_create(struct weston_compositor *compositor,
 			};
 			ret = weston_compositor_init_renderer(compositor,
 							      WESTON_RENDERER_GL,
+							      &options.base);
+			break;
+		}
+		case WESTON_RENDERER_VULKAN: {
+			const struct vulkan_renderer_display_options options = {
+				.formats = b->formats,
+				.formats_count = b->formats_count,
+			};
+			ret = weston_compositor_init_renderer(compositor,
+							      WESTON_RENDERER_VULKAN,
 							      &options.base);
 			break;
 		}
@@ -663,6 +784,8 @@ err_input:
 	if (b->theme)
 		theme_destroy(b->theme);
 err_free:
+	if (b->use_fake_seat)
+		headless_input_destroy(b);
 	wl_list_remove(&b->base.link);
 	free(b);
 	return NULL;
@@ -672,6 +795,8 @@ static void
 config_init_to_defaults(struct weston_headless_backend_config *config)
 {
 	config->refresh = DEFAULT_OUTPUT_REPAINT_REFRESH;
+	config->fake_seat = false;
+	config->output_fb_alpha_encoding = WESTON_OUTPUT_FB_ALPHA_PREMULT;
 }
 
 WL_EXPORT int

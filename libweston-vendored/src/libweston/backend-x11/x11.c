@@ -57,6 +57,7 @@
 #include "shared/timespec-util.h"
 #include "shared/file-util.h"
 #include "renderer-gl/gl-renderer.h"
+#include "renderer-vulkan/vulkan-renderer.h"
 #include "shared/weston-drm-fourcc.h"
 #include "shared/weston-egl-ext.h"
 #include "shared/xalloc.h"
@@ -140,7 +141,7 @@ struct x11_output {
 
 	xcb_gc_t		gc;
 	xcb_shm_seg_t		segment;
-	struct weston_renderbuffer *renderbuffer;
+	weston_renderbuffer_t	renderbuffer;
 	int			shm_id;
 	void		       *buf;
 	uint8_t			depth;
@@ -167,6 +168,10 @@ to_x11_head(struct weston_head *base)
 
 static void
 x11_output_destroy(struct weston_output *base);
+
+static int
+x11_output_init_shm(struct x11_backend *b, struct x11_output *output,
+		    const struct pixel_format_info *pfmt);
 
 static inline struct x11_output *
 to_x11_output(struct weston_output *base)
@@ -451,6 +456,29 @@ x11_output_repaint_gl(struct weston_output *output_base)
 	return 0;
 }
 
+static int
+x11_output_repaint_vulkan(struct weston_output *output_base)
+{
+	struct x11_output *output = to_x11_output(output_base);
+	struct weston_compositor *ec;
+	pixman_region32_t damage;
+
+	assert(output);
+
+	ec = output->base.compositor;
+
+	pixman_region32_init(&damage);
+
+	weston_output_flush_damage_for_primary_plane(output_base, &damage);
+
+	ec->renderer->repaint_output(output_base, &damage, NULL);
+
+	pixman_region32_fini(&damage);
+
+	weston_output_arm_frame_timer(output_base, output->finish_frame_timer);
+	return 0;
+}
+
 static void
 set_clip_for_output(struct weston_output *output_base, pixman_region32_t *region)
 {
@@ -507,8 +535,6 @@ static int
 x11_output_repaint_shm(struct weston_output *output_base)
 {
 	struct x11_output *output = to_x11_output(output_base);
-	const struct weston_renderer *renderer;
-	pixman_image_t *image;
 	struct weston_compositor *ec;
 	struct x11_backend *b;
 	xcb_void_cookie_t cookie;
@@ -518,10 +544,7 @@ x11_output_repaint_shm(struct weston_output *output_base)
 	assert(output);
 
 	ec = output->base.compositor;
-	renderer = ec->renderer;
 	b = output->backend;
-
-	image = renderer->pixman->renderbuffer_get_image(output->renderbuffer);
 
 	pixman_region32_init(&damage);
 
@@ -534,13 +557,13 @@ x11_output_repaint_shm(struct weston_output *output_base)
 	pixman_region32_fini(&damage);
 
 	cookie = xcb_shm_put_image_checked(b->conn, output->window, output->gc,
-					pixman_image_get_width(image),
-					pixman_image_get_height(image),
-					0, 0,
-					pixman_image_get_width(image),
-					pixman_image_get_height(image),
-					0, 0, output->depth, XCB_IMAGE_FORMAT_Z_PIXMAP,
-					0, output->segment, 0);
+					   output_base->current_mode->width,
+					   output_base->current_mode->height,
+					   0, 0,
+					   output_base->current_mode->width,
+					   output_base->current_mode->height,
+					   0, 0, output->depth, XCB_IMAGE_FORMAT_Z_PIXMAP,
+					   0, output->segment, 0);
 	err = xcb_request_check(b->conn, cookie);
 	if (err != NULL) {
 		weston_log("Failed to put shm image, err: %d\n", err->error_code);
@@ -568,7 +591,7 @@ x11_output_deinit_shm(struct x11_backend *b, struct x11_output *output)
 	xcb_generic_error_t *err;
 	xcb_free_gc(b->conn, output->gc);
 
-	weston_renderbuffer_unref(output->renderbuffer);
+	b->compositor->renderer->destroy_renderbuffer(output->renderbuffer);
 	output->renderbuffer = NULL;
 	cookie = xcb_shm_detach_checked(b->conn, output->segment);
 	err = xcb_request_check(b->conn, cookie);
@@ -793,17 +816,40 @@ x11_output_get_shm_pixel_format(struct x11_output *output)
 	}
 }
 
+static bool
+x11_rb_discarded_cb(weston_renderbuffer_t rb, void *data)
+{
+	struct x11_output *output = (struct x11_output *) data;
+	const struct pixel_format_info *pfmt;
+
+	if (output->base.compositor->renderer->type == WESTON_RENDERER_PIXMAN) {
+		x11_output_deinit_shm(output->backend, output);
+		pfmt = x11_output_get_shm_pixel_format(output);
+		if (!pfmt)
+			return false;
+		if (x11_output_init_shm(output->backend, output, pfmt) < 0) {
+			weston_log("Failed to initialize SHM for the X11 output\n");
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static int
 x11_output_init_shm(struct x11_backend *b, struct x11_output *output,
-		    const struct pixel_format_info *pfmt, int width, int height)
+		    const struct pixel_format_info *pfmt)
 {
 	struct weston_renderer *renderer = output->base.compositor->renderer;
 	int bitsperpixel = pfmt->bpp;
+	size_t size = output->base.current_mode->width *
+		output->base.current_mode->height * (bitsperpixel / 8);
+	int stride = output->base.current_mode->width * (bitsperpixel / 8);
 	xcb_void_cookie_t cookie;
 	xcb_generic_error_t *err;
 
 	/* Create SHM segment and attach it */
-	output->shm_id = shmget(IPC_PRIVATE, width * height * (bitsperpixel / 8), IPC_CREAT | S_IRWXU);
+	output->shm_id = shmget(IPC_PRIVATE, size, IPC_CREAT | S_IRWXU);
 	if (output->shm_id == -1) {
 		weston_log("x11shm: failed to allocate SHM segment\n");
 		return -1;
@@ -827,15 +873,27 @@ x11_output_init_shm(struct x11_backend *b, struct x11_output *output,
 
 	/* Now create pixman image */
 	output->renderbuffer =
-		renderer->pixman->create_image_from_ptr(&output->base,
-							pfmt, width, height,
-							output->buf,
-							width * (bitsperpixel / 8));
+		renderer->create_renderbuffer(&output->base, pfmt, output->buf,
+					      stride, x11_rb_discarded_cb,
+					      output);
 
 	output->gc = xcb_generate_id(b->conn);
 	xcb_create_gc(b->conn, output->gc, output->window, 0, NULL);
 
 	return 0;
+}
+
+static void
+x11_set_dpms(struct weston_output *base, enum dpms_enum level)
+{
+	struct x11_output *output = to_x11_output(base);
+
+	if (level == WESTON_DPMS_ON)
+		weston_output_schedule_repaint(base);
+	else if (output->base.repaint_status == REPAINT_AWAITING_COMPLETION) {
+		wl_event_source_timer_update(output->finish_frame_timer, 0);
+		weston_output_schedule_repaint_reset(base);
+	}
 }
 
 static int
@@ -875,20 +933,8 @@ x11_output_switch_mode(struct weston_output *base, struct weston_mode *mode)
 	fb_size.width = output->mode.width = mode->width;
 	fb_size.height = output->mode.height = mode->height;
 
-	weston_renderer_resize_output(&output->base, &fb_size, NULL);
-
-	if (base->compositor->renderer->type == WESTON_RENDERER_PIXMAN) {
-		const struct pixel_format_info *pfmt;
-		x11_output_deinit_shm(b, output);
-		pfmt = x11_output_get_shm_pixel_format(output);
-		if (!pfmt)
-			return -1;
-		if (x11_output_init_shm(b, output, pfmt,
-					fb_size.width, fb_size.height) < 0) {
-			weston_log("Failed to initialize SHM for the X11 output\n");
-			return -1;
-		}
-	}
+	if (!weston_renderer_resize_output(&output->base, &fb_size, NULL))
+		return -1;
 
 	output->resize_pending = false;
 	output->window_resized = false;
@@ -919,6 +965,9 @@ x11_output_disable(struct weston_output *base)
 		break;
 	case WESTON_RENDERER_GL:
 		renderer->gl->output_destroy(&output->base);
+		break;
+	case WESTON_RENDERER_VULKAN:
+		renderer->vulkan->output_destroy(&output->base);
 		break;
 	default:
 		unreachable("invalid renderer");
@@ -1068,8 +1117,7 @@ x11_output_enable(struct weston_output *base)
 			weston_log("Failed to create pixman renderer for output\n");
 			goto err;
 		}
-		if (x11_output_init_shm(b, output, options.format,
-					mode->width, mode->height) < 0) {
+		if (x11_output_init_shm(b, output, options.format) < 0) {
 			weston_log("Failed to initialize SHM for the X11 output\n");
 			renderer->pixman->output_destroy(&output->base);
 			goto err;
@@ -1102,6 +1150,29 @@ x11_output_enable(struct weston_output *base)
 		output->base.repaint = x11_output_repaint_gl;
 		break;
 	}
+	case WESTON_RENDERER_VULKAN: {
+		struct vulkan_renderer_surface_options options = {
+			.formats = b->formats,
+			.formats_count = b->formats_count,
+			.area.x = 0,
+			.area.y = 0,
+			.area.width = mode->width,
+			.area.height = mode->height,
+			.fb_size.width = mode->width,
+			.fb_size.height = mode->height,
+		};
+
+		options.xcb_connection = b->conn;
+		options.xcb_visualid = screen->root_visual;
+		options.xcb_window = output->window;
+
+		ret = renderer->vulkan->output_surface_create(base, &options);
+		if (ret < 0)
+			goto err;
+
+		output->base.repaint = x11_output_repaint_vulkan;
+		break;
+	}
 	default:
 		unreachable("invalid renderer");
 	}
@@ -1109,7 +1180,7 @@ x11_output_enable(struct weston_output *base)
 	output->base.start_repaint_loop = x11_output_start_repaint_loop;
 	output->base.assign_planes = NULL;
 	output->base.set_backlight = NULL;
-	output->base.set_dpms = NULL;
+	output->base.set_dpms = x11_set_dpms;
 	output->base.switch_mode = x11_output_switch_mode;
 
 	loop = wl_display_get_event_loop(b->compositor->wl_display);
@@ -1343,6 +1414,7 @@ x11_backend_deliver_button_event(struct x11_backend *b,
 	uint32_t button;
 	struct x11_output *output;
 	struct weston_pointer_axis_event weston_event;
+	struct weston_pointer_button_event b_event;
 	bool is_button_pressed = event->response_type == XCB_BUTTON_PRESS;
 	struct timespec time = { 0 };
 
@@ -1384,49 +1456,45 @@ x11_backend_deliver_button_event(struct x11_backend *b,
 		/* Axis are measured in pixels, but the xcb events are discrete
 		 * steps. Therefore move the axis by some pixels every step. */
 		if (is_button_pressed) {
-			weston_event.value = -DEFAULT_AXIS_STEP_DISTANCE;
-			weston_event.discrete = -1;
-			weston_event.has_discrete = true;
-			weston_event.axis =
-				WL_POINTER_AXIS_VERTICAL_SCROLL;
 			weston_compositor_get_time(&time);
-			notify_axis(&b->core_seat, &time, &weston_event);
+
+			weston_pointer_axis_event_init(&weston_event, &time, &b->core_seat,
+						       WL_POINTER_AXIS_VERTICAL_SCROLL,
+						       -DEFAULT_AXIS_STEP_DISTANCE, true, -1);
+			notify_axis(&weston_event);
 			notify_pointer_frame(&b->core_seat);
 		}
 		return;
 	case 5:
 		if (is_button_pressed) {
-			weston_event.value = DEFAULT_AXIS_STEP_DISTANCE;
-			weston_event.discrete = 1;
-			weston_event.has_discrete = true;
-			weston_event.axis =
-				WL_POINTER_AXIS_VERTICAL_SCROLL;
 			weston_compositor_get_time(&time);
-			notify_axis(&b->core_seat, &time, &weston_event);
+
+			weston_pointer_axis_event_init(&weston_event, &time, &b->core_seat,
+						       WL_POINTER_AXIS_VERTICAL_SCROLL,
+						       DEFAULT_AXIS_STEP_DISTANCE, true, 1);
+			notify_axis(&weston_event);
 			notify_pointer_frame(&b->core_seat);
 		}
 		return;
 	case 6:
 		if (is_button_pressed) {
-			weston_event.value = -DEFAULT_AXIS_STEP_DISTANCE;
-			weston_event.discrete = -1;
-			weston_event.has_discrete = true;
-			weston_event.axis =
-				WL_POINTER_AXIS_HORIZONTAL_SCROLL;
 			weston_compositor_get_time(&time);
-			notify_axis(&b->core_seat, &time, &weston_event);
+
+			weston_pointer_axis_event_init(&weston_event, &time, &b->core_seat,
+						       WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+						       -DEFAULT_AXIS_STEP_DISTANCE, true, -1);
+			notify_axis(&weston_event);
 			notify_pointer_frame(&b->core_seat);
 		}
 		return;
 	case 7:
 		if (is_button_pressed) {
-			weston_event.value = DEFAULT_AXIS_STEP_DISTANCE;
-			weston_event.discrete = 1;
-			weston_event.has_discrete = true;
-			weston_event.axis =
-				WL_POINTER_AXIS_HORIZONTAL_SCROLL;
 			weston_compositor_get_time(&time);
-			notify_axis(&b->core_seat, &time, &weston_event);
+
+			weston_pointer_axis_event_init(&weston_event, &time, &b->core_seat,
+						       WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+						       DEFAULT_AXIS_STEP_DISTANCE, true, 1);
+			notify_axis(&weston_event);
 			notify_pointer_frame(&b->core_seat);
 		}
 		return;
@@ -1436,10 +1504,12 @@ x11_backend_deliver_button_event(struct x11_backend *b,
 	}
 
 	weston_compositor_get_time(&time);
+	weston_pointer_button_event_init(&b_event, &time, &b->core_seat,
+					 button, is_button_pressed ?
+					 WL_POINTER_BUTTON_STATE_PRESSED :
+					 WL_POINTER_BUTTON_STATE_RELEASED);
 
-	notify_button(&b->core_seat, &time, button,
-		      is_button_pressed ? WL_POINTER_BUTTON_STATE_PRESSED :
-					  WL_POINTER_BUTTON_STATE_RELEASED);
+	notify_button(&b_event);
 	notify_pointer_frame(&b->core_seat);
 }
 
@@ -1449,7 +1519,8 @@ x11_backend_deliver_motion_event(struct x11_backend *b,
 {
 	struct x11_output *output;
 	struct weston_coord_global pos;
-	struct weston_pointer_motion_event motion_event = { 0 };
+	struct weston_pointer_motion_event motion_event;
+	struct weston_coord rel;
 	xcb_motion_notify_event_t *motion_notify =
 			(xcb_motion_notify_event_t *) event;
 	struct timespec time;
@@ -1464,12 +1535,13 @@ x11_backend_deliver_motion_event(struct x11_backend *b,
 						    motion_notify->event_y,
 						    &output->base);
 
-	motion_event = (struct weston_pointer_motion_event) {
-		.mask = WESTON_POINTER_MOTION_REL,
-		.rel = weston_coord_global_sub(pos, b->prev_pos).c,
-	};
+	rel = weston_coord_global_sub(pos, b->prev_pos).c;
 	weston_compositor_get_time(&time);
-	notify_motion(&b->core_seat, &time, &motion_event);
+
+	weston_pointer_motion_event_init(&motion_event, &time, &b->core_seat,
+					 WESTON_POINTER_MOTION_REL,
+					 NULL, &rel, NULL);
+	notify_motion(&motion_event);
 	notify_pointer_frame(&b->core_seat);
 
 	b->prev_pos = pos;
@@ -1559,11 +1631,15 @@ x11_backend_handle_event(int fd, uint32_t mask, void *data)
 				 * event below. */
 				update_xkb_state_from_core(b, key_release->state);
 				weston_compositor_get_time(&time);
-				notify_key(&b->core_seat,
-					   &time,
-					   key_release->detail - 8,
-					   WL_KEYBOARD_KEY_STATE_RELEASED,
-					   STATE_UPDATE_AUTOMATIC);
+
+				struct weston_key_event key_event;
+
+				weston_key_event_init(&key_event, &time, &b->core_seat,
+						      key_release->detail - 8,
+						      WL_KEYBOARD_KEY_STATE_RELEASED,
+						      STATE_UPDATE_AUTOMATIC);
+
+				notify_key(&key_event);
 				free(b->prev_event);
 				b->prev_event = NULL;
 				break;
@@ -1604,12 +1680,15 @@ x11_backend_handle_event(int fd, uint32_t mask, void *data)
 			if (!b->has_xkb)
 				update_xkb_state_from_core(b, key_press->state);
 			weston_compositor_get_time(&time);
-			notify_key(&b->core_seat,
-				   &time,
-				   key_press->detail - 8,
-				   WL_KEYBOARD_KEY_STATE_PRESSED,
-				   b->has_xkb ? STATE_UPDATE_NONE :
-						STATE_UPDATE_AUTOMATIC);
+
+			struct weston_key_event key_event;
+
+			weston_key_event_init(&key_event, &time, &b->core_seat,
+					      key_press->detail - 8,
+					      WL_KEYBOARD_KEY_STATE_PRESSED,
+					      b->has_xkb ? STATE_UPDATE_NONE : STATE_UPDATE_AUTOMATIC);
+			notify_key(&key_event);
+
 			break;
 		case XCB_KEY_RELEASE:
 			/* If we don't have XKB, we need to use the lame
@@ -1620,11 +1699,13 @@ x11_backend_handle_event(int fd, uint32_t mask, void *data)
 			}
 			key_release = (xcb_key_press_event_t *) event;
 			weston_compositor_get_time(&time);
-			notify_key(&b->core_seat,
-				   &time,
-				   key_release->detail - 8,
-				   WL_KEYBOARD_KEY_STATE_RELEASED,
-				   STATE_UPDATE_NONE);
+
+			struct weston_key_event w_key_event;
+
+			weston_key_event_init(&w_key_event, &time, &b->core_seat,
+					      key_release->detail - 8,
+					      WL_KEYBOARD_KEY_STATE_RELEASED, STATE_UPDATE_NONE);
+			notify_key(&w_key_event);
 			break;
 		case XCB_BUTTON_PRESS:
 		case XCB_BUTTON_RELEASE:
@@ -1753,11 +1834,14 @@ x11_backend_handle_event(int fd, uint32_t mask, void *data)
 		key_release = (xcb_key_press_event_t *) b->prev_event;
 		update_xkb_state_from_core(b, key_release->state);
 		weston_compositor_get_time(&time);
-		notify_key(&b->core_seat,
-			   &time,
-			   key_release->detail - 8,
-			   WL_KEYBOARD_KEY_STATE_RELEASED,
-			   STATE_UPDATE_AUTOMATIC);
+
+		struct weston_key_event lshift_key_event;
+
+		weston_key_event_init(&lshift_key_event, &time, &b->core_seat,
+				      key_release->detail - 8,
+				      WL_KEYBOARD_KEY_STATE_RELEASED, STATE_UPDATE_AUTOMATIC);
+		notify_key(&lshift_key_event);
+
 		free(b->prev_event);
 		b->prev_event = NULL;
 		break;
@@ -1948,6 +2032,17 @@ x11_backend_create(struct weston_compositor *compositor,
 		};
 		if (weston_compositor_init_renderer(compositor,
 						    WESTON_RENDERER_GL,
+						    &options.base) < 0)
+			goto err_xdisplay;
+		break;
+	}
+	case WESTON_RENDERER_VULKAN: {
+		const struct vulkan_renderer_display_options options = {
+			.formats = b->formats,
+			.formats_count = b->formats_count,
+		};
+		if (weston_compositor_init_renderer(compositor,
+						    WESTON_RENDERER_VULKAN,
 						    &options.base) < 0)
 			goto err_xdisplay;
 		break;

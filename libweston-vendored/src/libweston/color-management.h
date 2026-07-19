@@ -52,7 +52,23 @@ weston_cm_send_primaries(struct cm_image_desc_info *cm_image_desc_info,
                          const struct weston_color_gamut *color_gamut);
 
 void
-weston_cm_send_tf_named(struct cm_image_desc_info *cm_image_desc_info,
-                        const struct weston_color_tf_info *tf_info);
+weston_cm_send_target_primaries(struct cm_image_desc_info *cm_image_desc_info,
+                                const struct weston_color_gamut *color_gamut);
+
+void
+weston_cm_send_tf(struct cm_image_desc_info *cm_image_desc_info,
+		  const struct weston_color_tf *tf);
+
+void
+weston_cm_send_luminances(struct cm_image_desc_info *cm_image_desc_info,
+                          float min_lum, float max_lum, float ref_lum);
+
+void
+weston_cm_send_target_luminances(struct cm_image_desc_info *cm_image_desc_info,
+                                 float min_lum, float max_lum);
+
+void
+weston_cm_send_parametric_info(struct cm_image_desc_info *cm_image_desc_info,
+			       const struct weston_color_profile_params *par);
 
 #endif /* WESTON_COLOR_MANAGEMENT_H */

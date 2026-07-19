@@ -36,9 +36,6 @@
 #include <wayland-util.h>
 
 void
-surface_flush_device(cairo_surface_t *surface);
-
-void
 render_shadow(cairo_t *cr, cairo_surface_t *surface,
 	      int x, int y, int width, int height, int margin, int top_margin);
 
@@ -76,7 +73,8 @@ theme_destroy(struct theme *t);
 enum {
 	THEME_FRAME_ACTIVE = 1,
 	THEME_FRAME_MAXIMIZED = 2,
-	THEME_FRAME_NO_TITLE = 4
+	THEME_FRAME_NO_TITLE = 4,
+	THEME_FRAME_NO_SHADOW = 8
 };
 
 void
@@ -122,7 +120,8 @@ enum frame_status {
 
 enum frame_flag {
 	FRAME_FLAG_ACTIVE = 0x1,
-	FRAME_FLAG_MAXIMIZED = 0x2
+	FRAME_FLAG_MAXIMIZED = 0x2,
+	FRAME_FLAG_NO_SHADOW = 0x4
 };
 
 enum {

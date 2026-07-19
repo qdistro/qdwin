@@ -24,19 +24,23 @@ srcs_renderer_gl = [
 	'gl-renderer.c',
 	'gl-shaders.c',
 	'gl-shader-config-color-transformation.c',
+	'gl-utils.c',
 	linux_dmabuf_unstable_v1_protocol_c,
 	linux_dmabuf_unstable_v1_server_protocol_h,
 	vertex_glsl,
 ]
 
 deps_renderer_gl = [
-	dep_gbm,
 	dep_libm,
 	dep_pixman,
 	dep_libweston_private,
 	dep_libdrm_headers,
 	dep_vertex_clipping
 ]
+
+if dep_gbm.found()
+	deps_renderer_gl += dep_gbm
+endif
 
 foreach name : [ 'egl', 'glesv2' ]
 	d = dependency(name, required: false)

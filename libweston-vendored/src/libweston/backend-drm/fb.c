@@ -41,6 +41,7 @@
 #include "shared/hash.h"
 #include "shared/helpers.h"
 #include "shared/weston-drm-fourcc.h"
+#include "shared/weston-assert.h"
 #include "drm-internal.h"
 #include "linux-dmabuf.h"
 
@@ -54,6 +55,8 @@ drm_fb_destroy(struct drm_fb *fb)
 	 * it is free to destroy our fb once it stops using it. */
 	if (fb->fb_id != 0 && !fb->backend->compositor->shutting_down)
 		drmModeRmFB(fb->fd, fb->fb_id);
+
+	free(fb->modifier_name);
 	free(fb);
 }
 
@@ -99,7 +102,7 @@ static void gem_handle_put(struct drm_device *device, int handle)
 	ref_count = hash_table_lookup(device->gem_handle_refcnt, handle);
 	if (!ref_count) {
 		weston_log("failed to find GEM handle %d for device %s\n",
-			   handle, device->drm.filename);
+			   handle, device->kms_device->filename);
 		return;
 	}
 	(*ref_count)--;
@@ -107,20 +110,28 @@ static void gem_handle_put(struct drm_device *device, int handle)
 	if (*ref_count == 0) {
 		hash_table_remove(device->gem_handle_refcnt, handle);
 		free(ref_count);
-		drmCloseBufferHandle(device->drm.fd, handle);
+		drmCloseBufferHandle(device->kms_device->fd, handle);
 	}
 }
 
 static int
 drm_fb_import_plane(struct drm_device *device, struct drm_fb *fb, int plane)
 {
-	int bo_fd;
+	int bo_fd = -1;
 	uint32_t handle;
 	int ret;
 
-	bo_fd = gbm_bo_get_fd_for_plane(fb->bo, plane);
-	if (bo_fd < 0)
-		return bo_fd;
+	/* neither a BO nor a direct-display means we shouldn't be calling this */
+	assert(!!fb->bo ^ fb->direct_display);
+
+	if (fb->bo) {
+		bo_fd = gbm_bo_get_fd_for_plane(fb->bo, plane);
+		if (bo_fd < 0)
+			return bo_fd;
+	}
+
+	if (fb->direct_display)
+		bo_fd = fb->fds[plane];
 
 	/*
 	 * drmPrimeFDToHandle is dangerous, because the GEM handles are
@@ -147,7 +158,10 @@ drm_fb_import_plane(struct drm_device *device, struct drm_fb *fb, int plane)
 	fb->handles[plane] = gem_handle_get(device, handle);
 
 out:
-	close(bo_fd);
+	/* on the direct-display path the dup'ed fds will be closed by
+	 * drm_fb_destroy_dmabuf */
+	if (fb->bo)
+		close(bo_fd);
 	return ret;
 }
 #endif
@@ -171,23 +185,35 @@ drm_fb_maybe_import(struct drm_device *device, struct drm_fb *fb)
 	struct gbm_device *gbm_device;
 	int ret = 0;
 	int plane;
+	int num_planes;
 
-	/* No import possible, if there is no gbm bo */
-	if (!fb->bo)
+	/* No import possible, if there is no gbm bo or fb is not using
+	 * direct-display */
+	if (!fb->bo && !fb->direct_display)
 		return 0;
 
-	/* No import necessary, if the gbm bo and the fb use the same device */
-	gbm_device = gbm_bo_get_device(fb->bo);
-	if (gbm_device_get_fd(gbm_device) == fb->fd)
-		return 0;
+	if (fb->bo) {
+		weston_assert_false(device->backend->compositor, fb->direct_display);
 
-	if (fb->fd != device->drm.fd) {
-		weston_log("fb was not allocated for scanout device %s\n",
-			   device->drm.filename);
-		return -1;
+		/* No import necessary, if the gbm bo and the fb use the same device */
+		gbm_device = gbm_bo_get_device(fb->bo);
+		if (gbm_device_get_fd(gbm_device) == fb->fd)
+			return 0;
+
+		if (fb->fd != device->kms_device->fd) {
+			weston_log("fb was not allocated for scanout device %s\n",
+				   device->kms_device->filename);
+			return -1;
+		}
+
+		num_planes = gbm_bo_get_plane_count(fb->bo);
+	} else {
+		weston_assert_true(device->backend->compositor, fb->direct_display);
+
+		num_planes = fb->num_planes;
 	}
 
-	for (plane = 0; plane < gbm_bo_get_plane_count(fb->bo); plane++) {
+	for (plane = 0; plane < num_planes; plane++) {
 		ret = drm_fb_import_plane(device, fb, plane);
 		if (ret)
 			goto err;
@@ -289,19 +315,20 @@ drm_fb_create_dumb(struct drm_device *device, int width, int height,
 	create_arg.width = width;
 	create_arg.height = height;
 
-	ret = drmIoctl(device->drm.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_arg);
+	ret = drmIoctl(device->kms_device->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_arg);
 	if (ret)
 		goto err_fb;
 
 	fb->type = BUFFER_PIXMAN_DUMB;
 	fb->modifier = DRM_FORMAT_MOD_INVALID;
+	fb->modifier_name = pixel_format_get_modifier(fb->modifier);
 	fb->handles[0] = create_arg.handle;
 	fb->strides[0] = create_arg.pitch;
 	fb->num_planes = 1;
 	fb->size = create_arg.size;
 	fb->width = width;
 	fb->height = height;
-	fb->fd = device->drm.fd;
+	fb->fd = device->kms_device->fd;
 
 	if (drm_fb_addfb(device, fb) != 0) {
 		weston_log("failed to create kms fb: %s\n", strerror(errno));
@@ -315,18 +342,18 @@ drm_fb_create_dumb(struct drm_device *device, int width, int height,
 		goto err_add_fb;
 
 	fb->map = mmap(NULL, fb->size, PROT_WRITE,
-		       MAP_SHARED, device->drm.fd, map_arg.offset);
+		       MAP_SHARED, device->kms_device->fd, map_arg.offset);
 	if (fb->map == MAP_FAILED)
 		goto err_add_fb;
 
 	return fb;
 
 err_add_fb:
-	drmModeRmFB(device->drm.fd, fb->fb_id);
+	drmModeRmFB(device->kms_device->fd, fb->fb_id);
 err_bo:
 	memset(&destroy_arg, 0, sizeof(destroy_arg));
 	destroy_arg.handle = create_arg.handle;
-	drmIoctl(device->drm.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
+	drmIoctl(device->kms_device->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
 err_fb:
 	free(fb);
 	return NULL;
@@ -364,27 +391,35 @@ drm_fb_destroy_dmabuf(struct drm_fb *fb)
 	 * If we imported the dmabuf into a scanout device, we are responsible
 	 * for closing the GEM handle.
 	 */
-	for (i = 0; i < 4; i++)
-		if (fb->scanout_device && fb->handles[i] != 0)
+	for (i = 0; i < MAX_DMABUF_PLANES; i++) {
+		if (fb->scanout_device && fb->handles[i] != 0) {
 			gem_handle_put(fb->scanout_device, fb->handles[i]);
+			fb->handles[i] = 0;
+		}
+
+	}
+
+	for (i = 0; i < fb->num_duped_fds; i++)
+		close(fb->fds[i]);
 
 	drm_fb_destroy(fb);
 }
 
-static struct drm_fb *
-drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
-		       struct drm_device *device, bool is_opaque,
-		       uint32_t *try_view_on_plane_failure_reasons)
+struct drm_fb *
+drm_fb_get_from_dmabuf_attributes(struct dmabuf_attributes *attributes,
+				  struct drm_device *device,
+				  bool direct_display, bool is_internal,
+				  uint32_t *try_view_on_plane_failure_reasons)
 {
 	struct drm_backend *backend = device->backend;
 	struct drm_fb *fb;
 	int i;
 	struct gbm_import_fd_modifier_data import_mod = {
-		.width = dmabuf->attributes.width,
-		.height = dmabuf->attributes.height,
-		.format = dmabuf->attributes.format,
-		.num_fds = dmabuf->attributes.n_planes,
-		.modifier = dmabuf->attributes.modifier,
+		.width = attributes->width,
+		.height = attributes->height,
+		.format = attributes->format,
+		.num_fds = attributes->n_planes,
+		.modifier = attributes->modifier,
 	};
 
 	/* We should not import to KMS a buffer that has been allocated using no
@@ -394,7 +429,7 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 	 * KMS driver can't know. So giving the buffer to KMS is not safe, as
 	 * not knowing its layout can result in garbage being displayed. In
 	 * short, importing a buffer to KMS requires explicit modifiers. */
-	if (dmabuf->attributes.modifier == DRM_FORMAT_MOD_INVALID) {
+	if (attributes->modifier == DRM_FORMAT_MOD_INVALID) {
 		if (try_view_on_plane_failure_reasons)
 			*try_view_on_plane_failure_reasons |=
 				FAILURE_REASONS_DMABUF_MODIFIER_INVALID;
@@ -410,7 +445,7 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 	 * these types of buffers should be handled through buffer
 	 * transforms and not as spot-checks requiring specific
 	 * knowledge. */
-	if (dmabuf->attributes.flags)
+	if (attributes->flags)
 		return NULL;
 
 	fb = zalloc(sizeof *fb);
@@ -418,12 +453,30 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 		return NULL;
 
 	fb->refcnt = 1;
-	fb->type = BUFFER_DMABUF;
+	fb->type = is_internal ? BUFFER_DMABUF_BACKEND : BUFFER_DMABUF;
 	fb->backend = device->backend;
 
-	ARRAY_COPY(import_mod.fds, dmabuf->attributes.fd);
-	ARRAY_COPY(import_mod.strides, dmabuf->attributes.stride);
-	ARRAY_COPY(import_mod.offsets, dmabuf->attributes.offset);
+	ARRAY_COPY(import_mod.fds, attributes->fd);
+	ARRAY_COPY(import_mod.strides, attributes->stride);
+	ARRAY_COPY(import_mod.offsets, attributes->offset);
+
+	/* skip bo import if dmabuf is using direct-display extension */
+	if (direct_display) {
+		fb->direct_display = true;
+		/* we're making a dup of the fds from attributes->fd as
+		 * opposed to just copying the fds with ARRAY_COPY() */
+		for (i = 0; i < attributes->n_planes; i++) {
+			fb->fds[i] = dup(attributes->fd[i]);
+			if (fb->fds[i] == -1) {
+				weston_log("failed to dup dmabuf attribute fd: %s\n",
+					   strerror(errno));
+				goto err_free;
+			}
+			fb->num_duped_fds++;
+		}
+
+		goto bo_import_skip;
+	}
 
 	fb->bo = gbm_bo_import(backend->gbm, GBM_BO_IMPORT_FD_MODIFIER,
 			       &import_mod, GBM_BO_USE_SCANOUT);
@@ -434,24 +487,23 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 		goto err_free;
 	}
 
-	fb->width = dmabuf->attributes.width;
-	fb->height = dmabuf->attributes.height;
-	fb->modifier = dmabuf->attributes.modifier;
+bo_import_skip:
+	fb->width = attributes->width;
+	fb->height = attributes->height;
+	fb->modifier = attributes->modifier;
+	fb->modifier_name = pixel_format_get_modifier(fb->modifier);
 	fb->size = 0;
-	fb->fd = device->drm.fd;
+	fb->fd = device->kms_device->fd;
 
-	ARRAY_COPY(fb->strides, dmabuf->attributes.stride);
-	ARRAY_COPY(fb->offsets, dmabuf->attributes.offset);
+	ARRAY_COPY(fb->strides, attributes->stride);
+	ARRAY_COPY(fb->offsets, attributes->offset);
 
-	fb->format = pixel_format_get_info(dmabuf->attributes.format);
+	fb->format = pixel_format_get_info(attributes->format);
 	if (!fb->format) {
 		weston_log("couldn't look up format info for 0x%lx\n",
-			   (unsigned long) dmabuf->attributes.format);
+			   (unsigned long) attributes->format);
 		goto err_free;
 	}
-
-	if (is_opaque)
-		fb->format = pixel_format_get_opaque_substitute(fb->format);
 
 	if (device->min_width > fb->width ||
 	    fb->width > device->max_width ||
@@ -461,8 +513,8 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
 		goto err_free;
 	}
 
-	fb->num_planes = dmabuf->attributes.n_planes;
-	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
+	fb->num_planes = attributes->n_planes;
+	for (i = 0; fb->bo && i < attributes->n_planes; i++) {
 		union gbm_bo_handle handle;
 
 	        handle = gbm_bo_get_handle_for_plane(fb->bo, i);
@@ -489,8 +541,19 @@ err_free:
 }
 
 struct drm_fb *
+drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
+		       struct drm_device *device,
+		       uint32_t *try_view_on_plane_failure_reasons)
+{
+	return drm_fb_get_from_dmabuf_attributes(&dmabuf->attributes,
+						 device,
+						 dmabuf->direct_display, false,
+						 try_view_on_plane_failure_reasons);
+}
+
+struct drm_fb *
 drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_device *device,
-		   bool is_opaque, enum drm_fb_type type)
+		   enum drm_fb_type type)
 {
 	struct drm_fb *fb = gbm_bo_get_user_data(bo);
 	int i;
@@ -508,7 +571,7 @@ drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_device *device,
 	fb->refcnt = 1;
 	fb->backend = device->backend;
 	fb->bo = bo;
-	fb->fd = device->drm.fd;
+	fb->fd = device->kms_device->fd;
 
 	fb->width = gbm_bo_get_width(bo);
 	fb->height = gbm_bo_get_height(bo);
@@ -516,6 +579,8 @@ drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_device *device,
 	fb->size = 0;
 
 	fb->modifier = gbm_bo_get_modifier(bo);
+	fb->modifier_name = pixel_format_get_modifier(fb->modifier);
+
 	fb->num_planes = gbm_bo_get_plane_count(bo);
 	for (i = 0; i < fb->num_planes; i++) {
 		fb->strides[i] = gbm_bo_get_stride_for_plane(bo, i);
@@ -528,11 +593,6 @@ drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_device *device,
 			   (unsigned long) gbm_bo_get_format(bo));
 		goto err_free;
 	}
-
-	/* We can scanout an ARGB buffer if the surface's opaque region covers
-	 * the whole output, but we have to use XRGB as the KMS format code. */
-	if (is_opaque)
-		fb->format = pixel_format_get_opaque_substitute(fb->format);
 
 	if (device->min_width > fb->width ||
 	    fb->width > device->max_width ||
@@ -582,6 +642,7 @@ drm_fb_unref(struct drm_fb *fb)
 		gbm_surface_release_buffer(fb->gbm_surface, fb->bo);
 		break;
 	case BUFFER_DMABUF:
+	case BUFFER_DMABUF_BACKEND:
 		drm_fb_destroy_dmabuf(fb);
 		break;
 #endif
@@ -602,7 +663,7 @@ drm_can_scanout_dmabuf(struct weston_backend *backend,
 	bool ret = false;
 	uint32_t try_reason = 0x0;
 
-	fb = drm_fb_get_from_dmabuf(dmabuf, device, true, &try_reason);
+	fb = drm_fb_get_from_dmabuf(dmabuf, device, &try_reason);
 	if (fb)
 		ret = true;
 
@@ -614,7 +675,7 @@ drm_can_scanout_dmabuf(struct weston_backend *backend,
 
 static bool
 drm_fb_compatible_with_plane(struct drm_fb *fb, struct drm_plane *plane,
-			     struct weston_view *view)
+			     struct weston_paint_node *pnode)
 {
 	struct drm_device *device = plane->device;
 	struct drm_backend *b = device->backend;
@@ -638,10 +699,11 @@ drm_fb_compatible_with_plane(struct drm_fb *fb, struct drm_plane *plane,
 			return true;
 	}
 
-	drm_debug(b, "\t\t\t\t[%s] not assigning view %p on %s, "
+	drm_debug(b, "\t\t\t\t[%s] not assigning paint node %s on %s, "
 		  "plane %d (format %s (0x%lx) with modifier 0x%llx) not supported\n",
 		  drm_output_get_plane_type_name(plane),
-		  view, drm_output_get_plane_type_name(plane),
+		  pnode->internal_name,
+		  drm_output_get_plane_type_name(plane),
 		  plane->plane_id, fb->format->drm_format_name,
 		  (unsigned long) fb->format->format,
 		  (unsigned long long) fb->modifier);
@@ -674,28 +736,28 @@ drm_fb_handle_buffer_destroy(struct wl_listener *listener, void *data)
 
 struct drm_fb *
 drm_fb_get_from_paint_node(struct drm_output_state *state,
-			   struct weston_paint_node *pnode)
+			   struct weston_paint_node *pnode,
+			   uint32_t *try_view_on_plane_failure_reasons)
 {
 	struct drm_output *output = state->output;
 	struct drm_backend *b = output->backend;
 	struct drm_device *device = output->device;
-	struct weston_view *ev = pnode->view;
-	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
+	struct weston_surface *surface = pnode->surface;
+	struct weston_buffer *buffer = surface->buffer_ref.buffer;
 	struct drm_fb_private *private;
 	struct drm_buffer_fb *buf_fb;
-	bool is_opaque = weston_view_is_opaque(ev, &ev->transform.boundingbox);
 	struct drm_fb *fb;
 	struct drm_plane *plane;
 
-	if (ev->surface->protection_mode == WESTON_SURFACE_PROTECTION_MODE_ENFORCED &&
-	    ev->surface->desired_protection > output->base.current_protection) {
-		pnode->try_view_on_plane_failure_reasons |=
+	if (surface->protection_mode == WESTON_SURFACE_PROTECTION_MODE_ENFORCED &&
+	    surface->desired_protection > output->base.current_protection) {
+		*try_view_on_plane_failure_reasons |=
 			FAILURE_REASONS_INADEQUATE_CONTENT_PROTECTION;
 		return NULL;
 	}
 
 	if (!buffer) {
-		pnode->try_view_on_plane_failure_reasons |= FAILURE_REASONS_NO_BUFFER;
+		*try_view_on_plane_failure_reasons |= FAILURE_REASONS_NO_BUFFER;
 		return NULL;
 	}
 
@@ -711,7 +773,7 @@ drm_fb_get_from_paint_node(struct drm_output_state *state,
 
 	wl_list_for_each(buf_fb, &private->buffer_fb_list, link) {
 		if (buf_fb->device == device) {
-			pnode->try_view_on_plane_failure_reasons |= buf_fb->failure_reasons;
+			*try_view_on_plane_failure_reasons |= buf_fb->failure_reasons;
 			return buf_fb->fb ? drm_fb_ref(buf_fb->fb) : NULL;
 		}
 	}
@@ -722,12 +784,12 @@ drm_fb_get_from_paint_node(struct drm_output_state *state,
 
 	/* GBM is used for dmabuf import as well as from client wl_buffer. */
 	if (!b->gbm) {
-		pnode->try_view_on_plane_failure_reasons |= FAILURE_REASONS_NO_GBM;
+		*try_view_on_plane_failure_reasons |= FAILURE_REASONS_NO_GBM;
 		goto unsuitable;
 	}
 
 	if (buffer->type == WESTON_BUFFER_DMABUF) {
-		fb = drm_fb_get_from_dmabuf(buffer->dmabuf, device, is_opaque,
+		fb = drm_fb_get_from_dmabuf(buffer->dmabuf, device,
 					    &buf_fb->failure_reasons);
 		if (!fb)
 			goto unsuitable;
@@ -739,15 +801,15 @@ drm_fb_get_from_paint_node(struct drm_output_state *state,
 		if (!bo)
 			goto unsuitable;
 
-		fb = drm_fb_get_from_bo(bo, device, is_opaque, BUFFER_CLIENT);
+		fb = drm_fb_get_from_bo(bo, device, BUFFER_CLIENT);
 		if (!fb) {
-			pnode->try_view_on_plane_failure_reasons |=
-				(1 << FAILURE_REASONS_ADD_FB_FAILED);
+			*try_view_on_plane_failure_reasons |=
+				FAILURE_REASONS_ADD_FB_FAILED;
 			gbm_bo_destroy(bo);
 			goto unsuitable;
 		}
 	} else {
-		pnode->try_view_on_plane_failure_reasons |= FAILURE_REASONS_BUFFER_TYPE;
+		*try_view_on_plane_failure_reasons |= FAILURE_REASONS_BUFFER_TYPE;
 		goto unsuitable;
 	}
 
@@ -758,7 +820,7 @@ drm_fb_get_from_paint_node(struct drm_output_state *state,
 		if (plane->type == WDRM_PLANE_TYPE_CURSOR)
 			continue;
 
-		if (drm_fb_compatible_with_plane(fb, plane, pnode->view))
+		if (drm_fb_compatible_with_plane(fb, plane, pnode))
 			fb->plane_mask |= 1 << (plane->plane_idx);
 	}
 	if (fb->plane_mask == 0) {
@@ -771,12 +833,12 @@ drm_fb_get_from_paint_node(struct drm_output_state *state,
 	 * drm_fb we take an additional ref for the weston_buffer's cache. */
 	buf_fb->fb = drm_fb_ref(fb);
 
-	drm_debug(b, "\t\t\t[view] view %p format: %s\n",
-		  ev, fb->format->drm_format_name);
+	drm_debug(b, "\t\t\t[paint node] paint node %s format: %s\n",
+		  pnode->internal_name, fb->format->drm_format_name);
 	return fb;
 
 unsuitable:
-	pnode->try_view_on_plane_failure_reasons |= buf_fb->failure_reasons;
+	*try_view_on_plane_failure_reasons |= buf_fb->failure_reasons;
 	return NULL;
 }
 #endif

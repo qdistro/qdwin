@@ -36,8 +36,11 @@ bool
 get_parametric_curveset_params(struct weston_compositor *compositor,
 			       _cmsStageToneCurvesData *trc_data,
 			       cmsInt32Number *type,
-			       float curveset_params[3][10],
+			       float curveset_params[3][MAX_PARAMS_LCMS_PARAM_CURVE],
 			       bool *clamped_input);
+
+cmsStage *
+lcms_matrix_stage_from_curve(cmsContext context_id, cmsStage *stage);
 
 void
 curveset_print(cmsStage *stage, struct weston_log_scope *scope);
@@ -58,10 +61,16 @@ static inline bool
 get_parametric_curveset_params(struct weston_compositor *compositor,
 			       _cmsStageToneCurvesData *trc_data,
 			       cmsInt32Number *type,
-			       float curveset_params[3][10],
+			       float curveset_params[3][MAX_PARAMS_LCMS_PARAM_CURVE],
 			       bool *clamped_input)
 {
 	return false;
+}
+
+cmsStage *
+lcms_matrix_stage_from_curve(cmsContext ContextID, cmsStage *stage)
+{
+	return NULL;
 }
 
 static inline void

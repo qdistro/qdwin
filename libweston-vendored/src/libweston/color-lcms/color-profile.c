@@ -298,11 +298,10 @@ ensure_output_profile_extract(struct cmlcms_color_profile *cprof,
 							cprof->icc.profile, num_points,
 							err_msg);
 		if (ret)
-			weston_assert_ptr(compositor, cprof->extract.eotf.p);
+			weston_assert_ptr_not_null(compositor, cprof->extract.eotf.p);
 		break;
 	case CMLCMS_PROFILE_TYPE_PARAMS:
-		/* TODO: need to address this when we create param profiles. */
-		ret = false;
+		ret = true;
 		break;
 	default:
 		weston_assert_not_reached(compositor, "unknown profile type");
@@ -349,9 +348,9 @@ validate_icc_profile(struct lcmsProfilePtr profile, char **errmsg)
 		return false;
 	}
 
-	if (class_sig != cmsSigDisplayClass) {
-		str_printf(errmsg, "ICC profile is required to be of Display device class, "
-				   "but it is %s class (0x%08x)",
+	if (class_sig != cmsSigDisplayClass && class_sig != cmsSigColorSpaceClass) {
+		str_printf(errmsg, "ICC profile is required to be of Display or "
+				   "ColorSpace device class, but it is %s class (0x%08x)",
 			   icc_profile_class_name(class_sig), (unsigned)class_sig);
 		return false;
 	}
@@ -384,15 +383,23 @@ cmlcms_find_color_profile_by_params(const struct weston_color_manager_lcms *cm,
 	struct cmlcms_color_profile *cprof;
 
 	/* Ensure no uninitialized data inside struct to make memcmp work. */
+	static_assert(sizeof(params->tf) ==
+			sizeof(params->tf.info) +
+			sizeof(params->tf.params) +
+			sizeof(params->tf.padding),
+		"struct weston_color_transfer_function must not contain implicit padding");
 	static_assert(sizeof(*params) ==
 			2 * sizeof(float) * 2 * 4 + /* primaries, target_primaries */
 			sizeof(params->primaries_info) +
-			sizeof(params->tf_info) +
-			sizeof(params->tf_params) +
+			sizeof(params->tf) +
 			sizeof(params->min_luminance) +
 			sizeof(params->max_luminance) +
+			sizeof(params->reference_white_luminance) +
+			sizeof(params->target_min_luminance) +
+			sizeof(params->target_max_luminance) +
 			sizeof(params->maxCLL) +
-			sizeof(params->maxFALL),
+			sizeof(params->maxFALL) +
+			sizeof(params->padding),
 		"struct weston_color_profile_params must not contain implicit padding");
 
 	wl_list_for_each(cprof, &cm->color_profile_list, link) {
@@ -409,33 +416,54 @@ cmlcms_find_color_profile_by_params(const struct weston_color_manager_lcms *cm,
 char *
 cmlcms_color_profile_print(const struct cmlcms_color_profile *cprof)
 {
-	char *str;
+	struct weston_compositor *compositor = cprof->base.cm->compositor;
+	char *str, *params_str;
 
-	/* TODO: also print cprof->params for parametric profiles. */
-
-	str_printf(&str, "  description: %s\n", cprof->base.description);
-	abort_oom_if_null(str);
+	switch(cprof->type) {
+	case CMLCMS_PROFILE_TYPE_ICC:
+		/* For ICC profiles, the description is enough. */
+		str_printf(&str, "  description: %s\n", cprof->base.description);
+		abort_oom_if_null(str);
+		break;
+	case CMLCMS_PROFILE_TYPE_PARAMS:
+		params_str = weston_color_profile_params_to_str(cprof->params, "  ");
+		str_printf(&str, "  description: %s\n%s", cprof->base.description, params_str);
+		abort_oom_if_null(str);
+		free(params_str);
+		break;
+	default:
+		weston_assert_not_reached(compositor, "unknown profile type");
+	}
 
 	return str;
 }
 
 static struct cmlcms_color_profile *
-cmlcms_color_profile_create(struct weston_color_manager_lcms *cm,
-			    struct lcmsProfilePtr profile,
-			    char *desc,
-			    char **errmsg)
+cmlcms_color_profile_alloc(struct weston_color_manager_lcms *cm,
+			   enum cmlcms_profile_type type,
+			   char *desc)
 {
 	struct cmlcms_color_profile *cprof;
-	char *str;
 
-	cprof = zalloc(sizeof *cprof);
-	if (!cprof)
-		return NULL;
-
+	cprof = xzalloc(sizeof *cprof);
 	weston_color_profile_init(&cprof->base, &cm->base);
 	cprof->base.description = desc;
-	cprof->icc.profile = profile;
-	cmsGetHeaderProfileID(profile.p, cprof->icc.md5sum.bytes);
+	cprof->type = type;
+	wl_list_init(&cprof->link);
+
+	if (type == CMLCMS_PROFILE_TYPE_PARAMS)
+		cprof->params = xzalloc(sizeof(*cprof->params));
+
+	return cprof;
+}
+
+static void
+cmlcms_color_profile_register(struct cmlcms_color_profile *cprof)
+{
+	struct weston_color_manager_lcms *cm = to_cmlcms(cprof->base.cm);
+	char *str;
+
+	wl_list_remove(&cprof->link);
 	wl_list_insert(&cm->color_profile_list, &cprof->link);
 
 	weston_log_scope_printf(cm->profiles_scope,
@@ -444,8 +472,6 @@ cmlcms_color_profile_create(struct weston_color_manager_lcms *cm,
 	str = cmlcms_color_profile_print(cprof);
 	weston_log_scope_printf(cm->profiles_scope, "%s", str);
 	free(str);
-
-	return cprof;
 }
 
 void
@@ -453,7 +479,6 @@ cmlcms_color_profile_destroy(struct cmlcms_color_profile *cprof)
 {
 	struct weston_color_manager_lcms *cm = to_cmlcms(cprof->base.cm);
 
-	wl_list_remove(&cprof->link);
 	cmsCloseProfile(cprof->extract.vcgt.p);
 	cmsCloseProfile(cprof->extract.inv_eotf.p);
 	cmsCloseProfile(cprof->extract.eotf.p);
@@ -477,9 +502,13 @@ cmlcms_color_profile_destroy(struct cmlcms_color_profile *cprof)
 					  "unknown profile type");
 	}
 
-	weston_log_scope_printf(cm->profiles_scope, "Destroyed color profile p%u. " \
-				"Description: %s\n", cprof->base.id, cprof->base.description);
+	if (!wl_list_empty(&cprof->link)) {
+		weston_log_scope_printf(cm->profiles_scope, "Destroyed color profile p%u. "
+					"Description: %s\n", cprof->base.id,
+					cprof->base.description);
+	}
 
+	wl_list_remove(&cprof->link);
 	free(cprof->base.description);
 	free(cprof);
 }
@@ -524,51 +553,41 @@ make_icc_file_description(struct lcmsProfilePtr profile,
 }
 
 /**
+ * Build stock sRGB profile used as fallback
  *
- * Build stock profile which available for clients unaware of color management
+ * BT.709 primaries with gamma-2.2 transfer characteristic. This is the
+ * expected sRGB display response.
  */
-bool
+struct cmlcms_color_profile *
 cmlcms_create_stock_profile(struct weston_color_manager_lcms *cm)
 {
-	struct lcmsProfilePtr profile;
-	struct cmlcms_md5_sum md5sum;
+	struct weston_compositor *compositor = cm->base.compositor;
+	struct weston_color_profile_params p = {};
+	struct cmlcms_color_profile *stock;
 	char *desc = NULL;
-	const char *err_msg = NULL;
 
-	profile.p = cmsCreate_sRGBProfileTHR(cm->lcms_ctx);
-	if (!profile.p) {
-		weston_log("color-lcms: error: cmsCreate_sRGBProfileTHR failed\n");
-		return false;
-	}
-	if (!cmsMD5computeID(profile.p)) {
-		weston_log("Failed to compute MD5 for ICC profile\n");
-		goto err_close;
-	}
+	p.primaries_info = weston_color_primaries_info_from(compositor,
+							    WESTON_PRIMARIES_CICP_SRGB);
+	p.primaries = p.primaries_info->color_gamut;
+	p.tf.info = weston_color_tf_info_from(compositor, WESTON_TF_GAMMA22);
+	p.reference_white_luminance = 80.0;
+	p.min_luminance = 0.2;
+	p.max_luminance = 80.0;
+	p.target_primaries = p.primaries;
+	p.target_min_luminance = p.min_luminance;
+	p.target_max_luminance = p.max_luminance;
+	p.maxCLL = -1.0f;
+	p.maxFALL = -1.0f;
 
-	cmsGetHeaderProfileID(profile.p, md5sum.bytes);
-	desc = make_icc_file_description(profile, &md5sum, "sRGB stock");
-	if (!desc)
-		goto err_close;
+	str_printf(&desc, "default sRGB: %s primaries, %s transfer function",
+		   p.primaries_info->desc, p.tf.info->desc);
+	abort_oom_if_null(desc);
 
-	cm->sRGB_profile = cmlcms_color_profile_create(cm, profile, desc, NULL);
-	if (!cm->sRGB_profile)
-		goto err_close;
+	stock = cmlcms_color_profile_alloc(cm, CMLCMS_PROFILE_TYPE_PARAMS, desc);
+	*stock->params = p;
+	cmlcms_color_profile_register(stock);
 
-	cm->sRGB_profile->type = CMLCMS_PROFILE_TYPE_ICC;
-
-	if (!ensure_output_profile_extract(cm->sRGB_profile, cm->lcms_ctx,
-					   cmlcms_reasonable_1D_points(), &err_msg))
-		goto err_close;
-
-	return true;
-
-err_close:
-	if (err_msg)
-		weston_log("%s\n", err_msg);
-
-	free(desc);
-	cmsCloseProfile(profile.p);
-	return false;
+	return stock;
 }
 
 struct weston_color_profile *
@@ -636,21 +655,17 @@ cmlcms_get_color_profile_from_icc(struct weston_color_manager *cm_base,
 	if (!prof_rofile)
 		goto err_close;
 
-	cprof = cmlcms_color_profile_create(cm, profile, desc, errmsg);
-	if (!cprof)
-		goto err_close;
-
-	cprof->type = CMLCMS_PROFILE_TYPE_ICC;
+	cprof = cmlcms_color_profile_alloc(cm, CMLCMS_PROFILE_TYPE_ICC, desc);
+	cprof->icc.profile = profile;
+	cmsGetHeaderProfileID(profile.p, cprof->icc.md5sum.bytes);
 	cprof->icc.prof_rofile = prof_rofile;
+
+	cmlcms_color_profile_register(cprof);
 
 	*cprof_out = &cprof->base;
 	return true;
 
 err_close:
-	if (prof_rofile)
-		os_ro_anonymous_file_destroy(prof_rofile);
-	if (cprof)
-		cmlcms_color_profile_destroy(cprof);
 	free(desc);
 	cmsCloseProfile(profile.p);
 	return false;
@@ -666,15 +681,6 @@ cmlcms_get_color_profile_from_params(struct weston_color_manager *cm_base,
 	struct weston_color_manager_lcms *cm = to_cmlcms(cm_base);
 	struct cmlcms_color_profile *cprof;
 	char *desc;
-	char *str;
-
-	/* TODO: add a helper similar to cmlcms_color_profile_create() but for
-	 * parametric color profiles. For now this just creates a cprof
-	 * boilerplate, just to help us to imagine how things would work.
-	 *
-	 * The color profile that this function creates is invalid and we won't
-	 * be able to do anything useful with that.
-	 */
 
 	cprof = cmlcms_find_color_profile_by_params(cm, params);
 	if (cprof) {
@@ -682,33 +688,39 @@ cmlcms_get_color_profile_from_params(struct weston_color_manager *cm_base,
 		return true;
 	}
 
-	cprof = xzalloc(sizeof(*cprof));
-	cprof->type = CMLCMS_PROFILE_TYPE_PARAMS;
+	str_printf(&desc, "Parametric %s", name_part);
 
-	cprof->params = xzalloc(sizeof(*cprof->params));
-	memcpy(cprof->params, params, sizeof(*params));
-
-	str_printf(&desc, "Parametric (%s): %s, %s",
-			  name_part,
-			  params->primaries_info ? params->primaries_info->desc :
-						   "custom primaries",
-			  params->tf_info->desc);
-
-	weston_color_profile_init(&cprof->base, &cm->base);
-	cprof->base.description = desc;
-	wl_list_insert(&cm->color_profile_list, &cprof->link);
-
-	weston_log_scope_printf(cm->profiles_scope,
-				"New color profile: p%u. WARNING: this is a " \
-				"boilerplate color profile. We still do not fully " \
-				"support creating color profiles from params\n",
-				cprof->base.id);
-
-	str = cmlcms_color_profile_print(cprof);
-	weston_log_scope_printf(cm->profiles_scope, "%s", str);
-	free(str);
-
+	cprof = cmlcms_color_profile_alloc(cm, CMLCMS_PROFILE_TYPE_PARAMS, desc);
+	*cprof->params = *params;
+	cmlcms_color_profile_register(cprof);
 	*cprof_out = &cprof->base;
+
+	return true;
+}
+
+static bool
+cmlcms_send_icc_info(struct cm_image_desc_info *cm_image_desc_info,
+		     const struct cmlcms_color_profile *cprof)
+{
+	int32_t fd;
+	uint32_t len;
+
+	/* ICC-based color profile, so just send the ICC file fd. If we
+	 * get an error (negative fd), the helper will send the proper
+	 * error to the client. */
+	fd = os_ro_anonymous_file_get_fd(cprof->icc.prof_rofile,
+					 RO_ANONYMOUS_FILE_MAPMODE_PRIVATE);
+	if (fd < 0) {
+		weston_cm_send_icc_file(cm_image_desc_info, -1, 0);
+		return false;
+	}
+
+	len = os_ro_anonymous_file_size(cprof->icc.prof_rofile);
+	weston_assert_u32_gt(cprof->base.cm->compositor, len, 0);
+
+	weston_cm_send_icc_file(cm_image_desc_info, fd, len);
+
+	os_ro_anonymous_file_put_fd(fd);
 	return true;
 }
 
@@ -716,70 +728,38 @@ bool
 cmlcms_send_image_desc_info(struct cm_image_desc_info *cm_image_desc_info,
 			    struct weston_color_profile *cprof_base)
 {
+	struct cmlcms_color_profile *cprof = to_cmlcms_cprof(cprof_base);
+
+	switch (cprof->type) {
+	case CMLCMS_PROFILE_TYPE_ICC:
+		return cmlcms_send_icc_info(cm_image_desc_info, cprof);
+	case CMLCMS_PROFILE_TYPE_PARAMS:
+		weston_cm_send_parametric_info(cm_image_desc_info, cprof->params);
+		return true;
+	}
+
+	return false;
+}
+
+struct weston_color_profile *
+cmlcms_get_parametric_color_profile(struct weston_color_profile *cprof_base,
+				    char **errmsg)
+{
 	struct weston_color_manager_lcms *cm = to_cmlcms(cprof_base->cm);
 	struct weston_compositor *compositor = cm->base.compositor;
 	struct cmlcms_color_profile *cprof = to_cmlcms_cprof(cprof_base);
-	const struct weston_color_primaries_info *primaries_info;
-	const struct weston_color_tf_info *tf_info;
-        int32_t fd;
-        uint32_t len;
 
-	/**
-	 * TODO: when we convert the stock sRGB profile to a parametric profile
-	 * instead of an ICC one, we'll be able to change the if/else below to
-	 * a switch/case.
-	 */
-
-	if (cprof->type == CMLCMS_PROFILE_TYPE_ICC && cprof != cm->sRGB_profile) {
-		/* ICC-based color profile, so just send the ICC file fd. If we
-		 * get an error (negative fd), the helper will send the proper
-		 * error to the client. */
-		fd = os_ro_anonymous_file_get_fd(cprof->icc.prof_rofile,
-						 RO_ANONYMOUS_FILE_MAPMODE_PRIVATE);
-		if (fd < 0) {
-			weston_cm_send_icc_file(cm_image_desc_info, -1, 0);
-			return false;
-		}
-
-		len = os_ro_anonymous_file_size(cprof->icc.prof_rofile);
-		weston_assert_uint32_gt(compositor, len, 0);
-
-		weston_cm_send_icc_file(cm_image_desc_info, fd, len);
-
-		os_ro_anonymous_file_put_fd(fd);
-	} else {
-		/* TODO: we still don't support parametric color profiles that
-		 * are not the stock one. This should change when we start
-		 * advertising parametric image description support in our
-		 * color-management protocol implementation. */
-		if (cprof != cm->sRGB_profile)
-			weston_assert_not_reached(compositor, "we don't support parametric " \
-						  "cprof's that are not the stock sRGB one");
-
-		/* Stock sRGB color profile. TODO: when we add support for
-		 * parametric color profiles, the stock sRGB will be crafted
-		 * using parameters, instead of cmsCreate_sRGBProfileTHR()
-		 * (which we currently use). So we'll get the parameters
-		 * directly from it, instead of hardcoding as we are doing here.
-		 * We don't get the parameters from the stock sRGB color profile
-		 * because it is not trivial to retrieve that from LittleCMS. */
-
-		/* Send the H.273 ColourPrimaries code point that matches the
-		 * Rec709 primaries and the D65 white point. */
-		primaries_info = weston_color_primaries_info_from(compositor,
-								  WESTON_PRIMARIES_CICP_SRGB);
-		weston_cm_send_primaries_named(cm_image_desc_info, primaries_info);
-
-		/* These are the Rec709 primaries and D65 white point. */
-		weston_cm_send_primaries(cm_image_desc_info,
-					 &primaries_info->color_gamut);
-
-		/* sRGB transfer function. */
-		tf_info = weston_color_tf_info_from(compositor, WESTON_TF_GAMMA22);
-		weston_cm_send_tf_named(cm_image_desc_info, tf_info);
+	switch(cprof->type) {
+	case CMLCMS_PROFILE_TYPE_ICC:
+		/* TODO: transform an ICC profile into an equivalent parametric one. */
+		str_printf(errmsg, "we still can't create param cprof equivalent to ICC cprof");
+		return NULL;
+	case CMLCMS_PROFILE_TYPE_PARAMS:
+		ref_cprof(cprof);
+		return cprof_base;
+	default:
+		weston_assert_not_reached(compositor, "unknown cprof type");
 	}
-
-	return true;
 }
 
 void

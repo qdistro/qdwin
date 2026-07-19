@@ -25,7 +25,6 @@
 
 #include "config.h"
 
-#include <assert.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -43,7 +42,10 @@ direct_display_enable(struct wl_client *client,
 	struct linux_dmabuf_buffer *dmabuf;
 
 	dmabuf = wl_resource_get_user_data(dmabuf_res);
-	assert(dmabuf);
+
+	if (!dmabuf)
+		return;
+
 	dmabuf->direct_display = true;
 }
 

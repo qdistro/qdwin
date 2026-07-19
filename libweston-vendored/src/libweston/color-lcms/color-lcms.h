@@ -30,10 +30,16 @@
 #include <lcms2.h>
 #include <libweston/libweston.h>
 #include <libweston/weston-log.h>
+#include <libweston/linalg-3.h>
 
 #include "color.h"
 #include "shared/helpers.h"
 #include "shared/os-compatibility.h"
+
+/**
+ * LittleCMS parametric curves may have up to 10 params.
+ */
+#define MAX_PARAMS_LCMS_PARAM_CURVE 10
 
 /*
  * Because cmsHPROFILE is a typedef of void*, it happily and implicitly
@@ -177,11 +183,45 @@ bool
 cmlcms_send_image_desc_info(struct cm_image_desc_info *cm_image_desc_info,
 			    struct weston_color_profile *cprof_base);
 
+struct weston_color_profile *
+cmlcms_get_parametric_color_profile(struct weston_color_profile *cprof_base,
+				    char **errmsg);
+
 void
 cmlcms_destroy_color_profile(struct weston_color_profile *cprof_base);
 
+enum color_transform_step {
+	STEP_PRE_CURVE  = 0x1,
+	STEP_MAPPING    = 0x2,
+	STEP_POST_CURVE = 0x4,
+};
 
-struct cmlcms_color_transform_search_param {
+struct color_transform_steps_mask {
+	/** enum color_transform_step values bitwise or'd */
+	uint8_t steps;
+};
+
+enum cmlcms_color_transformer_elem {
+	CMLCMS_TRANSFORMER_CURVE1    = 1 << 0,
+	CMLCMS_TRANSFORMER_LIN1      = 1 << 1,
+	CMLCMS_TRANSFORMER_ICC_CHAIN = 1 << 2,
+	CMLCMS_TRANSFORMER_LIN2      = 1 << 3,
+	CMLCMS_TRANSFORMER_CURVE2    = 1 << 4,
+};
+
+/** A complete color transformation to be computed on the CPU */
+struct cmlcms_color_transformer {
+	/** Or'd together from enum cmlcms_color_transformer_elem */
+	uint8_t element_mask;
+
+	struct weston_color_curve curve1;
+	struct weston_color_mapping_matrix lin1;
+	cmsHTRANSFORM icc_chain;
+	struct weston_color_mapping_matrix lin2;
+	struct weston_color_curve curve2;
+};
+
+struct cmlcms_color_transform_recipe {
 	enum cmlcms_category category;
 	struct cmlcms_color_profile *input_profile;
 	struct cmlcms_color_profile *output_profile;
@@ -194,7 +234,7 @@ struct cmlcms_color_transform {
 	/* weston_color_manager_lcms::color_transform_list */
 	struct wl_list link;
 
-	struct cmlcms_color_transform_search_param search_key;
+	struct cmlcms_color_transform_recipe search_key;
 
 	/**
 	 * Cached data used when we can't translate the curves into parametric
@@ -209,12 +249,11 @@ struct cmlcms_color_transform {
 	cmsToneCurve *post_curve[3];
 
 	/**
-	 * 3D LUT color mapping part of the transformation, if needed by the
-	 * weston_color_transform. This is used as a fallback when an
-	 * arbitrary LittleCMS pipeline cannot be translated into a more
-	 * specific form.
+	 * For evaluating points through the complete color transformation,
+	 * even when base.steps_valid is false. This is used for the 3D LUT
+	 * path.
 	 */
-	cmsHTRANSFORM cmap_3dlut;
+	struct cmlcms_color_transformer transformer;
 
 	/**
 	 * Certain categories of transformations need their own LittleCMS
@@ -223,21 +262,12 @@ struct cmlcms_color_transform {
 	cmsContext lcms_ctx;
 
 	/**
-	 * The result of pipeline construction, optimization, and analysis.
+	 * This determines which elements of struct weston_color_transform
+	 * can be used by the ICC chain. With parametric<->ICC color
+	 * transformations, some steps need to be reserved for additional
+	 * operations.
 	 */
-	enum {
-		/** Error producing a pipeline */
-		CMLCMS_TRANSFORM_FAILED = 0,
-
-		/**
-		 * Pipeline was optimized into weston_color_transform,
-		 * 3D LUT not used.
-		 */
-		CMLCMS_TRANSFORM_OPTIMIZED,
-
-		/** The transformation uses 3D LUT. */
-		CMLCMS_TRANSFORM_3DLUT,
-	} status;
+	struct color_transform_steps_mask allowed;
 };
 
 static inline struct cmlcms_color_transform *
@@ -248,13 +278,13 @@ to_cmlcms_xform(struct weston_color_transform *xform_base)
 
 struct cmlcms_color_transform *
 cmlcms_color_transform_get(struct weston_color_manager_lcms *cm,
-			   const struct cmlcms_color_transform_search_param *param);
+			   const struct cmlcms_color_transform_recipe *recipe);
 
 void
 cmlcms_color_transform_destroy(struct cmlcms_color_transform *xform);
 
 char *
-cmlcms_color_transform_search_param_string(const struct cmlcms_color_transform_search_param *search_key);
+cmlcms_color_transform_recipe_string(const struct cmlcms_color_transform_recipe *recipe);
 
 struct cmlcms_color_profile *
 ref_cprof(struct cmlcms_color_profile *cprof);
@@ -262,7 +292,7 @@ ref_cprof(struct cmlcms_color_profile *cprof);
 void
 unref_cprof(struct cmlcms_color_profile *cprof);
 
-bool
+struct cmlcms_color_profile *
 cmlcms_create_stock_profile(struct weston_color_manager_lcms *cm);
 
 void
@@ -286,5 +316,19 @@ lcms_optimize_pipeline(cmsPipeline **lut, cmsContext context_id);
 cmsToneCurve *
 lcmsJoinToneCurve(cmsContext context_id, const cmsToneCurve *X,
 		  const cmsToneCurve *Y, unsigned int resulting_points);
+
+void
+cmlcms_color_transformer_fini(struct cmlcms_color_transformer *t);
+
+void
+cmlcms_color_transformer_eval(struct weston_compositor *compositor,
+			      const struct cmlcms_color_transformer *t,
+			      struct weston_vec3f *dst,
+			      const struct weston_vec3f *src,
+			      size_t len);
+
+char *
+cmlcms_color_transformer_string(int indent,
+				const struct cmlcms_color_transformer *t);
 
 #endif /* WESTON_COLOR_LCMS_H */

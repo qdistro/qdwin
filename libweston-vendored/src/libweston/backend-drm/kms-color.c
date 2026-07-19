@@ -30,6 +30,7 @@
 #include <assert.h>
 #include <string.h>
 #include <math.h>
+#include <shared/weston-assert.h>
 
 #include "drm-internal.h"
 
@@ -160,7 +161,7 @@ drm_output_ensure_hdr_output_metadata_blob(struct drm_output *output)
 		return -1;
 	}
 
-	ret = drmModeCreatePropertyBlob(device->drm.fd,
+	ret = drmModeCreatePropertyBlob(device->kms_device->fd,
 					&meta, sizeof meta, &blob_id);
 	if (ret != 0) {
 		weston_log("Error: failed to create KMS blob for HDR metadata on output '%s': %s\n",
@@ -168,7 +169,7 @@ drm_output_ensure_hdr_output_metadata_blob(struct drm_output *output)
 		return -1;
 	}
 
-	drmModeDestroyPropertyBlob(device->drm.fd,
+	drmModeDestroyPropertyBlob(device->kms_device->fd,
 				   output->hdr_output_metadata_blob_id);
 
 	output->hdr_output_metadata_blob_id = blob_id;
@@ -192,4 +193,31 @@ wdrm_colorspace_from_output(struct weston_output *output)
 	}
 
 	return cm->wdrm;
+}
+
+enum wdrm_color_format
+wdrm_color_format_from_output(struct weston_output *output)
+{
+	enum weston_color_format color_format = output->color_format;
+
+	if (!color_format)
+		return WDRM_COLOR_FORMAT_AUTO;
+
+	weston_assert_true(output->compositor,
+		weston_output_get_supported_color_formats(output) & color_format);
+
+	switch (color_format) {
+	case WESTON_COLOR_FORMAT_AUTO:
+		return WDRM_COLOR_FORMAT_AUTO;
+	case WESTON_COLOR_FORMAT_RGB:
+		return WDRM_COLOR_FORMAT_RGB;
+	case WESTON_COLOR_FORMAT_YUV444:
+		return WDRM_COLOR_FORMAT_YUV444;
+	case WESTON_COLOR_FORMAT_YUV422:
+		return WDRM_COLOR_FORMAT_YUV422;
+	case WESTON_COLOR_FORMAT_YUV420:
+		return WDRM_COLOR_FORMAT_YUV420;
+	default:
+		return WDRM_COLOR_FORMAT__COUNT;
+	}
 }

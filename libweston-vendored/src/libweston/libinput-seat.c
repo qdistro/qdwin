@@ -145,6 +145,9 @@ device_added(struct udev_input *input, struct libinput_device *libinput_device)
 			seat->led_update(seat, seat->keyboard_state->xkb_state.leds);
 	}
 
+	if (device->touch_device)
+		wl_signal_emit(&seat->compositor->touch_device_created_signal, device->touch_device);
+
 	return 0;
 }
 
@@ -345,6 +348,10 @@ udev_input_init(struct udev_input *input, struct weston_compositor *c,
 
 	input->compositor = c;
 	input->configure_device = configure_device;
+	if (c->disable_input) {
+		weston_log("Frontend disabled all input devices.\n");
+		return 0;
+	}
 
 	log_priority = getenv("WESTON_LIBINPUT_LOG_PRIORITY");
 

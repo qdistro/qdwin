@@ -34,6 +34,7 @@
 #include "weston-debug-server-protocol.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <string.h>
@@ -69,6 +70,7 @@ struct weston_log_context {
 	struct wl_listener compositor_destroy_listener;
 	struct wl_list scope_list; /**< weston_log_scope::compositor_link */
 	struct wl_list pending_subscription_list; /**< weston_log_subscription::source_link */
+	struct wl_list advertised_debug_list; /** weston_debug_scope_advertised::link */
 };
 
 /** weston-log message scope
@@ -87,6 +89,8 @@ struct weston_log_scope {
 	void *user_data;
 	struct wl_list compositor_link;
 	struct wl_list subscription_list;  /**< weston_log_subscription::source_link */
+	FILE *input_stream;
+	char input_stream_buf[3 * 1024];
 };
 
 /** Ties a subscriber to a scope
@@ -117,6 +121,15 @@ struct weston_log_subscription {
 
 	void *data;
 };
+
+struct weston_debug_scope_advertised {
+	const char *name;
+	struct wl_list link; /** weston_log_context::advertised_debug_list */
+};
+
+static void
+weston_destroy_scopes_from_advertised_list(struct weston_log_context *ctx);
+
 
 static struct weston_log_subscription *
 find_pending_subscription(struct weston_log_context *log_ctx,
@@ -175,14 +188,23 @@ weston_log_subscription_destroy_pending(struct weston_log_subscription *sub)
 	free(sub);
 }
 
-/** Write to the stream's subscription
+/** Write log data for a subscription
+ *
+ * \param sub The recipient.
+ * \param[in] data Pointer to the data to write.
+ * \param len Number of bytes to write.
+ *
+ * Writes the given data to the subscriber's stream.
  *
  * @memberof weston_log_subscription
  */
-static void
+WL_EXPORT void
 weston_log_subscription_write(struct weston_log_subscription *sub,
 			      const char *data, size_t len)
 {
+	if (!sub)
+		return;
+
 	if (sub->owner && sub->owner->write)
 		sub->owner->write(sub->owner, data, len);
 }
@@ -312,6 +334,9 @@ weston_log_subscription_add(struct weston_log_scope *scope,
 	/* don't allow subscriptions to have a source already! */
 	assert(!sub->source);
 
+	/* Ensure the subscriber does not get messages from before */
+	fflush(scope->input_stream);
+
 	sub->source = scope;
 	wl_list_insert(&scope->subscription_list, &sub->source_link);
 }
@@ -372,8 +397,10 @@ weston_debug_protocol_advertise_scopes(struct weston_log_context *log_ctx,
 				       struct wl_resource *res)
 {
 	struct weston_log_scope *scope;
+
 	wl_list_for_each(scope, &log_ctx->scope_list, compositor_link)
-		weston_debug_v1_send_available(res, scope->name, scope->desc);
+		if (weston_log_scope_to_be_advertised(log_ctx, scope->name))
+			weston_debug_v1_send_available(res, scope->name, scope->desc);
 }
 
 /** Disable debug-protocol
@@ -413,6 +440,7 @@ weston_log_ctx_create(void)
 	wl_list_init(&log_ctx->scope_list);
 	wl_list_init(&log_ctx->pending_subscription_list);
 	wl_list_init(&log_ctx->compositor_destroy_listener.link);
+	wl_list_init(&log_ctx->advertised_debug_list);
 
 	return log_ctx;
 }
@@ -448,6 +476,8 @@ weston_log_ctx_destroy(struct weston_log_context *log_ctx)
 			      &log_ctx->pending_subscription_list, source_link) {
 		weston_log_subscription_destroy_pending(pending_sub);
 	}
+
+	weston_destroy_scopes_from_advertised_list(log_ctx);
 
 	/* pending_subscription_list should be empty at this point */
 
@@ -522,6 +552,50 @@ weston_compositor_is_debug_protocol_enabled(struct weston_compositor *wc)
 	return wc->weston_log_ctx->global != NULL;
 }
 
+WL_EXPORT bool
+weston_log_scope_to_be_advertised(struct weston_log_context *ctx, const char *name)
+{
+	struct weston_debug_scope_advertised *entry;
+
+	if (wl_list_empty(&ctx->advertised_debug_list))
+		return true;
+
+	wl_list_for_each(entry, &ctx->advertised_debug_list, link) {
+		if (!strcmp(entry->name, name))
+			return true;
+	}
+
+	return false;
+}
+
+static void
+weston_log_scope_do_write(struct weston_log_scope *scope,
+		       const char *data, size_t len)
+{
+	struct weston_log_subscription *sub;
+
+	wl_list_for_each(sub, &scope->subscription_list, source_link)
+		weston_log_subscription_write(sub, data, len);
+}
+
+static ssize_t
+input_stream_write(void *cookie, const char *buf, size_t size)
+{
+	struct weston_log_scope *scope = cookie;
+
+	weston_log_scope_do_write(scope, buf, size);
+	return size;
+}
+
+static int
+input_stream_close(void *cookie)
+{
+	struct weston_log_scope *scope = cookie;
+
+	scope->input_stream = NULL;
+	return 0;
+}
+
 /** Register a new stream name, creating a log scope.
  *
  * @param log_ctx The weston_log_context where to add.
@@ -579,6 +653,10 @@ weston_log_ctx_add_log_scope(struct weston_log_context *log_ctx,
 {
 	struct weston_log_scope *scope;
 	struct weston_log_subscription *pending_sub = NULL;
+	const cookie_io_functions_t input_stream_io_funcs = {
+		.write = input_stream_write,
+		.close = input_stream_close,
+	};
 
 	if (!name || !description) {
 		fprintf(stderr, "Error: cannot add a debug scope without name or description.\n");
@@ -611,14 +689,21 @@ weston_log_ctx_add_log_scope(struct weston_log_context *log_ctx,
 	scope->user_data = user_data;
 	wl_list_init(&scope->subscription_list);
 
-	if (!scope->name || !scope->desc) {
-		fprintf(stderr, "Error adding debug scope '%s': out of memory.\n",
+	scope->input_stream = fopencookie(scope, "w", input_stream_io_funcs);
+
+	if (!scope->name || !scope->desc || !scope->input_stream) {
+		fprintf(stderr, "Error adding debug scope '%s': out of memory or cookie.\n",
 			   name);
+		if (scope->input_stream)
+			fclose(scope->input_stream);
 		free(scope->name);
 		free(scope->desc);
 		free(scope);
 		return NULL;
 	}
+
+	setvbuf(scope->input_stream, scope->input_stream_buf,
+		_IOFBF, sizeof scope->input_stream_buf);
 
 	wl_list_insert(log_ctx->scope_list.prev, &scope->compositor_link);
 
@@ -670,6 +755,33 @@ weston_compositor_add_log_scope(struct weston_compositor *compositor,
 	return scope;
 }
 
+WL_EXPORT void
+weston_add_scope_to_advertised_list(struct weston_log_context *ctx, const char *name)
+{
+	struct weston_debug_scope_advertised *advertised_scope;
+
+	if (!name || !*name)
+		return;
+
+	advertised_scope = zalloc(sizeof(*advertised_scope));
+	advertised_scope->name = strdup(name);
+
+	wl_list_insert(&ctx->advertised_debug_list, &advertised_scope->link);
+}
+
+static void
+weston_destroy_scopes_from_advertised_list(struct weston_log_context *ctx)
+{
+	struct weston_debug_scope_advertised *entry, *tmp_entry;
+
+	wl_list_for_each_safe(entry, tmp_entry, &ctx->advertised_debug_list, link) {
+		free((char *) entry->name);
+		wl_list_remove(&entry->link);
+		free(entry);
+	}
+
+}
+
 /** Destroy a log scope
  *
  * @param scope The log scope to destroy; may be NULL.
@@ -690,6 +802,7 @@ weston_log_scope_destroy(struct weston_log_scope *scope)
 	wl_list_for_each_safe(sub, sub_tmp, &scope->subscription_list, source_link)
 		weston_log_subscription_destroy(sub);
 
+	fclose(scope->input_stream);
 	wl_list_remove(&scope->compositor_link);
 	free(scope->name);
 	free(scope->desc);
@@ -777,13 +890,39 @@ WL_EXPORT void
 weston_log_scope_write(struct weston_log_scope *scope,
 		       const char *data, size_t len)
 {
-	struct weston_log_subscription *sub;
-
 	if (!scope)
 		return;
 
-	wl_list_for_each(sub, &scope->subscription_list, source_link)
-		weston_log_subscription_write(sub, data, len);
+	fflush(scope->input_stream);
+	weston_log_scope_do_write(scope, data, len);
+}
+
+/** Get the stdio stream for a log scope
+ *
+ * This function returns the stdio stream that you can use with fprintf() and
+ * friends to print into the log scope. The stream is fully buffered. The
+ * flushing implementation will write the text to all subscribed clients'
+ * streams.
+ *
+ * When the log scope is disabled, this function returns NULL. Therefore you
+ * must always check for NULL before printing. It is ok to keep a hold of the
+ * stdio stream pointer for as long as the log scope exists.
+ *
+ * The FILE pointer is owned by the log scope. The caller must not close it.
+ *
+ * \param scope The scope where you want to print.
+ * \return A stream pointer if the scope is enabled, or NULL if the scope is
+ * disabled.
+ *
+ * \memberof weston_log_scope
+ */
+WL_EXPORT FILE *
+weston_log_scope_stream(struct weston_log_scope *scope)
+{
+	if (weston_log_scope_is_enabled(scope))
+		return scope->input_stream;
+
+	return NULL;
 }
 
 /** Write a formatted string for a scope (varargs)
@@ -796,7 +935,7 @@ weston_log_scope_write(struct weston_log_scope *scope,
  * Writes to formatted string to all subscribed clients' streams.
  *
  * The behavioral details for each stream are the same as for
- * weston_debug_stream_write().
+ * weston_log_scope_write().
  *
  * \memberof weston_log_scope
  */
@@ -804,20 +943,13 @@ WL_EXPORT int
 weston_log_scope_vprintf(struct weston_log_scope *scope,
 			 const char *fmt, va_list ap)
 {
-	static const char oom[] = "Out of memory";
-	char *str;
 	int len = 0;
 
 	if (!weston_log_scope_is_enabled(scope))
 		return len;
 
-	len = vasprintf(&str, fmt, ap);
-	if (len >= 0) {
-		weston_log_scope_write(scope, str, len);
-		free(str);
-	} else {
-		weston_log_scope_write(scope, oom, sizeof oom - 1);
-	}
+	len = vfprintf(scope->input_stream, fmt, ap);
+	fflush(scope->input_stream);
 
 	return len;
 }
@@ -831,7 +963,7 @@ weston_log_scope_vprintf(struct weston_log_scope *scope,
  * Writes to formatted string to all subscribed clients' streams.
  *
  * The behavioral details for each stream are the same as for
- * weston_debug_stream_write().
+ * weston_log_scope_write().
  *
  * \memberof weston_log_scope
  */
@@ -847,6 +979,28 @@ weston_log_scope_printf(struct weston_log_scope *scope,
 	va_end(ap);
 
 	return len;
+}
+
+/** Write an unformatted string for a scope
+ *
+ * \param scope The log scope to write for; may be NULL, in which case
+ *              nothing will be written.
+ * \param str The string to write
+ *
+ * Writes an unformatted string to all subscribed clients' streams.
+ *
+ * The behavioral details for each stream are the same as for
+ * weston_log_scope_write().
+ *
+ * \memberof weston_log_scope
+ */
+WL_EXPORT void
+weston_log_scope_puts(struct weston_log_scope *scope, const char *str)
+{
+	if (!weston_log_scope_is_enabled(scope))
+		return;
+
+	fputs(str, scope->input_stream);
 }
 
 /** Write a formatted string for a subscription
@@ -900,8 +1054,8 @@ weston_log_scope_timestamp(struct weston_log_scope *scope,
 			       "%Y-%m-%d %H:%M:%S", bdt);
 
 	if (ret > 0) {
-		snprintf(buf, len, "[%s.%03ld][%s]", string,
-			 tv.tv_usec / 1000,
+		snprintf(buf, len, "[%s.%03" PRId64 "][%s]", string,
+			 (int64_t)(tv.tv_usec / 1000),
 			 (scope) ? scope->name : "no scope");
 	} else {
 		snprintf(buf, len, "[?][%s]",
@@ -954,8 +1108,8 @@ weston_log_timestamp(char *buf, size_t len, int *cached_tm_mday)
 
        strftime(timestr, sizeof(timestr), "%H:%M:%S", brokendown_time);
        /* if datestr is empty it prints only timestr*/
-       snprintf(buf, len, "%s[%s.%03li]", datestr,
-                timestr, (tv.tv_usec / 1000));
+       snprintf(buf, len, "%s[%s.%03" PRId64 "]", datestr,
+                timestr, (int64_t)(tv.tv_usec / 1000));
 
        return buf;
 }

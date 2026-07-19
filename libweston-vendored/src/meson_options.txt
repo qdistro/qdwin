@@ -9,12 +9,6 @@ option(
 	description: 'Weston backend: DRM/KMS'
 )
 option(
-	'backend-drm-screencast-vaapi',
-	type: 'boolean',
-	value: true,
-	description: 'DRM/KMS backend support for VA-API screencasting'
-)
-option(
 	'backend-headless',
 	type: 'boolean',
 	value: true,
@@ -31,12 +25,6 @@ option(
 	type: 'boolean',
 	value: true,
 	description: 'Weston backend: RDP remote screensharing'
-)
-option(
-	'screenshare',
-	type: 'boolean',
-	value: true,
-	description: 'Compositor: RDP screen-sharing support'
 )
 option(
 	'backend-vnc',
@@ -72,6 +60,13 @@ option(
 )
 
 option(
+	'renderer-vulkan',
+	type: 'boolean',
+	value: true,
+	description: 'Weston renderer: Vulkan'
+)
+
+option(
 	'xwayland',
 	type: 'boolean',
 	value: true,
@@ -92,17 +87,17 @@ option(
 )
 
 option(
-	'remoting',
+	'deprecated-remoting',
 	type: 'boolean',
-	value: true,
-	description: 'Virtual remote output with GStreamer on DRM backend'
+	value: false,
+	description: 'DEPRECATED: Virtual remote output with GStreamer on DRM backend - migrate to backend-pipewire instead'
 )
 
 option(
-	'pipewire',
+	'deprecated-pipewire',
 	type: 'boolean',
-	value: true,
-	description: 'Virtual remote output with Pipewire on DRM backend'
+	value: false,
+	description: 'DEPRECATED: Virtual remote output with Pipewire on DRM backend - migrate to backend-pipewire instead'
 )
 
 option(
@@ -110,12 +105,6 @@ option(
 	type: 'boolean',
 	value: true,
 	description: 'Weston shell UI: traditional desktop'
-)
-option(
-	'shell-fullscreen',
-	type: 'boolean',
-	value: true,
-	description: 'Weston shell UI: fullscreen/kiosk'
 )
 option(
 	'shell-ivi',
@@ -129,12 +118,25 @@ option(
 	value: true,
 	description: 'Weston shell UI: kiosk (desktop apps)'
 )
+option(
+	'shell-lua',
+	type: 'boolean',
+	value: true,
+	description: 'Weston shell UI: Lua (programmable)'
+)
 
 option(
 	'desktop-shell-client-default',
 	type: 'string',
 	value: 'weston-desktop-shell',
 	description: 'Weston desktop shell: default helper client selection'
+)
+
+option(
+	'deprecated-xdg-shell-v6-unstable',
+	type: 'boolean',
+	value: false,
+	description: 'DEPRECATED: xdg-shell v6 unstable support. Use xdg-shell stable'
 )
 
 option(
@@ -183,12 +185,6 @@ option(
 	value: true,
 	description: 'Sample clients: optimize window resize performance'
 )
-option(
-	'wcap-decode',
-	type: 'boolean',
-	value: true,
-	description: 'Tools: screen recording decoder tool'
-)
 
 option(
 	'tests',
@@ -213,4 +209,17 @@ option(
 	type: 'boolean',
 	value: false,
 	description: 'Generate documentation'
+)
+option(
+	'perfetto',
+	type : 'boolean',
+	value : false,
+	description : 'Enable performance analysis with Perfetto.'
+)
+
+option(
+	'allow-deprecated-modeset',
+	type: 'boolean',
+	value: false,
+	description: 'DEPRECATED: Allow non-atomic modeset paths which will be removed soon'
 )

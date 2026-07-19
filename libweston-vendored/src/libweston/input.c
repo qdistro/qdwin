@@ -41,6 +41,7 @@
 #include <linux/input.h>
 
 #include "shared/helpers.h"
+#include "shared/weston-assert.h"
 #include "shared/os-compatibility.h"
 #include "shared/timespec-util.h"
 #include <libweston/libweston.h>
@@ -51,6 +52,8 @@
 #include "pointer-constraints-unstable-v1-server-protocol.h"
 #include "input-timestamps-unstable-v1-server-protocol.h"
 #include "tablet-unstable-v2-server-protocol.h"
+#include "timeline.h"
+#include "weston-trace.h"
 
 enum pointer_constraint_type {
 	POINTER_CONSTRAINT_TYPE_LOCK,
@@ -82,13 +85,6 @@ empty_region(pixman_region32_t *region)
 {
 	pixman_region32_fini(region);
 	pixman_region32_init(region);
-}
-
-static void
-region_init_infinite(pixman_region32_t *region)
-{
-	pixman_region32_init_rect(region, INT32_MIN, INT32_MIN,
-				  UINT32_MAX, UINT32_MAX);
 }
 
 static void
@@ -133,13 +129,15 @@ remove_input_resource_from_timestamps(struct wl_resource *input_resource,
  * \param syspath Unique device name.
  * \param backend_data Backend private data if necessary.
  * \param ops Calibration operations, or NULL for not able to run calibration.
+ * \param set_output Set output function.
  * \return New touch device, or NULL on failure.
  */
 WL_EXPORT struct weston_touch_device *
 weston_touch_create_touch_device(struct weston_touch *touch,
 				 const char *syspath,
 				 void *backend_data,
-				 const struct weston_touch_device_ops *ops)
+				 const struct weston_touch_device_ops *ops,
+				 weston_touch_device_set_output_func_t set_output)
 {
 	struct weston_touch_device *device;
 
@@ -165,6 +163,7 @@ weston_touch_create_touch_device(struct weston_touch *touch,
 
 	device->backend_data = backend_data;
 	device->ops = ops;
+	device->set_output = set_output;
 
 	device->aggregate = touch;
 	wl_list_insert(touch->device_list.prev, &device->link);
@@ -184,13 +183,13 @@ weston_touch_device_destroy(struct weston_touch_device *device)
 
 /** Is it possible to run calibration on this touch device? */
 WL_EXPORT bool
-weston_touch_device_can_calibrate(struct weston_touch_device *device)
+weston_touch_device_can_calibrate(const struct weston_touch_device *device)
 {
 	return !!device->ops;
 }
 
 static enum weston_touch_mode
-weston_touch_device_get_mode(struct weston_touch_device *device)
+weston_touch_device_get_mode(const struct weston_touch_device *device)
 {
 	return device->aggregate->seat->compositor->touch_mode;
 }
@@ -311,7 +310,7 @@ static void unbind_resource(struct wl_resource *resource)
 
 WL_EXPORT struct weston_coord_global
 weston_pointer_motion_to_abs(struct weston_pointer *pointer,
-			     struct weston_pointer_motion_event *event)
+			     const struct weston_pointer_motion_event *event)
 {
 	struct weston_coord_global pos;
 
@@ -329,7 +328,7 @@ weston_pointer_motion_to_abs(struct weston_pointer *pointer,
 
 static bool
 weston_pointer_motion_to_rel(struct weston_pointer *pointer,
-			     struct weston_pointer_motion_event *event,
+			     const struct weston_pointer_motion_event *event,
 			     struct weston_coord *rel,
 			     struct weston_coord *rel_unaccel)
 {
@@ -483,8 +482,6 @@ default_grab_pointer_focus(struct weston_pointer_grab *grab)
 	if (view && view == pointer->focus) {
 		struct weston_coord_surface surf_pos;
 
-		weston_view_update_transform(view);
-
 		surf_pos = weston_coord_global_to_surface(view, pointer->pos);
 		if (pointer->sx != wl_fixed_from_double(surf_pos.c.x) ||
 		    pointer->sy != wl_fixed_from_double(surf_pos.c.y))
@@ -494,28 +491,112 @@ default_grab_pointer_focus(struct weston_pointer_grab *grab)
 		weston_pointer_set_focus(pointer, view);
 }
 
+static struct weston_coord_global
+weston_pointer_clamp_for_output(struct weston_pointer *pointer,
+				struct weston_output *output,
+				struct weston_coord_global pos)
+{
+	return weston_coord_global_clamp_for_output(pos, output);
+}
+
+WL_EXPORT struct weston_coord_global
+weston_pointer_clamp(struct weston_pointer *pointer, struct weston_coord_global pos)
+{
+	struct weston_compositor *ec = pointer->seat->compositor;
+	struct weston_output *output, *prev = NULL;
+	int valid = 0;
+
+	wl_list_for_each(output, &ec->output_list, link) {
+		if (pointer->seat->output && pointer->seat->output != output)
+			continue;
+		if (weston_output_contains_coord(output, pos))
+			valid = 1;
+		if (weston_output_contains_coord(output, pointer->pos))
+			prev = output;
+	}
+
+	if (!prev)
+		prev = pointer->seat->output;
+
+	if (prev && !valid)
+		pos = weston_pointer_clamp_for_output(pointer, prev, pos);
+
+	return pos;
+}
+
+static void
+weston_pointer_move_to_preclamped(struct weston_pointer *pointer,
+				  struct weston_coord_global pos)
+{
+	pointer->pos = pos;
+
+	if (pointer->sprite) {
+		struct weston_coord_surface hotspot_inv;
+
+		hotspot_inv = weston_coord_surface_invert(pointer->hotspot);
+		weston_view_set_position_with_offset(pointer->sprite,
+						     pos, hotspot_inv);
+	}
+
+	pointer->grab->interface->focus(pointer->grab);
+	wl_signal_emit(&pointer->motion_signal, pointer);
+}
+
+WL_EXPORT void
+weston_pointer_move_to(struct weston_pointer *pointer,
+		       struct weston_coord_global pos)
+{
+	pos = weston_pointer_clamp(pointer, pos);
+	weston_pointer_move_to_preclamped(pointer, pos);
+}
+
+WL_EXPORT void
+weston_pointer_move(struct weston_pointer *pointer,
+		    const struct weston_pointer_motion_event *event)
+{
+	struct weston_coord_global pos;
+
+	pos = weston_pointer_motion_to_abs(pointer, event);
+	weston_pointer_move_to(pointer, pos);
+}
+
 static void
 pointer_send_relative_motion(struct weston_pointer *pointer,
-			     const struct timespec *time,
-			     struct weston_pointer_motion_event *event)
+			     const struct weston_pointer_motion_event *event)
 {
 	uint64_t time_usec;
 	struct weston_coord rel, rel_unaccel;
 	struct wl_list *resource_list;
 	struct wl_resource *resource;
 
-	if (!pointer->focus_client)
+	if (!pointer->focus_client) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+					   ("discard relative pointer motion",
+					    "missing focus client"));
 		return;
+	}
 
-	if (!weston_pointer_motion_to_rel(pointer, event,
-					  &rel,
-					  &rel_unaccel))
+	if (!weston_pointer_motion_to_rel(pointer, event, &rel, &rel_unaccel)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+					   ("discard relative pointer motion",
+					    "invalid relative data"),
+					   ("internal_name", pointer->focus->internal_name),
+					   ("label", pointer->focus->surface->label),
+					   ("pointer surface x", wl_fixed_to_double(pointer->sx)),
+					   ("pointer surface y", wl_fixed_to_double(pointer->sy)));
 		return;
+	}
+
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+				   ("send", "relative pointer motion"),
+				   ("latency(us)", (weston_trace_time_since *)&event->base.ts),
+				   ("internal_name", pointer->focus->internal_name),
+				   ("label", pointer->focus->surface->label),
+				   ("pointer surface x", wl_fixed_to_double(pointer->sx)),
+				   ("pointer surface y", wl_fixed_to_double(pointer->sy)));
 
 	resource_list = &pointer->focus_client->relative_pointer_resources;
-	time_usec = timespec_to_usec(&event->time);
-	if (time_usec == 0)
-		time_usec = timespec_to_usec(time);
+	time_usec = timespec_to_usec(&event->base.ts);
 
 	wl_resource_for_each(resource, resource_list) {
 		zwp_relative_pointer_v1_send_relative_motion(
@@ -530,9 +611,8 @@ pointer_send_relative_motion(struct weston_pointer *pointer,
 }
 
 static void
-pointer_send_motion(struct weston_pointer *pointer,
-		    const struct timespec *time,
-		    wl_fixed_t sx, wl_fixed_t sy)
+pointer_send_motion(struct weston_pointer *pointer, wl_fixed_t sx, wl_fixed_t sy,
+		    const struct weston_pointer_motion_event *event)
 {
 	struct wl_list *resource_list;
 	struct wl_resource *resource;
@@ -541,33 +621,43 @@ pointer_send_motion(struct weston_pointer *pointer,
 	if (!pointer->focus_client)
 		return;
 
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+				   ("send", "relative pointer motion"),
+				   ("latency(us)", (weston_trace_time_since *)&event->base.ts),
+				   ("internal_name", pointer->focus->internal_name),
+				   ("label", pointer->focus->surface->label),
+				   ("pointer surface x", wl_fixed_to_double(sx)),
+				   ("pointer surface y", wl_fixed_to_double(sy)));
+
 	resource_list = &pointer->focus_client->pointer_resources;
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&event->base.ts);
 	wl_resource_for_each(resource, resource_list) {
 		send_timestamps_for_input_resource(resource,
 		                                   &pointer->timestamps_list,
-		                                   time);
+		                                   &event->base.ts);
 		wl_pointer_send_motion(resource, msecs, sx, sy);
 	}
 }
 
 WL_EXPORT void
 weston_pointer_send_motion(struct weston_pointer *pointer,
-			   const struct timespec *time,
-			   struct weston_pointer_motion_event *event)
+			   const struct weston_pointer_motion_event *event)
 {
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow));
+
 	wl_fixed_t old_sx;
 	wl_fixed_t old_sy;
 	struct weston_view *old_focus = pointer->focus;
+	struct weston_coord_global pos;
+
+	pos = weston_pointer_motion_to_abs(pointer, event);
+	pos = weston_pointer_clamp(pointer, pos);
 
 	if (pointer->focus) {
-		struct weston_coord_global pos;
 		struct weston_coord_surface surf_pos;
 
-		pos = weston_pointer_motion_to_abs(pointer, event);
 		old_sx = pointer->sx;
 		old_sy = pointer->sy;
-		weston_view_update_transform(pointer->focus);
 
 		surf_pos = weston_coord_global_to_surface(pointer->focus, pos);
 		pointer->sx = wl_fixed_from_double(surf_pos.c.x);
@@ -577,23 +667,21 @@ weston_pointer_send_motion(struct weston_pointer *pointer,
 		old_sy = -1000000;
 	}
 
-	weston_pointer_move(pointer, event);
+	weston_pointer_move_to_preclamped(pointer, pos);
 
 	if (pointer->focus && old_focus == pointer->focus &&
 	    (old_sx != pointer->sx || old_sy != pointer->sy)) {
-		pointer_send_motion(pointer, time,
-				    pointer->sx, pointer->sy);
+		pointer_send_motion(pointer, pointer->sx, pointer->sy, event);
 	}
 
-	pointer_send_relative_motion(pointer, time, event);
+	pointer_send_relative_motion(pointer, event);
 }
 
 static void
 default_grab_pointer_motion(struct weston_pointer_grab *grab,
-			    const struct timespec *time,
-			    struct weston_pointer_motion_event *event)
+			    const struct weston_pointer_motion_event *event)
 {
-	weston_pointer_send_motion(grab->pointer, time, event);
+	weston_pointer_send_motion(grab->pointer, event);
 }
 
 /** Check if the pointer has focused resources.
@@ -616,9 +704,7 @@ weston_pointer_has_focus_resource(struct weston_pointer *pointer)
 /** Send wl_pointer.button events to focused resources.
  *
  * \param pointer The pointer where the button events originates from.
- * \param time The timestamp of the event
- * \param button The button value of the event
- * \param state The state enum value of the event
+ * \param button_event A pointer to weston_pointer_button_event
  *
  * For every resource that is currently in focus, send a wl_pointer.button event
  * with the passed parameters. The focused resources are the wl_pointer
@@ -626,39 +712,54 @@ weston_pointer_has_focus_resource(struct weston_pointer *pointer)
  */
 WL_EXPORT void
 weston_pointer_send_button(struct weston_pointer *pointer,
-			   const struct timespec *time, uint32_t button,
-			   enum wl_pointer_button_state state)
+			  const struct weston_pointer_button_event *button_event)
 {
 	struct wl_display *display = pointer->seat->compositor->wl_display;
 	struct wl_list *resource_list;
 	struct wl_resource *resource;
 	uint32_t serial;
 	uint32_t msecs;
+	struct timespec time = button_event->base.ts;
+	uint32_t button = button_event->button;
+	enum wl_pointer_button_state state = button_event->button_state;
 
-	if (!weston_pointer_has_focus_resource(pointer))
+	if (!weston_pointer_has_focus_resource(pointer)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &button_event->base.flow),
+					   ("discard button", "missing focus resource"),
+					   ("state", button_event->button_state),
+					   ("button", button_event->button));
 		return;
+	}
+
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &button_event->base.flow),
+				   ("send", "button"),
+				   ("latency(us)", (weston_trace_time_since *)&button_event->base.ts),
+				   ("internal_name", pointer->focus->internal_name),
+				   ("label", pointer->focus->surface->label),
+				   ("state", button_event->button_state),
+				   ("button", button_event->button));
 
 	resource_list = &pointer->focus_client->pointer_resources;
 	serial = wl_display_next_serial(display);
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&time);
 	wl_resource_for_each(resource, resource_list) {
 		send_timestamps_for_input_resource(resource,
 		                                   &pointer->timestamps_list,
-		                                   time);
+		                                   &time);
 		wl_pointer_send_button(resource, serial, msecs, button, state);
 	}
 }
 
 static void
 default_grab_pointer_button(struct weston_pointer_grab *grab,
-			    const struct timespec *time, uint32_t button,
-			    enum wl_pointer_button_state state)
+			    const struct weston_pointer_button_event *button_event)
 {
 	struct weston_pointer *pointer = grab->pointer;
 	struct weston_compositor *compositor = pointer->seat->compositor;
 	struct weston_view *view;
+	enum wl_pointer_button_state state = button_event->button_state;
 
-	weston_pointer_send_button(pointer, time, button, state);
+	weston_pointer_send_button(pointer, button_event);
 
 	if (pointer->button_count == 0 &&
 	    state == WL_POINTER_BUTTON_STATE_RELEASED) {
@@ -672,7 +773,6 @@ default_grab_pointer_button(struct weston_pointer_grab *grab,
 /** Send wl_pointer.axis events to focused resources.
  *
  * \param pointer The pointer where the axis events originates from.
- * \param time The timestamp of the event
  * \param event The axis value of the event
  *
  * For every resource that is currently in focus, send a wl_pointer.axis event
@@ -681,18 +781,34 @@ default_grab_pointer_button(struct weston_pointer_grab *grab,
  */
 WL_EXPORT void
 weston_pointer_send_axis(struct weston_pointer *pointer,
-			 const struct timespec *time,
-			 struct weston_pointer_axis_event *event)
+			 const struct weston_pointer_axis_event *event)
 {
 	struct wl_resource *resource;
 	struct wl_list *resource_list;
 	uint32_t msecs;
 
-	if (!weston_pointer_has_focus_resource(pointer))
+	if (!weston_pointer_has_focus_resource(pointer)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+					   ("discard axis", "missing focus resource"),
+					   ("axis", event->axis),
+					   ("value", event->value),
+					   ("has_discrete", event->has_discrete),
+					   ("discrete", event->discrete));
 		return;
+	}
+
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+				   ("send", "axis"),
+				   ("latency(us)", (weston_trace_time_since *)&event->base.ts),
+				   ("internal_name", pointer->focus->internal_name),
+				   ("label", pointer->focus->surface->label),
+				   ("axis", event->axis),
+				   ("value", event->value),
+				   ("has_discrete", event->has_discrete),
+				   ("discrete", event->discrete));
 
 	resource_list = &pointer->focus_client->pointer_resources;
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&event->base.ts);
 	wl_resource_for_each(resource, resource_list) {
 		if (event->has_discrete &&
 		    wl_resource_get_version(resource) >=
@@ -703,7 +819,7 @@ weston_pointer_send_axis(struct weston_pointer *pointer,
 		if (event->value) {
 			send_timestamps_for_input_resource(resource,
 							   &pointer->timestamps_list,
-							   time);
+							   &event->base.ts);
 			wl_pointer_send_axis(resource, msecs,
 					     event->axis,
 					     wl_fixed_from_double(event->value));
@@ -711,7 +827,7 @@ weston_pointer_send_axis(struct weston_pointer *pointer,
 			 WL_POINTER_AXIS_STOP_SINCE_VERSION) {
 			send_timestamps_for_input_resource(resource,
 							   &pointer->timestamps_list,
-							   time);
+							   &event->base.ts);
 			wl_pointer_send_axis_stop(resource, msecs,
 						  event->axis);
 		}
@@ -779,10 +895,9 @@ weston_pointer_send_frame(struct weston_pointer *pointer)
 
 static void
 default_grab_pointer_axis(struct weston_pointer_grab *grab,
-			  const struct timespec *time,
-			  struct weston_pointer_axis_event *event)
+			  const struct weston_pointer_axis_event *event)
 {
-	weston_pointer_send_axis(grab->pointer, time, event);
+	weston_pointer_send_axis(grab->pointer, event);
 }
 
 static void
@@ -833,19 +948,16 @@ weston_touch_has_focus_resource(struct weston_touch *touch)
 
 /** Send wl_touch.down events to focused resources.
  *
- * \param touch The touch where the down events originates from.
- * \param time The timestamp of the event
- * \param touch_id The touch_id value of the event
- * \param pos The global coordinate of the event
+ * \param event The weston_touch_event
  *
  * For every resource that is currently in focus, send a wl_touch.down event
  * with the passed parameters. The focused resources are the wl_touch
  * resources of the client which currently has the surface with touch focus.
  */
 WL_EXPORT void
-weston_touch_send_down(struct weston_touch *touch, const struct timespec *time,
-		       int touch_id, struct weston_coord_global pos)
+weston_touch_send_down(const struct weston_touch_event *event)
 {
+	struct weston_touch *touch = event->base.seat->touch_state;
 	struct wl_display *display = touch->seat->compositor->wl_display;
 	uint32_t serial;
 	struct wl_resource *resource;
@@ -853,123 +965,153 @@ weston_touch_send_down(struct weston_touch *touch, const struct timespec *time,
 	struct weston_coord_surface surf_pos;
 	uint32_t msecs;
 
-	if (!weston_touch_has_focus_resource(touch))
+	if (!weston_touch_has_focus_resource(touch)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+					   ("discard touch down", "missing focus resource"),
+					   ("touch pos x", event->pos.c.x),
+					   ("touch pos y", event->pos.c.y),
+					   ("touch id", event->touch_id));
 		return;
+	}
 
+	surf_pos = weston_coord_global_to_surface(touch->focus, event->pos);
 	weston_view_update_transform(touch->focus);
 
-	surf_pos = weston_coord_global_to_surface(touch->focus, pos);
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+				   ("send", "touch down"),
+				   ("latency(us)", (weston_trace_time_since *)&event->base.ts),
+				   ("internal_name", touch->focus->internal_name),
+				   ("label", touch->focus->surface->label),
+				   ("touch pos x", event->pos.c.x),
+				   ("touch pos y", event->pos.c.y),
+				   ("surface pos x", surf_pos.c.x),
+				   ("surface pos y", surf_pos.c.y),
+				   ("touch id", event->touch_id));
 
 	resource_list = &touch->focus_resource_list;
 	serial = wl_display_next_serial(display);
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&event->base.ts);
 	wl_resource_for_each(resource, resource_list) {
 		send_timestamps_for_input_resource(resource,
 						   &touch->timestamps_list,
-						   time);
+						   &event->base.ts);
 		wl_touch_send_down(resource, serial, msecs,
 				   touch->focus->surface->resource,
-				   touch_id,
+				   event->touch_id,
 				   wl_fixed_from_double(surf_pos.c.x),
 				   wl_fixed_from_double(surf_pos.c.y));
 	}
 }
 
 static void
-default_grab_touch_down(struct weston_touch_grab *grab,
-			const struct timespec *time, int touch_id,
-			struct weston_coord_global pos)
+default_grab_touch_down(struct weston_touch_grab *grab, const struct weston_touch_event *event)
 {
-	weston_touch_send_down(grab->touch, time, touch_id, pos);
+	weston_touch_send_down(event);
 }
 
 /** Send wl_touch.up events to focused resources.
  *
- * \param touch The touch where the up events originates from.
- * \param time The timestamp of the event
- * \param touch_id The touch_id value of the event
+ * \param event The weston_touch_event
  *
  * For every resource that is currently in focus, send a wl_touch.up event
  * with the passed parameters. The focused resources are the wl_touch
  * resources of the client which currently has the surface with touch focus.
  */
 WL_EXPORT void
-weston_touch_send_up(struct weston_touch *touch, const struct timespec *time,
-		     int touch_id)
+weston_touch_send_up(const struct weston_touch_event *event)
 {
+	struct weston_touch *touch = event->base.seat->touch_state;
 	struct wl_display *display = touch->seat->compositor->wl_display;
 	uint32_t serial;
 	struct wl_resource *resource;
 	struct wl_list *resource_list;
 	uint32_t msecs;
 
-	if (!weston_touch_has_focus_resource(touch))
+	if (!weston_touch_has_focus_resource(touch)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+					   ("discard touch up", "missing focus resource"),
+					   ("touch id", event->touch_id));
 		return;
+	}
+
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+				   ("send", "touch up"),
+				   ("latency(us)", (weston_trace_time_since *)&event->base.ts),
+				   ("internal_name", touch->focus->internal_name),
+				   ("label", touch->focus->surface->label),
+				   ("touch id", event->touch_id));
 
 	resource_list = &touch->focus_resource_list;
 	serial = wl_display_next_serial(display);
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&event->base.ts);
 	wl_resource_for_each(resource, resource_list) {
 		send_timestamps_for_input_resource(resource,
 						   &touch->timestamps_list,
-						   time);
-		wl_touch_send_up(resource, serial, msecs, touch_id);
+						   &event->base.ts);
+		wl_touch_send_up(resource, serial, msecs, event->touch_id);
 	}
 }
 
 static void
-default_grab_touch_up(struct weston_touch_grab *grab,
-		      const struct timespec *time, int touch_id)
+default_grab_touch_up(struct weston_touch_grab *grab, const struct weston_touch_event *event)
 {
-	weston_touch_send_up(grab->touch, time, touch_id);
+	weston_touch_send_up(event);
 }
 
 /** Send wl_touch.motion events to focused resources.
  *
- * \param touch The touch where the motion events originates from.
- * \param time The timestamp of the event
- * \param touch_id The touch_id value of the event
- * \param pos The global coordinate of the event
+ * \param event The weston_touch_event
  *
  * For every resource that is currently in focus, send a wl_touch.motion event
  * with the passed parameters. The focused resources are the wl_touch
  * resources of the client which currently has the surface with touch focus.
  */
 WL_EXPORT void
-weston_touch_send_motion(struct weston_touch *touch,
-			 const struct timespec *time, int touch_id,
-			 struct weston_coord_global pos)
+weston_touch_send_motion(const struct weston_touch_event *event)
 {
 	struct wl_resource *resource;
 	struct wl_list *resource_list;
 	uint32_t msecs;
 	struct weston_coord_surface surf_pos;
+	struct weston_touch *touch = event->base.seat->touch_state;
 
-	if (!weston_touch_has_focus_resource(touch))
+	if (!weston_touch_has_focus_resource(touch)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+					   ("discard touch motion", "missing focus resource"),
+					   ("touch pos x", event->pos.c.x),
+					   ("touch pos y", event->pos.c.y),
+					   ("touch id", event->touch_id));
 		return;
+	}
 
+	surf_pos = weston_coord_global_to_surface(touch->focus, event->pos);
 	weston_view_update_transform(touch->focus);
 
-	surf_pos = weston_coord_global_to_surface(touch->focus, pos);
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &event->base.flow),
+				   ("send", "touch motion"),
+				   ("latency(us)", (weston_trace_time_since *)&event->base.ts),
+				   ("internal_name", touch->focus->internal_name),
+				   ("label", touch->focus->surface->label),
+				   ("touch pos x", event->pos.c.x),
+				   ("touch pos y", event->pos.c.y),
+				   ("touch id", event->touch_id));
 
 	resource_list = &touch->focus_resource_list;
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&event->base.ts);
 	wl_resource_for_each(resource, resource_list) {
 		send_timestamps_for_input_resource(resource,
 						   &touch->timestamps_list,
-						   time);
-		wl_touch_send_motion(resource, msecs, touch_id,
+						   &event->base.ts);
+		wl_touch_send_motion(resource, msecs, event->touch_id,
 				     wl_fixed_from_double(surf_pos.c.x),
 				     wl_fixed_from_double(surf_pos.c.y));
 	}
 }
 
 static void
-default_grab_touch_motion(struct weston_touch_grab *grab,
-			  const struct timespec *time, int touch_id,
-			  struct weston_coord_global pos)
+default_grab_touch_motion(struct weston_touch_grab *grab, const struct weston_touch_event *event)
 {
-	weston_touch_send_motion(grab->touch, time, touch_id, pos);
+	weston_touch_send_motion(event);
 }
 
 
@@ -1032,9 +1174,7 @@ weston_keyboard_has_focus_resource(struct weston_keyboard *keyboard)
 /** Send wl_keyboard.key events to focused resources.
  *
  * \param keyboard The keyboard where the key events originates from.
- * \param time The timestamp of the event
- * \param key The key value of the event
- * \param state The state enum value of the event
+ * \param key_event The weston_key_event as a pointer
  *
  * For every resource that is currently in focus, send a wl_keyboard.key event
  * with the passed parameters. The focused resources are the wl_keyboard
@@ -1042,35 +1182,52 @@ weston_keyboard_has_focus_resource(struct weston_keyboard *keyboard)
  */
 WL_EXPORT void
 weston_keyboard_send_key(struct weston_keyboard *keyboard,
-			 const struct timespec *time, uint32_t key,
-			 enum wl_keyboard_key_state state)
+			 const struct weston_key_event *key_event)
 {
 	struct wl_resource *resource;
 	struct wl_display *display = keyboard->seat->compositor->wl_display;
 	uint32_t serial;
 	struct wl_list *resource_list;
 	uint32_t msecs;
+	struct timespec time = key_event->base.ts;
+	uint32_t key = key_event->key;
+	enum wl_keyboard_key_state state = key_event->key_state;
 
-	if (!weston_keyboard_has_focus_resource(keyboard))
+	if (!weston_keyboard_has_focus_resource(keyboard)) {
+		WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &key_event->base.flow),
+					   ("discard send key", "missing touch resource"),
+					   ("key", key),
+					   ("state", state),
+					   ("update state", key_event->key_update_state));
 		return;
+	}
 
 	resource_list = &keyboard->focus_resource_list;
 	serial = wl_display_next_serial(display);
-	msecs = timespec_to_msec(time);
+	msecs = timespec_to_msec(&time);
+
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &key_event->base.flow),
+				   ("send", "key"),
+				   ("latency(us)", (weston_trace_time_since *)&key_event->base.ts),
+				   ("internal_name", keyboard->focus->internal_name),
+				   ("label", keyboard->focus->label),
+				   ("key", key),
+				   ("state", state),
+				   ("update state", key_event->key_update_state));
+
 	wl_resource_for_each(resource, resource_list) {
 		send_timestamps_for_input_resource(resource,
 						   &keyboard->timestamps_list,
-						   time);
+						   &time);
 		wl_keyboard_send_key(resource, serial, msecs, key, state);
 	}
 };
 
 static void
 default_grab_keyboard_key(struct weston_keyboard_grab *grab,
-			  const struct timespec *time, uint32_t key,
-			  uint32_t state)
+			  const struct weston_key_event *key_event)
 {
-	weston_keyboard_send_key(grab->keyboard, time, key, state);
+	weston_keyboard_send_key(grab->keyboard, key_event);
 }
 
 static void
@@ -1231,7 +1388,7 @@ pointer_unmap_sprite(struct weston_pointer *pointer)
 	wl_list_remove(&pointer->sprite_destroy_listener.link);
 	surface->committed = NULL;
 	surface->committed_private = NULL;
-	weston_surface_set_label_func(surface, NULL);
+	weston_surface_set_label(surface, NULL);
 	weston_view_destroy(pointer->sprite);
 	pointer->sprite = NULL;
 }
@@ -1919,10 +2076,11 @@ weston_pointer_set_focus(struct weston_pointer *pointer,
 	int refocus = 0;
 	wl_fixed_t sx, sy;
 
+	sx = sy = wl_fixed_from_int(-999999); /* poison */
+
 	if (view) {
 		struct weston_coord_surface surf_pos;
 
-		weston_view_update_transform(view);
 		surf_pos = weston_coord_global_to_surface(view, pointer->pos);
 		sx = wl_fixed_from_double(surf_pos.c.x);
 		sy = wl_fixed_from_double(surf_pos.c.y);
@@ -2024,6 +2182,9 @@ weston_keyboard_set_focus(struct weston_keyboard *keyboard,
 	struct wl_display *display = keyboard->seat->compositor->wl_display;
 	uint32_t serial;
 	struct wl_list *focus_resource_list;
+
+	/* A sub-surface never has the keyboard focus of any seat. */
+	assert(!surface || !weston_surface_to_subsurface(surface));
 
 	/* Keyboard focus on a surface without a client is equivalent to NULL
 	 * focus as nothing would react to the keyboard events anyway.
@@ -2141,69 +2302,6 @@ weston_touch_cancel_grab(struct weston_touch *touch)
 	touch->grab->interface->cancel(touch->grab);
 }
 
-static struct weston_coord_global
-weston_pointer_clamp_for_output(struct weston_pointer *pointer,
-				struct weston_output *output,
-				struct weston_coord_global pos)
-{
-	return weston_coord_global_clamp_for_output(pos, output);
-}
-
-WL_EXPORT struct weston_coord_global
-weston_pointer_clamp(struct weston_pointer *pointer, struct weston_coord_global pos)
-{
-	struct weston_compositor *ec = pointer->seat->compositor;
-	struct weston_output *output, *prev = NULL;
-	int valid = 0;
-
-	wl_list_for_each(output, &ec->output_list, link) {
-		if (pointer->seat->output && pointer->seat->output != output)
-			continue;
-		if (weston_output_contains_coord(output, pos))
-			valid = 1;
-		if (weston_output_contains_coord(output, pointer->pos))
-			prev = output;
-	}
-
-	if (!prev)
-		prev = pointer->seat->output;
-
-	if (prev && !valid)
-		pos = weston_pointer_clamp_for_output(pointer, prev, pos);
-
-	return pos;
-}
-
-static void
-weston_pointer_move_to(struct weston_pointer *pointer,
-		       struct weston_coord_global pos)
-{
-	pos = weston_pointer_clamp(pointer, pos);
-
-	pointer->pos = pos;
-
-	if (pointer->sprite) {
-		struct weston_coord_surface hotspot_inv;
-
-		hotspot_inv = weston_coord_surface_invert(pointer->hotspot);
-		weston_view_set_position_with_offset(pointer->sprite,
-						     pos, hotspot_inv);
-	}
-
-	pointer->grab->interface->focus(pointer->grab);
-	wl_signal_emit(&pointer->motion_signal, pointer);
-}
-
-WL_EXPORT void
-weston_pointer_move(struct weston_pointer *pointer,
-		    struct weston_pointer_motion_event *event)
-{
-	struct weston_coord_global pos;
-
-	pos = weston_pointer_motion_to_abs(pointer, event);
-	weston_pointer_move_to(pointer, pos);
-}
-
 /** Verify if the pointer is in a valid position and move it if it isn't.
  */
 static void
@@ -2249,15 +2347,14 @@ weston_pointer_handle_output_destroy(struct wl_listener *listener, void *data)
 }
 
 WL_EXPORT void
-notify_motion(struct weston_seat *seat,
-	      const struct timespec *time,
-	      struct weston_pointer_motion_event *event)
+notify_motion(const struct weston_pointer_motion_event *event)
 {
+	struct weston_seat *seat = event->base.seat;
 	struct weston_compositor *ec = seat->compositor;
 	struct weston_pointer *pointer = weston_seat_get_pointer(seat);
 
 	weston_compositor_wake(ec);
-	pointer->grab->interface->motion(pointer->grab, time, event);
+	pointer->grab->interface->motion(pointer->grab, event);
 }
 
 static void
@@ -2296,23 +2393,6 @@ run_modifier_bindings(struct weston_seat *seat, uint32_t old, uint32_t new)
 	}
 }
 
-WL_EXPORT void
-notify_motion_absolute(struct weston_seat *seat, const struct timespec *time,
-		       struct weston_coord_global pos)
-{
-	struct weston_compositor *ec = seat->compositor;
-	struct weston_pointer *pointer = weston_seat_get_pointer(seat);
-	struct weston_pointer_motion_event event = { 0 };
-
-	weston_compositor_wake(ec);
-
-	event = (struct weston_pointer_motion_event) {
-		.mask = WESTON_POINTER_MOTION_ABS,
-		.abs = pos,
-	};
-	pointer->grab->interface->motion(pointer->grab, time, &event);
-}
-
 static unsigned int
 peek_next_activate_serial(struct weston_compositor *c)
 {
@@ -2340,7 +2420,9 @@ weston_view_activate_input(struct weston_view *view,
 			peek_next_activate_serial(compositor);
 	}
 
-	weston_seat_set_keyboard_focus(seat, view->surface);
+	/* A sub-surface never has the keyboard focus of any seat. */
+	weston_seat_set_keyboard_focus(seat,
+				       weston_surface_get_main_surface(view->surface));
 
 	inc_activate_serial(compositor);
 
@@ -2353,17 +2435,17 @@ weston_view_activate_input(struct weston_view *view,
 }
 
 WL_EXPORT void
-notify_button(struct weston_seat *seat, const struct timespec *time,
-	      int32_t button, enum wl_pointer_button_state state)
+notify_button(const struct weston_pointer_button_event *event)
 {
+	struct weston_seat *seat = event->base.seat;
 	struct weston_compositor *compositor = seat->compositor;
 	struct weston_pointer *pointer = weston_seat_get_pointer(seat);
 
-	if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+	if (event->button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
 		weston_compositor_idle_inhibit(compositor);
 		if (pointer->button_count == 0) {
-			pointer->grab_button = button;
-			pointer->grab_time = *time;
+			pointer->grab_button = event->button;
+			pointer->grab_time = event->base.ts;
 			pointer->grab_pos = pointer->pos;
 		}
 		pointer->button_count++;
@@ -2372,10 +2454,10 @@ notify_button(struct weston_seat *seat, const struct timespec *time,
 		pointer->button_count--;
 	}
 
-	weston_compositor_run_button_binding(compositor, pointer, time, button,
-					     state);
+	weston_compositor_run_button_binding(compositor, pointer, &event->base.ts,
+					     event->button, event->button_state);
 
-	pointer->grab->interface->button(pointer->grab, time, button, state);
+	pointer->grab->interface->button(pointer->grab, event);
 
 	if (pointer->button_count == 1)
 		pointer->grab_serial =
@@ -2383,19 +2465,18 @@ notify_button(struct weston_seat *seat, const struct timespec *time,
 }
 
 WL_EXPORT void
-notify_axis(struct weston_seat *seat, const struct timespec *time,
-	    struct weston_pointer_axis_event *event)
+notify_axis(const struct weston_pointer_axis_event *event)
 {
+	struct weston_seat *seat = event->base.seat;
 	struct weston_compositor *compositor = seat->compositor;
 	struct weston_pointer *pointer = weston_seat_get_pointer(seat);
 
 	weston_compositor_wake(compositor);
 
-	if (weston_compositor_run_axis_binding(compositor, pointer,
-					       time, event))
+	if (weston_compositor_run_axis_binding(compositor, pointer, &event->base.ts, event))
 		return;
 
-	pointer->grab->interface->axis(pointer->grab, time, event);
+	pointer->grab->interface->axis(pointer->grab, event);
 }
 
 WL_EXPORT void
@@ -2518,13 +2599,21 @@ notify_modifiers(struct weston_seat *seat, uint32_t serial)
 	/* Finally, notify the compositor that LEDs have changed. */
 	if (xkb_state_led_index_is_active(keyboard->xkb_state.state,
 					  keyboard->xkb_info->num_led))
-		leds |= LED_NUM_LOCK;
+		leds |= WESTON_LED_NUM_LOCK;
 	if (xkb_state_led_index_is_active(keyboard->xkb_state.state,
 					  keyboard->xkb_info->caps_led))
-		leds |= LED_CAPS_LOCK;
+		leds |= WESTON_LED_CAPS_LOCK;
 	if (xkb_state_led_index_is_active(keyboard->xkb_state.state,
 					  keyboard->xkb_info->scroll_led))
-		leds |= LED_SCROLL_LOCK;
+		leds |= WESTON_LED_SCROLL_LOCK;
+#ifdef HAVE_COMPOSE_AND_KANA
+	if (xkb_state_led_index_is_active(keyboard->xkb_state.state,
+					  keyboard->xkb_info->compose_led))
+		leds |= WESTON_LED_COMPOSE;
+	if (xkb_state_led_index_is_active(keyboard->xkb_state.state,
+					  keyboard->xkb_info->kana_led))
+		leds |= WESTON_LED_KANA;
+#endif
 	if (leds != keyboard->xkb_state.leds && seat->led_update)
 		seat->led_update(seat, leds);
 	keyboard->xkb_state.leds = leds;
@@ -2661,13 +2750,16 @@ update_keymap(struct weston_seat *seat)
 }
 
 WL_EXPORT void
-notify_key(struct weston_seat *seat, const struct timespec *time, uint32_t key,
-	   enum wl_keyboard_key_state state,
-	   enum weston_key_state_update update_state)
+notify_key(const struct weston_key_event *key_event)
 {
+	struct timespec time = key_event->base.ts;
+	struct weston_seat *seat = key_event->base.seat;
 	struct weston_compositor *compositor = seat->compositor;
 	struct weston_keyboard *keyboard = weston_seat_get_keyboard(seat);
 	struct weston_keyboard_grab *grab = keyboard->grab;
+	enum wl_keyboard_key_state state = key_event->key_state;
+	uint32_t key = key_event->key;
+	enum weston_key_state_update update_state = key_event->key_update_state;
 	uint32_t *k, *end;
 
 	end = keyboard->keys.data + keyboard->keys.size;
@@ -2677,6 +2769,7 @@ notify_key(struct weston_seat *seat, const struct timespec *time, uint32_t key,
 			if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
 				return;
 			*k = *--end;
+			break;
 		}
 	}
 	keyboard->keys.size = (void *) end - keyboard->keys.data;
@@ -2693,12 +2786,12 @@ notify_key(struct weston_seat *seat, const struct timespec *time, uint32_t key,
 
 	if (grab == &keyboard->default_grab ||
 	    grab == &keyboard->input_method_grab) {
-		weston_compositor_run_key_binding(compositor, keyboard, time,
+		weston_compositor_run_key_binding(compositor, keyboard, &time,
 						  key, state);
 		grab = keyboard->grab;
 	}
 
-	grab->interface->key(grab, time, key, state);
+	grab->interface->key(grab, key_event);
 
 	if (keyboard->pending_keymap &&
 	    keyboard->keys.size == 0)
@@ -2713,7 +2806,7 @@ notify_key(struct weston_seat *seat, const struct timespec *time, uint32_t key,
 
 	keyboard->grab_serial = wl_display_get_serial(compositor->wl_display);
 	if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		keyboard->grab_time = *time;
+		keyboard->grab_time = time;
 		keyboard->grab_key = key;
 	}
 }
@@ -2852,32 +2945,29 @@ weston_touch_set_focus(struct weston_touch *touch, struct weston_view *view)
 		wl_signal_add(&view->destroy_signal, &touch->focus_view_listener);
 	}
 	touch->focus = view;
+	wl_signal_emit(&touch->focus_signal, touch);
 }
 
 static void
-process_touch_normal(struct weston_touch_device *device,
-		     const struct timespec *time, int touch_id,
-		     const struct weston_coord_global *pos, int touch_type)
+process_touch_normal(const struct weston_touch_device *device,
+		     const struct weston_touch_event *event)
 {
 	struct weston_touch *touch = device->aggregate;
 	struct weston_touch_grab *grab = device->aggregate->grab;
 	struct weston_compositor *ec = device->aggregate->seat->compositor;
 	struct weston_view *ev;
 
-	if (touch_type != WL_TOUCH_UP)
-		assert(pos);
-
 	/* Update grab's global coordinates. */
-	if (touch_id == touch->grab_touch_id && touch_type != WL_TOUCH_UP)
-		touch->grab_pos = *pos;
+	if (event->touch_id == touch->grab_touch_id && event->touch_type != WL_TOUCH_UP)
+		touch->grab_pos = event->pos;
 
-	switch (touch_type) {
+	switch (event->touch_type) {
 	case WL_TOUCH_DOWN:
 		/* the first finger down picks the view, and all further go
 		 * to that view for the remainder of the touch session i.e.
 		 * until all touch points are up again. */
 		if (touch->num_tp == 1) {
-			ev = weston_compositor_pick_view(ec, *pos);
+			ev = weston_compositor_pick_view(ec, event->pos);
 			weston_touch_set_focus(touch, ev);
 		} else if (!touch->focus) {
 			/* Unexpected condition: We have non-initial touch but
@@ -2889,15 +2979,16 @@ process_touch_normal(struct weston_touch_device *device,
 		}
 
 		weston_compositor_run_touch_binding(ec, touch,
-						    time, touch_type);
+						    &event->base.ts,
+						    event->touch_type);
 
-		grab->interface->down(grab, time, touch_id, *pos);
+		grab->interface->down(grab, event);
 		if (touch->num_tp == 1) {
 			touch->grab_serial =
 				wl_display_get_serial(ec->wl_display);
-			touch->grab_touch_id = touch_id;
-			touch->grab_time = *time;
-			touch->grab_pos = *pos;
+			touch->grab_touch_id = event->touch_id;
+			touch->grab_time = event->base.ts;
+			touch->grab_pos = event->pos;
 		}
 
 		break;
@@ -2906,10 +2997,10 @@ process_touch_normal(struct weston_touch_device *device,
 		if (!ev)
 			break;
 
-		grab->interface->motion(grab, time, touch_id, *pos);
+		grab->interface->motion(grab, event);
 		break;
 	case WL_TOUCH_UP:
-		grab->interface->up(grab, time, touch_id);
+		grab->interface->up(grab, event);
 		touch->pending_focus_reset = true;
 		break;
 	}
@@ -3020,12 +3111,8 @@ weston_compositor_set_touch_mode_calib(struct weston_compositor *compositor)
  * → touch_update → ... → touch_update → touch_end. The driver is responsible
  * for sending along such order.
  *
- * \param device The physical device that generated the event.
- * \param time The event timestamp.
- * \param touch_id ID for the touch point of this event (multi-touch).
- * \param pos X,Y coordinate in compositor global space, or NULL for WL_TOUCH_UP.
+ * \param event The weston_touch_event event
  * \param norm Normalized device X, Y coordinates in calibration space, or NULL.
- * \param touch_type Either WL_TOUCH_DOWN, WL_TOUCH_UP, or WL_TOUCH_MOTION.
  *
  * Coordinates double_x and double_y are used for normal operation.
  *
@@ -3038,29 +3125,21 @@ weston_compositor_set_touch_mode_calib(struct weston_compositor *compositor)
  * weston_output.
  */
 WL_EXPORT void
-notify_touch_normalized(struct weston_touch_device *device,
-			const struct timespec *time,
-			int touch_id,
-			const struct weston_coord_global *pos,
-			const struct weston_point2d_device_normalized *norm,
-			int touch_type)
+notify_touch_normalized(const struct weston_touch_event *event,
+			const struct weston_point2d_device_normalized *norm)
 {
-	struct weston_seat *seat = device->aggregate->seat;
-	struct weston_touch *touch = device->aggregate;
+	struct weston_seat *seat = event->base.seat;
+	struct weston_touch *touch = seat->touch_state;
 
-	if (touch_type != WL_TOUCH_UP) {
-		assert(pos);
-
-		if (weston_touch_device_can_calibrate(device))
+	if (event->touch_type != WL_TOUCH_UP) {
+		if (weston_touch_device_can_calibrate(event->device))
 			assert(norm != NULL);
 		else
 			assert(norm == NULL);
-	} else {
-		assert(!pos);
 	}
 
 	/* Update touchpoints count regardless of the current mode. */
-	switch (touch_type) {
+	switch (event->touch_type) {
 	case WL_TOUCH_DOWN:
 		weston_compositor_idle_inhibit(seat->compositor);
 
@@ -3073,7 +3152,7 @@ notify_touch_normalized(struct weston_touch_device *device,
 			 * case we didn't get the corresponding down
 			 * event. */
 			weston_log("Unmatched touch up event on seat %s, device %s\n",
-				   seat->seat_name, device->syspath);
+				   seat->seat_name, event->device->syspath);
 			return;
 		}
 		weston_compositor_idle_release(seat->compositor);
@@ -3085,15 +3164,14 @@ notify_touch_normalized(struct weston_touch_device *device,
 	}
 
 	/* Properly forward the touch event */
-	switch (weston_touch_device_get_mode(device)) {
+	switch (weston_touch_device_get_mode(event->device)) {
 	case WESTON_TOUCH_MODE_NORMAL:
 	case WESTON_TOUCH_MODE_PREP_CALIB:
-		process_touch_normal(device, time, touch_id, pos, touch_type);
+		process_touch_normal(event->device, event);
 		break;
 	case WESTON_TOUCH_MODE_CALIB:
 	case WESTON_TOUCH_MODE_PREP_NORMAL:
-		notify_touch_calibrator(device, time, touch_id,
-					norm, touch_type);
+		notify_touch_calibrator(event, norm);
 		break;
 	}
 }
@@ -3141,13 +3219,6 @@ notify_touch_cancel(struct weston_touch_device *device)
 	}
 
 	weston_compositor_update_touch_mode(device->aggregate->seat->compositor);
-}
-
-static int
-pointer_cursor_surface_get_label(struct weston_surface *surface,
-				 char *buf, size_t len)
-{
-	return snprintf(buf, len, "cursor");
 }
 
 static void
@@ -3578,8 +3649,7 @@ pointer_set_cursor(struct wl_client *client, struct wl_resource *resource,
 
 		surface->committed = pointer_cursor_surface_committed;
 		surface->committed_private = pointer;
-		weston_surface_set_label_func(surface,
-					    pointer_cursor_surface_get_label);
+		weston_surface_set_label_static(surface, "cursor");
 		pointer->sprite = weston_view_create(surface);
 	}
 
@@ -3650,8 +3720,6 @@ seat_get_pointer(struct wl_client *client, struct wl_resource *resource,
 	if (pointer->focus && pointer->focus->surface->resource &&
 	    wl_resource_get_client(pointer->focus->surface->resource) == client) {
 		struct weston_coord_surface surf_pos;
-
-		weston_view_update_transform(pointer->focus);
 
 		surf_pos = weston_coord_global_to_surface(pointer->focus,
 							  pointer->pos);
@@ -4017,6 +4085,12 @@ weston_xkb_info_create(struct xkb_keymap *keymap)
 						      XKB_LED_NAME_CAPS);
 	xkb_info->scroll_led = xkb_keymap_led_get_index(xkb_info->keymap,
 							XKB_LED_NAME_SCROLL);
+#ifdef HAVE_COMPOSE_AND_KANA
+	xkb_info->compose_led = xkb_keymap_led_get_index(xkb_info->keymap,
+							XKB_LED_NAME_COMPOSE);
+	xkb_info->kana_led = xkb_keymap_led_get_index(xkb_info->keymap,
+							XKB_LED_NAME_KANA);
+#endif
 
 	keymap_string = xkb_keymap_get_as_string(xkb_info->keymap,
 							   XKB_KEYMAP_FORMAT_TEXT_V1);
@@ -4610,6 +4684,14 @@ enable_pointer_constraint(struct weston_pointer_constraint *constraint,
 			  struct weston_view *view)
 {
 	assert(constraint->view == NULL);
+
+	if (!constraint->pointer->focus ||
+	    constraint->pointer->focus->surface != constraint->surface) {
+		weston_log("WARNING: Not enabling constraint because "
+			   "pointer focus doesn't match\n");
+		return;
+	}
+
 	constraint->view = view;
 	pointer_constraint_notify_activated(constraint);
 	weston_pointer_start_grab(constraint->pointer, &constraint->grab);
@@ -4707,7 +4789,6 @@ maybe_enable_pointer_constraint(struct weston_pointer_constraint *constraint)
 	if (!keyboard || keyboard->focus != surface)
 		return;
 
-	weston_view_update_transform(view);
 	/* Postpone constraint if the pointer is not within the
 	 * constraint region.
 	 */
@@ -4725,27 +4806,23 @@ locked_pointer_grab_pointer_focus(struct weston_pointer_grab *grab)
 
 static void
 locked_pointer_grab_pointer_motion(struct weston_pointer_grab *grab,
-				   const struct timespec *time,
-				   struct weston_pointer_motion_event *event)
+				   const struct weston_pointer_motion_event *event)
 {
-	pointer_send_relative_motion(grab->pointer, time, event);
+	pointer_send_relative_motion(grab->pointer, event);
 }
 
 static void
 locked_pointer_grab_pointer_button(struct weston_pointer_grab *grab,
-				   const struct timespec *time,
-				   uint32_t button,
-				   uint32_t state_w)
+				   const struct weston_pointer_button_event *button_event)
 {
-	weston_pointer_send_button(grab->pointer, time, button, state_w);
+	weston_pointer_send_button(grab->pointer, button_event);
 }
 
 static void
 locked_pointer_grab_pointer_axis(struct weston_pointer_grab *grab,
-				 const struct timespec *time,
-				 struct weston_pointer_axis_event *event)
+				 const struct weston_pointer_axis_event *event)
 {
-	weston_pointer_send_axis(grab->pointer, time, event);
+	weston_pointer_send_axis(grab->pointer, event);
 }
 
 static void
@@ -4814,7 +4891,6 @@ pointer_constraint_surface_activate(struct wl_listener *listener, void *data)
 	if (is_constraint_surface &&
 	    !is_pointer_constraint_enabled(constraint)) {
 		if (activation->flags & WESTON_ACTIVATE_FLAG_FULLSCREEN) {
-			weston_view_update_transform(activation->view);
 			weston_pointer_set_focus(pointer, activation->view);
 			enable_pointer_constraint(constraint, activation->view);
 			maybe_warp_confined_pointer(constraint);
@@ -4855,9 +4931,6 @@ pointer_constraint_surface_committed(struct wl_listener *listener, void *data)
 		container_of(listener, struct weston_pointer_constraint,
 			     surface_commit_listener);
 
-	if (is_pointer_constraint_enabled(constraint))
-		weston_view_update_transform(constraint->view);
-
 	if (constraint->region_is_pending) {
 		constraint->region_is_pending = false;
 		pixman_region32_copy(&constraint->region,
@@ -4869,7 +4942,6 @@ pointer_constraint_surface_committed(struct wl_listener *listener, void *data)
 	if (constraint->hint_is_pending) {
 		constraint->hint_is_pending = false;
 
-		constraint->hint_is_pending = true;
 		constraint->hint = constraint->hint_pending;
 	}
 
@@ -4982,7 +5054,6 @@ init_pointer_constraint(struct wl_resource *pointer_constraints_resource,
 			is_fullscreen =  weston_desktop_surface_get_fullscreen(desktop_surface);
 		}
 		if (is_fullscreen && !is_pointer_constraint_enabled(constraint)) {
-			weston_view_update_transform(pointer->focus);
 			weston_pointer_set_focus(pointer, pointer->focus);
 			enable_pointer_constraint(constraint, pointer->focus);
 			maybe_warp_confined_pointer(constraint);
@@ -5535,7 +5606,7 @@ get_motion_directions(struct line *motion)
 
 static struct weston_coord_global
 weston_pointer_clamp_event_to_region(struct weston_pointer *pointer,
-				     struct weston_pointer_motion_event *event,
+				     const struct weston_pointer_motion_event *event,
 				     pixman_region32_t *region)
 {
 	wl_fixed_t old_sx = pointer->sx;
@@ -5702,9 +5773,10 @@ maybe_warp_confined_pointer(struct weston_pointer_constraint *constraint)
 
 static void
 confined_pointer_grab_pointer_motion(struct weston_pointer_grab *grab,
-				     const struct timespec *time,
-				     struct weston_pointer_motion_event *event)
+				     const struct weston_pointer_motion_event *event)
 {
+	WESTON_TRACE_ANNOTATE_FUNC(("event flow", &event->base.flow));
+
 	struct weston_pointer_constraint *constraint =
 		container_of(grab, struct weston_pointer_constraint, grab);
 	struct weston_pointer *pointer = grab->pointer;
@@ -5720,8 +5792,6 @@ confined_pointer_grab_pointer_motion(struct weston_pointer_grab *grab,
 
 	surface = pointer->focus->surface;
 
-	weston_view_update_transform(pointer->focus);
-
 	pixman_region32_init(&confine_region);
 	pixman_region32_intersect(&confine_region,
 				  &surface->input,
@@ -5736,28 +5806,24 @@ confined_pointer_grab_pointer_motion(struct weston_pointer_grab *grab,
 	pointer->sy = wl_fixed_from_double(surf_pos.c.y);
 
 	if (old_sx != pointer->sx || old_sy != pointer->sy) {
-		pointer_send_motion(pointer, time,
-				    pointer->sx, pointer->sy);
+		pointer_send_motion(pointer, pointer->sx, pointer->sy, event);
 	}
 
-	pointer_send_relative_motion(pointer, time, event);
+	pointer_send_relative_motion(pointer, event);
 }
 
 static void
 confined_pointer_grab_pointer_button(struct weston_pointer_grab *grab,
-				     const struct timespec *time,
-				     uint32_t button,
-				     uint32_t state_w)
+				     const struct weston_pointer_button_event *button_event)
 {
-	weston_pointer_send_button(grab->pointer, time, button, state_w);
+	weston_pointer_send_button(grab->pointer, button_event);
 }
 
 static void
 confined_pointer_grab_pointer_axis(struct weston_pointer_grab *grab,
-				   const struct timespec *time,
-				   struct weston_pointer_axis_event *event)
+				   const struct weston_pointer_axis_event *event)
 {
-	weston_pointer_send_axis(grab->pointer, time, event);
+	weston_pointer_send_axis(grab->pointer, event);
 }
 
 static void
@@ -6026,4 +6092,105 @@ weston_input_init(struct weston_compositor *compositor)
 		return -1;
 
 	return 0;
+}
+
+static void
+weston_input_event_init(struct weston_input_event *ievent, struct timespec *ts,
+			struct weston_seat *seat)
+{
+	ievent->ts = *ts;
+	ievent->seat = seat;
+	ievent->flow = (struct weston_trace_flow){};
+
+	WESTON_TRACE_ANNOTATE_FUNC(("input event flow", &ievent->flow));
+
+	TL_POINT(seat->compositor, TLP_INPUT_KERNEL_TS, TLP_INPUT_EVENT(ievent), TLP_END);
+}
+
+WL_EXPORT void
+weston_key_event_init(struct weston_key_event *event, struct timespec *ts,
+		      struct weston_seat *seat, uint32_t key,
+		      enum wl_keyboard_key_state key_state,
+		      enum weston_key_state_update key_update_state)
+{
+	weston_input_event_init(&event->base, ts, seat);
+
+	event->key = key;
+	event->key_state = key_state;
+	event->key_update_state = key_update_state;
+}
+
+WL_EXPORT void
+weston_pointer_motion_event_init(struct weston_pointer_motion_event *event,
+			         struct timespec *ts, struct weston_seat *seat,
+				 uint32_t mask,
+				 const struct weston_coord_global *abs,
+				 const struct weston_coord *rel,
+				 const struct weston_coord *rel_unaccel)
+{
+	weston_input_event_init(&event->base, ts, seat);
+
+	if (mask & WESTON_POINTER_MOTION_ABS) {
+		weston_assert_ptr_not_null(event->base.seat->compositor, abs);
+		event->abs = *abs;
+	}
+
+	if (mask & WESTON_POINTER_MOTION_REL) {
+		weston_assert_ptr_not_null(event->base.seat->compositor, rel);
+		event->rel = *rel;
+	}
+
+	if (mask & WESTON_POINTER_MOTION_REL_UNACCEL) {
+		weston_assert_ptr_not_null(event->base.seat->compositor, rel_unaccel);
+		event->rel_unaccel = *rel_unaccel;
+	}
+
+
+	event->mask = mask;
+}
+
+WL_EXPORT void
+weston_pointer_button_event_init(struct weston_pointer_button_event *event,
+				 struct timespec *ts, struct weston_seat *seat,
+				 uint32_t button, enum wl_pointer_button_state button_state)
+{
+	weston_input_event_init(&event->base, ts, seat);
+
+	event->button = button;
+	event->button_state = button_state;
+}
+
+WL_EXPORT void
+weston_pointer_axis_event_init(struct weston_pointer_axis_event *event,
+			       struct timespec *ts, struct weston_seat *seat,
+			       uint32_t axis, double value, bool has_discrete,
+			       int32_t discrete)
+{
+	weston_input_event_init(&event->base, ts, seat);
+
+	event->axis = axis;
+	event->value = value;
+	event->has_discrete = has_discrete;
+	event->discrete = discrete;
+}
+
+WL_EXPORT void
+weston_touch_event_init(struct weston_touch_event *event, struct timespec *ts,
+			struct weston_seat *seat, struct weston_touch_device *device,
+			int32_t touch_type, int32_t touch_id,
+			const struct weston_coord_global *pos)
+{
+	weston_input_event_init(&event->base, ts, seat);
+
+	weston_assert_ptr_not_null(event->base.seat->compositor, device);
+
+	event->touch_type = touch_type;
+	event->touch_id = touch_id;
+	event->device = device;
+	event->pos.c = weston_coord(0, 0);
+
+	if (touch_type == WL_TOUCH_DOWN || touch_type == WL_TOUCH_MOTION) {
+		weston_assert_ptr_not_null(event->base.seat->compositor, pos);
+		event->pos = *pos;
+	}
 }

@@ -32,8 +32,11 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "colorops.h"
 #include "drm-internal.h"
+#include "shared/weston-assert.h"
 #include "shared/weston-drm-fourcc.h"
+#include "shared/xalloc.h"
 
 /**
  * Allocate a new, empty, plane state.
@@ -47,6 +50,7 @@ drm_plane_state_alloc(struct drm_output_state *state_output,
 	assert(state);
 	state->output_state = state_output;
 	state->plane = plane;
+	state->handle = NULL;
 	state->in_fence_fd = -1;
 	state->rotation = drm_rotation_from_output_transform(plane,
 							     WL_OUTPUT_TRANSFORM_NORMAL);
@@ -54,6 +58,11 @@ drm_plane_state_alloc(struct drm_output_state *state_output,
 	state->zpos = DRM_PLANE_ZPOS_INVALID_PLANE;
 	state->alpha = (plane->alpha_max < DRM_PLANE_ALPHA_OPAQUE) ?
 		       plane->alpha_max : DRM_PLANE_ALPHA_OPAQUE;
+
+	state->blend_mode = WDRM_PLANE_BLEND_DEFAULT;
+
+	state->color_encoding = WDRM_PLANE_COLOR_ENCODING_DEFAULT;
+	state->color_range = WDRM_PLANE_COLOR_RANGE_DEFAULT;
 
 	/* Here we only add the plane state to the desired link, and not
 	 * set the member. Having an output pointer set means that the
@@ -89,6 +98,8 @@ drm_plane_state_free(struct drm_plane_state *state, bool force)
 	state->in_fence_fd = -1;
 	state->zpos = DRM_PLANE_ZPOS_INVALID_PLANE;
 	state->alpha = DRM_PLANE_ALPHA_OPAQUE;
+	drm_color_pipeline_state_unref(state->pipeline_state);
+	state->pipeline_state = NULL;
 
 	/* Once the damage blob has been submitted, it is refcounted internally
 	 * by the kernel, which means we can safely discard it.
@@ -96,7 +107,7 @@ drm_plane_state_free(struct drm_plane_state *state, bool force)
 	if (state->damage_blob_id != 0) {
 		device = state->plane->device;
 
-		drmModeDestroyPropertyBlob(device->drm.fd,
+		drmModeDestroyPropertyBlob(device->kms_device->fd,
 					   state->damage_blob_id);
 		state->damage_blob_id = 0;
 	}
@@ -134,6 +145,12 @@ drm_plane_state_duplicate(struct drm_output_state *state_output,
 	 * again is not necessary
 	 */
 	dst->in_fence_fd = -1;
+
+	/**
+	 * Take a reference on the pipeline state, as we don't want it to be
+	 * destroyed with src plane_state.
+	 */
+	dst->pipeline_state = drm_color_pipeline_state_ref(src->pipeline_state);
 
 	wl_list_for_each_safe(old, tmp, &state_output->plane_list, link) {
 		/* Duplicating a plane state into the same output state, so
@@ -210,110 +227,46 @@ drm_plane_state_put_back(struct drm_plane_state *state)
 }
 
 /**
- * Given a weston_view, fill the drm_plane_state's co-ordinates to display on
- * a given plane.
+ * Given a weston_paint_node, fill the drm_plane_state's co-ordinates to
+ * display on a given plane.
  */
-bool
+void
 drm_plane_state_coords_for_paint_node(struct drm_plane_state *state,
-				      struct weston_paint_node *node,
+				      struct weston_paint_node *pnode,
 				      uint64_t zpos)
 {
-	struct drm_output *output = state->output;
-	struct weston_view *ev = node->view;
-	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
-	pixman_region32_t dest_rect;
-	pixman_box32_t *box;
-	struct weston_coord corners[2];
-	float sxf1, syf1, sxf2, syf2;
 	uint16_t min_alpha = state->plane->alpha_min;
 	uint16_t max_alpha = state->plane->alpha_max;
 
-	if (!drm_paint_node_transform_supported(node, state->plane))
-		return false;
-
-	assert(node->valid_transform);
-	state->rotation = drm_rotation_from_output_transform(state->plane, node->transform);
-
-	/* Update the base weston_plane co-ordinates. */
-	box = pixman_region32_extents(&ev->transform.boundingbox);
-	state->plane->base.x = box->x1;
-	state->plane->base.y = box->y1;
-
-	/* First calculate the destination co-ordinates by taking the
-	 * area of the view which is visible on this output, performing any
-	 * transforms to account for output rotation and scale as necessary. */
-	pixman_region32_init(&dest_rect);
-	pixman_region32_intersect(&dest_rect, &ev->transform.boundingbox,
-				  &output->base.region);
-	weston_region_global_to_output(&dest_rect, &output->base, &dest_rect);
-
-	box = pixman_region32_extents(&dest_rect);
-
-	state->dest_x = box->x1;
-	state->dest_y = box->y1;
-	state->dest_w = box->x2 - box->x1;
-	state->dest_h = box->y2 - box->y1;
-
-	/* Now calculate the source rectangle, by transforming the destination
-	 * rectangle by the output to buffer matrix. */
-	corners[0] = weston_matrix_transform_coord(
-		&node->output_to_buffer_matrix,
-		weston_coord(box->x1, box->y1));
-	corners[1] = weston_matrix_transform_coord(
-		&node->output_to_buffer_matrix,
-		weston_coord(box->x2, box->y2));
-	sxf1 = corners[0].x;
-	syf1 = corners[0].y;
-	sxf2 = corners[1].x;
-	syf2 = corners[1].y;
-	pixman_region32_fini(&dest_rect);
-
-	/* Make sure that our post-transform coordinates are in the
-	 * right order.
+	/* The caller has already checked supported transforms when creating
+	 * a list of candidate planes, so we should only ever get here with
+	 * a supported transform.
 	 */
-	if (sxf1 > sxf2) {
-		float temp = sxf1;
+	assert(drm_paint_node_transform_supported(pnode, state->plane));
 
-		sxf1 = sxf2;
-		sxf2 = temp;
-	}
-	if (syf1 > syf2) {
-		float temp = syf1;
+	assert(pnode->simple_transform);
+	state->rotation = drm_rotation_from_output_transform(state->plane, pnode->transform);
 
-		syf1 = syf2;
-		syf2 = temp;
-	}
+	state->dest_x = pnode->output_dest.x;
+	state->dest_y = pnode->output_dest.y;
+	state->dest_w = pnode->output_dest.width;
+	state->dest_h = pnode->output_dest.height;
 
-	/* Shift from S23.8 wl_fixed to U16.16 KMS fixed-point encoding. */
-	state->src_x = wl_fixed_from_double(sxf1) << 8;
-	state->src_y = wl_fixed_from_double(syf1) << 8;
-	state->src_w = wl_fixed_from_double(sxf2 - sxf1) << 8;
-	state->src_h = wl_fixed_from_double(syf2 - syf1) << 8;
-
-	/* Clamp our source co-ordinates to surface bounds; it's possible
-	 * for intermediate translations to give us slightly incorrect
-	 * co-ordinates if we have, for example, multiple zooming
-	 * transformations. View bounding boxes are also explicitly rounded
-	 * greedily. */
-	if (state->src_x < 0)
-		state->src_x = 0;
-	if (state->src_y < 0)
-		state->src_y = 0;
-	if (state->src_w > (uint32_t) ((buffer->width << 16) - state->src_x))
-		state->src_w = (buffer->width << 16) - state->src_x;
-	if (state->src_h > (uint32_t) ((buffer->height << 16) - state->src_y))
-		state->src_h = (buffer->height << 16) - state->src_y;
+	/* Convert to U16.16 KMS fixed-point encoding. */
+	state->src_x = wl_fixed_from_double(pnode->buffer_source_x) << 8;
+	state->src_y = wl_fixed_from_double(pnode->buffer_source_y) << 8;
+	state->src_w = wl_fixed_from_double(pnode->buffer_source_width) << 8;
+	state->src_h = wl_fixed_from_double(pnode->buffer_source_height) << 8;
 
 	/* apply zpos if available */
 	state->zpos = zpos;
 
-	/* The alpha of the view is normalized to alpha value range
-	 * [min_alpha, max_alpha] that got from drm. The alpha value would
-	 * never exceed max_alpha if ev->alpha <= 1.0.
+	/* The pnode->alpha is normalized to alpha value range [min_alpha,
+	 * max_alpha] that got from drm. The alpha value would never exceed
+	 * max_alpha if pnode->alpha <= 1.0.
 	 */
-	state->alpha = min_alpha + (uint16_t)round((max_alpha - min_alpha) * ev->alpha);
-
-	return true;
+	state->alpha = min_alpha +
+		       (uint16_t)round((max_alpha - min_alpha) * pnode->alpha);
 }
 
 /**
@@ -398,10 +351,12 @@ drm_output_state_duplicate(struct drm_output_state *src,
 			   struct drm_pending_state *pending_state,
 			   enum drm_output_state_duplicate_mode plane_mode)
 {
-	struct drm_output_state *dst = malloc(sizeof(*dst));
+	struct weston_compositor *compositor = src->output->base.compositor;
+	struct drm_output_state *dst = xmalloc(sizeof(*dst));
 	struct drm_plane_state *ps;
 
-	assert(dst);
+	/* The reuse bit isn't stored in the state */
+	weston_assert_false(compositor, src->mode & DRM_OUTPUT_PROPOSE_STATE_REUSE);
 
 	/* Copy the whole structure, then individually modify the
 	 * pending_state, as well as the list link into our pending
@@ -419,7 +374,7 @@ drm_output_state_duplicate(struct drm_output_state *src,
 	wl_list_for_each(ps, &src->plane_list, link) {
 		/* Don't carry planes which are now disabled; these should be
 		 * free for other outputs to reuse. */
-		if (!ps->output)
+		if (!ps->handle)
 			continue;
 
 		if (plane_mode == DRM_OUTPUT_STATE_CLEAR_PLANES)

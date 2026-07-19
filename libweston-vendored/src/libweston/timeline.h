@@ -27,6 +27,8 @@
 #ifndef WESTON_TIMELINE_H
 #define WESTON_TIMELINE_H
 
+#include "config.h"
+
 #include <wayland-util.h>
 #include <stdbool.h>
 
@@ -41,6 +43,22 @@ enum timeline_type {
 	TLT_SURFACE,
 	TLT_VBLANK,
 	TLT_GPU,
+	TLT_INPUT_EVENT,
+};
+
+enum timeline_point_name {
+	TLP_CORE_FLUSH_DAMAGE,
+	TLP_CORE_REPAINT_EXIT_LOOP,
+	TLP_CORE_REPAINT_BEGIN,
+	TLP_CORE_REPAINT_POSTED,
+	TLP_CORE_REPAINT_RESTART,
+	TLP_CORE_REPAINT_FINISHED,
+	TLP_CORE_REPAINT_REQ,
+	TLP_CORE_REPAINT_ENTER_LOOP,
+	TLP_CORE_COMMIT_DAMAGE,
+	TLP_RENDERER_GPU_BEGIN,
+	TLP_RENDERER_GPU_END,
+	TLP_INPUT_KERNEL_TS,
 };
 
 /** Timeline subscription created for each subscription
@@ -80,21 +98,39 @@ struct weston_timeline_subscription_object {
 #define TLP_SURFACE(s) TLT_SURFACE, TYPEVERIFY(struct weston_surface *, (s))
 #define TLP_VBLANK(t) TLT_VBLANK, TYPEVERIFY(const struct timespec *, (t))
 #define TLP_GPU(t) TLT_GPU, TYPEVERIFY(const struct timespec *, (t))
+#define TLP_INPUT_EVENT(t) TLT_INPUT_EVENT, TYPEVERIFY(const struct weston_input_event *, (t))
 
 /** This macro is used to add timeline points.
  *
  * Use TLP_END when done for the vargs.
  *
+ * Timeline points are fed to the timeline log scope, and
+ * to perfetto if it was enabled at build time.
+ *
  * @param ec weston_compositor instance
  *
  * @ingroup log
  */
+#ifdef HAVE_PERFETTO
+#define TL_POINT(ec, ...) do { \
+	weston_timeline_perfetto(ec->timeline, __VA_ARGS__); \
+	weston_timeline_point(ec->timeline, __VA_ARGS__); \
+} while (0)
+#else
 #define TL_POINT(ec, ...) do { \
 	weston_timeline_point(ec->timeline, __VA_ARGS__); \
 } while (0)
+#endif /* HAVE_PERFETTO */
 
 void
 weston_timeline_point(struct weston_log_scope *timeline_scope,
-		      const char *name, ...);
+		      enum timeline_point_name tlp_name, ...);
+
+void
+weston_timeline_perfetto(struct weston_log_scope *timeline_scope,
+			 enum timeline_point_name tlp_name, ...);
+
+bool
+weston_timeline_profiling(struct weston_log_scope *timeline_scope);
 
 #endif /* WESTON_TIMELINE_H */

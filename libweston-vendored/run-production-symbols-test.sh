@@ -5,7 +5,7 @@
 # (see qdwin/doc/decisions/0001-vendored-libweston-packaging.md). This
 # gate proves that profile actually exports the four soft-linked helper
 # symbols qdwin resolves via dlsym — i.e. the packaged library can drive
-# the layer-shell popup / grab paths. Stock libweston-14 exports none of
+# the layer-shell popup / grab paths. Stock libweston-16 exports none of
 # them, so this is the discriminator between a shippable tree and a
 # decorative one.
 #
@@ -114,9 +114,9 @@ fail() { echo "[prod-syms] FAIL: $*" >&2; exit 1; }
 # (lib/x86_64-linux-gnu) on Debian/Ubuntu, and build-libweston.sh deliberately
 # does not force --libdir. Echoes the core .so path, or nothing if not built.
 find_core() {
-    ls "$PREFIX"/lib64/libweston-14.so.0.0.2 \
-       "$PREFIX"/lib/*/libweston-14.so.0.0.2 \
-       "$PREFIX"/lib/libweston-14.so.0.0.2 2>/dev/null | head -n1
+    ls "$PREFIX"/lib64/libweston-16.so.0.0.0 \
+       "$PREFIX"/lib/*/libweston-16.so.0.0.0 \
+       "$PREFIX"/lib/libweston-16.so.0.0.0 2>/dev/null | head -n1
 }
 
 # Dependency preflight for the deps the auto-disable block above does NOT
@@ -214,7 +214,7 @@ fi
 
 CORE="$(find_core)"
 [ -n "$CORE" ] && [ -f "$CORE" ] \
-    || fail "no libweston-14.so.0.0.2 under $PREFIX (lib64 or lib/<arch>) after build"
+    || fail "no libweston-16.so.0.0.0 under $PREFIX (lib64 or lib/<arch>) after build"
 
 # Capture the dynamic symbol table once. Piping nm into `grep -q` under
 # `pipefail` would report SIGPIPE (141) when grep exits early, so read
@@ -238,9 +238,9 @@ if [ -x "$STAGE_SCRIPT" ]; then
     echo "[prod-syms] staging dry-run -> $DEST"
     DEST="$DEST" QDWIN_LIBWESTON_PREFIX="$PREFIX" bash "$STAGE_SCRIPT" \
         >/dev/null 2>&1 || fail "install-vendored-libweston.sh staging failed"
-    [ -f "$DEST/lib64/libweston-14.so.0" ] \
-        || fail "staged tree missing libweston-14.so.0"
-    [ -f "$DEST/lib64/libweston-14/drm-backend.so" ] \
+    [ -f "$DEST/lib64/libweston-16.so.0" ] \
+        || fail "staged tree missing libweston-16.so.0"
+    [ -f "$DEST/lib64/libweston-16/drm-backend.so" ] \
         || fail "staged tree missing drm-backend.so (headless-only / wrong prefix?)"
     rm -rf "$(dirname "$DEST")"
     echo "[prod-syms] staging dry-run OK"

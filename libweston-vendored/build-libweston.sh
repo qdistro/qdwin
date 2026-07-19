@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot build wrapper for the qdistro-vendored libweston-14.
+# One-shot build wrapper for the qdistro-vendored libweston-16.
 #
 # Two profiles (set QDWIN_LIBWESTON_PROFILE):
 #
@@ -10,7 +10,7 @@
 #   production         — full backend set (drm + pipewire + rdp + wayland
 #       + x11 + headless, GL renderer, xwayland, lcms) for shipping in a
 #       qdistro VM/image. The system `weston` binary loads this
-#       libweston-14.so.0 via LD_LIBRARY_PATH and its backends via
+#       libweston-16.so.0 via LD_LIBRARY_PATH and its backends via
 #       WESTON_MODULE_MAP. Installed under $PREFIX (default
 #       /tmp/qdwin-libweston-prod-prefix); qdistro's
 #       install-vendored-libweston.sh stages that tree into
@@ -77,9 +77,8 @@ headless)
         -Dbackend-headless=true
         -Dbackend-default=headless
         -Drenderer-gl=false
+        -Drenderer-vulkan=false
         -Dxwayland=false
-        -Dremoting=false
-        -Dpipewire=false
         -Dcolor-management-lcms=false
     )
     NINJA_TARGETS=(
@@ -112,9 +111,8 @@ production)
         -Dbackend-headless=true
         -Dbackend-default=drm
         -Drenderer-gl="${QDWIN_LW_GL:-true}"
+        -Drenderer-vulkan=false
         -Dxwayland="${QDWIN_LW_XWAYLAND:-true}"
-        -Dremoting=false
-        -Dpipewire="${QDWIN_LW_PIPEWIRE:-true}"
         -Dcolor-management-lcms="${QDWIN_LW_LCMS:-true}"
     )
     # Build everything that gets installed for this backend set.
@@ -162,19 +160,19 @@ fi
 if [[ "$reuse_build" -eq 0 ]]; then
     rm -rf "$BUILD"
     # The trailing -D flags disable optional weston features qdwin does not use
-    # so the production tree builds without their devel deps. backend-drm's
-    # VA-API screencast recorder (-Dbackend-drm-screencast-vaapi) defaults ON and
-    # hard-requires libva (`ERROR: VA-API recorder requires libva >= 0.34.0`);
-    # qdwin records nothing through it (view streaming goes via pipewire), so
-    # disable it rather than pull libva-devel into every bake.
+    # so the production tree builds without their devel deps. J29 (weston 16):
+    # -Dscreenshare / -Dshell-fullscreen / -Dwcap-decode / -Dremoting / -Dpipewire
+    # (the gst plugin) / -Dbackend-drm-screencast-vaapi were REMOVED upstream in
+    # 16 (vaapi recorder + screenshare dropped, remoting/pipewire demoted to
+    # -Ddeprecated-* and default off), so they no longer need explicit -D…=false.
+    # -Dshell-lua is new in 16 (Lua ≥5.4) and off here.
     meson setup "$BUILD" \
         --prefix="$PREFIX" \
         "${MESON_OPTS[@]}" \
-        -Dscreenshare=false \
         -Dshell-desktop=false \
-        -Dshell-fullscreen=false \
         -Dshell-ivi=false \
         -Dshell-kiosk=false \
+        -Dshell-lua=false \
         -Dimage-jpeg=false \
         -Dimage-webp=false \
         -Dsystemd=false \
@@ -182,9 +180,7 @@ if [[ "$reuse_build" -eq 0 ]]; then
         -Dtests=false \
         -Ddemo-clients=false \
         -Dsimple-clients= \
-        -Ddoc=false \
-        -Dwcap-decode=false \
-        -Dbackend-drm-screencast-vaapi=false
+        -Ddoc=false
 fi
 
 if [[ ${#NINJA_TARGETS[@]} -gt 0 ]]; then
@@ -194,7 +190,7 @@ else
 fi
 
 # Install into the build's --prefix. libweston bakes its module-search
-# directory in at compile time (= ${prefix}/${libdir}/libweston-14), so
+# directory in at compile time (= ${prefix}/${libdir}/libweston-16), so
 # weston only finds the backends if the install populates that
 # directory. We use a writable temp prefix; nothing global is touched.
 DESTDIR= ninja -C "$BUILD" install >/dev/null

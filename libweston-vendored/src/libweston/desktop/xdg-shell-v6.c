@@ -674,9 +674,10 @@ weston_desktop_xdg_toplevel_committed(struct weston_desktop_xdg_toplevel *toplev
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
 
-		wl_resource_post_error(client_resource,
-				       ZXDG_SHELL_V6_ERROR_INVALID_SURFACE_STATE,
-				       "xdg_surface buffer does not match the configured state");
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       ZXDG_SHELL_V6_ERROR_INVALID_SURFACE_STATE,
+					       "xdg_surface buffer does not match the configured state");
 		return;
 	}
 
@@ -856,9 +857,10 @@ weston_desktop_xdg_popup_protocol_grab(struct wl_client *wl_client,
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
 
-		wl_resource_post_error(client_resource,
-				       ZXDG_SHELL_V6_ERROR_NOT_THE_TOPMOST_POPUP,
-				       "xdg_popup was not created on the topmost popup");
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       ZXDG_SHELL_V6_ERROR_NOT_THE_TOPMOST_POPUP,
+					       "xdg_popup was not created on the topmost popup");
 		return;
 	}
 
@@ -934,9 +936,10 @@ weston_desktop_xdg_popup_destroy(struct weston_desktop_xdg_popup *popup)
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
 
-		wl_resource_post_error(client_resource,
-				       ZXDG_SHELL_V6_ERROR_NOT_THE_TOPMOST_POPUP,
-				       "xdg_popup was destroyed while it was not the topmost popup.");
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       ZXDG_SHELL_V6_ERROR_NOT_THE_TOPMOST_POPUP,
+					       "xdg_popup was destroyed while it was not the topmost popup.");
 	}
 
 	weston_desktop_surface_popup_ungrab(popup->base.desktop_surface,
@@ -1257,9 +1260,11 @@ weston_desktop_xdg_surface_protocol_ack_configure(struct wl_client *wl_client,
 			weston_desktop_surface_get_client(dsurface);
 		struct wl_resource *client_resource =
 			weston_desktop_client_get_resource(client);
-		wl_resource_post_error(client_resource,
-				       ZXDG_SHELL_V6_ERROR_INVALID_SURFACE_STATE,
-				       "Wrong configure serial: %u", serial);
+
+		if (client_resource)
+			wl_resource_post_error(client_resource,
+					       ZXDG_SHELL_V6_ERROR_INVALID_SURFACE_STATE,
+					       "Wrong configure serial: %u", serial);
 		return;
 	}
 
@@ -1286,9 +1291,13 @@ weston_desktop_xdg_surface_ping(struct weston_desktop_surface *dsurface,
 {
 	struct weston_desktop_client *client =
 		weston_desktop_surface_get_client(dsurface);
+	struct wl_resource *client_resource =
+		weston_desktop_client_get_resource(client);
 
-	zxdg_shell_v6_send_ping(weston_desktop_client_get_resource(client),
-				serial);
+	if (!client_resource)
+		return;
+
+	zxdg_shell_v6_send_ping(client_resource, serial);
 }
 
 static void
@@ -1492,13 +1501,18 @@ weston_desktop_xdg_shell_protocol_get_xdg_surface(struct wl_client *wl_client,
 						    &zxdg_surface_v6_interface,
 						    &weston_desktop_xdg_surface_implementation,
 						    id, weston_desktop_xdg_surface_resource_destroy);
-	if (surface->resource == NULL)
+	if (surface->resource == NULL) {
+		weston_desktop_surface_destroy(surface->desktop_surface);
+		free(surface);
 		return;
+	}
 
 	if (weston_surface_has_content(wsurface)) {
 		wl_resource_post_error(surface->resource,
 				       ZXDG_SURFACE_V6_ERROR_UNCONFIGURED_BUFFER,
 				       "xdg_surface must not have a buffer at creation");
+		weston_desktop_surface_destroy(surface->desktop_surface);
+		free(surface);
 		return;
 	}
 }
@@ -1514,8 +1528,27 @@ weston_desktop_xdg_shell_protocol_pong(struct wl_client *wl_client,
 	weston_desktop_client_pong(client, serial);
 }
 
+static void
+weston_desktop_xdg_shell_protocol_destroy(struct wl_client *wl_client,
+					  struct wl_resource *resource)
+{
+	struct weston_desktop_client *client =
+		wl_resource_get_user_data(resource);
+	struct wl_list *surface_list =
+		weston_desktop_client_get_surface_list(client);
+
+	if (!wl_list_empty(surface_list)) {
+		wl_resource_post_error(resource,
+				       ZXDG_SHELL_V6_ERROR_DEFUNCT_SURFACES,
+				       "xdg_wm_base being destroyed before child surfaces");
+		return;
+	}
+
+	weston_desktop_destroy_request(wl_client, resource);
+}
+
 static const struct zxdg_shell_v6_interface weston_desktop_xdg_shell_implementation = {
-	.destroy = weston_desktop_destroy_request,
+	.destroy = weston_desktop_xdg_shell_protocol_destroy,
 	.create_positioner = weston_desktop_xdg_shell_protocol_create_positioner,
 	.get_xdg_surface = weston_desktop_xdg_shell_protocol_get_xdg_surface,
 	.pong = weston_desktop_xdg_shell_protocol_pong,

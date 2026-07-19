@@ -38,6 +38,7 @@
 #include "drm-internal.h"
 #include "pixel-formats.h"
 #include "renderer-gl/gl-renderer.h"
+#include "shared/weston-assert.h"
 
 #define POISON_PTR ((void *)8)
 
@@ -104,7 +105,7 @@ get_drm_plane_index_maximum(struct drm_device *device)
  * @param device DRM device
  * @param output Output to create internal plane for
  */
-static struct drm_plane *
+static struct drm_plane_handle *
 drm_virtual_plane_create(struct drm_device *device, struct drm_output *output)
 {
 	struct drm_backend *b = device->backend;
@@ -145,7 +146,7 @@ drm_virtual_plane_create(struct drm_device *device, struct drm_output *output)
 	plane->plane_idx = get_drm_plane_index_maximum(device) + 1;
 	wl_list_insert(&device->plane_list, &plane->link);
 
-	return plane;
+	return drm_plane_create_handle(plane, output);
 
 err:
 	drm_plane_state_free(plane->state_cur, true);
@@ -157,11 +158,15 @@ err:
 /**
  * Destroy one DRM plane
  *
- * @param plane Plane to deallocate (will be freed)
+ * @param handle Plane handle to deallocate (will be freed along with the plane)
  */
 static void
-drm_virtual_plane_destroy(struct drm_plane *plane)
+drm_virtual_plane_destroy(struct drm_plane_handle *handle)
 {
+	struct drm_plane *plane = handle->plane;
+
+	drm_plane_destroy_handle(handle);
+
 	drm_plane_state_free(plane->state_cur, true);
 	weston_plane_release(&plane->base);
 	wl_list_remove(&plane->link);
@@ -205,8 +210,9 @@ static int
 drm_virtual_output_repaint(struct weston_output *output_base)
 {
 	struct drm_output_state *state = NULL;
+	struct weston_compositor *compositor = output_base->compositor;
 	struct drm_output *output = to_drm_output(output_base);
-	struct drm_plane *scanout_plane = output->scanout_plane;
+	struct drm_plane *scanout_plane = output->scanout_handle->plane;
 	struct drm_plane_state *scanout_state;
 	struct drm_pending_state *pending_state;
 	struct drm_device *device;
@@ -227,14 +233,10 @@ drm_virtual_output_repaint(struct weston_output *output_base)
 
 	assert(!output->state_last);
 
-	/* If planes have been disabled in the core, we might not have
-	 * hit assign_planes at all, so might not have valid output state
-	 * here. */
+	/* assign_planes() is always called before a repaint, so we must have a
+	 * valid output state here. */
 	state = drm_pending_state_get_output(pending_state, output);
-	if (!state)
-		state = drm_output_state_duplicate(output->state_cur,
-						   pending_state,
-						   DRM_OUTPUT_STATE_CLEAR_PLANES);
+	weston_assert_ptr_not_null(compositor, state);
 
 	drm_output_render(state);
 	scanout_state = drm_output_state_get_plane(state, scanout_plane);
@@ -258,7 +260,7 @@ drm_virtual_output_deinit(struct weston_output *base)
 
 	drm_output_fini_egl(output);
 
-	drm_virtual_plane_destroy(output->scanout_plane);
+	drm_virtual_plane_destroy(output->scanout_handle);
 	drm_virtual_crtc_destroy(output->crtc);
 }
 
@@ -301,8 +303,8 @@ drm_virtual_output_enable(struct weston_output *output_base)
 		goto err;
 	}
 
-	output->scanout_plane = drm_virtual_plane_create(device, output);
-	if (!output->scanout_plane) {
+	output->scanout_handle = drm_virtual_plane_create(device, output);
+	if (!output->scanout_handle) {
 		weston_log("Failed to find primary plane for output %s\n",
 			   output->base.name);
 		return -1;
@@ -318,12 +320,6 @@ drm_virtual_output_enable(struct weston_output *output_base)
 	output->base.assign_planes = drm_assign_planes;
 	output->base.set_dpms = NULL;
 	output->base.switch_mode = NULL;
-	output->base.gamma_size = 0;
-	output->base.set_gamma = NULL;
-
-	weston_compositor_stack_plane(b->compositor,
-				      &output->scanout_plane->base,
-				      &output->base.primary_plane);
 
 	return 0;
 err:
@@ -444,11 +440,6 @@ drm_virtual_output_finish_frame(struct weston_output *output_base,
 	output->state_last = NULL;
 
 	weston_output_finish_frame(&output->base, stamp, presented_flags);
-
-	/* We can't call this from frame_notify, because the output's
-	 * repaint needed flag is cleared just after that */
-	if (output->recorder)
-		weston_output_schedule_repaint(&output->base);
 }
 
 static const struct weston_drm_virtual_output_api virt_api = {

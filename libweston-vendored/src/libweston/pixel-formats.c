@@ -50,18 +50,55 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <GLES3/gl3.h>
+
+#define SWIZZLES_A1GB { GL_ALPHA, GL_ONE,   GL_GREEN, GL_BLUE  }
+#define SWIZZLES_ABG1 { GL_ALPHA, GL_BLUE,  GL_GREEN, GL_ONE   }
+#define SWIZZLES_ABGR { GL_ALPHA, GL_BLUE,  GL_GREEN, GL_RED   }
+#define SWIZZLES_ARGB { GL_ALPHA, GL_RED,   GL_GREEN, GL_BLUE  }
+#define SWIZZLES_B1RG { GL_BLUE,  GL_ONE,   GL_RED,   GL_GREEN }
+#define SWIZZLES_BARG { GL_BLUE,  GL_ALPHA, GL_RED,   GL_GREEN }
+#define SWIZZLES_BGR1 { GL_BLUE,  GL_GREEN, GL_RED,   GL_ONE   }
+#define SWIZZLES_BGRA { GL_BLUE,  GL_GREEN, GL_RED,   GL_ALPHA }
+#define SWIZZLES_G1AB { GL_GREEN, GL_ONE,   GL_ALPHA, GL_BLUE  }
+#define SWIZZLES_GBA1 { GL_GREEN, GL_BLUE,  GL_ALPHA, GL_ONE   }
+#define SWIZZLES_GBAR { GL_GREEN, GL_BLUE,  GL_ALPHA, GL_RED   }
+#define SWIZZLES_GRAB { GL_GREEN, GL_RED,   GL_ALPHA, GL_BLUE  }
+#define SWIZZLES_R001 { GL_RED,   GL_ZERO,  GL_ZERO,  GL_ONE   }
+#define SWIZZLES_R1BG { GL_RED,   GL_ONE,   GL_BLUE,  GL_GREEN }
+#define SWIZZLES_RABG { GL_RED,   GL_ALPHA, GL_BLUE,  GL_GREEN }
+#define SWIZZLES_RG01 { GL_RED,   GL_GREEN, GL_ZERO,  GL_ONE   }
+#define SWIZZLES_GR01 { GL_GREEN, GL_RED,   GL_ZERO,  GL_ONE   }
+#define SWIZZLES_RGB1 { GL_RED,   GL_GREEN, GL_BLUE,  GL_ONE   }
+#define SWIZZLES_RGBA { GL_RED,   GL_GREEN, GL_BLUE,  GL_ALPHA }
+
+#define GL_FORMAT_INFO(internal_, external_, type_, swizzles_) \
+	.gl = { \
+		.internal = internal_, \
+		.external = external_, \
+		.type = type_, \
+		.swizzles.array = SWIZZLES_ ## swizzles_, \
+	}
 #define GL_INTERNALFORMAT(fmt) .gl_internalformat = (fmt)
 #define GL_FORMAT(fmt) .gl_format = (fmt)
 #define GL_TYPE(type) .gl_type = (type)
-#define GL_CHANNEL_ORDER(order) \
-	.gl_channel_order = (SHADER_CHANNEL_ORDER_ ## order)
-#define SAMPLER_TYPE(type) .sampler_type = (type)
 #else
+#define GL_FORMAT_INFO(internal_, external_, type_, swizzles_) \
+	.gl = { \
+		.internal = 0, \
+		.external = 0, \
+		.type = 0, \
+		.swizzles.array = { 0, 0, 0, 0 }, \
+	}
 #define GL_INTERNALFORMAT(fmt) .gl_internalformat = 0
 #define GL_FORMAT(fmt) .gl_format = 0
 #define GL_TYPE(type) .gl_type = 0
-#define GL_CHANNEL_ORDER(order) .gl_channel_order = 0
-#define SAMPLER_TYPE(type) .sampler_type = 0
+#endif
+
+#ifdef ENABLE_VULKAN
+#include <vulkan/vulkan.h>
+#define VULKAN_FORMAT(fmt) .vulkan_format = (fmt)
+#else
+#define VULKAN_FORMAT(fmt) .vulkan_format = 0
 #endif
 
 #define DRM_FORMAT(f) .format = DRM_FORMAT_ ## f, .drm_format_name = #f
@@ -78,6 +115,7 @@
 	.bits.a = a_, \
 	.component_type = PIXEL_COMPONENT_TYPE_FLOAT
 
+#define COLOR_MODEL(model) .color_model = (COLOR_MODEL_ ## model)
 #define PIXMAN_FMT(fmt) .pixman_format = (PIXMAN_ ## fmt)
 
 #include "shared/weston-egl-ext.h"
@@ -90,164 +128,298 @@
 static const struct pixel_format_info pixel_format_table[] = {
 	{
 		DRM_FORMAT(R8),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 0, 0, 0),
 		.bpp = 8,
 		.hide_from_clients = true,
+		GL_FORMAT_INFO(GL_R8, GL_RED, GL_UNSIGNED_BYTE, R001),
 		GL_FORMAT(GL_R8_EXT),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_R8_UNORM),
+	},
+	{
+		DRM_FORMAT(R16),
+		COLOR_MODEL(RGB),
+		BITS_RGBA_FIXED(16, 0, 0, 0),
+		.bpp = 16,
+		.hide_from_clients = true,
+		GL_FORMAT_INFO(GL_R16_EXT, GL_RED, GL_UNSIGNED_SHORT, R001),
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		VULKAN_FORMAT(VK_FORMAT_R16_UNORM),
+#endif
 	},
 	{
 		DRM_FORMAT(GR88),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 0, 0),
 		.bpp = 16,
 		.hide_from_clients = true,
+		GL_FORMAT_INFO(GL_RG8, GL_RG, GL_UNSIGNED_BYTE, RG01),
 		GL_FORMAT(GL_RG8_EXT),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_R8G8_UNORM),
+	},
+	{
+		DRM_FORMAT(RG88),
+		COLOR_MODEL(RGB),
+		BITS_RGBA_FIXED(8, 8, 0, 0),
+		.bpp = 16,
+		.hide_from_clients = true,
+		GL_FORMAT_INFO(GL_RG8, GL_RG, GL_UNSIGNED_BYTE, GR01),
+	},
+	{
+		DRM_FORMAT(GR1616),
+		COLOR_MODEL(RGB),
+		BITS_RGBA_FIXED(16, 16, 0, 0),
+		.bpp = 32,
+		.hide_from_clients = true,
+		GL_FORMAT_INFO(GL_RG16_EXT, GL_RG, GL_UNSIGNED_SHORT, RG01),
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		VULKAN_FORMAT(VK_FORMAT_R16G16_UNORM),
+#endif
+	},
+	{
+		DRM_FORMAT(RG1616),
+		COLOR_MODEL(RGB),
+		BITS_RGBA_FIXED(16, 16, 0, 0),
+		.bpp = 32,
+		.hide_from_clients = true,
+		GL_FORMAT_INFO(GL_RG16_EXT, GL_RG, GL_UNSIGNED_SHORT, GR01),
 	},
 	{
 		DRM_FORMAT(XRGB4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 0),
 		.bpp = 16,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, GBA1),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, A1GB),
+#endif
 	},
 	{
 		DRM_FORMAT(ARGB4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 4),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_XRGB4444,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, GBAR),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, ARGB),
+#endif
 	},
 	{
 		DRM_FORMAT(XBGR4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 0),
 		.bpp = 16,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, ABG1),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, G1AB),
+#endif
 	},
 	{
 		DRM_FORMAT(ABGR4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 4),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_XBGR4444,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, ABGR),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, GRAB),
+#endif
 	},
 	{
 		DRM_FORMAT(RGBX4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 0),
 		.bpp = 16,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, RGB1),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_SHORT_4_4_4_4),
+		VULKAN_FORMAT(VK_FORMAT_R4G4B4A4_UNORM_PACK16),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, B1RG),
 #endif
 	},
 	{
 		DRM_FORMAT(RGBA4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 4),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_RGBX4444,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, RGBA),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_SHORT_4_4_4_4),
+		VULKAN_FORMAT(VK_FORMAT_R4G4B4A4_UNORM_PACK16),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, BARG),
 #endif
 	},
 	{
 		DRM_FORMAT(BGRX4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 0),
 		.bpp = 16,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, BGR1),
+		VULKAN_FORMAT(VK_FORMAT_B4G4R4A4_UNORM_PACK16),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, R1BG),
+#endif
 	},
 	{
 		DRM_FORMAT(BGRA4444),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(4, 4, 4, 4),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_BGRX4444,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, BGRA),
+		VULKAN_FORMAT(VK_FORMAT_B4G4R4A4_UNORM_PACK16),
+#else
+		GL_FORMAT_INFO(GL_RGBA4, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, RABG),
+#endif
 	},
 	{
 		DRM_FORMAT(XRGB1555),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 0),
 		.addfb_legacy_depth = 15,
 		.bpp = 16,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		VULKAN_FORMAT(VK_FORMAT_A1R5G5B5_UNORM_PACK16),
+#endif
 	},
 	{
 		DRM_FORMAT(ARGB1555),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 1),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_XRGB1555,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		VULKAN_FORMAT(VK_FORMAT_A1R5G5B5_UNORM_PACK16),
+#endif
 	},
 	{
 		DRM_FORMAT(XBGR1555),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 0),
 		.bpp = 16,
 	},
 	{
 		DRM_FORMAT(ABGR1555),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 1),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_XBGR1555,
 	},
 	{
 		DRM_FORMAT(RGBX5551),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 0),
 		.bpp = 16,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB5_A1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, RGB1),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_SHORT_5_5_5_1),
+		VULKAN_FORMAT(VK_FORMAT_R5G5B5A1_UNORM_PACK16),
 #endif
 	},
 	{
 		DRM_FORMAT(RGBA5551),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 1),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_RGBX5551,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB5_A1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, RGBA),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_SHORT_5_5_5_1),
+		VULKAN_FORMAT(VK_FORMAT_R5G5B5A1_UNORM_PACK16),
 #endif
 	},
 	{
 		DRM_FORMAT(BGRX5551),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 0),
 		.bpp = 16,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB5_A1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, BGR1),
+		VULKAN_FORMAT(VK_FORMAT_B5G5R5A1_UNORM_PACK16),
+#endif
 	},
 	{
 		DRM_FORMAT(BGRA5551),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 5, 5, 1),
 		.bpp = 16,
 		.opaque_substitute = DRM_FORMAT_BGRX5551,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB5_A1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, BGRA),
+		VULKAN_FORMAT(VK_FORMAT_B5G5R5A1_UNORM_PACK16),
+#endif
 	},
 	{
 		DRM_FORMAT(RGB565),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 6, 5, 0),
 		.addfb_legacy_depth = 16,
 		.bpp = 16,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB565, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, RGB1),
 		GL_FORMAT(GL_RGB),
 		GL_TYPE(GL_UNSIGNED_SHORT_5_6_5),
 		PIXMAN_FMT(r5g6b5),
+		VULKAN_FORMAT(VK_FORMAT_R5G6B5_UNORM_PACK16),
 #endif
 	},
 	{
 		DRM_FORMAT(BGR565),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(5, 6, 5, 0),
 		.bpp = 16,
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB565, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, BGR1),
+		VULKAN_FORMAT(VK_FORMAT_B5G6R5_UNORM_PACK16),
+#endif
 	},
 	{
 		DRM_FORMAT(RGB888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 0),
 		.bpp = 24,
+		GL_FORMAT_INFO(GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, BGR1),
 		GL_FORMAT(GL_RGB),
 		GL_TYPE(GL_UNSIGNED_BYTE),
-		GL_CHANNEL_ORDER(BGRA),
+		VULKAN_FORMAT(VK_FORMAT_B8G8R8_UNORM),
 	},
 	{
 		DRM_FORMAT(BGR888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 0),
 		.bpp = 24,
+		GL_FORMAT_INFO(GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, RGB1),
 		GL_FORMAT(GL_RGB),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_R8G8B8_UNORM),
 	},
 	{
 		DRM_FORMAT(XRGB8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 0),
 		.addfb_legacy_depth = 24,
 		.bpp = 32,
+		GL_FORMAT_INFO(GL_BGRA8_EXT, GL_BGRA_EXT, GL_UNSIGNED_BYTE, RGB1),
 		GL_INTERNALFORMAT(GL_RGB8),
 		GL_FORMAT(GL_BGRA_EXT),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_B8G8R8A8_UNORM),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(x8r8g8b8),
 #else
@@ -256,13 +428,16 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(ARGB8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 8),
 		.opaque_substitute = DRM_FORMAT_XRGB8888,
 		.addfb_legacy_depth = 32,
 		.bpp = 32,
+		GL_FORMAT_INFO(GL_BGRA8_EXT, GL_BGRA_EXT, GL_UNSIGNED_BYTE, RGBA),
 		GL_INTERNALFORMAT(GL_RGBA8),
 		GL_FORMAT(GL_BGRA_EXT),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_B8G8R8A8_UNORM),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(a8r8g8b8),
 #else
@@ -271,10 +446,13 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(XBGR8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 0),
 		.bpp = 32,
+		GL_FORMAT_INFO(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, RGB1),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_R8G8B8A8_UNORM),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(x8b8g8r8),
 #else
@@ -283,11 +461,14 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(ABGR8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 8),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_XBGR8888,
+		GL_FORMAT_INFO(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, RGBA),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_BYTE),
+		VULKAN_FORMAT(VK_FORMAT_R8G8B8A8_UNORM),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(a8b8g8r8),
 #else
@@ -296,11 +477,12 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(RGBX8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 0),
 		.bpp = 32,
+		GL_FORMAT_INFO(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, ABG1),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_BYTE),
-		GL_CHANNEL_ORDER(ABGR),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(r8g8b8x8),
 #else
@@ -309,12 +491,13 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(RGBA8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 8),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_RGBX8888,
+		GL_FORMAT_INFO(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, ABGR),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_BYTE),
-		GL_CHANNEL_ORDER(ABGR),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(r8g8b8a8),
 #else
@@ -323,11 +506,12 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(BGRX8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 0),
 		.bpp = 32,
+		GL_FORMAT_INFO(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GBA1),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_BYTE),
-		GL_CHANNEL_ORDER(ARGB),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(b8g8r8x8),
 #else
@@ -336,12 +520,13 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(BGRA8888),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(8, 8, 8, 8),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_BGRX8888,
+		GL_FORMAT_INFO(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GBAR),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_BYTE),
-		GL_CHANNEL_ORDER(ARGB),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 		PIXMAN_FMT(b8g8r8a8),
 #else
@@ -350,139 +535,186 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(XRGB2101010),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 0),
 		.addfb_legacy_depth = 30,
 		.bpp = 32,
 		GL_INTERNALFORMAT(GL_RGB10_A2),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, BGR1),
 		PIXMAN_FMT(x2r10g10b10),
+		VULKAN_FORMAT(VK_FORMAT_A2R10G10B10_UNORM_PACK32),
 #endif
 	},
 	{
 		DRM_FORMAT(ARGB2101010),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 2),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_XRGB2101010,
 		GL_INTERNALFORMAT(GL_RGB10_A2),
 #if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, BGRA),
 		PIXMAN_FMT(a2r10g10b10),
+		VULKAN_FORMAT(VK_FORMAT_A2R10G10B10_UNORM_PACK32),
 #endif
 	},
 	{
 		DRM_FORMAT(XBGR2101010),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 0),
 		.bpp = 32,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, RGB1),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_INT_2_10_10_10_REV_EXT),
 		PIXMAN_FMT(x2b10g10r10),
+		VULKAN_FORMAT(VK_FORMAT_A2B10G10R10_UNORM_PACK32),
 #endif
 	},
 	{
 		DRM_FORMAT(ABGR2101010),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 2),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_XBGR2101010,
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, RGBA),
 		GL_FORMAT(GL_RGBA),
 		GL_TYPE(GL_UNSIGNED_INT_2_10_10_10_REV_EXT),
 		PIXMAN_FMT(a2b10g10r10),
+		VULKAN_FORMAT(VK_FORMAT_A2B10G10R10_UNORM_PACK32),
 #endif
 	},
 	{
 		DRM_FORMAT(RGBX1010102),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 0),
 		.bpp = 32,
 	},
 	{
 		DRM_FORMAT(RGBA1010102),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 2),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_RGBX1010102,
 	},
 	{
 		DRM_FORMAT(BGRX1010102),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 0),
 		.bpp = 32,
 	},
 	{
 		DRM_FORMAT(BGRA1010102),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(10, 10, 10, 2),
 		.bpp = 32,
 		.opaque_substitute = DRM_FORMAT_BGRX1010102,
 	},
 	{
 		DRM_FORMAT(XBGR16161616),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(16, 16, 16, 0),
 		.bpp = 64,
-#if __BYTE_ORDER__ == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA16_EXT, GL_RGBA, GL_UNSIGNED_SHORT, RGB1),
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 		GL_FORMAT(GL_RGBA16_EXT),
 		GL_TYPE(GL_UNSIGNED_SHORT),
+		VULKAN_FORMAT(VK_FORMAT_R16G16B16A16_UNORM),
 #endif
 	},
 	{
 		DRM_FORMAT(ABGR16161616),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FIXED(16, 16, 16, 16),
 		.bpp = 64,
 		.opaque_substitute = DRM_FORMAT_XBGR16161616,
-#if __BYTE_ORDER__ == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA16_EXT, GL_RGBA, GL_UNSIGNED_SHORT, RGBA),
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 		GL_FORMAT(GL_RGBA16_EXT),
 		GL_TYPE(GL_UNSIGNED_SHORT),
+		VULKAN_FORMAT(VK_FORMAT_R16G16B16A16_UNORM),
 #endif
 	},
 	{
+		DRM_FORMAT(XRGB16161616),
+		COLOR_MODEL(RGB),
+		BITS_RGBA_FIXED(16, 16, 16, 0),
+		.bpp = 64,
+		GL_FORMAT_INFO(GL_RGBA16_EXT, GL_RGBA, GL_UNSIGNED_SHORT, BGR1),
+	},
+	{
+		DRM_FORMAT(ARGB16161616),
+		COLOR_MODEL(RGB),
+		BITS_RGBA_FIXED(16, 16, 16, 16),
+		.bpp = 64,
+		.opaque_substitute = DRM_FORMAT_XRGB16161616,
+		GL_FORMAT_INFO(GL_RGBA16_EXT, GL_RGBA, GL_UNSIGNED_SHORT, BGRA),
+	},
+	{
 		DRM_FORMAT(XBGR16161616F),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FLOAT(16, 16, 16, 0),
 		.bpp = 64,
-#if __BYTE_ORDER__ == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, RGB1),
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 		GL_FORMAT(GL_RGBA16F),
 		GL_TYPE(GL_HALF_FLOAT),
+		VULKAN_FORMAT(VK_FORMAT_R16G16B16A16_SFLOAT),
 #endif
 	},
 	{
 		DRM_FORMAT(ABGR16161616F),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FLOAT(16, 16, 16, 16),
 		.bpp = 64,
 		.opaque_substitute = DRM_FORMAT_XBGR16161616F,
-#if __BYTE_ORDER__ == __LITTLE_ENDIAN
+		GL_FORMAT_INFO(GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, RGBA),
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 		GL_FORMAT(GL_RGBA16F),
 		GL_TYPE(GL_HALF_FLOAT),
+		VULKAN_FORMAT(VK_FORMAT_R16G16B16A16_SFLOAT),
 #endif
 	},
 	{
 		DRM_FORMAT(XRGB16161616F),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FLOAT(16, 16, 16, 0),
 		.bpp = 64,
+		GL_FORMAT_INFO(GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, BGR1),
 	},
 	{
 		DRM_FORMAT(ARGB16161616F),
+		COLOR_MODEL(RGB),
 		BITS_RGBA_FLOAT(16, 16, 16, 16),
 		.bpp = 64,
 		.opaque_substitute = DRM_FORMAT_XRGB16161616F,
+		GL_FORMAT_INFO(GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, BGRA),
 	},
 	{
 		DRM_FORMAT(YUYV),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_XUXV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 1,
 		.hsub = 2,
 	},
 	{
 		DRM_FORMAT(YVYU),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_XUXV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 1,
 		.chroma_order = ORDER_VU,
 		.hsub = 2,
 	},
 	{
 		DRM_FORMAT(UYVY),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_XUXV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 1,
 		.luma_chroma_order = ORDER_CHROMA_LUMA,
 		.hsub = 2,
 	},
 	{
 		DRM_FORMAT(VYUY),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_XUXV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 1,
 		.luma_chroma_order = ORDER_CHROMA_LUMA,
 		.chroma_order = ORDER_VU,
@@ -490,14 +722,35 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(NV12),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.hsub = 2,
 		.vsub = 2,
 	},
 	{
+		DRM_FORMAT(NV15),
+		COLOR_MODEL(YUV),
+		.num_planes = 2,
+		.hsub = 2,
+		.vsub = 2,
+	},
+	{
+		DRM_FORMAT(NV20),
+		COLOR_MODEL(YUV),
+		.num_planes = 2,
+		.hsub = 2,
+		.vsub = 1,
+	},
+	{
+		DRM_FORMAT(NV30),
+		COLOR_MODEL(YUV),
+		.num_planes = 2,
+		.hsub = 1,
+		.vsub = 1,
+	},
+	{
 		DRM_FORMAT(NV21),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.chroma_order = ORDER_VU,
 		.hsub = 2,
@@ -505,14 +758,14 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(NV16),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.hsub = 2,
 		.vsub = 1,
 	},
 	{
 		DRM_FORMAT(NV61),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.chroma_order = ORDER_VU,
 		.hsub = 2,
@@ -520,46 +773,69 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(NV24),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 	},
 	{
 		DRM_FORMAT(NV42),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.chroma_order = ORDER_VU,
 	},
 	{
 		DRM_FORMAT(P010),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.hsub = 2,
 		.vsub = 2,
 	},
 	{
 		DRM_FORMAT(P012),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.hsub = 2,
 		.vsub = 2,
 	},
 	{
 		DRM_FORMAT(P016),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 2,
 		.hsub = 2,
 		.vsub = 2,
 	},
 	{
+		DRM_FORMAT(P030),
+		COLOR_MODEL(YUV),
+		.num_planes = 2,
+		.hsub = 2,
+		.vsub = 2,
+	},
+	{
+		DRM_FORMAT(YUV420_8BIT),
+		COLOR_MODEL(YUV),
+		.num_planes = 1,
+		/* this format is 2x2 subsampled, but we don't declare that as
+		 * it's represented by a single plane; it's there to support
+		 * compression */
+	},
+	{
+		DRM_FORMAT(YUV420_10BIT),
+		COLOR_MODEL(YUV),
+		.num_planes = 1,
+		/* this format is 2x2 subsampled, but we don't declare that as
+		 * it's represented by a single plane; it's there to support
+		 * compression */
+	},
+	{
 		DRM_FORMAT(YUV410),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.hsub = 4,
 		.vsub = 4,
 	},
 	{
 		DRM_FORMAT(YVU410),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.chroma_order = ORDER_VU,
 		.hsub = 4,
@@ -567,14 +843,14 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(YUV411),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.hsub = 4,
 		.vsub = 1,
 	},
 	{
 		DRM_FORMAT(YVU411),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.chroma_order = ORDER_VU,
 		.hsub = 4,
@@ -582,14 +858,14 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(YUV420),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.hsub = 2,
 		.vsub = 2,
 	},
 	{
 		DRM_FORMAT(YVU420),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.chroma_order = ORDER_VU,
 		.hsub = 2,
@@ -597,14 +873,14 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(YUV422),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.hsub = 2,
 		.vsub = 1,
 	},
 	{
 		DRM_FORMAT(YVU422),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.chroma_order = ORDER_VU,
 		.hsub = 2,
@@ -612,18 +888,76 @@ static const struct pixel_format_info pixel_format_table[] = {
 	},
 	{
 		DRM_FORMAT(YUV444),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 	},
 	{
 		DRM_FORMAT(YVU444),
-		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+		COLOR_MODEL(YUV),
 		.num_planes = 3,
 		.chroma_order = ORDER_VU,
 	},
 	{
 		DRM_FORMAT(XYUV8888),
+		COLOR_MODEL(YUV),
 		.bpp = 32,
+	},
+	{
+		DRM_FORMAT(S010),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+		.hsub = 2,
+		.vsub = 2,
+	},
+	{
+		DRM_FORMAT(S210),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+		.hsub = 2,
+		.vsub = 1,
+	},
+	{
+		DRM_FORMAT(S410),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+	},
+	{
+		DRM_FORMAT(S012),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+		.hsub = 2,
+		.vsub = 2,
+	},
+	{
+		DRM_FORMAT(S212),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+		.hsub = 2,
+		.vsub = 1,
+	},
+	{
+		DRM_FORMAT(S412),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+	},
+	{
+		DRM_FORMAT(S016),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+		.hsub = 2,
+		.vsub = 2,
+	},
+	{
+		DRM_FORMAT(S216),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
+		.hsub = 2,
+		.vsub = 1,
+	},
+	{
+		DRM_FORMAT(S416),
+		COLOR_MODEL(YUV),
+		.num_planes = 3,
 	},
 };
 

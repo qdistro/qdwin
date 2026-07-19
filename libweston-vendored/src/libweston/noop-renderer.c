@@ -36,19 +36,10 @@ struct noop_renderer {
 	unsigned char seed; /* see comment in attach() */
 };
 
-static int
-noop_renderer_read_pixels(struct weston_output *output,
-			  const struct pixel_format_info *format, void *pixels,
-			  uint32_t x, uint32_t y,
-			  uint32_t width, uint32_t height)
-{
-	return 0;
-}
-
 static void
 noop_renderer_repaint_output(struct weston_output *output,
 			     pixman_region32_t *output_damage,
-			     struct weston_renderbuffer *renderbuffer)
+			     weston_renderbuffer_t renderbuffer)
 {
 }
 
@@ -64,6 +55,12 @@ noop_renderer_resize_output(struct weston_output *output,
 static void
 noop_renderer_flush_damage(struct weston_paint_node *pnode)
 {
+}
+
+static bool
+noop_renderer_can_render_straight_alpha(struct weston_compositor *wc)
+{
+	return true;
 }
 
 static void
@@ -139,14 +136,19 @@ noop_renderer_init(struct weston_compositor *ec)
 	if (renderer == NULL)
 		return -1;
 
-	renderer->base.read_pixels = noop_renderer_read_pixels;
 	renderer->base.repaint_output = noop_renderer_repaint_output;
 	renderer->base.resize_output = noop_renderer_resize_output;
 	renderer->base.flush_damage = noop_renderer_flush_damage;
 	renderer->base.attach = noop_renderer_attach;
 	renderer->base.destroy = noop_renderer_destroy;
+	renderer->base.can_render_straight_alpha = noop_renderer_can_render_straight_alpha;
 	renderer->base.type = WESTON_RENDERER_NOOP;
 	ec->renderer = &renderer->base;
+	ec->capabilities |=
+		WESTON_CAP_ROTATION_ANY |
+		WESTON_CAP_VIEW_CLIP_MASK |
+		WESTON_CAP_COLOR_OPS |
+		WESTON_CAP_COLOR_REP;
 
 	return 0;
 }

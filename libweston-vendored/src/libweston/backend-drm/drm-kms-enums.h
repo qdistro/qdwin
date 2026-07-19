@@ -56,6 +56,10 @@ enum wdrm_plane_property {
 	WDRM_PLANE_ZPOS,
 	WDRM_PLANE_ROTATION,
 	WDRM_PLANE_ALPHA,
+	WDRM_PLANE_BLEND,
+	WDRM_PLANE_COLOR_ENCODING,
+	WDRM_PLANE_COLOR_PIPELINE,
+	WDRM_PLANE_COLOR_RANGE,
 	WDRM_PLANE_HOTSPOT_X,
 	WDRM_PLANE_HOTSPOT_Y,
 	WDRM_PLANE__COUNT
@@ -85,6 +89,111 @@ enum wdrm_plane_rotation {
 };
 
 /**
+ * Possible values for the WDRM_PLANE_COLOR_ENCODING property.
+ */
+enum wdrm_plane_color_encoding {
+	WDRM_PLANE_COLOR_ENCODING_BT601 = 0,
+	WDRM_PLANE_COLOR_ENCODING_BT709,
+	WDRM_PLANE_COLOR_ENCODING_BT2020,
+	WDRM_PLANE_COLOR_ENCODING__COUNT
+};
+#define WDRM_PLANE_COLOR_ENCODING_DEFAULT WDRM_PLANE_COLOR_ENCODING_BT709
+
+/**
+ * Possible values for the WDRM_PLANE_COLOR_PIPELINE property.
+ *
+ * This property is special: the enum values are not deterministic. Each enum
+ * value corresponds to the id of a colorop created at runtime by the KMS
+ * driver. drm_property_info_populate() expects well-known values for enum
+ * properties, so a dummy value is defined to allow it to populate plane->props
+ * correctly.
+ */
+enum wdrm_plane_color_pipeline {
+	WDRM_PLANE_COLOR_PIPELINE_DUMMY = 0,
+	WDRM_PLANE_COLOR_PIPELINE__COUNT
+};
+
+/**
+ * Possible values for the WDRM_PLANE_COLOR_RANGE property.
+ */
+enum wdrm_plane_color_range {
+	WDRM_PLANE_COLOR_RANGE_LIMITED = 0,
+	WDRM_PLANE_COLOR_RANGE_FULL,
+	WDRM_PLANE_COLOR_RANGE__COUNT
+};
+#define WDRM_PLANE_COLOR_RANGE_DEFAULT WDRM_PLANE_COLOR_RANGE_LIMITED
+
+/**
+ * List of properties attached to a DRM colorop.
+ */
+enum wdrm_colorop_property {
+	WDRM_COLOROP_TYPE = 0,
+	WDRM_COLOROP_NEXT,
+	WDRM_COLOROP_BYPASS,
+	WDRM_COLOROP_SIZE,
+	WDRM_COLOROP_DATA,
+	WDRM_COLOROP_MULTIPLIER,
+	WDRM_COLOROP_LUT1D_INTERPOLATION,
+	WDRM_COLOROP_LUT3D_INTERPOLATION,
+	WDRM_COLOROP_CURVE_1D,
+	WDRM_COLOROP__COUNT,
+};
+
+/**
+ * Possible values for the WDRM_COLOROP_TYPE property.
+ */
+enum wdrm_colorop_type {
+	WDRM_COLOROP_TYPE_1D_CURVE = 0,
+	WDRM_COLOROP_TYPE_1D_LUT,
+	WDRM_COLOROP_TYPE_CTM_3X4,
+	WDRM_COLOROP_TYPE_MULTIPLIER,
+	WDRM_COLOROP_TYPE_3D_LUT,
+	WDRM_COLOROP_TYPE__COUNT,
+};
+
+/**
+ * Possible values for the WDRM_COLOROP_CURVE_1D property.
+ */
+enum wdrm_colorop_curve_1d {
+	WDRM_COLOROP_CURVE_1D_SRGB_EOTF = 0,
+	WDRM_COLOROP_CURVE_1D_SRGB_INV_EOTF,
+	WDRM_COLOROP_CURVE_1D_PQ_125_EOTF,
+	WDRM_COLOROP_CURVE_1D_PQ_125_INV_EOTF,
+	WDRM_COLOROP_CURVE_1D_BT2020_INV_OETF,
+	WDRM_COLOROP_CURVE_1D_BT2020_OETF,
+	WDRM_COLOROP_CURVE_1D_GAMMA_22,
+	WDRM_COLOROP_CURVE_1D_GAMMA_22_INV,
+	WDRM_COLOROP_CURVE_1D__COUNT,
+};
+
+/**
+ * Possible values for the WDRM_COLOROP_LUT1D_INTERPOLATION property.
+ */
+enum wdrm_colorop_lut1d_interpolation {
+	WDRM_COLOROP_LUT1D_INTERPOLATION_LINEAR = 0,
+	WDRM_COLOROP_LUT1D_INTERPOLATION__COUNT,
+};
+
+/**
+ * Possible values for the WDRM_COLOROP_LUT3D_INTERPOLATION property.
+ */
+enum wdrm_colorop_lut3d_interpolation {
+	WDRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL = 0,
+	WDRM_COLOROP_LUT3D_INTERPOLATION__COUNT,
+};
+
+/**
+ * Possible values for the WDRM_PLANE_BLEND property.
+ */
+enum wdrm_plane_blend {
+	WDRM_PLANE_BLEND_NONE = 0,
+	WDRM_PLANE_BLEND_PREMULT,
+	WDRM_PLANE_BLEND_COVERAGE,
+	WDRM_PLANE_BLEND__COUNT
+};
+#define WDRM_PLANE_BLEND_DEFAULT WDRM_PLANE_BLEND_PREMULT
+
+/**
  * List of properties attached to a DRM connector
  */
 enum wdrm_connector_property {
@@ -102,6 +211,15 @@ enum wdrm_connector_property {
 	WDRM_CONNECTOR_MAX_BPC,
 	WDRM_CONNECTOR_CONTENT_TYPE,
 	WDRM_CONNECTOR_COLORSPACE,
+	WDRM_CONNECTOR_VRR_CAPABLE,
+	WDRM_CONNECTOR_UNDERSCAN,
+	WDRM_CONNECTOR_UNDERSCAN_HBORDER,
+	WDRM_CONNECTOR_UNDERSCAN_VBORDER,
+	WDRM_CONNECTOR_LEFT_MARGIN,
+	WDRM_CONNECTOR_RIGHT_MARGIN,
+	WDRM_CONNECTOR_TOP_MARGIN,
+	WDRM_CONNECTOR_BOTTOM_MARGIN,
+	WDRM_CONNECTOR_COLOR_FORMAT,
 	WDRM_CONNECTOR__COUNT
 };
 
@@ -163,6 +281,22 @@ enum wdrm_colorspace {
 	WDRM_COLORSPACE__COUNT,
 };
 
+enum wdrm_underscan {
+	WDRM_UNDERSCAN_OFF = 0,
+	WDRM_UNDERSCAN_ON,
+	WDRM_UNDERSCAN_AUTO,
+	WDRM_UNDERSCAN__COUNT
+};
+
+enum wdrm_color_format {
+	WDRM_COLOR_FORMAT_RGB,
+	WDRM_COLOR_FORMAT_YUV422,
+	WDRM_COLOR_FORMAT_YUV444,
+	WDRM_COLOR_FORMAT_YUV420,
+	WDRM_COLOR_FORMAT_AUTO,
+	WDRM_COLOR_FORMAT__COUNT
+};
+
 /**
  * List of properties attached to DRM CRTCs
  */
@@ -175,5 +309,6 @@ enum wdrm_crtc_property {
 	WDRM_CRTC_GAMMA_LUT,
 	WDRM_CRTC_GAMMA_LUT_SIZE,
 	WDRM_CRTC_VRR_ENABLED,
+	WDRM_CRTC_BACKGROUND_COLOR,
 	WDRM_CRTC__COUNT
 };

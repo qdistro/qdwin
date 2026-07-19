@@ -1,5 +1,5 @@
 #!/bin/bash
-# V1 host-side gate for the vendored libweston-14 NULL-parent xdg_popup
+# V1 host-side gate for the vendored libweston-16 NULL-parent xdg_popup
 # patch.
 #
 # Spawns a fresh headless weston with qdwin-shell.so loaded, runs
@@ -30,7 +30,7 @@ if [[ ! -f "$QDWIN_SO" ]]; then
     echo "[v1] run tests/host/lib.sh ht_require_build first" >&2
     exit 2
 fi
-if [[ ! -f "$VEND_LIB/libweston-14.so.0.0.2" || ! -f "$VEND_LIB/libweston-14/headless-backend.so" ]]; then
+if [[ ! -f "$VEND_LIB/libweston-16.so.0.0.0" || ! -f "$VEND_LIB/libweston-16/headless-backend.so" ]]; then
     echo "[v1] vendored libweston not installed at $VEND_PREFIX" >&2
     echo "[v1] run $HERE/build-libweston.sh first" >&2
     exit 2
@@ -70,7 +70,7 @@ run_one() {
 
     # Confirm which libweston is loaded.
     local actual_lib
-    actual_lib=$(pmap "$wpid" 2>/dev/null | grep -oE '[^ ]*libweston-14\.so[^ ]*' | head -1)
+    actual_lib=$(pmap "$wpid" 2>/dev/null | grep -oE '[^ ]*libweston-16\.so[^ ]*' | head -1)
     echo "[v1/$mode] weston pid=$wpid libweston=$actual_lib"
 
     "${env_pfx[@]}" python3 "$TEST_PY" "$sock"

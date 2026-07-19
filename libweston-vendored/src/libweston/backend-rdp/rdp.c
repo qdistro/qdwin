@@ -46,6 +46,7 @@
 #include <libweston/pixel-formats.h>
 #include "pixman-renderer.h"
 #include "renderer-gl/gl-renderer.h"
+#include "renderer-vulkan/vulkan-renderer.h"
 #include "shared/weston-egl-ext.h"
 
 /* These can be removed when we bump FreeRDP dependency past 3.0.0 in the future */
@@ -57,6 +58,12 @@
 #endif
 
 extern PWtsApiFunctionTable FreeRDP_InitWtsApi(void);
+
+static struct rdp_buffer *
+rdp_buffer_create(struct rdp_output *output);
+
+static void
+rdp_buffer_destroy(struct rdp_buffer *buffer);
 
 static BOOL
 xf_peer_adjust_monitor_layout(freerdp_peer *client);
@@ -261,11 +268,11 @@ rdp_peer_refresh_region(pixman_region32_t *region, freerdp_peer *peer)
 	rdpSettings *settings = peer->context->settings;
 
 	if (freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec))
-		rdp_peer_refresh_rfx(region, output->shadow_surface, peer);
+		rdp_peer_refresh_rfx(region, output->buffer->shadow_surface, peer);
 	else if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec))
-		rdp_peer_refresh_nsc(region, output->shadow_surface, peer);
+		rdp_peer_refresh_nsc(region, output->buffer->shadow_surface, peer);
 	else
-		rdp_peer_refresh_raw(region, output->shadow_surface, peer);
+		rdp_peer_refresh_raw(region, output->buffer->shadow_surface, peer);
 }
 
 static int
@@ -295,7 +302,7 @@ rdp_output_repaint(struct weston_output *output_base)
 	weston_output_flush_damage_for_primary_plane(output_base, &damage);
 
 	ec->renderer->repaint_output(&output->base, &damage,
-				     output->renderbuffer);
+				     output->buffer->rb);
 
 	if (pixman_region32_not_empty(&damage)) {
 		pixman_region32_t transformed_damage;
@@ -346,52 +353,14 @@ rdp_output_set_mode(struct weston_output *base, struct weston_mode *mode)
 	struct weston_output *output = base;
 	struct rdp_peers_item *rdpPeer;
 	rdpSettings *settings;
-	struct weston_renderbuffer *new_renderbuffer;
 
 	mode->refresh = b->rdp_monitor_refresh_rate;
 	weston_output_set_single_mode(base, mode);
 
-	if (base->enabled) {
-		const struct weston_renderer *renderer;
-		pixman_image_t *new_image;
-
+	if (base->enabled)
 		weston_renderer_resize_output(output, &(struct weston_size){
 			.width = output->current_mode->width,
 			.height = output->current_mode->height }, NULL);
-
-		new_image = pixman_image_create_bits(b->formats[0]->pixman_format,
-						     mode->width, mode->height,
-						     NULL, mode->width * 4);
-		renderer = b->compositor->renderer;
-		switch (renderer->type) {
-		case WESTON_RENDERER_PIXMAN: {
-			const struct pixman_renderer_interface *pixman;
-
-			pixman = renderer->pixman;
-			new_renderbuffer =
-				pixman->create_image_from_ptr(output, b->formats[0],
-							      mode->width, mode->height,
-							      pixman_image_get_data(new_image),
-							      mode->width * 4);
-			break;
-		}
-		case WESTON_RENDERER_GL:
-			new_renderbuffer =
-				renderer->gl->create_fbo(output, b->formats[0],
-							 mode->width, mode->height,
-							 pixman_image_get_data(new_image));
-			break;
-		default:
-			unreachable("cannot have auto renderer at runtime");
-		}
-		pixman_image_composite32(PIXMAN_OP_SRC, rdpOutput->shadow_surface,
-					 0, new_image, 0, 0, 0, 0, 0, 0,
-					 mode->width, mode->height);
-		weston_renderbuffer_unref(rdpOutput->renderbuffer);
-		rdpOutput->renderbuffer = new_renderbuffer;
-		pixman_image_unref(rdpOutput->shadow_surface);
-		rdpOutput->shadow_surface = new_image;
-	}
 
 	/* Apparently settings->DesktopWidth is supposed to be primary only.
 	 * For now we only work with a single monitor, so we don't need to
@@ -412,6 +381,19 @@ rdp_output_set_mode(struct weston_output *base, struct weston_mode *mode)
 			freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, mode->height);
 			rdpPeer->peer->context->update->DesktopResize(rdpPeer->peer->context);
 		}
+	}
+}
+
+static void
+rdp_output_set_dpms(struct weston_output *base, enum dpms_enum level)
+{
+	struct rdp_output *output = to_rdp_output(base);
+
+	if (level == WESTON_DPMS_ON)
+		weston_output_schedule_repaint(base);
+	else if (output->base.repaint_status == REPAINT_AWAITING_COMPLETION) {
+		wl_event_source_timer_update(output->finish_frame_timer, 0);
+		weston_output_schedule_repaint_reset(base);
 	}
 }
 
@@ -436,11 +418,88 @@ rdp_head_get_monitor(struct weston_head *base,
 	monitor->desktop_scale = h->config.attributes.desktopScaleFactor;
 }
 
+static bool
+rdp_rb_discarded_cb(weston_renderbuffer_t rb, void *data)
+{
+	struct rdp_buffer *buffer = (struct rdp_buffer *) data;
+	struct rdp_output *output = buffer->output;
+
+	rdp_buffer_destroy(buffer);
+	output->buffer = rdp_buffer_create(output);
+	if (output->buffer == NULL)
+		return false;
+
+	return true;
+}
+
+static struct rdp_buffer *
+rdp_buffer_create(struct rdp_output *output)
+{
+	const struct pixel_format_info *format = output->backend->formats[0];
+	struct weston_renderer *rdr = output->base.compositor->renderer;
+	pixman_image_t *shadow_surface;
+	weston_renderbuffer_t rb;
+	struct rdp_buffer *buffer;
+
+	shadow_surface = pixman_image_create_bits(format->pixman_format,
+						  output->base.current_mode->width,
+						  output->base.current_mode->height,
+						  NULL,
+						  output->base.current_mode->width * 4);
+	buffer = xmalloc(sizeof *buffer);
+
+	rb = rdr->create_renderbuffer(&output->base, format,
+				      pixman_image_get_data(shadow_surface),
+				      output->base.current_mode->width * 4,
+				      rdp_rb_discarded_cb, buffer);
+	if (rb == NULL) {
+		weston_log("Failed to create offscreen renderbuffer.\n");
+		pixman_image_unref(shadow_surface);
+		free(buffer);
+		return NULL;
+	}
+
+	buffer->output = output;
+	buffer->shadow_surface = shadow_surface;
+	buffer->rb = rb;
+
+	return buffer;
+}
+
+static void
+rdp_buffer_destroy(struct rdp_buffer *buffer)
+{
+	struct weston_renderer *rdr = buffer->output->base.compositor->renderer;
+
+	pixman_image_unref(buffer->shadow_surface);
+	rdr->destroy_renderbuffer(buffer->rb);
+	free(buffer);
+}
+
+static void
+rdp_renderer_output_destroy(struct weston_output *base)
+{
+	struct weston_renderer *rdr = base->compositor->renderer;
+
+	switch (rdr->type) {
+	case WESTON_RENDERER_PIXMAN:
+		rdr->pixman->output_destroy(base);
+		break;
+	case WESTON_RENDERER_GL:
+		rdr->gl->output_destroy(base);
+		break;
+	case WESTON_RENDERER_VULKAN:
+		rdr->vulkan->output_destroy(base);
+		break;
+	default:
+		unreachable("cannot have auto renderer at runtime");
+	}
+}
+
 static int
 rdp_output_enable(struct weston_output *base)
 {
 	const struct weston_renderer *renderer = base->compositor->renderer;
-	const struct pixman_renderer_interface *pixman = renderer->pixman;
 	struct rdp_output *output = to_rdp_output(base);
 	struct rdp_backend *b;
 	struct wl_event_loop *loop;
@@ -448,12 +507,6 @@ rdp_output_enable(struct weston_output *base)
 	assert(output);
 
 	b = output->backend;
-
-	output->shadow_surface = pixman_image_create_bits(b->formats[0]->pixman_format,
-							  output->base.current_mode->width,
-							  output->base.current_mode->height,
-							  NULL,
-							  output->base.current_mode->width * 4);
 
 	switch (renderer->type) {
 	case WESTON_RENDERER_PIXMAN: {
@@ -465,23 +518,8 @@ rdp_output_enable(struct weston_output *base)
 			.format = b->formats[0],
 		};
 
-		if (renderer->pixman->output_create(&output->base, &options) < 0) {
+		if (renderer->pixman->output_create(&output->base, &options) < 0)
 			return -1;
-		}
-
-		output->renderbuffer =
-			pixman->create_image_from_ptr(&output->base, options.format,
-						      output->base.current_mode->width,
-						      output->base.current_mode->height,
-						      pixman_image_get_data(output->shadow_surface),
-						      output->base.current_mode->width * 4);
-		if (output->renderbuffer == NULL) {
-			weston_log("Failed to create surface for frame buffer.\n");
-			renderer->pixman->output_destroy(&output->base);
-			pixman_image_unref(output->shadow_surface);
-			output->shadow_surface = NULL;
-			return -1;
-		}
 		break;
 	}
 	case WESTON_RENDERER_GL: {
@@ -496,25 +534,36 @@ rdp_output_enable(struct weston_output *base)
 			},
 		};
 
-		if (renderer->gl->output_fbo_create(&output->base, &options) < 0)
+		if (renderer->gl->output_fbo_create(&output->base, &options) < 0) {
 			return -1;
+		}
+		break;
+	}
+	case WESTON_RENDERER_VULKAN: {
+		const struct vulkan_renderer_surfaceless_options options = {
+			.area = {
+				.width = output->base.current_mode->width,
+				.height = output->base.current_mode->height,
+			},
+			.fb_size = {
+				.width = output->base.current_mode->width,
+				.height = output->base.current_mode->height,
+			},
+		};
 
-		output->renderbuffer =
-			renderer->gl->create_fbo(&output->base, b->formats[0],
-						 output->base.current_mode->width,
-						 output->base.current_mode->height,
-						 pixman_image_get_data(output->shadow_surface));
-		if (output->renderbuffer == NULL) {
-			weston_log("Failed to create surface for frame buffer.\n");
-			renderer->pixman->output_destroy(&output->base);
-			pixman_image_unref(output->shadow_surface);
-			output->shadow_surface = NULL;
+		if (renderer->vulkan->output_surfaceless_create(&output->base, &options) < 0) {
 			return -1;
 		}
 		break;
 	}
 	default:
 		unreachable("cannot have auto renderer at runtime");
+	}
+
+	output->buffer = rdp_buffer_create(output);
+	if (output->buffer == NULL) {
+		rdp_renderer_output_destroy(base);
+		return -1;
 	}
 
 	loop = wl_display_get_event_loop(b->compositor->wl_display);
@@ -526,7 +575,6 @@ rdp_output_enable(struct weston_output *base)
 static int
 rdp_output_disable(struct weston_output *base)
 {
-	struct weston_renderer *renderer = base->compositor->renderer;
 	struct rdp_output *output = to_rdp_output(base);
 
 	assert(output);
@@ -534,21 +582,9 @@ rdp_output_disable(struct weston_output *base)
 	if (!output->base.enabled)
 		return 0;
 
-	weston_renderbuffer_unref(output->renderbuffer);
-	output->renderbuffer = NULL;
-	switch (renderer->type) {
-	case WESTON_RENDERER_PIXMAN:
-		renderer->pixman->output_destroy(&output->base);
-		break;
-	case WESTON_RENDERER_GL:
-		renderer->gl->output_destroy(&output->base);
-		break;
-	default:
-		unreachable("cannot have auto renderer at runtime");
-	}
-	pixman_image_unref(output->shadow_surface);
-	output->shadow_surface = NULL;
-
+	rdp_buffer_destroy(output->buffer);
+	output->buffer = NULL;
+	rdp_renderer_output_destroy(base);
 	wl_event_source_remove(output->finish_frame_timer);
 
 	return 0;
@@ -584,6 +620,7 @@ rdp_output_create(struct weston_backend *backend, const char *name)
 
 	output->base.start_repaint_loop = rdp_output_start_repaint_loop;
 	output->base.repaint = rdp_output_repaint;
+	output->base.set_dpms = rdp_output_set_dpms;
 	output->base.switch_mode = rdp_output_switch_mode;
 
 	output->backend = b;
@@ -871,125 +908,134 @@ struct rdp_to_xkb_keyboard_layout {
 	UINT32 rdpLayoutCode;
 	const char *xkbLayout;
 	const char *xkbVariant;
+	/* options are comma-separated key-value pairs that are colon- */
+	/* delimited, e.g. "caps:shift,lv3:ralt_alt". use the command  */
+	/* `xprop -root _XKB_RULES_NAMES | cut -d, -f5-` to see which  */
+	/* options that are currently set on your desktop.             */
+	const char *xkbOptions;
 };
 
 /* table reversed from
 	https://github.com/awakecoding/FreeRDP/blob/master/libfreerdp/locale/xkb_layout_ids.c#L811 */
 static const
 struct rdp_to_xkb_keyboard_layout rdp_keyboards[] = {
-	{KBD_ARABIC_101, "ara", 0},
-	{KBD_BULGARIAN, 0, 0},
-	{KBD_CHINESE_TRADITIONAL_US, 0},
-	{KBD_CZECH, "cz", 0},
-	{KBD_CZECH_PROGRAMMERS, "cz", "bksl"},
-	{KBD_CZECH_QWERTY, "cz", "qwerty"},
-	{KBD_DANISH, "dk", 0},
-	{KBD_GERMAN, "de", 0},
-	{KBD_GERMAN_NEO, "de", "neo"},
-	{KBD_GERMAN_IBM, "de", "qwerty"},
-	{KBD_GREEK, "gr", 0},
-	{KBD_GREEK_220, "gr", "simple"},
-	{KBD_GREEK_319, "gr", "extended"},
-	{KBD_GREEK_POLYTONIC, "gr", "polytonic"},
-	{KBD_US, "us", 0},
-	{KBD_UNITED_STATES_INTERNATIONAL, "us", "intl"},
-	{KBD_US_ENGLISH_TABLE_FOR_IBM_ARABIC_238_L, "ara", "buckwalter"},
-	{KBD_SPANISH, "es", 0},
-	{KBD_SPANISH_VARIATION, "es", "nodeadkeys"},
-	{KBD_FINNISH, "fi", 0},
-	{KBD_FRENCH, "fr", 0},
-	{KBD_HEBREW, "il", 0},
-	{KBD_HEBREW_STANDARD, "il", "basic"},
-	{KBD_HUNGARIAN, "hu", 0},
-	{KBD_HUNGARIAN_101_KEY, "hu", "standard"},
-	{KBD_ICELANDIC, "is", 0},
-	{KBD_ITALIAN, "it", 0},
-	{KBD_ITALIAN_142, "it", "nodeadkeys"},
-	{KBD_JAPANESE, "jp", 0},
-	{KBD_JAPANESE_INPUT_SYSTEM_MS_IME2002, "jp", 0},
-	{KBD_KOREAN, "kr", 0},
-	{KBD_KOREAN_INPUT_SYSTEM_IME_2000, "kr", "kr104"},
-	{KBD_DUTCH, "nl", 0},
-	{KBD_NORWEGIAN, "no", 0},
-	{KBD_POLISH_PROGRAMMERS, "pl", 0},
-	{KBD_POLISH_214, "pl", "qwertz"},
-	{KBD_ROMANIAN, "ro", 0},
-	{KBD_RUSSIAN, "ru", 0},
-	{KBD_RUSSIAN_TYPEWRITER, "ru", "typewriter"},
-	{KBD_CROATIAN, "hr", 0},
-	{KBD_SLOVAK, "sk", 0},
-	{KBD_SLOVAK_QWERTY, "sk", "qwerty"},
-	{KBD_ALBANIAN, 0, 0},
-	{KBD_SWEDISH, "se", 0},
-	{KBD_THAI_KEDMANEE, "th", 0},
-	{KBD_THAI_KEDMANEE_NON_SHIFTLOCK, "th", "tis"},
-	{KBD_TURKISH_Q, "tr", 0},
-	{KBD_TURKISH_F, "tr", "f"},
-	{KBD_URDU, "in", "urd-phonetic3"},
-	{KBD_UKRAINIAN, "ua", 0},
-	{KBD_BELARUSIAN, "by", 0},
-	{KBD_SLOVENIAN, "si", 0},
-	{KBD_ESTONIAN, "ee", 0},
-	{KBD_LATVIAN, "lv", 0},
-	{KBD_LITHUANIAN_IBM, "lt", "ibm"},
-	{KBD_FARSI, "ir", "pes"},
-	{KBD_PERSIAN, "af", "basic"},
-	{KBD_VIETNAMESE, "vn", 0},
-	{KBD_ARMENIAN_EASTERN, "am", 0},
-	{KBD_AZERI_LATIN, 0, 0},
-	{KBD_FYRO_MACEDONIAN, "mk", 0},
-	{KBD_GEORGIAN, "ge", 0},
-	{KBD_FAEROESE, 0, 0},
-	{KBD_DEVANAGARI_INSCRIPT, 0, 0},
-	{KBD_MALTESE_47_KEY, 0, 0},
-	{KBD_NORWEGIAN_WITH_SAMI, "no", "smi"},
-	{KBD_KAZAKH, "kz", 0},
-	{KBD_KYRGYZ_CYRILLIC, "kg", "phonetic"},
-	{KBD_TATAR, "ru", "tt"},
-	{KBD_BENGALI, "bd", 0},
-	{KBD_BENGALI_INSCRIPT, "bd", "probhat"},
-	{KBD_PUNJABI, 0, 0},
-	{KBD_GUJARATI, "in", "guj"},
-	{KBD_TAMIL, "in", "tam"},
-	{KBD_TELUGU, "in", "tel"},
-	{KBD_KANNADA, "in", "kan"},
-	{KBD_MALAYALAM, "in", "mal"},
-	{KBD_HINDI_TRADITIONAL, "in", 0},
-	{KBD_MARATHI, 0, 0},
-	{KBD_MONGOLIAN_CYRILLIC, "mn", 0},
-	{KBD_UNITED_KINGDOM_EXTENDED, "gb", "intl"},
-	{KBD_SYRIAC, "syc", 0},
-	{KBD_SYRIAC_PHONETIC, "syc", "syc_phonetic"},
-	{KBD_NEPALI, "np", 0},
-	{KBD_PASHTO, "af", "ps"},
-	{KBD_DIVEHI_PHONETIC, 0, 0},
-	{KBD_LUXEMBOURGISH, 0, 0},
-	{KBD_MAORI, "mao", 0},
-	{KBD_CHINESE_SIMPLIFIED_US, 0, 0},
-	{KBD_SWISS_GERMAN, "ch", "de_nodeadkeys"},
-	{KBD_UNITED_KINGDOM, "gb", 0},
-	{KBD_LATIN_AMERICAN, "latam", 0},
-	{KBD_BELGIAN_FRENCH, "be", 0},
-	{KBD_BELGIAN_PERIOD, "be", "oss_sundeadkeys"},
-	{KBD_PORTUGUESE, "pt", 0},
-	{KBD_SERBIAN_LATIN, "rs", 0},
-	{KBD_AZERI_CYRILLIC, "az", "cyrillic"},
-	{KBD_SWEDISH_WITH_SAMI, "se", "smi"},
-	{KBD_UZBEK_CYRILLIC, "af", "uz"},
-	{KBD_INUKTITUT_LATIN, "ca", "ike"},
-	{KBD_CANADIAN_FRENCH_LEGACY, "ca", "fr-legacy"},
-	{KBD_SERBIAN_CYRILLIC, "rs", 0},
-	{KBD_CANADIAN_FRENCH, "ca", "fr-legacy"},
-	{KBD_SWISS_FRENCH, "ch", "fr"},
-	{KBD_BOSNIAN, "ba", 0},
-	{KBD_IRISH, 0, 0},
-	{KBD_BOSNIAN_CYRILLIC, "ba", "us"},
-	{KBD_UNITED_STATES_DVORAK, "us", "dvorak"},
-	{KBD_PORTUGUESE_BRAZILIAN_ABNT2, "br", "abnt2"},
-	{KBD_CANADIAN_MULTILINGUAL_STANDARD, "ca", "multix"},
-	{KBD_GAELIC, "ie", "CloGaelach"},
+	{KBD_ARABIC_101, "ara", 0, 0},
+	{KBD_BULGARIAN, 0, 0, 0},
+	{KBD_CHINESE_TRADITIONAL_US, 0, 0, 0},
+	{KBD_CZECH, "cz", 0, 0},
+	{KBD_CZECH_PROGRAMMERS, "cz", "bksl", 0},
+	{KBD_CZECH_QWERTY, "cz", "qwerty", 0},
+	{KBD_DANISH, "dk", 0, 0},
+	{KBD_GERMAN, "de", 0, 0},
+	{KBD_GERMAN_NEO, "de", "neo", 0},
+	{KBD_GERMAN_IBM, "de", "qwerty", 0},
+	{KBD_GREEK, "gr", 0, 0},
+	{KBD_GREEK_220, "gr", "simple", 0},
+	{KBD_GREEK_319, "gr", "extended", 0},
+	{KBD_GREEK_POLYTONIC, "gr", "polytonic", 0},
+	{KBD_US, "us", 0, 0},
+	{KBD_UNITED_STATES_INTERNATIONAL, "us", "intl", 0},
+	{KBD_US_ENGLISH_TABLE_FOR_IBM_ARABIC_238_L, "ara", "buckwalter", 0},
+	{KBD_SPANISH, "es", 0, 0},
+	{KBD_SPANISH_VARIATION, "es", "nodeadkeys", 0},
+	{KBD_FINNISH, "fi", 0, 0},
+	{KBD_FRENCH, "fr", 0, 0},
+	{KBD_HEBREW, "il", 0, 0},
+	{KBD_HEBREW_STANDARD, "il", "basic", 0},
+	{KBD_HUNGARIAN, "hu", 0, 0},
+	{KBD_HUNGARIAN_101_KEY, "hu", "standard", 0},
+	{KBD_ICELANDIC, "is", 0, 0},
+	{KBD_ITALIAN, "it", 0, 0},
+	{KBD_ITALIAN_142, "it", "nodeadkeys", 0},
+	{KBD_JAPANESE, "jp", 0, 0},
+	{KBD_JAPANESE_INPUT_SYSTEM_MS_IME2002, "jp", 0, 0},
+	{KBD_KOREAN, "kr", 0, 0},
+	{KBD_KOREAN_INPUT_SYSTEM_IME_2000, "kr", "kr104", 0},
+	{KBD_DUTCH, "nl", 0, 0},
+	{KBD_NORWEGIAN, "no", 0, 0},
+	{KBD_POLISH_PROGRAMMERS, "pl", 0, 0},
+	{KBD_POLISH_214, "pl", "qwertz", 0},
+	{KBD_ROMANIAN, "ro", 0, 0},
+	{KBD_RUSSIAN, "ru", 0, 0},
+	{KBD_RUSSIAN_TYPEWRITER, "ru", "typewriter", 0},
+	{KBD_CROATIAN, "hr", 0, 0},
+	{KBD_SLOVAK, "sk", 0, 0},
+	{KBD_SLOVAK_QWERTY, "sk", "qwerty", 0},
+	{KBD_ALBANIAN, 0, 0, 0},
+	{KBD_SWEDISH, "se", 0, 0},
+	{KBD_THAI_KEDMANEE, "th", 0, 0},
+	{KBD_THAI_KEDMANEE_NON_SHIFTLOCK, "th", "tis", 0},
+	{KBD_TURKISH_Q, "tr", 0, 0},
+	{KBD_TURKISH_F, "tr", "f", 0},
+	{KBD_URDU, "in", "urd-phonetic3", 0},
+	{KBD_UKRAINIAN, "ua", 0, 0},
+	{KBD_BELARUSIAN, "by", 0, 0},
+	{KBD_SLOVENIAN, "si", 0, 0},
+	{KBD_ESTONIAN, "ee", 0, 0},
+	{KBD_LATVIAN, "lv", 0, 0},
+	{KBD_LITHUANIAN_IBM, "lt", "ibm", 0},
+	{KBD_FARSI, "ir", "pes", 0},
+	{KBD_PERSIAN, "af", "basic", 0},
+	{KBD_VIETNAMESE, "vn", 0, 0},
+	{KBD_ARMENIAN_EASTERN, "am", 0, 0},
+	{KBD_AZERI_LATIN, 0, 0, 0},
+	{KBD_FYRO_MACEDONIAN, "mk", 0, 0},
+	{KBD_GEORGIAN, "ge", 0, 0},
+	{KBD_FAEROESE, 0, 0, 0},
+	{KBD_DEVANAGARI_INSCRIPT, 0, 0, 0},
+	{KBD_MALTESE_47_KEY, 0, 0, 0},
+	{KBD_NORWEGIAN_WITH_SAMI, "no", "smi", 0},
+	{KBD_KAZAKH, "kz", 0, 0},
+	{KBD_KYRGYZ_CYRILLIC, "kg", "phonetic", 0},
+	{KBD_TATAR, "ru", "tt", 0},
+	{KBD_BENGALI, "bd", 0, 0},
+	{KBD_BENGALI_INSCRIPT, "bd", "probhat", 0},
+	{KBD_PUNJABI, 0, 0, 0},
+	{KBD_GUJARATI, "in", "guj", 0},
+	{KBD_TAMIL, "in", "tam", 0},
+	{KBD_TELUGU, "in", "tel", 0},
+	{KBD_KANNADA, "in", "kan", 0},
+	{KBD_MALAYALAM, "in", "mal", 0},
+	{KBD_HINDI_TRADITIONAL, "in", 0, 0},
+	{KBD_MARATHI, 0, 0, 0},
+	{KBD_MONGOLIAN_CYRILLIC, "mn", 0, 0},
+	{KBD_UNITED_KINGDOM_EXTENDED, "gb", "intl", 0},
+	{KBD_SYRIAC, "syc", 0, 0},
+	{KBD_SYRIAC_PHONETIC, "syc", "syc_phonetic", 0},
+	{KBD_NEPALI, "np", 0, 0},
+	{KBD_PASHTO, "af", "ps", 0},
+	{KBD_DIVEHI_PHONETIC, 0, 0, 0},
+	{KBD_LUXEMBOURGISH, 0, 0, 0},
+	{KBD_MAORI, "mao", 0, 0},
+	{KBD_CHINESE_SIMPLIFIED_US, 0, 0, 0},
+	{KBD_SWISS_GERMAN, "ch", "de_nodeadkeys", 0},
+	{KBD_UNITED_KINGDOM, "gb", 0, 0},
+	{KBD_LATIN_AMERICAN, "latam", 0, 0},
+	{KBD_BELGIAN_FRENCH, "be", 0, 0},
+	{KBD_BELGIAN_PERIOD, "be", "oss_sundeadkeys", 0},
+	{KBD_PORTUGUESE, "pt", 0, 0},
+	{KBD_SERBIAN_LATIN, "rs", 0, 0},
+	{KBD_AZERI_CYRILLIC, "az", "cyrillic", 0},
+	{KBD_SWEDISH_WITH_SAMI, "se", "smi", 0},
+	{KBD_UZBEK_CYRILLIC, "af", "uz", 0},
+	{KBD_INUKTITUT_LATIN, "ca", "ike", 0},
+	{KBD_CANADIAN_FRENCH_LEGACY, "ca", "fr-legacy", 0},
+	{KBD_SERBIAN_CYRILLIC, "rs", 0, 0},
+	{KBD_CANADIAN_FRENCH, "ca", "fr-legacy", 0},
+	{KBD_SWISS_FRENCH, "ch", "fr", 0},
+	{KBD_BOSNIAN, "ba", 0, 0},
+	{KBD_IRISH, 0, 0, 0},
+	{KBD_BOSNIAN_CYRILLIC, "ba", "us", 0},
+	{KBD_UNITED_STATES_DVORAK, "us", "dvorak", 0},
+	{KBD_UNITED_STATES_DVORAK_FOR_LEFT_HAND, "us", "dvorak-l", 0},
+	{KBD_UNITED_STATES_DVORAK_FOR_RIGHT_HAND, "us", "dvorak-r", 0},
+	{KBD_UNITED_STATES_DVORAK_PROGRAMMER, "us", "dvp",
+		"compose:102,caps:shift,numpad:shift3,kpdl:semi,keypad:atm,lv3:ralt_alt"},
+	{KBD_PORTUGUESE_BRAZILIAN_ABNT2, "br", "abnt2", 0},
+	{KBD_CANADIAN_MULTILINGUAL_STANDARD, "ca", "multix", 0},
+	{KBD_GAELIC, "ie", "CloGaelach", 0},
 
-	{0x00000000, 0, 0},
+	{0x00000000, 0, 0, 0},
 };
 
 void
@@ -1006,6 +1052,7 @@ convert_rdp_keyboard_to_xkb_rule_names(UINT32 KeyboardType,
 		if (rdp_keyboards[i].rdpLayoutCode == KeyboardLayout) {
 			xkbRuleNames->layout = rdp_keyboards[i].xkbLayout;
 			xkbRuleNames->variant = rdp_keyboards[i].xkbVariant;
+			xkbRuleNames->options = rdp_keyboards[i].xkbOptions;
 			break;
 		}
 	}
@@ -1032,9 +1079,9 @@ convert_rdp_keyboard_to_xkb_rule_names(UINT32 KeyboardType,
 		xkbRuleNames->variant = 0;
 	}
 
-	weston_log("%s: matching model=%s layout=%s variant=%s\n",
+	weston_log("%s: matching model=%s layout=%s variant=%s options=%s\n",
 		   __func__, xkbRuleNames->model, xkbRuleNames->layout,
-		   xkbRuleNames->variant);
+		   xkbRuleNames->variant, xkbRuleNames->options);
 }
 
 static void
@@ -1235,9 +1282,16 @@ rdp_translate_and_notify_mouse_position(RdpPeerContext *peerContext, UINT16 x, U
 	         different scaling. In such case, hit test to that window area on
 	         non primary-resident monitor (surface->output) dosn't work. */
 	if (to_weston_coordinate(peerContext, &sx, &sy)) {
+		struct weston_pointer_motion_event event;
+
 		pos.c = weston_coord(sx, sy);
 		weston_compositor_get_time(&time);
-		notify_motion_absolute(peerContext->item.seat, &time, pos);
+
+		weston_pointer_motion_event_init(&event, &time,
+						 peerContext->item.seat,
+						 WESTON_POINTER_MOTION_ABS,
+						 &pos, NULL, NULL);
+		notify_motion(&event);
 		return TRUE;
 	}
 	return FALSE;
@@ -1310,7 +1364,6 @@ rdp_notify_wheel_scroll(RdpPeerContext *peerContext, UINT16 flags, uint32_t axis
 	struct weston_pointer_axis_event weston_event;
 	struct rdp_backend *b = peerContext->rdpBackend;
 	int ivalue;
-	double value;
 	struct timespec time;
 	int *accumWheelRotationPrecise;
 	int *accumWheelRotationDiscrete;
@@ -1354,19 +1407,17 @@ rdp_notify_wheel_scroll(RdpPeerContext *peerContext, UINT16 flags, uint32_t axis
 			  ivalue, *accumWheelRotationPrecise, *accumWheelRotationDiscrete);
 
 	if (abs(*accumWheelRotationPrecise) >= 12) {
-		value = (double)(*accumWheelRotationPrecise / 12);
+		weston_compositor_get_time(&time);
 
-		weston_event.axis = axis;
-		weston_event.value = value;
-		weston_event.discrete = *accumWheelRotationDiscrete / 120;
-		weston_event.has_discrete = true;
+		weston_pointer_axis_event_init(&weston_event,
+					       &time, peerContext->item.seat,
+					       axis, (double) *accumWheelRotationPrecise / 12,
+					       true, *accumWheelRotationDiscrete / 120);
 
 		rdp_debug_verbose(b, "wheel: value:%f discrete:%d\n",
 				  weston_event.value, weston_event.discrete);
 
-		weston_compositor_get_time(&time);
-
-		notify_axis(peerContext->item.seat, &time, &weston_event);
+		notify_axis(&weston_event);
 
 		*accumWheelRotationPrecise %= 12;
 		*accumWheelRotationDiscrete %= 120;
@@ -1412,10 +1463,16 @@ xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
 	}
 
 	if (button) {
+		struct weston_pointer_button_event button_event;
+
 		weston_compositor_get_time(&time);
-		notify_button(peerContext->item.seat, &time, button,
-			(flags & PTR_FLAGS_DOWN) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED
-		);
+
+		weston_pointer_button_event_init(&button_event, &time,
+						 peerContext->item.seat,
+						 button, (flags & PTR_FLAGS_DOWN) ?
+						 WL_POINTER_BUTTON_STATE_PRESSED :
+						 WL_POINTER_BUTTON_STATE_RELEASED);
+		notify_button(&button_event);
 		need_frame = true;
 	}
 
@@ -1460,17 +1517,29 @@ xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
 	}
 
 	if (button) {
+		struct weston_pointer_button_event button_event;
 		weston_compositor_get_time(&time);
-		notify_button(peerContext->item.seat, &time, button,
-			      (flags & PTR_XFLAGS_DOWN) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+
+		weston_pointer_button_event_init(&button_event, &time,
+						 peerContext->item.seat,
+						 button, (flags & PTR_XFLAGS_DOWN) ?
+						 WL_POINTER_BUTTON_STATE_PRESSED :
+						 WL_POINTER_BUTTON_STATE_RELEASED);
+		notify_button(&button_event);
 		need_frame = true;
 	}
 
 	output = rdp_get_first_output(peerContext->rdpBackend);
 	if (x < output->base.width && y < output->base.height) {
+		struct weston_pointer_motion_event event;
+
 		weston_compositor_get_time(&time);
 		pos.c = weston_coord(x, y);
-		notify_motion_absolute(peerContext->item.seat, &time, pos);
+
+		weston_pointer_motion_event_init(&event, &time, peerContext->item.seat,
+						 WESTON_POINTER_MOTION_ABS,
+						 &pos, NULL, NULL);
+		notify_motion(&event);
 		need_frame = true;
 	}
 
@@ -1526,6 +1595,7 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, XF_KEV_CODE_TYPE code)
 	bool send_release_key = false;
 	int notify = 0;
 	struct timespec time;
+	struct weston_key_event key_event;
 
         rdp_debug_verbose(peerContext->rdpBackend, "RDP backend: %s flags:0x%x, code:0x%x\n",
 			  __func__, flags, code);
@@ -1591,14 +1661,17 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, XF_KEV_CODE_TYPE code)
 		/*weston_log("code=%x ext=%d vk_code=%x scan_code=%x\n", code, (flags & KBD_FLAGS_EXTENDED) ? 1 : 0,
 				vk_code, scan_code);*/
 		weston_compositor_get_time(&time);
-		notify_key(peerContext->item.seat, &time,
-					scan_code - 8, keyState, STATE_UPDATE_AUTOMATIC);
+
+		weston_key_event_init(&key_event, &time, peerContext->item.seat,
+				      scan_code - 8, keyState,
+				      STATE_UPDATE_AUTOMATIC);
+		notify_key(&key_event);
 
 		if (send_release_key) {
-			notify_key(peerContext->item.seat, &time,
-				   scan_code - 8,
-				   WL_KEYBOARD_KEY_STATE_RELEASED,
-				   STATE_UPDATE_AUTOMATIC);
+			weston_key_event_init(&key_event, &time, peerContext->item.seat,
+					      scan_code - 8, WL_KEYBOARD_KEY_STATE_RELEASED,
+					      STATE_UPDATE_AUTOMATIC);
+			notify_key(&key_event);
 		}
 	}
 
@@ -1744,14 +1817,19 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 	settings = client->context->settings;
 #if USE_FREERDP_VERSION >= 3
 	/* configure security settings */
-	if (b->rdp_key) {
+	if (b->vmconnect) {
+		/* Special Hyper-V mode */
+		if (!freerdp_settings_set_bool(settings, FreeRDP_VmConnectMode, TRUE))
+			rdp_debug(b, "Error setting FreeRDP_VmConnectMode to 'TRUE'.\n");
+	} else if (b->rdp_key) {
+		/* Legacy RDP security */
 		rdpPrivateKey* key = freerdp_key_new_from_file(b->rdp_key);
 		if (!key)
 			goto error_initialize;
 		if (!freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1))
 			goto error_initialize;
-	}
-	if (b->tls_enabled) {
+	} else if (b->tls_enabled) {
+		/* TLS RDP security */
 		rdpCertificate* cert = freerdp_certificate_new_from_file(b->server_cert);
 		if (!cert)
 			goto error_initialize;
@@ -1762,20 +1840,80 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 			goto error_initialize;
 		if (!freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1))
 			goto error_initialize;
+		if (b->nla_enabled) {
+			if (!freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, b->nla_ntlm_db)) {
+				rdp_debug(b, "Error setting FreeRDP_NtlmSamFile to '%s'.\n", b->nla_ntlm_db);
+				goto error_initialize;
+			}
+
+			if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE))
+				rdp_debug(b, "Error setting FreeRDP_TlsSecurity to 'FALSE'.\n");
+
+			if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE))
+				rdp_debug(b, "Error setting FreeRDP_NlaSecurity to 'TRUE'.\n");
+
+		} else {
+			if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE))
+				rdp_debug(b, "Error setting FreeRDP_TlsSecurity to 'TRUE'.\n");
+
+			if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE))
+				rdp_debug(b, "Error setting FreeRDP_NlaSecurity to 'FALSE'.\n");
+		}
 	} else {
-		freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE);
+		if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE))
+			rdp_debug(b, "Error setting FreeRDP_TlsSecurity to 'FALSE'.\n");
+
+		if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE))
+			rdp_debug(b, "Error setting FreeRDP_NlaSecurity to 'FALSE'.\n");
 	}
+
 #else
-	if (b->rdp_key)
-		settings->RdpKeyFile = strdup(b->rdp_key);
+	if (b->rdp_key) {
+		if (!freerdp_settings_set_string(settings, FreeRDP_RdpKeyFile,b->rdp_key)) {
+			rdp_debug(b, "Error setting FreeRDP_RdpKeyFile to '%s'.\n", b->rdp_key);
+			goto error_initialize;
+		}
+	}
+
 	if (b->tls_enabled) {
-		settings->CertificateFile = strdup(b->server_cert);
-		settings->PrivateKeyFile = strdup(b->server_key);
+		if (!freerdp_settings_set_string(settings, FreeRDP_CertificateFile,b->server_cert)) {
+			rdp_debug(b, "Error setting FreeRDP_CertificateFile to '%s'.\n", b->server_cert);
+			goto error_initialize;
+		}
+
+		if (!freerdp_settings_set_string(settings, FreeRDP_PrivateKeyFile, b->server_key)) {
+			rdp_debug(b, "Error setting FreeRDP_PrivateKeyFile to '%s'.\n", b->server_key);
+			goto error_initialize;
+		}
+
+		if (b->nla_enabled) {
+			if (!freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, b->nla_ntlm_db)) {
+				rdp_debug(b, "Error setting FreeRDP_NtlmSamFile to '%s'.\n", b->nla_ntlm_db);
+				goto error_initialize;
+			}
+
+			if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE))
+				rdp_debug(b, "Error setting FreeRDP_TlsSecurity to 'FALSE'.\n");
+
+			if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE))
+				rdp_debug(b, "Error setting FreeRDP_NlaSecurity to 'TRUE'.\n");
+
+		} else {
+			if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE))
+				rdp_debug(b, "Error setting FreeRDP_TlsSecurity to 'TRUE'.\n");
+
+			if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE))
+				rdp_debug(b, "Error setting FreeRDP_NlaSecurity to 'FALSE'.\n");
+		}
 	} else {
-		settings->TlsSecurity = FALSE;
+
+		if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE))
+			rdp_debug(b, "Error setting FreeRDP_TlsSecurity to 'FALSE'.\n");
+
+		if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE))
+			rdp_debug(b, "Error setting FreeRDP_NlaSecurity to 'FALSE'.\n");
 	}
 #endif
-	freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
 
 	if (!client->Initialize(client)) {
 		weston_log("peer initialization failed\n");
@@ -1905,12 +2043,14 @@ rdp_backend_create(struct weston_compositor *compositor,
 	b->base.create_output = rdp_output_create;
 	b->rdp_key = config->rdp_key ? strdup(config->rdp_key) : NULL;
 	b->resizeable = config->resizeable;
+	b->vmconnect = config->vmconnect;
 	b->force_no_compression = config->force_no_compression;
 	b->remotefx_codec = config->remotefx_codec;
 	b->audio_in_setup = config->audio_in_setup;
 	b->audio_in_teardown = config->audio_in_teardown;
 	b->audio_out_setup = config->audio_out_setup;
 	b->audio_out_teardown = config->audio_out_teardown;
+	b->nla_ntlm_db = config->nla_ntlm_db;
 
 	b->debug = weston_compositor_add_log_scope(compositor,
 						   "rdp-backend",
@@ -1948,7 +2088,7 @@ rdp_backend_create(struct weston_compositor *compositor,
 	 * fd, we don't need to enforce TLS or RDP security, since FreeRDP
 	 * will consider it to be a local connection */
 	fd = config->external_listener_fd;
-	if (fd < 0) {
+	if (fd < 0 && !b->vmconnect) {
 		if (!b->rdp_key && (!b->server_cert || !b->server_key)) {
 			weston_log("the RDP compositor requires keys and an optional certificate for RDP or TLS security ("
 				   "--rdp4-key or --rdp-tls-cert/--rdp-tls-key)\n");
@@ -1957,6 +2097,15 @@ rdp_backend_create(struct weston_compositor *compositor,
 		if (b->server_cert && b->server_key) {
 			b->tls_enabled = 1;
 			rdp_debug(b, "TLS support activated\n");
+		}
+		if(b->tls_enabled && b->nla_ntlm_db) {
+			if (access(b->nla_ntlm_db, F_OK) == 0) {
+				b->nla_enabled = 1;
+				rdp_debug(b, "NLA support activated\n");
+			} else {
+				b->nla_enabled = 0;
+				rdp_debug(b, "NLA credential file ('%s') not found, fall back to TLS Security.\n", b->nla_ntlm_db);
+			}
 		}
 	}
 
@@ -1985,6 +2134,18 @@ rdp_backend_create(struct weston_compositor *compositor,
 
 			if (weston_compositor_init_renderer(compositor,
 							    WESTON_RENDERER_GL,
+							    &options.base) < 0)
+					goto err_compositor;
+			break;
+		}
+		case WESTON_RENDERER_VULKAN: {
+			const struct vulkan_renderer_display_options options = {
+				.formats = b->formats,
+				.formats_count = b->formats_count,
+			};
+
+			if (weston_compositor_init_renderer(compositor,
+							    WESTON_RENDERER_VULKAN,
 							    &options.base) < 0)
 					goto err_compositor;
 			break;
@@ -2086,6 +2247,7 @@ config_init_to_defaults(struct weston_rdp_backend_config *config)
 	config->audio_in_teardown = NULL;
 	config->audio_out_setup = NULL;
 	config->audio_out_teardown = NULL;
+	config->nla_ntlm_db = NULL;
 }
 
 WL_EXPORT int
@@ -2113,6 +2275,7 @@ weston_backend_init(struct weston_compositor *compositor,
 		switch (compositor->renderer->type) {
 		case WESTON_RENDERER_PIXMAN:
 		case WESTON_RENDERER_GL:
+		case WESTON_RENDERER_VULKAN:
 			break;
 		default:
 			weston_log("Renderer not supported by RDP backend\n");

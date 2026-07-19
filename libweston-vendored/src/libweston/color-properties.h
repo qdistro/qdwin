@@ -23,12 +23,13 @@
  * SOFTWARE.
  */
 
-#ifndef WESTON_COLOR_CHARACTERISTICS_H
-#define WESTON_COLOR_CHARACTERISTICS_H
+#ifndef WESTON_COLOR_PROPERTIES_H
+#define WESTON_COLOR_PROPERTIES_H
 
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "color.h"
 #include <libweston/libweston.h>
 
 struct weston_compositor;
@@ -41,6 +42,7 @@ enum weston_color_feature {
 	WESTON_COLOR_FEATURE_PARAMETRIC,
 	WESTON_COLOR_FEATURE_SET_PRIMARIES,
 	WESTON_COLOR_FEATURE_SET_TF_POWER,
+	WESTON_COLOR_FEATURE_SET_LUMINANCES,
 	WESTON_COLOR_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES,
 	WESTON_COLOR_FEATURE_EXTENDED_TARGET_VOLUME,
 };
@@ -108,10 +110,21 @@ struct weston_color_tf_info {
         /** CM&HDR protocol extension value representing the tf. */
         uint32_t protocol_tf;
 
+	/** KMS 1D curve colorop value representing the tf. */
+	uint32_t kms_colorop;
+	uint32_t kms_colorop_inverse;
+
 	/* The protocol also has support for parameterized functions, i.e.
 	 * certain known functions that clients can define passing arbitrary
 	 * parameters. */
-	bool has_parameters;
+	unsigned count_parameters;
+
+	/** Are curve and inverse_curve valid? */
+	bool curve_params_valid;
+
+	/** Parametric curves to which we can map the tf and its inverse. */
+	struct weston_color_curve_parametric curve;
+	struct weston_color_curve_parametric inverse_curve;
 };
 
 const struct weston_color_feature_info *
@@ -130,8 +143,17 @@ const struct weston_color_primaries_info *
 weston_color_primaries_info_from(struct weston_compositor *compositor,
                                  enum weston_color_primaries primaries);
 
+const struct weston_color_primaries_info *
+weston_color_primaries_info_from_protocol(uint32_t protocol_primaries);
+
 const struct weston_color_tf_info *
 weston_color_tf_info_from(struct weston_compositor *compositor,
 			  enum weston_transfer_function tf);
 
-#endif /* WESTON_COLOR_CHARACTERISTICS_H */
+const struct weston_color_tf_info *
+weston_color_tf_info_from_protocol(uint32_t protocol_tf);
+
+const struct weston_color_tf_info *
+weston_color_tf_info_from_parametric_curve(struct weston_color_curve_parametric *curve);
+
+#endif /* WESTON_COLOR_PROPERTIES_H */

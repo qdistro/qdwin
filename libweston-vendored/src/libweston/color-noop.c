@@ -131,7 +131,7 @@ cmnoop_get_color_profile_from_icc(struct weston_color_manager *cm,
 				  struct weston_color_profile **cprof_out,
 				  char **errmsg)
 {
-	*errmsg = xstrdup("ICC profiles are unsupported.");
+	*errmsg = xstrdup("Error: color manager no-op does not support ICC profiles.");
 	return false;
 }
 
@@ -142,7 +142,7 @@ cmnoop_get_color_profile_from_params(struct weston_color_manager *cm,
 				     struct weston_color_profile **cprof_out,
 				     char **errmsg)
 {
-	*errmsg = xstrdup("parametric profiles are unsupported.");
+	*errmsg = xstrdup("Error: color manager no-op does not support parametric color profiles.");
 	return false;
 }
 
@@ -167,7 +167,7 @@ cmnoop_get_surface_color_transform(struct weston_color_manager *cm_base,
 				     cmnoop->stock_cprof);
 
 	/* The output must have a cprof, and it has to be the stock one. */
-	weston_assert_ptr(compositor, output->color_profile);
+	weston_assert_ptr_not_null(compositor, output->color_profile);
 	weston_assert_ptr_eq(compositor, to_cmnoop_cprof(output->color_profile),
 			     cmnoop->stock_cprof);
 
@@ -189,7 +189,7 @@ cmnoop_create_output_color_outcome(struct weston_color_manager *cm_base,
 	struct weston_color_manager_noop *cmnoop = to_cmnoop(cm_base);
 	struct weston_output_color_outcome *co;
 
-	weston_assert_ptr(compositor, output->color_profile);
+	weston_assert_ptr_not_null(compositor, output->color_profile);
 	weston_assert_ptr_eq(compositor, to_cmnoop_cprof(output->color_profile),
 			     cmnoop->stock_cprof);
 
@@ -245,8 +245,8 @@ cmnoop_destroy(struct weston_color_manager *cm_base)
 	 * Currently we have a bug in which we leak surfaces when shutting down
 	 * Weston with client surfaces alive, and these surfaces may have a
 	 * reference to the stock sRGB profile. */
-	weston_assert_uint32_gt_or_eq(cm_base->compositor,
-				      cmnoop->stock_cprof->base.ref_count, 1);
+	weston_assert_s32_ge(cm_base->compositor,
+			     cmnoop->stock_cprof->base.ref_count, 1);
 	unref_cprof(cmnoop->stock_cprof);
 
 	free(cmnoop);

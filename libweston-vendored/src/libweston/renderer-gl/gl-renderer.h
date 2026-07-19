@@ -53,13 +53,6 @@ typedef intptr_t EGLNativeWindowType;
 
 #endif /* ENABLE_EGL */
 
-enum gl_renderer_border_side {
-	GL_RENDERER_BORDER_TOP = 0,
-	GL_RENDERER_BORDER_LEFT = 1,
-	GL_RENDERER_BORDER_RIGHT = 2,
-	GL_RENDERER_BORDER_BOTTOM = 3,
-};
-
 /**
  * Options passed to the \c display_create method of the GL renderer interface.
  *
@@ -161,6 +154,21 @@ struct gl_renderer_interface {
 				    const struct gl_renderer_output_options *options);
 
 	/**
+	 * Query rendering formats supported by EGL on GBM platform
+	 *
+	 * \param ec The weston_compositor.
+	 * \param formats_count The number of formats in the returned array.
+	 * \return The array of formats supported, or NULL on failure.
+	 *
+	 * This function returns the formats that are present in the EGLConfig's
+	 * that we query from the EGLDisplay. Such formats can be used for
+	 * rendering.
+	 */
+	const struct pixel_format_info **
+	(*get_supported_rendering_formats)(struct weston_compositor *ec,
+					   unsigned int *formats_count);
+
+	/**
 	 * Attach GL-renderer to the output with a frame buffer object
 	 *
 	 * \param output The output to prepare for FBO rendering.
@@ -176,62 +184,10 @@ struct gl_renderer_interface {
 
 	void (*output_destroy)(struct weston_output *output);
 
-	/* Sets the output border.
-	 *
-	 * The side specifies the side for which we are setting the border.
-	 * The width and height are the width and height of the border.
-	 * The tex_width patemeter specifies the width of the actual
-	 * texture; this may be larger than width if the data is not
-	 * tightly packed.
-	 *
-	 * The top and bottom textures will extend over the sides to the
-	 * full width of the bordered window.  The right and left edges,
-	 * however, will extend only to the top and bottom of the
-	 * compositor surface.  This is demonstrated by the picture below:
-	 *
-	 * +-----------------------+
-	 * |          TOP          |
-	 * +-+-------------------+-+
-	 * | |                   | |
-	 * |L|                   |R|
-	 * |E|                   |I|
-	 * |F|                   |G|
-	 * |T|                   |H|
-	 * | |                   |T|
-	 * | |                   | |
-	 * +-+-------------------+-+
-	 * |        BOTTOM         |
-	 * +-----------------------+
-	 */
-	void (*output_set_border)(struct weston_output *output,
-				  enum gl_renderer_border_side side,
-				  int32_t width, int32_t height,
-				  int32_t tex_width, unsigned char *data);
-
 	/* Create fence sync FD to wait for GPU rendering.
 	 *
 	 * Return FD on success, -1 on failure or unsupported
 	 * EGL_ANDROID_native_fence_sync extension.
 	 */
 	int (*create_fence_fd)(struct weston_output *output);
-
-	/**
-	 * Create an FBO renderbuffer that repaint_output can render to
-	 *
-	 * \param output The output to create an FBO renderbuffer for.
-	 * \param format The renderbuffer pixel format.
-	 * \param width The renderbuffer width.
-	 * \param height The renderbuffer height.
-	 * \param pixels Optional buffer to download the pixels to after rendering.
-	 * \return 0 on success, -1 on failure.
-	 *
-	 * This function creates an FBO renderbuffer that can be passed to \c
-	 * repaint_output. If pixels is non-NULL, repaint_output will call
-	 * glReadPixels to download pixel data into the provided buffer after
-	 * repaint.
-	 */
-	struct weston_renderbuffer *(*create_fbo)(struct weston_output *output,
-						  const struct pixel_format_info *format,
-						  int width, int height,
-						  uint32_t *pixels);
 };

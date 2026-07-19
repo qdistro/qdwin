@@ -41,6 +41,7 @@ enum weston_desktop_xwayland_surface_state {
 	NONE,
 	TOPLEVEL,
 	MAXIMIZED,
+	MINIMIZED,
 	FULLSCREEN,
 	TRANSIENT,
 	XWAYLAND,
@@ -166,7 +167,7 @@ weston_desktop_xwayland_surface_committed(struct weston_desktop_surface *dsurfac
 	surface->committed = true;
 
 #ifdef WM_DEBUG
-	weston_log("%s: xwayland surface %p\n", __func__, surface);
+	weston_log("%s: xwayland surface %s\n", __func__, surface->internal_name);
 #endif
 
 	tmp = buf_offset;
@@ -450,6 +451,7 @@ set_maximized(struct weston_desktop_xwayland_surface *surface)
 {
 	weston_desktop_xwayland_surface_change_state(surface, MAXIMIZED, NULL,
 						     NULL);
+
 	weston_desktop_api_maximized_requested(surface->desktop,
 					       surface->surface, true);
 }
@@ -457,6 +459,9 @@ set_maximized(struct weston_desktop_xwayland_surface *surface)
 static void
 set_minimized(struct weston_desktop_xwayland_surface *surface)
 {
+	weston_desktop_xwayland_surface_change_state(surface, MINIMIZED, NULL,
+						     NULL);
+
 	weston_desktop_api_minimized_requested(surface->desktop,
 					       surface->surface);
 }
@@ -471,7 +476,23 @@ static void
 get_position(struct weston_desktop_xwayland_surface *surface,
 	     int32_t *x, int32_t *y)
 {
-	if (!surface->surface) {
+	if (surface->state == XWAYLAND) {
+		struct weston_coord_global pos;
+		struct weston_geometry geom;
+
+		if (surface->has_next_geometry)
+			geom = surface->next_geometry;
+		else
+			geom = weston_desktop_surface_get_geometry(surface->surface);
+
+		pos = weston_view_get_pos_offset_global(surface->view);
+		*x = (int)pos.c.x + geom.x;
+		*y = (int)pos.c.y + geom.y;
+		return;
+	}
+
+	if (!surface->surface ||
+	    !weston_desktop_surface_get_user_data(surface->surface)) {
 		*x = 0;
 		*y = 0;
 		return;
