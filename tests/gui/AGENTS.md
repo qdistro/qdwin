@@ -43,7 +43,7 @@ and observation primitives are different.
 | Mouse pointer move | `qdwin_mouse_move <px_x> <px_y>` (QMP `input-send-event` abs axes; helper converts pixels to 0..32767) | toplevels under cursor receive enter events + can request cursor shape |
 | Mouse clicks (left/right/middle) | `qdwin_click <x> <y> [button]` or split `qdwin_mouse_button left down\|up` | left-click on a chrome side or content surface raises + focuses the toplevel (click-to-focus, since task(129)) |
 | Mouse drag (button held + motion) | `qdwin_drag <x1> <y1> <x2> <y2> [button]` | move + down + N intermediate moves + up. Drag of a titlebar (within the N chrome strip, outside the close/min/max buttons) translates the whole toplevel. `QDWIN_DRAG_STEPS`/`QDWIN_DRAG_STEP_MS` tune granularity. |
-| Visual assertion | `qdwin_screenshot <file.png>` (wraps virsh screenshot + PPM→PNG) | cursor is on a KMS plane and never appears in the screenshot |
+| Visual assertion | `qdwin_screenshot <file.png>` (root-authenticated qdshell capture of `Virtual-1`) | validates PNG and output dimensions; never falls back to the tty console |
 
 ## qcode reference
 
@@ -148,15 +148,14 @@ hard-coded coordinates across clones.
    just returns 0 and nothing happens. Stick to `KEY_*` constants
    from `/usr/include/linux/input-event-codes.h`.
 
-6. **Cursor visibility in `virsh screenshot` depends on the renderer.**
-   With `--renderer=pixman` (the VM default) weston falls back to
-   compositing the cursor into the primary framebuffer, so it DOES
-   show in `virsh screenshot` since task(135). With
-   `--renderer=gl` + virgl, weston puts the cursor on the hardware
-   cursor plane, which `virsh screenshot` doesn't capture. Don't rely
-   on its presence/absence as a robust assertion across renderer
-   profiles — assert by-effect for behavioural tests ("after click at
-   (X, Y), expected toplevel at the front").
+6. **Cursor visibility is not a screenshot contract.**
+   The shell-authorized framebuffer source may force hardware planes off for
+   the capture repaint, while the normal scanout may use a DRM cursor plane.
+   Do not assert cursor presence or absence from `qdwin_screenshot` across
+   renderer profiles. Assert by-effect for behavioural tests ("after click at
+   (X, Y), expected toplevel at the front") and use DRM plane state for tests
+   whose subject is cursor ownership. `qdwin_screenshot_virsh_diag` is only a
+   tty/VM diagnostic and never content evidence.
 
 7. **The pre-fixed VMs autologin as the `greeter` pseudo-user (uid
    471), not admin.** If `qdwin_session_healthy` returns false but the
@@ -193,6 +192,7 @@ hard-coded coordinates across clones.
 | `agent-protocol-audit.sh` | executable agent/CI audit: records qdwin Wayland globals, scans qdshell's Quickshell/Wayland usage, and checks that opening the qdshell launcher does not hit the xdg-popup null-parent protocol error |
 | `agent-cursor-clickthrough-smoke.sh` | plan3 H3: spawns a known xdg-toplevel, parks the pointer over it (so a cursor sprite maps on cursor_layer), and verifies the click still lands on the toplevel. Discriminator: `qdwin: focus handle=N` matches the test window. `QDWIN_CURSOR_CLICKTHROUGH_FORCE_BREAK=1` flips the expectation for validating the regression itself. |
 | `agent-cursor-paint-smoke.sh` | **agent-assisted** smoke for the two regressions that make a qdwin desktop unusable: (A) the qdshell crash-loop (version-skewed Qdwin.qml `onOutputsChanged` ↔ qdwin QML plugin — Quickshell exits 255, black scanout) and (B) the missing/doubled VM cursor (virtio-gpu hw cursor plane). Deterministic asserts: noctalia-shell active + bounded NRestarts + no QML "non-existent property" error since the live `qs` PID started + bind ≥ v14; qdshell bar-content layer surface mapped + non-black scanout; DRM `plane-1` crtc=crtc-0 / real fb / "allocated by weston"; cursor sprite mapped on cursor_layer. Then a **vision LLM** reads a post-pointer-move screenshot and confirms `{painted, top_bar, cursor_count}` — expecting 0 software cursors in the scanout (the cursor is on the off-scanout hw plane; >0 ⇒ double-cursor regression). Knobs: `QDWIN_CURSOR_IN_SCANOUT=1` for the pixman/software-cursor profile, `QDWIN_SKIP_AGENT=1` for deterministic-only, `QDWIN_AGENT_CMD` to swap the vision agent, `QDWIN_MAX_RESTARTS`. Self-tested both negatives: a stopped qdshell and an inverted cursor expectation both FAIL. |
+| `agent-shell-capture-smoke.sh` | executable agent/CI smoke for the in-compositor shell-authorized capture path (the only sanctioned visual-evidence source): L1 DRM/session gate, `QDWIN_ENABLE_SHELL_CAPTURE=1` present with `QDWIN_SECCTX_OPEN` absent, ordinary + real SECCTX clients cannot discover `weston_capture_v1`, same-uid ctrl peer denied (root-only `SO_PEERCRED`), non-designated output names refused, stable double capture, mutation-after-idle visibility, capture-while-locked, and qdshell/compositor death → L1 failure with no tty fallback. Registered in the qci `gui` gate. |
 | `agent-idle-dpms-recovery-smoke.sh` | executable VM smoke for qdwin internal-idle + qdshell display-power recovery. Requires an ABI-matched qdwin build deployed in the guest. Saves qdshell settings, sets display-off to 1 minute and a safe inactivity action to 2 minutes, keeps pointer motion active past the display-off timeout to assert it does not blank mid-use, waits for a black/inactive scanout, injects real QMP key+mouse input, and asserts a recovered non-black screenshot plus `set_display_power on=0` then `on=1` logs. Also fails if the longer inactivity notification fires at the shorter display-off timeout. Restores original qdshell settings on exit. |
 
 Run each scenario sequentially against the same VM; each cleans up after itself. For a full smoke pass, an orchestrator can spawn one runner per scenario in series.

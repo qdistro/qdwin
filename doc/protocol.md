@@ -122,17 +122,61 @@ Note: `tablet-v2`, `relative-pointer`, `pointer-constraints`,
 defaults listed above — advertised to every client, not curated or
 gated by qdwin.
 
-### Development-only screenshooter
+### Development/test output capture
 
-The Weston screenshooter interface is disabled by default. qdwin only calls
-`screenshooter_create()` when `QDWIN_ENABLE_SCREENSHOOTER` is set to `1`,
-`true`, or `yes`, and the compositor euid matches `allowed_uid`. This keeps
-whole-output capture out of the production default while preserving the
-interface for development and automated headless GUI tests.
+Libweston creates `weston_capture_v1` independently of qdwin's optional
+frontends. qdwin's global filter exposes it only to clients holding the
+shell credential — normally just the exact client that has successfully
+bound `qdwin_shell_v1`; ordinary and security-context clients do not
+discover it. (Discovery is broader than capture: an authorized
+`qdistro-secctx-exec` trusted launcher is mapped to the shell credential
+and can therefore *see* the global, and the explicit `QDWIN_SECCTX_OPEN`
+dev mode widens discovery further — but neither yields pixels, because the
+late authority below still denies their capture tasks.) A second, late
+libweston authority check defaults to deny for every capture task unless a
+registered authority explicitly permits that exact client and output.
 
-The host test harness (`tests/host/start.sh`) explicitly exports
-`QDWIN_ENABLE_SCREENSHOOTER=1` and starts Weston with `--debug` because its
-visual assertions use `weston-screenshooter`.
+Two separate opt-in facilities exist:
+
+- `QDWIN_ENABLE_SCREENSHOOTER=1|true|yes` calls Weston's legacy
+  `screenshooter_create()`. Its authority permits only the client Weston
+  itself launches from the screenshooter binding; an independently executed
+  `weston-screenshooter` is not authorized merely because this flag or
+  `--debug` is present. This path remains for the nested host development
+  harness and is not the VM GUI gate's content source.
+- `QDWIN_ENABLE_SHELL_CAPTURE=1|true|yes` registers qdwin's narrow authority.
+  It authorizes a task only when the requester is the exact live bound-shell
+  `wl_client` and the target is the single designated output
+  (`QDWIN_SHELL_CAPTURE_OUTPUT`, `Virtual-1` — an exact-name pin, not a
+  deny-list, so additional outputs on a future golden are not silently
+  capturable). "Bound shell" is the client currently holding the shell
+  role (uid/singleton/secctx-gated), not a pinned qdshell executable
+  identity — the same role trust every other shell operation already has.
+  qdshell discovers the capture global using a second registry enumeration
+  after `bind_as_shell`, selects `Virtual-1` by `wl_output.name`, sends the
+  v32 `prepare_output_capture` request to force full damage, and captures one
+  framebuffer into SHM. Every other output name — absent, additional heads,
+  PipeWire forwards — is refused at both layers.
+
+Both environment flags also require the compositor euid to equal
+`allowed_uid`, and both are disabled by default. The session installer
+(`qdistro/scripts/install/install-qdwin-session-for-vm.sh`) emits
+`QDWIN_ENABLE_SHELL_CAPTURE=1` on `qdwin-compositor.service` only when the
+caller itself exports that variable — the test-VM bake
+(`scripts/vm/fresh-vm-bootstrap.sh`) does; the production callers of the
+same installer (`image/config.sh`, `qdistro-bootstrap.sh`) do not, so
+production units never carry it. The qdshell capture control verb additionally requires a root
+Unix peer via `SO_PEERCRED`, while compositor authorization remains the final
+gate. Neither `QDWIN_SECCTX_OPEN` nor Weston `--debug` is required or permitted
+for this VM capture path.
+
+The VM GUI harness validates DRM ownership of the service compositor
+(unit MainPID), asks qdshell to capture only `Virtual-1`, copies the
+completed file out through QGA with guest/host size + sha256 agreement,
+and fully decodes the PNG, cross-checking decoded dimensions against the
+reply. `virsh screenshot` is retained as a diagnostic-only helper
+because `video model=none` VMs expose the tty console there, not qdwin's DRM
+output.
 
 ### Security posture: layer-shell
 

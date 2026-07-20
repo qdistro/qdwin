@@ -19,9 +19,9 @@
 #   2. qdshell ctrl-socket — `socat - UNIX-CONNECT:/run/user/1000/qdshell.sock`
 #      drives launcher / switcher / locker / windows, and returns
 #      machine-readable status snapshots.
-#   3. virsh screenshot — captures the framebuffer. Note: cursor is
-#      drawn on a KMS plane (not in the FB) so the pointer never
-#      appears in the screenshot. Toplevels and chrome do.
+#   3. qdshell shell-authorized capture — captures qdwin's real Virtual-1
+#      compositor framebuffer. virsh screenshot is retained only as a tty/
+#      VM diagnostic and must never back a content assertion.
 #
 # Usage:
 #     source phase1/gui-tests/qdwin/qdwin-helpers.sh
@@ -347,19 +347,161 @@ qdwin_drag() {
 }
 
 # --------------------------------------------------------- screenshot
-qdwin_screenshot() {
+qdwin_screenshot_virsh_diag() {
     qdwin_require_vm
-    local out="${1:-/tmp/qdwin-shot.png}"
+    local out="${1:-/tmp/qdwin-virsh-diag.png}"
     local tmp="${out%.png}.ppm"
-    $QDWIN_VIRSH screenshot "$VMNAME" "$tmp" >/dev/null
+    $QDWIN_VIRSH screenshot "$VMNAME" "$tmp" >/dev/null || return 1
     mv "$tmp" "$out"
     echo "$out"
+}
+
+qdwin_screenshot() {
+    qdwin_require_vm || return 2
+    local out="${1:-/tmp/qdwin-shot.png}"
+    local guest="/run/user/1000/qdwin-capture-$$-${RANDOM}.png"
+    local host_tmp="${out}.partial.$$"
+    local reply b64 dims width height reply_w reply_h
+    local guest_meta guest_size guest_sha host_size host_sha
+    local pid_before pid_after
+
+    # Remove any prior capture up front: publish is an atomic mv at the end,
+    # so a failed capture leaves NO file at $out — a stale image from an
+    # earlier attempt can never satisfy a content assertion, while reruns
+    # and QCI_GUI_RETRY on the same hardcoded path keep working. The removal
+    # itself must be fail-closed: if the old file cannot be deleted, a later
+    # capture failure would leave it in place as stale evidence.
+    if ! rm -f "$out" "$host_tmp" || [ -e "$out" ] || [ -e "$host_tmp" ]; then
+        echo "ERROR: stale-capture-path: could not remove prior $out" >&2
+        return 1
+    fi
+    qdwin_session_healthy || return $?
+    pid_before=$(qdwin_compositor_pid) || return 1
+
+    # Connect as root: CtrlServer verifies SO_PEERCRED so the admin desktop
+    # user cannot turn qdshell into a screenshot confused deputy. The qdshell
+    # process itself writes a new 0600 file and atomically publishes it at the
+    # requested runtime-dir path only after weston_capture reports complete.
+    reply=$(timeout 12s "$QDWIN_VM_EXEC" "$VMNAME" \
+        "printf 'capture Virtual-1 $guest\\n' | socat -T 10 - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1) || {
+        echo "ERROR: shell-capture-failed: ${reply:-capture command timed out}" >&2
+        qdwin_capture_fail_cleanup "$guest"
+        return 1
+    }
+    case "$reply" in
+        ok\ output=Virtual-1\ width=*\ height=*\ path="$guest") ;;
+        *)
+            echo "ERROR: shell-capture-failed: $reply" >&2
+            qdwin_capture_fail_cleanup "$guest"
+            return 1 ;;
+    esac
+    # The reply dimensions are cross-checked against the decoded PNG below.
+    reply_w=$(sed -n 's/.* width=\([0-9]*\) .*/\1/p' <<<"$reply")
+    reply_h=$(sed -n 's/.* height=\([0-9]*\) .*/\1/p' <<<"$reply")
+
+    # Guest-side ground truth BEFORE the copy: qemu-guest-agent stdout can be
+    # silently truncated, and base64 that is cut on a 4-char quantum still
+    # decodes cleanly. The copied host bytes must match this size + sha256.
+    guest_meta=$(timeout 8s "$QDWIN_VM_EXEC" "$VMNAME" \
+        "stat -c %s '$guest' && sha256sum '$guest' | cut -d' ' -f1") || {
+        echo "ERROR: shell-capture-copy-failed: could not stat/hash $guest" >&2
+        qdwin_capture_fail_cleanup "$guest"
+        return 1
+    }
+    guest_size=$(sed -n 1p <<<"$guest_meta")
+    guest_sha=$(sed -n 2p <<<"$guest_meta")
+
+    b64=$(timeout 8s "$QDWIN_VM_EXEC" "$VMNAME" "base64 -w0 '$guest'") || {
+        echo "ERROR: shell-capture-copy-failed: could not read $guest" >&2
+        qdwin_capture_fail_cleanup "$guest"
+        return 1
+    }
+    if ! printf '%s' "$b64" | base64 -d > "$host_tmp"; then
+        echo "ERROR: shell-capture-copy-failed: invalid base64 payload" >&2
+        rm -f "$host_tmp"
+        qdwin_capture_fail_cleanup "$guest"
+        return 1
+    fi
+    "$QDWIN_VM_EXEC" "$VMNAME" "rm -f '$guest'" >/dev/null 2>&1 || true
+
+    host_size=$(stat -c %s "$host_tmp")
+    host_sha=$(sha256sum "$host_tmp" | cut -d' ' -f1)
+    if [ "$host_size" != "$guest_size" ] || [ "$host_sha" != "$guest_sha" ]; then
+        echo "ERROR: shell-capture-copy-failed: guest/host mismatch" \
+             "(size $guest_size vs $host_size, sha $guest_sha vs $host_sha)" >&2
+        rm -f "$host_tmp"
+        return 1
+    fi
+
+    # Full decode (not just a header probe): PIL verifies every chunk CRC and
+    # the complete IDAT stream, then the decoded dimensions must agree with
+    # the numeric dimensions qdshell reported for the capture buffer.
+    dims=$(python3 -c 'import sys
+from PIL import Image
+with Image.open(sys.argv[1]) as im:
+    im.verify()
+with Image.open(sys.argv[1]) as im:
+    im.load()
+    print(im.width, im.height)' "$host_tmp" 2>&1) || {
+        echo "ERROR: invalid-shell-capture-png: full decode failed: $dims" >&2
+        rm -f "$host_tmp"
+        return 1
+    }
+    read -r width height <<<"$dims"
+    if [ "$width" != "$reply_w" ] || [ "$height" != "$reply_h" ]; then
+        echo "ERROR: invalid-shell-capture-png: decoded ${width}x${height}" \
+             "!= reported ${reply_w}x${reply_h}" >&2
+        rm -f "$host_tmp"
+        return 1
+    fi
+    # Identity stability: the compositor that produced this evidence must be
+    # the same service MainPID that passed the pre-capture health gate. A
+    # restart mid-capture means the pixels' provenance is unknown — refuse.
+    pid_after=$(qdwin_compositor_pid) || { rm -f "$host_tmp"; return 1; }
+    if [ "$pid_after" != "$pid_before" ]; then
+        echo "ERROR: compositor-restarted-mid-capture:" \
+             "MainPID $pid_before -> $pid_after" >&2
+        rm -f "$host_tmp"
+        return 1
+    fi
+    if ! mv "$host_tmp" "$out"; then
+        echo "ERROR: shell-capture-publish-failed: could not move to $out" >&2
+        rm -f "$host_tmp"
+        return 1
+    fi
+    echo "capture=Virtual-1 width=$width height=$height path=$out" >&2
+    echo "$out"
+}
+
+# The service compositor's stable identity: qdwin-compositor.service MainPID
+# (Type=simple, ExecStart=/usr/bin/weston — MainPID IS the compositor).
+qdwin_compositor_pid() {
+    local pid
+    pid=$("$QDWIN_VM_EXEC" "$VMNAME" \
+        "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user show qdwin-compositor.service -p MainPID --value" \
+        2>/dev/null | tr -cd '0-9')
+    case "$pid" in ""|0)
+        echo "ERROR: qdwin-compositor.service has no MainPID" >&2
+        return 1 ;;
+    esac
+    printf '%s\n' "$pid"
+}
+
+# After a capture/copy failure, re-run the FULL session health check (units +
+# socket + DRM master) so a qdshell/compositor death mid-capture is classified
+# as an L1 environment failure in the log, not a generic capture error; then
+# best-effort remove the guest-side temp path.
+qdwin_capture_fail_cleanup() {
+    local guest=$1
+    qdwin_session_healthy >/dev/null || true
+    "$QDWIN_VM_EXEC" "$VMNAME" "rm -f '$guest'" >/dev/null 2>&1 || true
 }
 
 # ----------------------------------------------------- session sanity
 #
 # Returns 0 if the qdwin user session is up: the admin wayland socket
-# exists and the qdwin-compositor + qdshell user units are active.
+# exists, the qdwin-compositor + qdshell user units are active, and the
+# compositor owns a DRM-master file (directly or through its seatd broker).
 # Mirrors the gui gate liveness probe (qdistro/ci/lib/gates/gui.sh) — the
 # old qdshell ctrl-socket ("launcher" command) was removed when qdshell
 # moved to Quickshell IPC, so probing it always failed. Use as the first
@@ -367,5 +509,83 @@ qdwin_screenshot() {
 qdwin_session_healthy() {
     qdwin_require_vm || return 2
     "$QDWIN_VM_EXEC" "$VMNAME" \
-        "test -S /run/user/1000/wayland-1 && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active qdwin-compositor.service qdshell.service >/dev/null"
+        "test -S /run/user/1000/wayland-1 && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active --quiet qdwin-compositor.service && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active --quiet qdshell.service" || {
+        echo "ERROR: qdwin-session-unhealthy: socket or user unit unavailable" >&2
+        return 1
+    }
+    qdwin_drm_master_ok
+}
+
+qdwin_drm_master_ok() {
+    qdwin_require_vm || return 2
+    "$QDWIN_VM_EXEC" "$VMNAME" '
+# Resolve THE service compositor, not the oldest process named weston: a
+# stray/leaked weston holding DRM master must not satisfy this gate while
+# the actual qdwin-compositor.service process is something else.
+pid=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user show qdwin-compositor.service -p MainPID --value)
+case "$pid" in ""|0|*[!0-9]*)
+    echo "ERROR: compositor-not-on-vt: qdwin-compositor.service has no MainPID" >&2
+    exit 1 ;;
+esac
+comm=$(cat /proc/$pid/comm 2>/dev/null || true)
+[ "$comm" = "weston" ] || {
+    echo "ERROR: compositor-not-on-vt: unit MainPID $pid is ${comm:-gone}, not weston" >&2
+    exit 1
+}
+# Direct DRM openers are recorded with weston tgid in debugfs. Under the
+# VM seatd backend the master file description is opened by seatd and
+# passed to weston over the seatd socket, so debugfs retains seatd as the
+# opener. In that branch, do NOT accept any same-card seatd master row:
+# prove with kcmp(2) that the compositor holds the SAME file description
+# the master-row seatd process opened (kcmp KCMP_FILE == 0 <=> identical
+# struct file), so an unrelated seatd master on the card cannot satisfy L1.
+python3 - "$pid" <<'"'"'PY'"'"'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+def card_fds(pid):
+    fds = []
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                t = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if t.startswith("/dev/dri/card"):
+                fds.append((int(fd), t))
+    except OSError:
+        pass
+    return fds
+wpid = int(sys.argv[1])
+wfds = card_fds(wpid)
+if not wfds:
+    print("ERROR: compositor-not-on-vt: weston has no open /dev/dri/card*",
+          file=sys.stderr)
+    sys.exit(1)
+for wfd, dev in wfds:
+    minor = dev[len("/dev/dri/card"):]
+    clients = f"/sys/kernel/debug/dri/{minor}/clients"
+    try:
+        rows = open(clients).read().splitlines()[1:]
+    except OSError:
+        continue
+    for row in rows:
+        f = row.split()
+        if len(f) < 4 or f[3] != "y":
+            continue
+        comm, tgid = f[0], int(f[1])
+        if tgid == wpid:
+            sys.exit(0)          # weston opened the master directly
+        if comm == "seatd":
+            for sfd, sdev in card_fds(tgid):
+                if sdev != dev:
+                    continue
+                # KCMP_FILE(0): rc 0 => same struct file (same description)
+                if libc.syscall(312, tgid, wpid, 0, sfd, wfd) == 0:
+                    sys.exit(0)
+print("ERROR: compositor-not-on-vt: no DRM master file description held by "
+      "the service weston (directly or via its seatd broker)",
+      file=sys.stderr)
+sys.exit(1)
+PY'
 }
