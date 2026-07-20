@@ -1209,6 +1209,19 @@ test('global-filter-gate',
   ],
 )
 
+# v32 shell-authorized screenshot invariants. This complements the global
+# filter gate (discovery) by pinning libweston's late authority decision and
+# the exact-output full-damage preparation request.
+test('shell-capture-policy',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_shell_capture_policy.py'),
+    files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-shell-v1.xml'),
+  ],
+)
+
 # v27 ext-workspace-v1 workspace-NAME parity invariants
 # (qdwin_shell_v1.set_workspace_name). Driven by
 # tests/host/21-ext-workspace-names.md; the live-VM half (a real

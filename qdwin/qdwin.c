@@ -109,6 +109,10 @@ void notify_motion(const struct weston_pointer_motion_event *event);
 void notify_button(const struct weston_pointer_button_event *event);
 void notify_axis(const struct weston_pointer_axis_event *event);
 void notify_key(const struct weston_key_event *key_event);
+/* Backend-facing in libweston 16 (exported, but declared only in the private
+ * libweston/backend.h). The v32 shell capture preparation request needs the
+ * full_repaint_needed behavior, not schedule_repaint alone. */
+void weston_output_damage(struct weston_output *output);
 
 /* Thin wrappers that keep the old (seat, time, ...) call shape used by the
  * per-stream / nested / IME injection sites and build the 16 event via the
@@ -738,6 +742,8 @@ struct qdwin {
 	/* qdwin_shell_v1 */
 	struct wl_global *shell_global;
 	struct wl_resource *shell_resource;
+	struct wl_listener capture_auth_listener;
+	bool capture_auth_registered;
 	uid_t allowed_uid;
 	int locked;
 	int shell_bound;
@@ -2312,6 +2318,50 @@ qdwin_client_is_bound_shell(struct qdwin *qdwin, struct wl_client *client)
 	       client == wl_resource_get_client(qdwin->shell_resource);
 }
 
+/* The single output the shell-capture authority covers. The facility exists
+ * for GUI-test observation of the main head on the headless test VMs, whose
+ * DRM connector is always Virtual-1; every other output — additional heads,
+ * PipeWire forwards — stays at the fail-closed default. An exact-name pin,
+ * not a deny-list: adding an output to a future golden must not silently
+ * widen capture. */
+#define QDWIN_SHELL_CAPTURE_OUTPUT "Virtual-1"
+
+static bool
+qdwin_shell_capture_output_ok(const char *name)
+{
+	return name && strcmp(name, QDWIN_SHELL_CAPTURE_OUTPUT) == 0;
+}
+
+/* QDWIN_ENABLE_SHELL_CAPTURE authority. libweston's capture API asks every
+ * registered listener late, when a renderer pulls the pending capture task.
+ * Grant only the exact wl_client that owns the live shell binding, and only
+ * for the designated main output. Everyone
+ * else is left at the API's fail-closed default (neither authorized nor
+ * explicitly denied), so another independent authority may still make its
+ * own decision without this listener weakening it. */
+static void
+qdwin_capture_auth_cb(struct wl_listener *listener,
+		      struct weston_output_capture_attempt *attempt)
+{
+	struct qdwin *qdwin =
+		wl_container_of(listener, qdwin, capture_auth_listener);
+	const struct weston_output_capture_client *who;
+
+	if (!attempt || !attempt->who)
+		return;
+	who = attempt->who;
+	if (!who->client || !who->output || !who->output->name)
+		return;
+	if (!qdwin_client_is_bound_shell(qdwin, who->client))
+		return;
+	if (!qdwin_shell_capture_output_ok(who->output->name))
+		return;
+
+	attempt->authorized = true;
+	weston_log("qdwin: shell capture authorized output=%s\n",
+		   who->output->name);
+}
+
 /* May this client MUTATE the display layout (zwlr_output_manager apply path)?
  *
  * Enumeration of heads/modes is advertised to every client (wlr-randr, kanshi,
@@ -3422,6 +3472,36 @@ qdwin_handle_request_set_position(struct wl_client *client,
 		   "size=%dx%d%s\n", handle, cx, cy, tl->last_width,
 		   tl->last_height,
 		   (cx != x || cy != y) ? " (clamped)" : "");
+}
+
+/* v32: force a full repaint of exactly one named physical/main output before
+ * the shell queues a framebuffer capture. Invalid and PipeWire names are
+ * deliberately silent no-ops: a typo must fail the capture job in qdshell,
+ * not kill the security-critical shell protocol connection. */
+static void
+qdwin_handle_prepare_output_capture(struct wl_client *client,
+				    struct wl_resource *resource,
+				    const char *output_name)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct weston_output *output;
+	(void)client;
+
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (!qdwin_shell_capture_output_ok(output_name))
+		return;
+
+	wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+		if (!output->name || strcmp(output->name, output_name) != 0)
+			continue;
+		if (output->destroying)
+			return;
+		weston_output_damage(output);
+		weston_log("qdwin: prepare_output_capture damaged output=%s\n",
+			   output->name);
+		return;
+	}
 }
 
 /* ------------------------------------------------------------------
@@ -8863,6 +8943,7 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_pointer_config = qdwin_handle_set_pointer_config,
 	.set_key_repeat = qdwin_handle_set_key_repeat,
 	.request_set_position = qdwin_handle_request_set_position,
+	.prepare_output_capture = qdwin_handle_prepare_output_capture,
 };
 
 static void
@@ -9524,6 +9605,18 @@ qdwin_refresh_background(struct qdwin *qdwin)
 				  &qdwin->background_layer.view_list);
 	weston_log("qdwin: background curtain %dx%d installed\n",
 		   max_x, max_y);
+
+	/* Libweston leaves new outputs repaint-inhibited until the shell has
+	 * installed content which makes their first frame safe. The opaque
+	 * curtain above is that content. Mark every live output ready only after
+	 * it exists in the scene graph; the operation is deliberately idempotent
+	 * so output-created and resize refreshes can share this path. Without
+	 * this call, damage (including capture preparation) never schedules a
+	 * repaint and an output may display only an inherited scanout buffer. */
+	wl_list_for_each(out, &qdwin->compositor->output_list, link) {
+		if (!out->destroying)
+			weston_output_set_ready(out);
+	}
 }
 
 /* Move the lock curtain to the BOTTOM of lock_layer. weston_layer.view_list
@@ -12573,6 +12666,10 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&qdwin->output_resized_listener.link);
 	wl_list_remove(&qdwin->output_destroyed_listener.link);
 	wl_list_remove(&qdwin->seat_created_listener.link);
+	if (qdwin->capture_auth_registered) {
+		wl_list_remove(&qdwin->capture_auth_listener.link);
+		qdwin->capture_auth_registered = false;
+	}
 	{
 		struct qdwin_seat_tracker *tr, *tmp;
 		wl_list_for_each_safe(tr, tmp, &qdwin->seat_trackers, link)
@@ -22647,10 +22744,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request/event through v31 (live app-id updates). */
+	 * request/event through v32 (shell-authorized output capture prep). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       31, qdwin, bind_qdwin_shell);
+					       32, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
@@ -23024,6 +23121,38 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 				   "QDWIN_ENABLE_SCREENSHOOTER — dev/test only, "
 				   "do not use in production\n");
 			screenshooter_create(ec);
+		}
+	}
+
+	/* Test/diagnostic capture for the bound shell only. Unlike the legacy
+	 * screenshooter frontend above, this merely registers a libweston
+	 * authority: weston_capture_v1 remains hidden from ordinary clients by
+	 * qdwin's global filter, and the callback re-checks the exact shell
+	 * wl_client plus the single designated output
+	 * (QDWIN_SHELL_CAPTURE_OUTPUT) at task execution time. Mirror
+	 * the screenshooter euid gate so an inherited environment cannot enable
+	 * this capability under a differently configured compositor identity. */
+	{
+		const char *capture_env = getenv("QDWIN_ENABLE_SHELL_CAPTURE");
+		int capture_enabled =
+			capture_env && (strcmp(capture_env, "1") == 0 ||
+					strcasecmp(capture_env, "true") == 0 ||
+					strcasecmp(capture_env, "yes") == 0);
+		if (capture_enabled && geteuid() != qdwin->allowed_uid) {
+			weston_log("qdwin: shell-capture env var set but "
+				   "euid=%u != allowed_uid=%u — REJECTED\n",
+				   (unsigned)geteuid(),
+				   (unsigned)qdwin->allowed_uid);
+			capture_enabled = 0;
+		}
+		if (capture_enabled) {
+			weston_log("qdwin: WARNING shell-authorized output capture "
+				   "enabled via QDWIN_ENABLE_SHELL_CAPTURE — "
+				   "dev/test only, do not use in production\n");
+			weston_compositor_add_screenshot_authority(
+				ec, &qdwin->capture_auth_listener,
+				qdwin_capture_auth_cb);
+			qdwin->capture_auth_registered = true;
 		}
 	}
 
