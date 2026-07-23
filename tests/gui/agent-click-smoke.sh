@@ -194,5 +194,12 @@ else
     echo "GAP: top-left launcher click did not emit qdwin: launcher_requested"
 fi
 
+# Close the launcher overlay the probe just opened. The smokes share one
+# session VM; a leaked open launcher occludes the center of the screen and
+# broke the shell-capture smoke's mutation assert downstream (its 480x320
+# test window mapped exactly under the launcher panel — zero visible diff).
+qdwin_send_key KEY_ESC
+sleep 0.5
+
 qdwin_screenshot "/tmp/qdwin-agent-click-smoke-$run_id.png" >/dev/null
 pass "artifact /tmp/qdwin-agent-click-smoke-$run_id.png"

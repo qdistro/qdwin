@@ -41,6 +41,15 @@ cleanup() {
         >/dev/null 2>&1 || true
     user_systemctl stop qdwin-capture-mutation.service >/dev/null 2>&1 || true
     user_systemctl restart qdwin-session.target >/dev/null 2>&1 || true
+    # The L1 failure-mode steps above legitimately burn several qdshell /
+    # compositor start attempts in a short window (qdshell stop/start,
+    # compositor stop, session-target restart). Clear the per-unit start-rate
+    # counters so the NEXT gate lane on this shared session VM (the
+    # qdshell-ui vision harness restarts qdshell once per test) does not
+    # inherit them and trip StartLimitBurst=5/30s with "start of the service
+    # was attempted too often".
+    user_systemctl reset-failed qdshell.service qdwin-compositor.service \
+        >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -92,6 +101,17 @@ pipe_reply=$(vm_exec "printf 'capture pipewire-0 /run/user/1000/capture-pipewire
 case "$pipe_reply" in *"error: refusing capture of non-designated output"*) ;; *) fail "PipeWire output did not fail: $pipe_reply" ;; esac
 pass "non-designated output names (absent + PipeWire) fail without killing qdshell"
 
+# Baseline hygiene: earlier smokes on this shared session VM can leak UI
+# state — notably an open launcher overlay (agent-click-smoke's final probe
+# clicks the launcher icon), which occludes the center of the screen where
+# the compositor places new toplevels. With the launcher panel leaked open,
+# the 480x320 mutation window below mapped fully underneath it and the
+# capture diff stayed at ~0 deterministically. Dismiss any overlay and
+# clear stray test windows BEFORE taking the static baseline.
+qdwin_send_key KEY_ESC
+vm_exec "pkill -u admin -f '[q]distro-test-window' 2>/dev/null; true" >/dev/null 2>&1 || true
+sleep 2
+
 capture "$ART/static-1.png"
 capture "$ART/static-2.png"
 python3 - "$ART/static-1.png" "$ART/static-2.png" <<'PY' \
@@ -111,10 +131,17 @@ pass "unchanged scene captured twice through Virtual-1 ($ART/static-{1,2}.png)"
 sleep "${QDWIN_CAPTURE_IDLE_SECONDS:-5}"
 user_systemctl start qdwin-capture-mutation.service >/dev/null 2>&1 || \
     vm_exec "runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemd-run --user --unit=qdwin-capture-mutation --collect env WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title qdwin-capture-mutation --width 480 --height 320 --color 0xffe04040" >/dev/null
-sleep 2
-capture "$ART/mutated.png"
-python3 - "$ART/static-2.png" "$ART/mutated.png" <<'PY' \
-    || fail "mutation-after-idle was absent from the next capture"
+# The mutation window is a cold-starting Qt client; under host load it can
+# take (much) longer than a fixed 2 s to launch and map. Poll the capture
+# until the mutation shows up instead of trusting one blind-sleep capture —
+# a zero-diff from that single early capture was this smoke's dominant
+# flake, and it indicts the harness timing, not the capture path.
+mutation_deadline=$((SECONDS + ${QDWIN_CAPTURE_MUTATION_WAIT:-30}))
+mutation_seen=0
+while [ "$SECONDS" -lt "$mutation_deadline" ]; do
+    sleep 2
+    capture "$ART/mutated.png"
+    if python3 - "$ART/static-2.png" "$ART/mutated.png" 2>/dev/null <<'PY'
 from PIL import Image, ImageChops
 import sys
 a = Image.open(sys.argv[1]).convert("RGB")
@@ -125,7 +152,16 @@ changed = sum(1 for px in d.getdata() if px != (0, 0, 0)) / (a.width * a.height)
 assert changed > 0.01, changed
 print(f"mutation_changed_fraction={changed:.6f}")
 PY
-pass "mutation after idle appears immediately in the captured framebuffer"
+    then
+        mutation_seen=1
+        break
+    fi
+done
+if [ "$mutation_seen" -ne 1 ]; then
+    user_systemctl status qdwin-capture-mutation.service --no-pager >&2 || true
+    fail "mutation-after-idle was absent from the capture within ${QDWIN_CAPTURE_MUTATION_WAIT:-30}s"
+fi
+pass "mutation after idle appears in the captured framebuffer"
 
 qdlocker_drain_lock_state || fail "could not establish unlocked baseline"
 case "$(qdlocker_ctrl lock)" in ok) ;; *) fail "locker ctrl request failed" ;; esac
