@@ -8578,11 +8578,19 @@ qdwin_handle_set_pointer_config(struct wl_client *client,
 	(void)client;
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
-	/* D6: uniform locked gate. Input-device config is not part of unlock
-	 * (qdshell pushes settings at session start, before any lock). */
+	/* D6: refuse input-device config while locked — but as a logged DROP,
+	 * not a fatal protocol error. qdshell pushes this snapshot
+	 * unconditionally during connect-and-bind, so a shell that (re)starts
+	 * while the session is locked (shell crash + systemd restart during a
+	 * lock) would be killed here by the fatal error, crash-loop into
+	 * StartLimitBurst=start-limit-hit, and never come back — not even
+	 * after unlock (qdlocker/tests/gui/06). Dropping keeps the lock
+	 * invariant intact (no input-config mutation behind the lock screen)
+	 * while letting the restarted shell live; the config is re-applied on
+	 * the next settings change or shell restart. */
 	if (qdwin->locked) {
-		wl_resource_post_error(resource,
-				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		weston_log("qdwin: set_pointer_config refused while locked "
+			   "(dropped, non-fatal)\n");
 		return;
 	}
 
@@ -8659,10 +8667,12 @@ qdwin_handle_set_key_repeat(struct wl_client *client,
 	(void)client;
 	if (!qdwin_shell_require_bound(qdwin, resource))
 		return;
-	/* D6: uniform locked gate (see set_pointer_config). */
+	/* D6: refuse while locked as a logged, NON-fatal drop — see
+	 * set_pointer_config above for why (a shell restarted during a lock
+	 * must survive its startup config push). */
 	if (qdwin->locked) {
-		wl_resource_post_error(resource,
-				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		weston_log("qdwin: set_key_repeat refused while locked "
+			   "(dropped, non-fatal)\n");
 		return;
 	}
 

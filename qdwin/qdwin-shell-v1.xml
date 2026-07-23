@@ -487,6 +487,10 @@
       <description summary="compositor entered or left locked state">
         While locked, qdwin refuses all request_* on the interface
         (raises `locked` error) and stops emitting per-toplevel events.
+        Exception: the session-config snapshots `set_pointer_config` and
+        `set_key_repeat` are dropped silently (logged, no error) while
+        locked, because the shell pushes them unconditionally at startup
+        and a shell restarted during a lock must not be killed for it.
         The shell uses this to swap to the lock UI layer-shell surface.
       </description>
       <arg name="locked" type="uint"/>
