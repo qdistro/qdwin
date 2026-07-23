@@ -138,7 +138,12 @@ qdwin_screenshot /tmp/19-tile-left.png
 ```
 
 **Assert (2.1):** the journal shows `qdwin: tile handle=$HANDLE edge=left`
-with the outer geometry at `(0,0)`. The screenshot should show the
+with the outer geometry at the left half of the output **work area** — the
+output minus the top-bar exclusive zone, exactly like maximize (only
+`request_fullscreen` covers the full output at `(0,0)`). On this fixed
+1280x800 GUI profile the qdshell bar reserves 31px at the top, so the required
+line is `outer=640x769 at (0,31)` (left half width 640; height 800−31=769;
+origin y=31, below the bar). The screenshot should show the
 `qd19-tile` window occupying the left half of the output (the client itself
 resized — not just chrome moved). If the journal tile line is present but
 the screenshot path is capturing the wrong VT/tty, record that as visual
