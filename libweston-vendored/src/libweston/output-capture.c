@@ -26,6 +26,10 @@
 #include "config.h"
 
 #include <assert.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include <libweston/libweston.h>
 #include <libweston/weston-log.h>
@@ -137,6 +141,29 @@ struct weston_output_capture_info {
 	struct wl_list capture_source_list;
 
 	struct weston_output_capture_source_info source_info[WESTON_OUTPUT_CAPTURE_SOURCE__COUNT];
+
+	/* qdistro: retained last-frame support. When enabled (by the shell,
+	 * test sessions only), renderers copy each composited FRAMEBUFFER
+	 * frame here so pending capture tasks can still be served after the
+	 * output loses the ability to repaint (seat loss, DPMS off, repaint
+	 * wedge). See weston_output_capture_retention_enable(). */
+	struct {
+		bool enabled;
+		bool valid;
+		void *data;
+		size_t size;
+		int width;
+		int height;
+		int stride;
+		const struct pixel_format_info *format;
+		struct timespec when;
+		uint64_t msc;
+	} retain;
+
+	/* qdistro: emitted with the weston_output* whenever a client files a
+	 * new capture task, so the shell can decide to serve it from the
+	 * retained frame when no repaint will come. */
+	struct wl_signal task_filed_signal;
 };
 
 /** Create capture tracking information on weston_output enable */
@@ -159,6 +186,8 @@ weston_output_capture_info_create(void)
 		ci->source_info[i].pixel_source = i;
 		weston_drm_format_array_init(&ci->source_info[i].writeback_formats);
 	}
+
+	wl_signal_init(&ci->task_filed_signal);
 
 	return ci;
 }
@@ -189,6 +218,7 @@ weston_output_capture_info_destroy(struct weston_output_capture_info **cip)
 	for (i = 0; i < ARRAY_LENGTH(ci->source_info); i++)
 		weston_drm_format_array_fini(&ci->source_info[i].writeback_formats);
 
+	free(ci->retain.data);
 	free(ci);
 	*cip = NULL;
 }
@@ -548,6 +578,163 @@ weston_output_has_renderer_capture_tasks(struct weston_output *output)
 	return false;
 }
 
+/*
+ * qdistro additions: retained last-frame capture support.
+ *
+ * When retention is enabled on an output, renderers copy every composited
+ * FRAMEBUFFER frame into a single retained buffer
+ * (weston_output_capture_retention_target() + _commit(), called from their
+ * repaint paths). The shell can then serve pending capture tasks from that
+ * buffer when the output has lost the ability to repaint — seat taken away
+ * (compositor OFFSCREEN), DPMS off, or a repaint wedge — instead of letting
+ * them sit in pending_capture_list until the client times out. The served
+ * frame is explicitly STALE: it is the last frame that was actually
+ * composited, and the shell must mark it as such to its own consumers.
+ */
+
+WL_EXPORT void
+weston_output_capture_retention_enable(struct weston_output *output)
+{
+	output->capture_info->retain.enabled = true;
+}
+
+WL_EXPORT void *
+weston_output_capture_retention_target(struct weston_output *output,
+				       int width, int height,
+				       const struct pixel_format_info *format,
+				       int *stride_out)
+{
+	struct weston_output_capture_info *ci = output->capture_info;
+	size_t bytes_pp, stride_sz, size;
+	int stride;
+
+	if (!ci->retain.enabled)
+		return NULL;
+	if (width <= 0 || height <= 0 || !format ||
+	    format->bpp == 0 || format->bpp % 8 != 0)
+		return NULL;
+
+	/* Overflow-checked: a configuration-derived output size must never
+	 * produce a short allocation that the renderer copy then overruns. */
+	bytes_pp = (size_t)format->bpp / 8;
+	stride_sz = (size_t)width * bytes_pp;
+	if (stride_sz > (size_t)INT_MAX)
+		return NULL;
+	size = stride_sz * (size_t)height;
+	if (size / (size_t)height != stride_sz)
+		return NULL;
+	stride = (int)stride_sz;
+	if (!ci->retain.data || ci->retain.size != size) {
+		free(ci->retain.data);
+		ci->retain.data = malloc(size);
+		ci->retain.size = ci->retain.data ? size : 0;
+		ci->retain.valid = false;
+		if (!ci->retain.data)
+			return NULL;
+	}
+	ci->retain.width = width;
+	ci->retain.height = height;
+	ci->retain.stride = stride;
+	ci->retain.format = format;
+	*stride_out = stride;
+	return ci->retain.data;
+}
+
+WL_EXPORT void
+weston_output_capture_retention_commit(struct weston_output *output)
+{
+	struct weston_output_capture_info *ci = output->capture_info;
+
+	if (!ci->retain.enabled || !ci->retain.data)
+		return;
+	clock_gettime(CLOCK_MONOTONIC, &ci->retain.when);
+	ci->retain.msc = output->msc;
+	ci->retain.valid = true;
+}
+
+WL_EXPORT void
+weston_output_capture_add_task_filed_listener(struct weston_output *output,
+					      struct wl_listener *listener)
+{
+	wl_signal_add(&output->capture_info->task_filed_signal, listener);
+}
+
+WL_EXPORT bool
+weston_output_capture_retained_frame_info(struct weston_output *output,
+					  uint32_t *age_ms_out,
+					  uint64_t *msc_out)
+{
+	struct weston_output_capture_info *ci = output->capture_info;
+	struct timespec now;
+	int64_t age;
+
+	if (!ci->retain.valid)
+		return false;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	age = (int64_t)(now.tv_sec - ci->retain.when.tv_sec) * 1000 +
+	      (now.tv_nsec - ci->retain.when.tv_nsec) / 1000000;
+	if (age < 0)
+		age = 0;
+	if (age_ms_out)
+		*age_ms_out = age > UINT32_MAX ? UINT32_MAX : (uint32_t)age;
+	if (msc_out)
+		*msc_out = ci->retain.msc;
+	return true;
+}
+
+WL_EXPORT int
+weston_output_capture_serve_retained(struct weston_output *output)
+{
+	struct weston_output_capture_info *ci = output->capture_info;
+	struct weston_output_capture_source_info *csi;
+	struct weston_capture_task *ct;
+	int served = 0;
+
+	if (!ci->retain.valid)
+		return -1;
+
+	/* weston_output_pull_capture_task() asserts the caller's geometry
+	 * and format match capture_info's; refuse to serve a frame retained
+	 * before an output reconfiguration rather than tripping them. */
+	csi = capture_info_get_csi(ci, WESTON_OUTPUT_CAPTURE_SOURCE_FRAMEBUFFER);
+	if (csi->width != ci->retain.width ||
+	    csi->height != ci->retain.height ||
+	    !ci->retain.format ||
+	    csi->drm_format != ci->retain.format->format)
+		return -1;
+
+	while ((ct = weston_output_pull_capture_task(
+			output, WESTON_OUTPUT_CAPTURE_SOURCE_FRAMEBUFFER,
+			ci->retain.width, ci->retain.height,
+			ci->retain.format, NULL))) {
+		struct weston_buffer *buffer = weston_capture_task_get_buffer(ct);
+		struct wl_shm_buffer *shm = buffer->shm_buffer;
+		const uint8_t *src = ci->retain.data;
+		uint8_t *dst;
+		int row_bytes;
+		int y;
+
+		if (buffer->type != WESTON_BUFFER_SHM || !shm) {
+			weston_capture_task_retire_failed(ct,
+				"retained-frame: only shm buffers supported");
+			continue;
+		}
+
+		row_bytes = MIN(buffer->stride, ci->retain.stride);
+		wl_shm_buffer_begin_access(shm);
+		dst = wl_shm_buffer_get_data(shm);
+		for (y = 0; y < ci->retain.height; y++)
+			memcpy(dst + (size_t)y * buffer->stride,
+			       src + (size_t)y * ci->retain.stride,
+			       row_bytes);
+		wl_shm_buffer_end_access(shm);
+		weston_capture_task_retire_complete(ct);
+		served++;
+	}
+
+	return served;
+}
+
 /** Get the destination buffer */
 WL_EXPORT struct weston_buffer *
 weston_capture_task_get_buffer(struct weston_capture_task *ct)
@@ -649,6 +836,11 @@ weston_capture_source_v1_capture(struct wl_client *client,
 
 	csrc->pending = weston_capture_task_create(csrc, buffer);
 	weston_output_schedule_repaint(csrc->output);
+
+	/* qdistro: let the shell serve this task from the retained frame if
+	 * the scheduled repaint will never actually run. */
+	wl_signal_emit(&csrc->output->capture_info->task_filed_signal,
+		       csrc->output);
 }
 
 static const struct weston_capture_source_v1_interface weston_capture_source_v1_impl = {

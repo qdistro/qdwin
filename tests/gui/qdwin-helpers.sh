@@ -372,6 +372,14 @@ QDWIN_CAPTURE_TIMEOUT_SCALE=${QDWIN_CAPTURE_TIMEOUT_SCALE:-1}
 QDWIN_CAPTURE_T=$((30 * QDWIN_CAPTURE_TIMEOUT_SCALE))   # outer, capture request
 QDWIN_CAPTURE_SOCAT_T=$((25 * QDWIN_CAPTURE_TIMEOUT_SCALE))  # inner, socat
 QDWIN_CAPTURE_COPY_T=$((20 * QDWIN_CAPTURE_TIMEOUT_SCALE))   # stat/hash + base64
+# In-shell Wayland pump deadline, passed through the ctrl verb. qdshell's
+# built-in 8s is otherwise the binding constraint on a loaded host — the
+# knobs above only stretch the transport around it. Sent ONLY when the scale
+# is raised so the default 3-arg ctrl form keeps working against goldens
+# whose qdshell predates the [timeout-ms] argument. Must stay below the
+# socat -T above or socat gives up first (8*scale < 25*scale holds).
+QDWIN_CAPTURE_SHELL_T_MS=$((8000 * QDWIN_CAPTURE_TIMEOUT_SCALE))
+[ "$QDWIN_CAPTURE_SHELL_T_MS" -gt 120000 ] && QDWIN_CAPTURE_SHELL_T_MS=120000  # ctrl-verb upper bound
 
 
 qdwin_screenshot() {
@@ -389,7 +397,7 @@ qdwin_screenshot() {
     # and QCI_GUI_RETRY on the same hardcoded path keep working. The removal
     # itself must be fail-closed: if the old file cannot be deleted, a later
     # capture failure would leave it in place as stale evidence.
-    if ! rm -f "$out" "$host_tmp" || [ -e "$out" ] || [ -e "$host_tmp" ]; then
+    if ! rm -f "$out" "$out.meta" "$host_tmp" || [ -e "$out" ] || [ -e "$host_tmp" ]; then
         echo "ERROR: stale-capture-path: could not remove prior $out" >&2
         return 1
     fi
@@ -430,10 +438,17 @@ qdwin_screenshot() {
     # expires. Recover, then ask once more.
     local attempt
     for attempt in 1 2; do
+        local shell_t_arg=""
+        [ "$QDWIN_CAPTURE_TIMEOUT_SCALE" -gt 1 ] && shell_t_arg=" $QDWIN_CAPTURE_SHELL_T_MS"
         reply=$(timeout "${QDWIN_CAPTURE_T}s" "$QDWIN_VM_EXEC" "$VMNAME" \
-            "printf 'capture Virtual-1 $guest\\n' | socat -T $QDWIN_CAPTURE_SOCAT_T - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1)
+            "printf 'capture Virtual-1 $guest$shell_t_arg\\n' | socat -T $QDWIN_CAPTURE_SOCAT_T - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1)
         case "${reply:-}" in
             ok\ output=Virtual-1\ width=*\ height=*\ path="$guest") break ;;
+            # v33 retained-frame fallback: the compositor served the LAST
+            # COMPOSITED frame because no repaint could happen (seat away,
+            # power off, repaint wedge). Valid image, stale evidence —
+            # flagged below via the .meta sidecar.
+            ok\ output=Virtual-1\ width=*\ height=*\ path="$guest"\ live=0\ age_ms=*) break ;;
         esac
         if [ "$attempt" = 1 ]; then
             echo "NOTE: capture attempt 1 failed (${reply:-timed out}); checking for a VT takeaway during the capture" >&2
@@ -521,6 +536,19 @@ with Image.open(sys.argv[1]) as im:
         rm -f "$host_tmp"
         return 1
     fi
+    # v33 stale marking. Policy: a stale frame may support "the session was
+    # showing X before the incident" but never a post-action assertion,
+    # unless the action provably predates the retained frame (age_ms).
+    # Scenario reports must quote the WARN.
+    rm -f "$out.meta"
+    case "$reply" in
+        *" live=0 age_ms="*)
+            local stale_fields
+            stale_fields=$(sed -n 's/.* \(live=0 age_ms=[0-9]* msc=[0-9]*\)$/\1/p' <<<"$reply")
+            printf '%s\n' "${stale_fields:-live=0}" > "$out.meta"
+            echo "WARN: stale-capture: $out is the compositor's RETAINED last frame (${stale_fields:-live=0}), not a fresh repaint — not valid post-action evidence" >&2
+            ;;
+    esac
     echo "capture=Virtual-1 width=$width height=$height path=$out" >&2
     echo "$out"
 }

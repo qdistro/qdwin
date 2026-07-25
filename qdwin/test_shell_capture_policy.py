@@ -42,18 +42,23 @@ def main() -> int:
     source = Path(sys.argv[1]).read_text()
     protocol = Path(sys.argv[2]).read_text()
 
-    if not re.search(r'<interface name="qdwin_shell_v1" version="32">', protocol):
-        return fail("qdwin_shell_v1 must advertise protocol version 32")
+    if not re.search(r'<interface name="qdwin_shell_v1" version="33">', protocol):
+        return fail("qdwin_shell_v1 must advertise protocol version 33")
     if not re.search(
         r'<request name="prepare_output_capture" since="32">.*?'
         r'<arg name="output_name" type="string"', protocol, re.S
     ):
         return fail("v32 prepare_output_capture(output_name) request is missing")
     if not re.search(
-        r"wl_global_create\s*\(\s*ec->wl_display\s*,\s*"
-        r"&qdwin_shell_v1_interface\s*,\s*32\s*,", source, re.S
+        r'<event name="capture_served_stale" since="33">.*?'
+        r'<arg name="age_ms" type="uint"', protocol, re.S
     ):
-        return fail("qdwin_shell_v1 wl_global_create version is not 32")
+        return fail("v33 capture_served_stale(age_ms) event is missing")
+    if not re.search(
+        r"wl_global_create\s*\(\s*ec->wl_display\s*,\s*"
+        r"&qdwin_shell_v1_interface\s*,\s*33\s*,", source, re.S
+    ):
+        return fail("qdwin_shell_v1 wl_global_create version is not 33")
 
     handler = function_body(source, "qdwin_handle_prepare_output_capture")
     if handler is None:

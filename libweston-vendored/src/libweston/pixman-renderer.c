@@ -592,6 +592,27 @@ pixman_renderer_do_capture_tasks(struct weston_output *output,
 		pixman_renderer_do_capture(buffer, from);
 		weston_capture_task_retire_complete(ct);
 	}
+
+	/* qdistro: retain the composited frame for stale-serve (no-op unless
+	 * the shell enabled retention on this output). */
+	if (source == WESTON_OUTPUT_CAPTURE_SOURCE_FRAMEBUFFER) {
+		int stride;
+		void *dst = weston_output_capture_retention_target(
+			output, width, height, pfmt, &stride);
+		if (dst) {
+			pixman_image_t *dimg = pixman_image_create_bits(
+				pfmt->pixman_format, width, height,
+				dst, stride);
+			if (dimg) {
+				pixman_image_composite32(PIXMAN_OP_SRC, from,
+							 NULL, dimg,
+							 0, 0, 0, 0, 0, 0,
+							 width, height);
+				pixman_image_unref(dimg);
+				weston_output_capture_retention_commit(output);
+			}
+		}
+	}
 }
 
 static void

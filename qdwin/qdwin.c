@@ -84,6 +84,10 @@ int screenshooter_create(struct weston_compositor *ec);
  * and delegate the actual arithmetic to these kernels. */
 #include "qdwin/qdwin-logic.h"
 
+/* v33 retained-frame capture: weak prototypes for the vendored-libweston
+ * additions (absent from stock installed headers; see the header comment). */
+#include "qdwin/qdwin-capture-retention.h"
+
 /* §6.5 S5c: libweston-16 exports these from libweston-16.so but does not
  * declare them in the installed plugin header (they're backend-facing).
  * Declare locally so qdwin-shell can act as a virtual input backend for
@@ -744,6 +748,15 @@ struct qdwin {
 	struct wl_resource *shell_resource;
 	struct wl_listener capture_auth_listener;
 	bool capture_auth_registered;
+	/* v33 retained-frame stale-serve (shell-capture sessions only): when
+	 * the designated capture output cannot repaint, pending capture tasks
+	 * are completed from the renderer-retained last frame and the shell
+	 * is told via capture_served_stale. */
+	struct wl_listener capture_task_filed_listener;
+	struct wl_listener capture_retain_output_gone_listener;
+	struct weston_output *capture_retain_output;
+	struct wl_event_source *capture_stale_timer;
+	bool capture_stale_timer_armed;
 	uid_t allowed_uid;
 	int locked;
 	int shell_bound;
@@ -2360,6 +2373,168 @@ qdwin_capture_auth_cb(struct wl_listener *listener,
 	attempt->authorized = true;
 	weston_log("qdwin: shell capture authorized output=%s\n",
 		   who->output->name);
+}
+
+/* v33 retained-frame stale-serve. Renderers retain each composited frame on
+ * the designated capture output (vendored-libweston support, enabled below);
+ * when a capture task is filed while the output cannot repaint — seat taken
+ * away (compositor OFFSCREEN), display power forced off — or a scheduled
+ * repaint never runs (wedge timer), the pending task is completed from that
+ * retained frame instead of hanging until the client's timeout, and the
+ * shell is told the pixels are STALE via capture_served_stale. Serving is
+ * strictly less capable than VT recovery (a retained frame predates the
+ * incident by definition); it converts "hang, timeout, no image" into
+ * "immediate image + explicit stale verdict" for triage. */
+
+#define QDWIN_CAPTURE_STALE_WEDGE_MS 5000
+
+static void
+qdwin_capture_serve_stale(struct qdwin *qdwin, const char *why)
+{
+	struct weston_output *output = qdwin->capture_retain_output;
+	uint32_t age_ms = 0;
+	uint64_t msc = 0;
+	int served;
+
+	if (!output)
+		return;
+	if (!weston_output_capture_retained_frame_info(output, &age_ms, &msc)) {
+		weston_log("qdwin: capture stale-serve skipped (%s): "
+			   "no retained frame yet\n", why);
+		return;
+	}
+	if (!weston_output_has_renderer_capture_tasks(output))
+		return;
+
+	/* ORDER MATTERS: the stale event must be posted BEFORE the capture
+	 * `complete` that serve_retained() sends, so the shell dispatches the
+	 * stale mark before its capture pump returns and publishes the reply
+	 * (both events ride the same client connection, so posting order is
+	 * dispatch order). The rare mispredictions are fail-safe: if serving
+	 * then completes nothing, the capture fails/times out (stale mark on
+	 * no published image), or a later live repaint services it (genuine
+	 * pixels conservatively downgraded to stale). */
+	if (qdwin->shell_bound && qdwin->shell_resource &&
+	    wl_resource_get_version(qdwin->shell_resource) >= 33)
+		qdwin_shell_v1_send_capture_served_stale(
+			qdwin->shell_resource, output->name, age_ms,
+			(uint32_t)msc);
+	served = weston_output_capture_serve_retained(output);
+	if (served <= 0) {
+		weston_log("qdwin: capture stale-serve (%s) completed no "
+			   "tasks (rc=%d) after stale mark — capture will "
+			   "fail or complete live-but-marked-stale\n",
+			   why, served);
+		return;
+	}
+	weston_log("qdwin: WARNING capture served STALE frame (%s) "
+		   "output=%s tasks=%d age_ms=%u msc=%llu\n",
+		   why, output->name, served, age_ms,
+		   (unsigned long long)msc);
+}
+
+static int
+qdwin_capture_stale_timer_cb(void *data)
+{
+	struct qdwin *qdwin = data;
+	struct weston_output *output = qdwin->capture_retain_output;
+
+	qdwin->capture_stale_timer_armed = false;
+	if (output && weston_output_has_renderer_capture_tasks(output))
+		qdwin_capture_serve_stale(qdwin, "repaint-wedge");
+	return 0;
+}
+
+static void
+qdwin_capture_task_filed_cb(struct wl_listener *listener, void *data)
+{
+	struct qdwin *qdwin =
+		wl_container_of(listener, qdwin, capture_task_filed_listener);
+	struct weston_output *output = data;
+
+	if (output != qdwin->capture_retain_output)
+		return;
+	if (qdwin->compositor->session_active &&
+	    output->power_state == WESTON_OUTPUT_POWER_NORMAL) {
+		/* Healthy on paper: the scheduled repaint should service the
+		 * task. Arm the wedge net anyway — if the task is still
+		 * pending when the timer fires, serve stale rather than let
+		 * the client time out. A serviced task empties the pending
+		 * list, making the firing a no-op. Never re-arm an armed
+		 * timer: a stream of new capture requests must not push the
+		 * first pending task's deadline out indefinitely. */
+		if (qdwin->capture_stale_timer &&
+		    !qdwin->capture_stale_timer_armed) {
+			qdwin->capture_stale_timer_armed = true;
+			wl_event_source_timer_update(
+				qdwin->capture_stale_timer,
+				QDWIN_CAPTURE_STALE_WEDGE_MS);
+		}
+		return;
+	}
+	qdwin_capture_serve_stale(qdwin,
+				  qdwin->compositor->session_active ?
+				  "power-off" : "seat-away");
+}
+
+/* Fires on compositor output_destroyed_signal — i.e. on weston_output
+ * disable as well as destroy, and BEFORE the output's capture_info (which
+ * holds our task_filed link) is freed, so the remove here is safe. */
+static void
+qdwin_capture_retain_output_gone_cb(struct wl_listener *listener, void *data)
+{
+	struct qdwin *qdwin = wl_container_of(
+		listener, qdwin, capture_retain_output_gone_listener);
+	struct weston_output *output = data;
+
+	if (output != qdwin->capture_retain_output)
+		return;
+	wl_list_remove(&qdwin->capture_task_filed_listener.link);
+	wl_list_init(&qdwin->capture_task_filed_listener.link);
+	qdwin->capture_retain_output = NULL;
+}
+
+/* Arm retention on the designated capture output. Idempotent; no-op unless
+ * the shell-capture authority is enabled (test sessions only) and this is
+ * the designated output. Re-arms via output_created after a disable/enable
+ * cycle (qdwin_capture_retain_output_gone_cb cleared the watch). */
+static void
+qdwin_capture_retention_maybe_arm(struct qdwin *qdwin,
+				  struct weston_output *output)
+{
+	if (!qdwin->capture_auth_registered)
+		return;
+	if (qdwin->capture_retain_output || !output)
+		return;
+	if (!qdwin_shell_capture_output_ok(output->name))
+		return;
+	/* Weak-symbol availability gate: NULL against a stock libweston
+	 * runtime — disable the feature rather than crash (see
+	 * qdwin-capture-retention.h). Checked once here; every other caller
+	 * runs only after arming succeeded. */
+	if (!weston_output_capture_retention_enable ||
+	    !weston_output_capture_add_task_filed_listener ||
+	    !weston_output_capture_retained_frame_info ||
+	    !weston_output_capture_serve_retained ||
+	    !weston_output_has_renderer_capture_tasks) {
+		weston_log("qdwin: retained-frame capture unavailable "
+			   "(stock libweston runtime lacks the vendored "
+			   "retention API) — stale-serve disabled\n");
+		return;
+	}
+
+	weston_output_capture_retention_enable(output);
+	qdwin->capture_task_filed_listener.notify = qdwin_capture_task_filed_cb;
+	weston_output_capture_add_task_filed_listener(
+		output, &qdwin->capture_task_filed_listener);
+	qdwin->capture_retain_output = output;
+	if (!qdwin->capture_stale_timer)
+		qdwin->capture_stale_timer = wl_event_loop_add_timer(
+			wl_display_get_event_loop(
+				qdwin->compositor->wl_display),
+			qdwin_capture_stale_timer_cb, qdwin);
+	weston_log("qdwin: retained-frame capture armed on output=%s\n",
+		   output->name);
 }
 
 /* May this client MUTATE the display layout (zwlr_output_manager apply path)?
@@ -12625,6 +12800,9 @@ qdwin_on_output_changed(struct wl_listener *listener, void *data)
 	qdwin_panels_on_output_change(qdwin);
 	if (output)
 		qdwin_send_output_created_evt(qdwin, output);
+	/* v33: (re-)arm retained-frame capture on the designated output. */
+	if (output)
+		qdwin_capture_retention_maybe_arm(qdwin, output);
 	/* ext-workspace: associate the group with the newly created/enabled
 	 * output. Clients that bind this output's wl_output global only after
 	 * this fires are handled at their bind time (a client binding the
@@ -12679,6 +12857,13 @@ qdwin_destroy(struct wl_listener *listener, void *data)
 	if (qdwin->capture_auth_registered) {
 		wl_list_remove(&qdwin->capture_auth_listener.link);
 		qdwin->capture_auth_registered = false;
+		wl_list_remove(&qdwin->capture_retain_output_gone_listener.link);
+		wl_list_remove(&qdwin->capture_task_filed_listener.link);
+		qdwin->capture_retain_output = NULL;
+		if (qdwin->capture_stale_timer) {
+			wl_event_source_remove(qdwin->capture_stale_timer);
+			qdwin->capture_stale_timer = NULL;
+		}
 	}
 	{
 		struct qdwin_seat_tracker *tr, *tmp;
@@ -22754,10 +22939,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request/event through v32 (shell-authorized output capture prep). */
+	 * request/event through v33 (retained-frame capture_served_stale). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       32, qdwin, bind_qdwin_shell);
+					       33, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
@@ -23156,6 +23341,8 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 			capture_enabled = 0;
 		}
 		if (capture_enabled) {
+			struct weston_output *out;
+
 			weston_log("qdwin: WARNING shell-authorized output capture "
 				   "enabled via QDWIN_ENABLE_SHELL_CAPTURE — "
 				   "dev/test only, do not use in production\n");
@@ -23163,6 +23350,18 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 				ec, &qdwin->capture_auth_listener,
 				qdwin_capture_auth_cb);
 			qdwin->capture_auth_registered = true;
+
+			/* v33 retained-frame stale-serve: watch for the
+			 * designated output going away, and arm retention on
+			 * it — now if it already exists, else from
+			 * output_created. */
+			wl_list_init(&qdwin->capture_task_filed_listener.link);
+			qdwin->capture_retain_output_gone_listener.notify =
+				qdwin_capture_retain_output_gone_cb;
+			wl_signal_add(&ec->output_destroyed_signal,
+				      &qdwin->capture_retain_output_gone_listener);
+			wl_list_for_each(out, &ec->output_list, link)
+				qdwin_capture_retention_maybe_arm(qdwin, out);
 		}
 	}
 

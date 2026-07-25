@@ -96,6 +96,36 @@ weston_capture_task_add_destroy_listener(struct weston_capture_task *ct,
 					 struct wl_listener *listener);
 
 /*
+ * qdistro additions: retained last-frame capture support (see the comment
+ * block in output-capture.c). Renderer-facing: _retention_target() /
+ * _retention_commit(). Shell-facing: everything else.
+ */
+
+void
+weston_output_capture_retention_enable(struct weston_output *output);
+
+void *
+weston_output_capture_retention_target(struct weston_output *output,
+				       int width, int height,
+				       const struct pixel_format_info *format,
+				       int *stride_out);
+
+void
+weston_output_capture_retention_commit(struct weston_output *output);
+
+void
+weston_output_capture_add_task_filed_listener(struct weston_output *output,
+					      struct wl_listener *listener);
+
+bool
+weston_output_capture_retained_frame_info(struct weston_output *output,
+					  uint32_t *age_ms_out,
+					  uint64_t *msc_out);
+
+int
+weston_output_capture_serve_retained(struct weston_output *output);
+
+/*
  * entry point for weston_compositor
  */
 

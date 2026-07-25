@@ -1624,6 +1624,17 @@ gl_renderer_do_capture_tasks(struct gl_renderer *gr,
 			weston_capture_task_retire_failed(ct, "GL: unsupported buffer");
 		}
 	}
+
+	/* qdistro: retain the composited frame for stale-serve (no-op unless
+	 * the shell enabled retention on this output). */
+	if (source == WESTON_OUTPUT_CAPTURE_SOURCE_FRAMEBUFFER) {
+		int stride;
+		void *dst = weston_output_capture_retention_target(
+			output, rect.width, rect.height, format, &stride);
+		if (dst && gl_renderer_do_read_pixels(gr, go, format, dst,
+						      stride, &rect))
+			weston_output_capture_retention_commit(output);
+	}
 }
 
 static void

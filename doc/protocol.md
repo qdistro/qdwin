@@ -158,6 +158,16 @@ Two separate opt-in facilities exist:
   framebuffer into SHM. Every other output name — absent, additional heads,
   PipeWire forwards — is refused at both layers.
 
+  v33 adds retained-frame stale-serve on the same gate: renderers retain the
+  last composited frame of the designated output, and when a capture task is
+  filed while the output cannot repaint (seat taken away, display power off)
+  or a scheduled repaint never runs, qdwin completes the task from that
+  retained frame and sends `capture_served_stale(output, age_ms, msc)`.
+  qdshell surfaces this on the ctrl reply as `live=0 age_ms=… msc=…`, and
+  the harness writes a `.meta` sidecar next to the PNG. Stale pixels are
+  triage evidence ("the session was showing X before the incident"), never
+  post-action proof.
+
 Both environment flags also require the compositor euid to equal
 `allowed_uid`, and both are disabled by default. The session installer
 (`qdistro/scripts/install/install-qdwin-session-for-vm.sh`) emits

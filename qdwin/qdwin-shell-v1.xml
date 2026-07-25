@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="32">
+  <interface name="qdwin_shell_v1" version="33">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1846,6 +1846,25 @@
       </description>
       <arg name="handle" type="uint" summary="from toplevel_added"/>
       <arg name="app_id" type="string" summary="current effective app id"/>
+    </event>
+
+    <event name="capture_served_stale" since="33">
+      <description summary="a capture was served from the retained frame">
+        The compositor completed one or more pending weston_capture_v1
+        framebuffer tasks on this shell connection from its retained
+        last-composited frame instead of a fresh repaint, because the output
+        could not repaint (seat taken away, display power off) or a scheduled
+        repaint never ran. The delivered pixels are STALE: they show the last
+        frame that was actually composited, age_ms milliseconds ago. A stale
+        frame may support "the session was showing X before the incident"
+        but never a post-action assertion, unless the action provably
+        predates the retained frame.
+      </description>
+      <arg name="output_name" type="string" summary="output that was served"/>
+      <arg name="age_ms" type="uint"
+           summary="milliseconds since the retained frame was composited"/>
+      <arg name="msc" type="uint"
+           summary="low 32 bits of the output frame counter at retention"/>
     </event>
   </interface>
 
