@@ -45,6 +45,27 @@ and observation primitives are different.
 | Mouse drag (button held + motion) | `qdwin_drag <x1> <y1> <x2> <y2> [button]` | move + down + N intermediate moves + up. Drag of a titlebar (within the N chrome strip, outside the close/min/max buttons) translates the whole toplevel. `QDWIN_DRAG_STEPS`/`QDWIN_DRAG_STEP_MS` tune granularity. |
 | Visual assertion | `qdwin_screenshot <file.png>` (root-authenticated qdshell capture of `Virtual-1`) | validates PNG and output dimensions; never falls back to the tty console |
 
+### When a capture fails: seat-taken-away vs never-had-master
+
+A capture needs a compositor that can still **repaint** — the in-compositor path
+calls `weston_output_damage()` and the pixels are produced during that repaint —
+so it requires DRM master. `qdwin_screenshot` therefore gates on
+`qdwin_session_healthy` first, and a failure there prints one of two verdicts:
+
+- `VERDICT: seat-taken-away` — the compositor HELD master and then lost it,
+  almost always because the VT was switched away (seatd then disables the seat,
+  weston drops master and closes every input device, and every later capture in
+  the scenario fails too). This is an **ENVIRONMENT** condition: report ERROR,
+  not a product FAIL. `qdwin_screenshot` tries once to switch back to the VT it
+  stamped while the session was healthy; if that works it logs
+  `WARN: recovered-vt-takeaway` and proceeds, and you should keep that WARN in
+  the report as an environment note even though the step passed.
+- `VERDICT: no seat-deactivation in the journal` — the compositor most likely
+  never acquired master (a start-up fault). Treat as a precondition ERROR.
+
+Do not read the older bare `compositor-not-on-vt` wording as "never had master";
+it covers both cases, which is why the verdict line above exists.
+
 ## qcode reference
 
 `qdwin_qmp_key` and `qdwin_chord` take qemu key codes (qcodes), NOT linux KEY_* names. See `qapi/ui.json` `QKeyCode` enum upstream. Common ones:

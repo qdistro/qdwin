@@ -355,6 +355,24 @@ qdwin_screenshot_virsh_diag() {
     mv "$tmp" "$out"
     echo "$out"
 }
+# Host-side deadlines for the capture round-trip, in seconds, scaled by
+# QDWIN_CAPTURE_TIMEOUT_SCALE (integer, default 1).
+#
+# These bound LIVENESS, not latency: the happy path returns as soon as the guest
+# answers, so a larger ceiling costs nothing when things work and only changes
+# how long a genuinely wedged capture waits. They are measured on the HOST while
+# the work happens in the GUEST, so host contention alone can blow them — the
+# `qci full` run that surfaced this had 7 concurrent qemu VMs and peak loadavg
+# 3.23, and a 1920x1080 PNG has to be base64'd through qemu-guest-agent. Raise
+# the scale on a loaded runner rather than editing the numbers.
+#
+# INVARIANT: the outer `timeout` must exceed the inner `socat -T`, or the host
+# gives up first and the error says "timed out" instead of socat's reason.
+QDWIN_CAPTURE_TIMEOUT_SCALE=${QDWIN_CAPTURE_TIMEOUT_SCALE:-1}
+QDWIN_CAPTURE_T=$((30 * QDWIN_CAPTURE_TIMEOUT_SCALE))   # outer, capture request
+QDWIN_CAPTURE_SOCAT_T=$((25 * QDWIN_CAPTURE_TIMEOUT_SCALE))  # inner, socat
+QDWIN_CAPTURE_COPY_T=$((20 * QDWIN_CAPTURE_TIMEOUT_SCALE))   # stat/hash + base64
+
 
 qdwin_screenshot() {
     qdwin_require_vm || return 2
@@ -375,15 +393,41 @@ qdwin_screenshot() {
         echo "ERROR: stale-capture-path: could not remove prior $out" >&2
         return 1
     fi
-    qdwin_session_healthy || return $?
+    # A capture needs a compositor that can still repaint, i.e. one holding DRM
+    # master. When that is missing mid-scenario the usual cause is an EXTERNAL
+    # VT takeaway, not a product fault: the seat is disabled, repaints stop, and
+    # every later capture in the scenario fails too — turning an already-passing
+    # product assertion into an ERROR for want of a screenshot. Try once to
+    # switch back to the stamped VT and re-probe.
+    #
+    # Deliberately NOT silent: a recovered takeaway prints a WARN and stays in
+    # the scenario log, so the environment event is still auditable and this
+    # cannot quietly paper over a compositor that really does lose its seat.
+    # qdwin_vt_recover returns nonzero unless it actually switched, so a
+    # genuinely unhealthy session still fails here rather than retrying blind.
+    # NB: capture the status on its own line. Inside `if ! cmd; then`, `$?` is
+    # the status of the NEGATION (always 0), so reading it there would return 0
+    # from this function and report a successful capture for an unhealthy
+    # session — a false green on the exact path this block exists to handle.
+    qdwin_session_healthy
+    local heal_rc=$?
+    if [ "$heal_rc" -ne 0 ]; then
+        [ "$heal_rc" -eq 2 ] && return 2
+        qdwin_vt_recover || return "$heal_rc"
+        qdwin_session_healthy || {
+            echo "ERROR: vt-recover-insufficient: switched back to the stamped VT but the session is still unhealthy" >&2
+            return 1
+        }
+        echo "WARN: recovered-vt-takeaway: the compositor had lost its seat to a VT switch; switched back and re-verified DRM master before capturing. This is an ENVIRONMENT event, not a product result — investigate what activated the other VT." >&2
+    fi
     pid_before=$(qdwin_compositor_pid) || return 1
 
     # Connect as root: CtrlServer verifies SO_PEERCRED so the admin desktop
     # user cannot turn qdshell into a screenshot confused deputy. The qdshell
     # process itself writes a new 0600 file and atomically publishes it at the
     # requested runtime-dir path only after weston_capture reports complete.
-    reply=$(timeout 12s "$QDWIN_VM_EXEC" "$VMNAME" \
-        "printf 'capture Virtual-1 $guest\\n' | socat -T 10 - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1) || {
+    reply=$(timeout "${QDWIN_CAPTURE_T}s" "$QDWIN_VM_EXEC" "$VMNAME" \
+        "printf 'capture Virtual-1 $guest\\n' | socat -T $QDWIN_CAPTURE_SOCAT_T - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1) || {
         echo "ERROR: shell-capture-failed: ${reply:-capture command timed out}" >&2
         qdwin_capture_fail_cleanup "$guest"
         return 1
@@ -402,7 +446,7 @@ qdwin_screenshot() {
     # Guest-side ground truth BEFORE the copy: qemu-guest-agent stdout can be
     # silently truncated, and base64 that is cut on a 4-char quantum still
     # decodes cleanly. The copied host bytes must match this size + sha256.
-    guest_meta=$(timeout 8s "$QDWIN_VM_EXEC" "$VMNAME" \
+    guest_meta=$(timeout "${QDWIN_CAPTURE_COPY_T}s" "$QDWIN_VM_EXEC" "$VMNAME" \
         "stat -c %s '$guest' && sha256sum '$guest' | cut -d' ' -f1") || {
         echo "ERROR: shell-capture-copy-failed: could not stat/hash $guest" >&2
         qdwin_capture_fail_cleanup "$guest"
@@ -411,7 +455,7 @@ qdwin_screenshot() {
     guest_size=$(sed -n 1p <<<"$guest_meta")
     guest_sha=$(sed -n 2p <<<"$guest_meta")
 
-    b64=$(timeout 8s "$QDWIN_VM_EXEC" "$VMNAME" "base64 -w0 '$guest'") || {
+    b64=$(timeout "${QDWIN_CAPTURE_COPY_T}s" "$QDWIN_VM_EXEC" "$VMNAME" "base64 -w0 '$guest'") || {
         echo "ERROR: shell-capture-copy-failed: could not read $guest" >&2
         qdwin_capture_fail_cleanup "$guest"
         return 1
@@ -513,7 +557,65 @@ qdwin_session_healthy() {
         echo "ERROR: qdwin-session-unhealthy: socket or user unit unavailable" >&2
         return 1
     }
-    qdwin_drm_master_ok
+    qdwin_drm_master_ok || return $?
+    qdwin_vt_stamp
+}
+
+# Where the guest records the VT the compositor was proven healthy on.
+QDWIN_VT_STAMP=${QDWIN_VT_STAMP:-/run/user/1000/qdwin-active-vt}
+
+# Record the VT the compositor currently owns. Only ever called right after
+# qdwin_drm_master_ok succeeded, so the active VT *is* the compositor's: holding
+# DRM master requires it. Nothing else records this — the compositor is started
+# with no --tty and has no logind seat, so seatd allocates its VT dynamically
+# and the number appears in no unit, config, or log. Without this stamp a later
+# VT takeaway is unrecoverable simply because we would not know where to switch
+# back to. Best-effort: a failure here must never fail a healthy session.
+qdwin_vt_stamp() {
+    "$QDWIN_VM_EXEC" "$VMNAME" \
+        "cat /sys/class/tty/tty0/active > '$QDWIN_VT_STAMP' 2>/dev/null || true" \
+        >/dev/null 2>&1 || true
+    return 0
+}
+
+# Undo an EXTERNAL VT takeaway by switching back to the stamped compositor VT.
+#
+# Cause-agnostic on purpose: weston.ini now sets vt-switching=false, which
+# closes the Ctrl+Alt+Fn keyboard path, but a programmatic VT_ACTIVATE or a
+# logind/seatd-initiated switch can still strand the compositor, and the trigger
+# in the observed failures was never identified. Switching back re-enables the
+# seat (seatd re-activates the client), weston re-acquires DRM master and
+# reopens its input devices, and a capture becomes possible again.
+#
+# Returns 0 only when a switch was actually performed, so the caller retries
+# exactly once and a "nothing to recover" case does not loop. Uses the VT
+# ioctls directly rather than chvt(1) so no kbd package is required.
+qdwin_vt_recover() {
+    qdwin_require_vm || return 2
+    "$QDWIN_VM_EXEC" "$VMNAME" '
+want=$(cat '"'$QDWIN_VT_STAMP'"' 2>/dev/null || true)
+now=$(cat /sys/class/tty/tty0/active 2>/dev/null || true)
+case "$want" in
+    tty[0-9]*) ;;
+    *) echo "vt-recover: no stamped compositor VT; cannot recover" >&2; exit 1 ;;
+esac
+if [ "$want" = "$now" ]; then
+    echo "vt-recover: still on the stamped VT $want — the seat was NOT taken by a VT switch; not a recoverable takeaway" >&2
+    exit 1
+fi
+echo "vt-recover: active VT is ${now:-unknown}, switching back to $want" >&2
+python3 - "${want#tty}" <<'"'"'PY'"'"'
+import fcntl, os, sys
+VT_ACTIVATE, VT_WAITACTIVE = 0x5606, 0x5607
+n = int(sys.argv[1])
+fd = os.open("/dev/tty0", os.O_WRONLY)
+try:
+    fcntl.ioctl(fd, VT_ACTIVATE, n)
+    fcntl.ioctl(fd, VT_WAITACTIVE, n)
+finally:
+    os.close(fd)
+PY
+'
 }
 
 qdwin_drm_master_ok() {
@@ -587,5 +689,35 @@ print("ERROR: compositor-not-on-vt: no DRM master file description held by "
       "the service weston (directly or via its seatd broker)",
       file=sys.stderr)
 sys.exit(1)
-PY'
+PY
+rc=$?
+# On failure, say WHY the master is missing. The bare message above reads as
+# "this compositor never had DRM master", but the common cause is the opposite:
+# a healthy session that HELD master and then had the seat taken away by a VT
+# switch (qdwin/tests/gui/19-wm-policy.md hit this — a switch to tty6 mid-chord
+# deactivated the session, so the post-tile capture could not be taken, and the
+# generic message sent the investigation looking for a compositor start-up
+# fault). Distinguishing the two costs one journal grep and turns a forensic
+# dig into a one-line diagnosis.
+if [ "$rc" -ne 0 ]; then
+    echo "--- drm-master diagnosis ---" >&2
+    act=$(cat /sys/class/tty/tty0/active 2>/dev/null || true)
+    [ -n "$act" ] && echo "active VT is now: $act" >&2
+    jl=$(journalctl _UID=1000 --no-pager -n 500 2>/dev/null || true)
+    if printf %s "$jl" | grep -qE "Disabling seat|deactivating session"; then
+        echo "VERDICT: seat-taken-away, NOT compositor-never-had-master." >&2
+        echo "  The compositor held an active session and then lost it" >&2
+        echo "  (libseat Disabling seat / deactivating session below). A VT" >&2
+        echo "  switch away from the compositor VT is the usual cause; check" >&2
+        echo "  for a getty started on another VT at the same timestamp." >&2
+        printf %s "$jl" | grep -E "Disabling seat|deactivating session" \
+            | tail -3 | sed "s/^/  /" >&2
+        systemctl --no-pager --no-legend list-units --state=active "getty@*" \
+            2>/dev/null | sed "s/^/  active getty: /" >&2
+    else
+        echo "VERDICT: no seat-deactivation in the journal — the compositor" >&2
+        echo "  most likely never acquired DRM master (start-up fault)." >&2
+    fi
+fi
+exit $rc'
 }
