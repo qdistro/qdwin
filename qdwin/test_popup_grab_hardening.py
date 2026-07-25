@@ -9,6 +9,9 @@ them. Each check states the user-visible compositor behavior it protects:
   D6 — the trusted shell's mutating popup / selection / input-config requests
        are refused while the screen is locked, consistent with fullscreen/tile
        (the lock screen owns the display; set_display_power is the exception).
+       Popup/selection refuse FATALLY (post_error); the two input-preference
+       snapshots refuse with a logged non-fatal drop so a shell restarted
+       during a lock is not crash-looped — see D6_DROP_HANDLERS.
   D7 — qdwin_shell_v1.show_popup requires a valid input grab serial (like an
        xdg_popup grab) before it installs a compositor-wide pointer grab, and
        the protocol advertises this (v29 + serial arg + invalid_grab error).
@@ -94,9 +97,28 @@ def check_d5_primary_mime_cap(source):
 
 # ---------------------------------------------------------------- D6
 
-D6_HANDLERS = (
+# Handlers whose locked gate is FATAL: refuse with
+# wl_resource_post_error(ERROR_LOCKED), killing a shell that tries to mutate
+# display state behind the lock screen.
+D6_FATAL_HANDLERS = (
     "qdwin_handle_show_popup",
     "qdwin_handle_clear_selection",
+)
+
+# Handlers whose locked gate is a logged, NON-fatal DROP. This is a deliberate,
+# enumerated exception, not a weakening: qdshell pushes both input-preference
+# snapshots unconditionally during connect-and-bind, so a shell that (re)starts
+# while the session is locked (shell crash + systemd Restart during a lock) was
+# killed by the fatal error on every respawn, crash-looped into
+# StartLimitBurst=start-limit-hit, and never recovered even after unlock
+# (qdlocker/tests/gui/06-shell-crash-survives.md). The lock invariant is
+# unchanged — the config is still refused, so nothing mutates behind the lock —
+# only the *answer* is a log line instead of a protocol kill.
+#
+# Keeping these in a separate, explicitly-named tuple is the point: a future
+# refactor that downgrades one of the FATAL handlers to a drop has to move it
+# here and justify it, rather than silently losing the post_error.
+D6_DROP_HANDLERS = (
     "qdwin_handle_set_pointer_config",
     "qdwin_handle_set_key_repeat",
 )
@@ -104,17 +126,35 @@ D6_HANDLERS = (
 
 def check_d6_locked_gate(source):
     code = _strip_comments(source)
-    for name in D6_HANDLERS:
+    for name in D6_FATAL_HANDLERS + D6_DROP_HANDLERS:
         body, err = _function_body(code, name + r"\s*\(", name)
         if err:
             return fail(err)
-        if "qdwin->locked" not in body or \
-           "QDWIN_SHELL_V1_ERROR_LOCKED" not in body:
-            return fail(f"D6: {name} missing the locked gate "
-                        f"(qdwin->locked -> ERROR_LOCKED)")
+        fatal = name in D6_FATAL_HANDLERS
+
+        # Every gated handler must test the lock, whichever way it answers.
+        if "qdwin->locked" not in body:
+            return fail(f"D6: {name} missing the locked gate (no qdwin->locked "
+                        f"test)")
+        if fatal:
+            if "QDWIN_SHELL_V1_ERROR_LOCKED" not in body:
+                return fail(f"D6: {name} must refuse with a FATAL locked gate "
+                            f"(qdwin->locked -> ERROR_LOCKED)")
+            gate = body.find("QDWIN_SHELL_V1_ERROR_LOCKED")
+        else:
+            # A drop handler must NOT post the fatal error (that is the
+            # regression it exists to prevent) and must log the refusal, so the
+            # drop is observable in the compositor log rather than silent.
+            if "QDWIN_SHELL_V1_ERROR_LOCKED" in body:
+                return fail(f"D6: {name} is a non-fatal DROP handler but still "
+                            f"posts ERROR_LOCKED")
+            locked_at = body.find("qdwin->locked")
+            if "weston_log" not in body[locked_at:]:
+                return fail(f"D6: {name} drops while locked without logging "
+                            f"the refusal (weston_log after the gate)")
+            gate = locked_at
         # the gate must precede any state mutation; require_bound must come first
         rb = body.find("qdwin_shell_require_bound")
-        gate = body.find("QDWIN_SHELL_V1_ERROR_LOCKED")
         if rb == -1 or gate < rb:
             return fail(f"D6: {name} locked gate must follow require_bound")
     return 0
