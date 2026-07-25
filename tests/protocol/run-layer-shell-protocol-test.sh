@@ -60,9 +60,44 @@ CLIENT="$(abspath "$CLIENT")"
 LAYER_SHELL_XML="$(abspath "$LAYER_SHELL_XML")"
 QDWIN_SHELL_XML="$(abspath "$QDWIN_SHELL_XML")"
 
+# J29: the libweston major this plugin targets comes from qdwin's single source
+# of truth (libweston-vendored/VERSION) so the probes below track a version bump
+# with no edits.
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../../libweston-vendored/lib-major.sh
+. "$_HERE/../../libweston-vendored/lib-major.sh"
+
 # --- prerequisite probes: missing tooling => SKIP, not FAIL ---------------
 command -v weston >/dev/null 2>&1 || skip "weston not in PATH"
 command -v pkg-config >/dev/null 2>&1 || skip "pkg-config not available"
+
+# The weston FRONTEND must link the same libweston major the plugin was built
+# against. weston resolves --backend=... and shell= against its own libweston,
+# so a major mismatch is a silent ABI mismatch, not a load error: the struct
+# layouts differ, weston SIGABRTs mid-startup and the client dies with SIGSEGV
+# — a crash that looks like a product failure but only says "wrong weston".
+# openSUSE ships weston 14 while the vendored tree is pinned to 16, and the
+# vendored build deliberately omits the weston frontend (libweston only), so
+# there is no matching frontend to point at on such a host. SKIP with the
+# reason; the matching-major coverage is the VM lane, whose golden image ships
+# weston $LIBWESTON_MAJOR.
+#
+# Probe with ldd, not `objdump -p ... NEEDED`: the weston binary's direct
+# NEEDED list is only libexec_weston.so.0 (+libc) — libweston comes in one
+# level down, through that frontend library — so a NEEDED-only scan finds
+# nothing and the check silently never fires. ldd resolves transitively.
+#
+# An undeterminable major SKIPs too, rather than proceeding: running on an
+# unverified ABI combination is what produced the SIGABRT/SIGSEGV pair this
+# probe exists to explain, and a crash attributed to the product is worse than
+# an honest skip.
+command -v ldd >/dev/null 2>&1 || skip "ldd not available (cannot verify the weston/libweston ABI major)"
+_weston_major=$(ldd "$(command -v weston)" 2>/dev/null \
+    | sed -n 's/.*[^a-z]libweston-\([0-9][0-9]*\)\.so\..*/\1/p' | head -n1)
+[ -n "${_weston_major:-}" ] \
+    || skip "cannot resolve a libweston major from the weston frontend (ldd found none); refusing to run on an unverified ABI combination"
+[ "$_weston_major" = "$LIBWESTON_MAJOR" ] \
+    || skip "weston frontend links libweston-$_weston_major but the plugin targets libweston-$LIBWESTON_MAJOR (VERSION); ABI mismatch — run this suite in the VM lane"
 python3 -c 'import pywayland, pywayland.scanner' 2>/dev/null \
     || skip "pywayland (+scanner) not importable"
 
@@ -73,11 +108,11 @@ python3 -c 'import pywayland, pywayland.scanner' 2>/dev/null \
 [ -f "$CLIENT" ] || die "test client not found at $CLIENT"
 
 # Headless backend: weston resolves --backend=headless-backend.so from its
-# module dir, which libweston-16 keeps at <libdir>/libweston-16/.
-LIBWESTON_LIBDIR="$(pkg-config --variable=libdir libweston-16 2>/dev/null || true)"
+# module dir, which libweston keeps at <libdir>/$LIBWESTON_SONAME/.
+LIBWESTON_LIBDIR="$(pkg-config --variable=libdir "$LIBWESTON_SONAME" 2>/dev/null || true)"
 HEADLESS_SO=""
-for d in "$LIBWESTON_LIBDIR/libweston-16" /usr/lib64/libweston-16 \
-         /usr/lib/libweston-16 /usr/lib/x86_64-linux-gnu/libweston-16; do
+for d in "$LIBWESTON_LIBDIR/$LIBWESTON_SONAME" "/usr/lib64/$LIBWESTON_SONAME" \
+         "/usr/lib/$LIBWESTON_SONAME" "/usr/lib/x86_64-linux-gnu/$LIBWESTON_SONAME"; do
     if [ -f "$d/headless-backend.so" ]; then HEADLESS_SO="$d/headless-backend.so"; break; fi
 done
 [ -n "$HEADLESS_SO" ] || skip "headless-backend.so not found (no headless weston)"
@@ -104,7 +139,7 @@ QDWIN_USE_VENDORED_LIBWESTON="${QDWIN_USE_VENDORED_LIBWESTON:-0}"
 QDWIN_VENDORED_LIBWESTON_PREFIX="${QDWIN_VENDORED_LIBWESTON_PREFIX:-/usr/libexec/qdistro/qdwin-libweston}"
 VENDORED_LD=""
 if [ "$QDWIN_USE_VENDORED_LIBWESTON" = "1" ]; then
-    vso="$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64/libweston-16.so.0.0.0"
+    vso="$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64/$LIBWESTON_SONAME.so.$LIBWESTON_LIBVER"
     [ -f "$vso" ] || die "QDWIN_USE_VENDORED_LIBWESTON=1 but no vendored .so at $vso"
     VENDORED_LD="$QDWIN_VENDORED_LIBWESTON_PREFIX/lib64"
     echo "protocol-suite: using vendored libweston at $QDWIN_VENDORED_LIBWESTON_PREFIX" >&2
