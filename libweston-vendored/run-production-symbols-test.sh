@@ -22,6 +22,12 @@ REPO="$(cd "$HERE/../.." && pwd)"   # workspace root (siblings: qdwin, qdistro)
 BUILD_SCRIPT="$HERE/build-libweston.sh"
 PREFIX="${QDWIN_LIBWESTON_PREFIX:-/tmp/qdwin-libweston-prod-prefix}"
 
+# J29: soname/soversion come from VERSION via lib-major.sh so a version bump is
+# a single edit and this gate cannot drift from what the build actually
+# produces ($LIBWESTON_SONAME, $LIBWESTON_LIBVER).
+# shellcheck source=lib-major.sh
+. "$HERE/lib-major.sh"
+
 # Allow CI on a host lacking pipewire/rdp/GL devel to still gate the
 # symbol export — those backends are orthogonal to the desktop helpers
 # (they live in their own backend .so files; the four soft-linked popup
@@ -114,9 +120,9 @@ fail() { echo "[prod-syms] FAIL: $*" >&2; exit 1; }
 # (lib/x86_64-linux-gnu) on Debian/Ubuntu, and build-libweston.sh deliberately
 # does not force --libdir. Echoes the core .so path, or nothing if not built.
 find_core() {
-    ls "$PREFIX"/lib64/libweston-16.so.0.0.0 \
-       "$PREFIX"/lib/*/libweston-16.so.0.0.0 \
-       "$PREFIX"/lib/libweston-16.so.0.0.0 2>/dev/null | head -n1
+    ls "$PREFIX"/lib64/"$LIBWESTON_SONAME.so.$LIBWESTON_LIBVER" \
+       "$PREFIX"/lib/*/"$LIBWESTON_SONAME.so.$LIBWESTON_LIBVER" \
+       "$PREFIX"/lib/"$LIBWESTON_SONAME.so.$LIBWESTON_LIBVER" 2>/dev/null | head -n1
 }
 
 # Dependency preflight for the deps the auto-disable block above does NOT
@@ -214,7 +220,7 @@ fi
 
 CORE="$(find_core)"
 [ -n "$CORE" ] && [ -f "$CORE" ] \
-    || fail "no libweston-16.so.0.0.0 under $PREFIX (lib64 or lib/<arch>) after build"
+    || fail "no $LIBWESTON_SONAME.so.$LIBWESTON_LIBVER under $PREFIX (lib64 or lib/<arch>) after build"
 
 # Capture the dynamic symbol table once. Piping nm into `grep -q` under
 # `pipefail` would report SIGPIPE (141) when grep exits early, so read
@@ -236,11 +242,22 @@ STAGE_SCRIPT="$REPO/qdistro/scripts/install/install-vendored-libweston.sh"
 if [ -x "$STAGE_SCRIPT" ]; then
     DEST="$(mktemp -d)/qdwin-libweston"
     echo "[prod-syms] staging dry-run -> $DEST"
-    DEST="$DEST" QDWIN_LIBWESTON_PREFIX="$PREFIX" bash "$STAGE_SCRIPT" \
-        >/dev/null 2>&1 || fail "install-vendored-libweston.sh staging failed"
-    [ -f "$DEST/lib64/libweston-16.so.0" ] \
-        || fail "staged tree missing libweston-16.so.0"
-    [ -f "$DEST/lib64/libweston-16/drm-backend.so" ] \
+    # Pass the qdwin source tree as $1. Without it the installer falls back to
+    # its in-VM default (/root/qdistro-src/qdwin), cannot read lib-major.sh,
+    # and stages whatever libweston major it can infer instead of the one
+    # VERSION pins — which silently staged a leftover libweston-14 out of this
+    # 16 prefix and failed the assertion below.
+    stage_log="$(mktemp)"
+    if ! DEST="$DEST" QDWIN_LIBWESTON_PREFIX="$PREFIX" \
+            bash "$STAGE_SCRIPT" "$REPO/qdwin" >"$stage_log" 2>&1; then
+        sed 's/^/[prod-syms]   /' "$stage_log" >&2
+        rm -f "$stage_log"
+        fail "install-vendored-libweston.sh staging failed"
+    fi
+    rm -f "$stage_log"
+    [ -f "$DEST/lib64/$LIBWESTON_SONAME.so.0" ] \
+        || fail "staged tree missing $LIBWESTON_SONAME.so.0"
+    [ -f "$DEST/lib64/$LIBWESTON_SONAME/drm-backend.so" ] \
         || fail "staged tree missing drm-backend.so (headless-only / wrong prefix?)"
     rm -rf "$(dirname "$DEST")"
     echo "[prod-syms] staging dry-run OK"

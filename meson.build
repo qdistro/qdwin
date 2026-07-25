@@ -49,15 +49,36 @@ endif
 
 # J29: derive the libweston major from the vendored VERSION file (single
 # source of truth) so a version bump is one edit. VERSION now pins 16.0.0, so
-# the primary dependency name resolves to 'libweston-16' (the legacy 13
-# fallback below is retained for old hosts). fs.read() (not run_command) so
+# the primary dependency name resolves to 'libweston-16'. There is deliberately
+# NO fallback to another major (see below). fs.read() (not run_command) so
 # meson registers VERSION as a configure dependency and reconfigures when it
 # is bumped.
 fs = import('fs')
 libweston_major = fs.read('libweston-vendored/VERSION').strip().split('.')[0]
 dep_libweston = dependency('libweston-' + libweston_major, required: false)
+# NO fallback to another major. The old `dependency('libweston-13')` fallback
+# predates VERSION being the single source of truth and is now actively unsafe:
+# qdwin.c is compiled against the API of the PINNED major, so configuring
+# against a different major's headers either fails deep in the compile or —
+# worse, if the headers happen to agree — links a plugin whose struct layouts
+# do not match the libweston the frontend loads, i.e. the exact silent ABI
+# mismatch that SIGSEGVs the protocol suite. Require the pinned major.
 if not dep_libweston.found()
-  dep_libweston = dependency('libweston-13')
+  # qdwin.c is ported to the libweston-@0@ API, but distros ship an older
+  # libweston devel package (openSUSE Tumbleweed: 14), so on a stock host the
+  # ONLY matching libweston-@0@.pc is the one the vendored production build
+  # installs into its prefix. Say so instead of leaving the bare
+  # "Dependency libweston-@0@ not found" — that message sent this gate looking
+  # for a distro package that does not exist.
+  error(
+    'libweston-@0@ not found.\n'.format(libweston_major) +
+    'qdwin targets the libweston major pinned in libweston-vendored/VERSION, which\n' +
+    'is newer than the distro devel package on most hosts. Build the vendored\n' +
+    'production profile and put its pkgconfig dir on PKG_CONFIG_PATH:\n' +
+    '    QDWIN_LIBWESTON_PROFILE=production libweston-vendored/build-libweston.sh\n' +
+    '    export PKG_CONFIG_PATH="$(bash libweston-vendored/pkgconfig-dir.sh):$PKG_CONFIG_PATH"\n' +
+    'The qci host gate does this for you (ci/lib/gates/host.sh, qdwin-meson).'
+  )
 endif
 dep_wayland_server = dependency('wayland-server')
 dep_wayland_scanner = dependency('wayland-scanner', native: true)

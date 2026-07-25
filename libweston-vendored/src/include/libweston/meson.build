@@ -15,6 +15,14 @@ install_headers(
 	'remoting-plugin.h',
 	'pipewire-plugin.h',
 	'shell-utils.h',
+	# qdistro (J29): upstream installs xwayland-api.h from compositor/, a
+	# subdir this vendored tree deliberately omits (frontend not built), so the
+	# header defined as xwayland_api_h below was never installed. qdwin.c
+	# includes <libweston/xwayland-api.h> unconditionally for
+	# weston_xwayland_surface_get_api() (the is_xwayland toplevel tagging), so
+	# without this the vendored prefix cannot build qdwin. Installing it here
+	# restores upstream's devel surface rather than diverging from it.
+	'xwayland-api.h',
 	subdir: dir_include_libweston_install
 )
 
