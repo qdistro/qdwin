@@ -121,19 +121,39 @@ CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
     "setsid -f runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
      WAYLAND_DISPLAY=wayland-1 qdistro-test-window --title 'qd19-tile' \
      --width 400 --height 260 --color 0xff304050 >/tmp/qd19-tile.log 2>&1"
-sleep 2
-HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
-  "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
-   grep -E 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=qdistro-test-window' | \
-   tail -1 | sed -nE 's/.*handle=([0-9]+).*/\1/p'")
+# Wait for the map itself rather than a fixed sleep.
+HANDLE=
+for _ in $(seq 1 20); do
+    HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
+      "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
+       grep -E 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=qdistro-test-window' | \
+       tail -1 | sed -nE 's/.*handle=([0-9]+).*/\1/p'")
+    [ -n "$HANDLE" ] && break
+    sleep 0.5
+done
 [ -n "$HANDLE" ] || { echo "ERROR: test window never mapped (precondition)"; exit 1; }
+# Brief settle for keyboard focus to land on the new toplevel (map-time
+# activation has no journal line to wait on) before driving the chord.
+sleep 1
 
 # The newly-mapped window holds keyboard focus; drive the default registered
 # tile-left shortcut. Super = Meta (qcode meta_l). Use qdwin_chord (real-keyboard
 # sequence) — a modifier+key chord needs the modifier-release transition, see
 # AGENTS.md "Why two key paths".
+# Take a fresh cursor first: configure_extent also fires on map/inset paths,
+# so the post-tile wait below must only see lines emitted after the chord.
+TILE_CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
+  --show-cursor --no-pager 2>/dev/null | tail -1 | sed 's/^-- cursor: //'")
 qdwin_chord meta_l -- left
-sleep 1
+# Deterministic post-action wait (no fixed sleep): the resize is in flight once
+# the compositor logs the configure_extent it sent for this handle; the
+# capture's own damage-repaint then guarantees fresh content.
+for _ in $(seq 1 20); do
+    "$QDWIN_VM_EXEC" "$VMNAME" \
+        "journalctl _UID=1000 --after-cursor='$TILE_CURSOR' --no-pager | \
+         grep -q 'qdwin: configure_extent handle=$HANDLE '" && break
+    sleep 0.5
+done
 qdwin_screenshot /tmp/19-tile-left.png
 ```
 
