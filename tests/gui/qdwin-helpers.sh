@@ -413,12 +413,7 @@ qdwin_screenshot() {
     local heal_rc=$?
     if [ "$heal_rc" -ne 0 ]; then
         [ "$heal_rc" -eq 2 ] && return 2
-        qdwin_vt_recover || return "$heal_rc"
-        qdwin_session_healthy || {
-            echo "ERROR: vt-recover-insufficient: switched back to the stamped VT but the session is still unhealthy" >&2
-            return 1
-        }
-        echo "WARN: recovered-vt-takeaway: the compositor had lost its seat to a VT switch; switched back and re-verified DRM master before capturing. This is an ENVIRONMENT event, not a product result — investigate what activated the other VT." >&2
+        qdwin_recover_and_verify || return "$heal_rc"
     fi
     pid_before=$(qdwin_compositor_pid) || return 1
 
@@ -426,19 +421,32 @@ qdwin_screenshot() {
     # user cannot turn qdshell into a screenshot confused deputy. The qdshell
     # process itself writes a new 0600 file and atomically publishes it at the
     # requested runtime-dir path only after weston_capture reports complete.
-    reply=$(timeout "${QDWIN_CAPTURE_T}s" "$QDWIN_VM_EXEC" "$VMNAME" \
-        "printf 'capture Virtual-1 $guest\\n' | socat -T $QDWIN_CAPTURE_SOCAT_T - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1) || {
+    # The capture itself is retried once through the same recovery, because the
+    # pre-capture gate above cannot cover the window that matters: in the
+    # 19-wm-policy failure the seat died 1ms after the tile chord — i.e. AFTER
+    # the gate passed and BEFORE/DURING this request. A takeaway here does not
+    # fail fast, it makes the capture task sit unserviced in
+    # pending_capture_list (nothing repaints while OFFSCREEN) until the timeout
+    # expires. Recover, then ask once more.
+    local attempt
+    for attempt in 1 2; do
+        reply=$(timeout "${QDWIN_CAPTURE_T}s" "$QDWIN_VM_EXEC" "$VMNAME" \
+            "printf 'capture Virtual-1 $guest\\n' | socat -T $QDWIN_CAPTURE_SOCAT_T - UNIX-CONNECT:/run/user/1000/qdshell.sock" 2>&1)
+        case "${reply:-}" in
+            ok\ output=Virtual-1\ width=*\ height=*\ path="$guest") break ;;
+        esac
+        if [ "$attempt" = 1 ]; then
+            echo "NOTE: capture attempt 1 failed (${reply:-timed out}); checking for a VT takeaway during the capture" >&2
+            rm -f "$host_tmp"
+            if qdwin_recover_and_verify; then
+                "$QDWIN_VM_EXEC" "$VMNAME" "rm -f '$guest'" >/dev/null 2>&1 || true
+                continue
+            fi
+        fi
         echo "ERROR: shell-capture-failed: ${reply:-capture command timed out}" >&2
         qdwin_capture_fail_cleanup "$guest"
         return 1
-    }
-    case "$reply" in
-        ok\ output=Virtual-1\ width=*\ height=*\ path="$guest") ;;
-        *)
-            echo "ERROR: shell-capture-failed: $reply" >&2
-            qdwin_capture_fail_cleanup "$guest"
-            return 1 ;;
-    esac
+    done
     # The reply dimensions are cross-checked against the decoded PNG below.
     reply_w=$(sed -n 's/.* width=\([0-9]*\) .*/\1/p' <<<"$reply")
     reply_h=$(sed -n 's/.* height=\([0-9]*\) .*/\1/p' <<<"$reply")
@@ -552,30 +560,113 @@ qdwin_capture_fail_cleanup() {
 # step of any scenario.
 qdwin_session_healthy() {
     qdwin_require_vm || return 2
+    local vt_before
     "$QDWIN_VM_EXEC" "$VMNAME" \
         "test -S /run/user/1000/wayland-1 && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active --quiet qdwin-compositor.service && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active --quiet qdshell.service" || {
         echo "ERROR: qdwin-session-unhealthy: socket or user unit unavailable" >&2
         return 1
     }
+    # Read the active VT BEFORE the master check so qdwin_vt_stamp can refuse to
+    # stamp when it changed underneath us (see there).
+    vt_before=$("$QDWIN_VM_EXEC" "$VMNAME" \
+        "cat /sys/class/tty/tty0/active 2>/dev/null || true" 2>/dev/null | tr -d '\r\n')
     qdwin_drm_master_ok || return $?
-    qdwin_vt_stamp
+    qdwin_vt_stamp "$vt_before"
 }
 
 # Where the guest records the VT the compositor was proven healthy on.
 QDWIN_VT_STAMP=${QDWIN_VT_STAMP:-/run/user/1000/qdwin-active-vt}
 
-# Record the VT the compositor currently owns. Only ever called right after
-# qdwin_drm_master_ok succeeded, so the active VT *is* the compositor's: holding
-# DRM master requires it. Nothing else records this — the compositor is started
-# with no --tty and has no logind seat, so seatd allocates its VT dynamically
-# and the number appears in no unit, config, or log. Without this stamp a later
-# VT takeaway is unrecoverable simply because we would not know where to switch
-# back to. Best-effort: a failure here must never fail a healthy session.
+# Record the VT the compositor currently owns, and re-arm K_OFF on it.
+#
+# Only ever called right after qdwin_drm_master_ok succeeded. "Holds DRM master
+# => the active VT is the compositor's" is NOT true of DRM in general (master is
+# not VT-coupled), but it IS true under this stack: seatd is VT-bound and drops
+# master synchronously on switch-away, and the kcmp gate in qdwin_drm_master_ok
+# proves the master is the seatd-brokered one. The condition is what makes the
+# stamp sound. Nothing else records the VT — weston starts with no --tty and
+# admin has no logind seat, so the VT is simply whichever was current when seatd
+# opened the client, and it appears in no unit, config, or log.
+#
+# The stamp is written only when the active VT is the SAME before and after the
+# master check. Those are separate vm-exec round-trips, hundreds of ms apart, so
+# a takeaway inside that window would otherwise stamp the FOREIGN VT — and
+# qdwin_vt_recover would then faithfully "recover" into it and declare the wrong
+# VT canonical.
+#
+# It also re-arms K_OFF on that VT. seatd installs K_OFF at session takeover,
+# but getty@tty1 shares the VT in profiles that leave it enabled and its
+# start-time TTY reset reverts the keyboard to K_UNICODE — at which point the
+# kernel console interprets injected chords itself (the openSUSE keymap maps
+# Super to Alt and Alt+Left to Decr_Console, so a tile chord becomes a console
+# switch). Re-arming here immunizes existing golden images with no rebake, and
+# the WARN doubles as detection of the getty-reset race. Best-effort throughout:
+# nothing here may fail an otherwise healthy session.
 qdwin_vt_stamp() {
-    "$QDWIN_VM_EXEC" "$VMNAME" \
-        "cat /sys/class/tty/tty0/active > '$QDWIN_VT_STAMP' 2>/dev/null || true" \
-        >/dev/null 2>&1 || true
+    local before="$1"
+    "$QDWIN_VM_EXEC" "$VMNAME" '
+before='"'$before'"'
+now=$(cat /sys/class/tty/tty0/active 2>/dev/null || true)
+case "$now" in tty[0-9]*) ;; *) exit 0 ;; esac
+if [ -n "$before" ] && [ "$before" != "$now" ]; then
+    echo "vt-stamp: active VT changed $before -> $now during the health check; not stamping" >&2
+    exit 0
+fi
+printf %s "$now" > '"'$QDWIN_VT_STAMP'"' 2>/dev/null || true
+# Re-arm K_OFF so the kernel console cannot consume injected chords.
+python3 - "$now" <<'"'"'PY'"'"'
+import fcntl, os, sys, struct
+KDGKBMODE, KDSKBMODE, K_OFF = 0x4B44, 0x4B45, 0x04
+vt = sys.argv[1]
+try:
+    fd = os.open("/dev/" + vt, os.O_RDONLY | os.O_NOCTTY)
+except OSError:
+    sys.exit(0)
+try:
+    buf = fcntl.ioctl(fd, KDGKBMODE, struct.pack("i", 0))
+    mode = struct.unpack("i", buf)[0]
+    if mode != K_OFF:
+        names = {0: "K_RAW", 1: "K_XLATE", 2: "K_MEDIUMRAW", 3: "K_UNICODE", 4: "K_OFF"}
+        try:
+            fcntl.ioctl(fd, KDSKBMODE, K_OFF)
+            print("WARN: console keyboard on %s was %s, not K_OFF — injected chords "
+                  "could VT-switch (kernel keymap: Super=Alt, Alt+Left=Decr_Console). "
+                  "Re-armed K_OFF." % (vt, names.get(mode, mode)), file=sys.stderr)
+        except OSError as e:
+            print("WARN: console keyboard on %s is %s, not K_OFF, and re-arming "
+                  "failed (%s) — injected chords may VT-switch."
+                  % (vt, names.get(mode, mode), e), file=sys.stderr)
+except OSError:
+    pass
+finally:
+    os.close(fd)
+PY
+' >/dev/null || true
     return 0
+}
+
+# Recover a VT takeaway and wait for the session to come back.
+#
+# Returns 0 only if a switch happened AND health returned. VT_WAITACTIVE returns
+# as soon as the VT is active, but everything that makes the session usable
+# again is asynchronous after that: seatd re-enables the client, weston's
+# handle_enable_seat -> session_notify re-acquires DRM master and re-enables
+# libinput devices. A single immediate re-check therefore races that tail and
+# would turn a recoverable event into ERROR on a loaded host — so poll.
+QDWIN_VT_RECOVER_WAIT_S=${QDWIN_VT_RECOVER_WAIT_S:-6}
+qdwin_recover_and_verify() {
+    qdwin_vt_recover || return 1
+    local deadline=$((SECONDS + QDWIN_VT_RECOVER_WAIT_S))
+    while :; do
+        if qdwin_session_healthy >/dev/null 2>&1; then
+            echo "WARN: recovered-vt-takeaway: the compositor had lost its seat to a VT switch; switched back to the stamped VT and re-verified DRM master. This is an ENVIRONMENT event, not a product result. Re-activation also re-arms K_OFF, so the session is immune to the same chord afterwards." >&2
+            return 0
+        fi
+        [ "$SECONDS" -ge "$deadline" ] && break
+        sleep 0.3
+    done
+    echo "ERROR: vt-recover-insufficient: switched back to the stamped VT but the session did not become healthy within ${QDWIN_VT_RECOVER_WAIT_S}s" >&2
+    return 1
 }
 
 # Undo an EXTERNAL VT takeaway by switching back to the stamped compositor VT.
