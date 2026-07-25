@@ -861,6 +861,21 @@ def check_nested_proxy_forwards_secctx(source):
     if "proxy_secctx_set" not in create:
         return fail("qdwin_nested_proxy_create does not stash the advertiser "
                     "secctx tag on the proxy (proxy_secctx_set)")
+    # The stash must be armed all-or-nothing. The accessors are guaranteed
+    # non-NULL (""), so a NULL field can only be a failed strdup — and the
+    # send path normalises NULL to "", so arming on a PARTIAL capture would
+    # emit a tagged-looking event with an empty field (an empty instance_id
+    # the shell cannot match, so the placeholder times out anyway while the
+    # event claims the window IS identified). Emitting nothing is the honest
+    # degradation, and it keeps "an event was sent" meaning "all three fields
+    # are the advertiser's".
+    m = re.search(
+        r"proxy_secctx_set\s*=\s*tl->proxy_secctx_engine\s*&&\s*"
+        r"tl->proxy_secctx_app_id\s*&&\s*tl->proxy_secctx_instance", create)
+    if not m:
+        return fail("qdwin_nested_proxy_create arms proxy_secctx_set without "
+                    "requiring all three stashed fields — a partial (OOM) "
+                    "capture would emit a secctx event with an empty field")
     lookup_pos = create.find("qdwin_secctx_client_lookup")
     added_pos = create.find("qdwin_send_toplevel_added")
     if added_pos < 0 or lookup_pos < 0 or lookup_pos > added_pos:

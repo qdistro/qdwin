@@ -20893,7 +20893,24 @@ qdwin_nested_proxy_create(struct qdwin *qdwin,
 				qdwin_xstrdup_or_null(qdwin_secctx_client_app_id(sc));
 			tl->proxy_secctx_instance =
 				qdwin_xstrdup_or_null(qdwin_secctx_client_instance_id(sc));
-			tl->proxy_secctx_set = true;
+			/* The accessors are guaranteed non-NULL (""), so a NULL here
+			 * can only be a failed strdup. Do NOT arm the stash on a
+			 * partial capture: the send path normalises NULL to "", so we
+			 * would emit a tagged-looking event with an empty field —
+			 * worst case an empty instance_id, which the shell cannot
+			 * match, so the placeholder times out anyway while the event
+			 * claims the window IS identified. Emitting nothing is the
+			 * honest degradation (absence == not sandboxed), and it keeps
+			 * "a secctx event was sent" meaning "all three fields are the
+			 * advertiser's". */
+			tl->proxy_secctx_set = tl->proxy_secctx_engine &&
+					       tl->proxy_secctx_app_id &&
+					       tl->proxy_secctx_instance;
+			if (!tl->proxy_secctx_set)
+				weston_log("qdwin: WARN: could not stash the advertiser "
+					   "secctx for nested proxy handle=%u (OOM); "
+					   "emitting no toplevel_security_context\n",
+					   tl->handle);
 		}
 	}
 
