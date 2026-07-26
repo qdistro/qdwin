@@ -2,10 +2,10 @@
 
 A libweston shell plugin that hosts the qdistro desktop. Single-seat,
 single-user, designed for one trusted shell client (typically
-[qdshell](https://codeberg.org/qdistro/qdshell)) plus arbitrary
+[qdshell](https://github.com/qdistro/qdshell)) plus arbitrary
 sandboxed application clients placed by the shell.
 
-qdwin is the compositor half of [qdistro](https://codeberg.org/qdistro/qdistro)
+qdwin is the compositor half of [qdistro](https://github.com/qdistro/qdistro)
 but is published as a separate project: nothing in qdwin assumes the
 qdistro broker, the qdshell QML stack, or the qdistro userland is
 present. A different shell can adopt it.
@@ -58,8 +58,8 @@ the canonical 3-repo checkout layout.
 ## What's NOT in here
 
 The qdistro userland — broker, polkit agent, SDK, vault, admin app,
-etc. — lives in the [qdistro umbrella repo](https://codeberg.org/qdistro/qdistro).
-The qdshell QML lives in [qdshell](https://codeberg.org/qdistro/qdshell).
+etc. — lives in the [qdistro umbrella repo](https://github.com/qdistro/qdistro).
+The qdshell QML lives in [qdshell](https://github.com/qdistro/qdshell).
 
 Several daemons that consume qdwin protocols (`qdistro-cursor-sprites`,
 `qdistro-nested-pixelfeed`, `qdistro-secctx-exec`, `qdistro-tier1-exec`,
