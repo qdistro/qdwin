@@ -14,8 +14,9 @@ not that a real RDP client successfully decodes them).
 ## Prerequisites
 
 This scenario REQUIRES:
-- `freerdp3` (or `freerdp2`) installed on the host (`xfreerdp` or
-  `xfreerdp3` on $PATH).
+- `freerdp3` (or `freerdp2`) installed in the VM (`xfreerdp` or
+  `xfreerdp3` on $PATH). The disposable VMs use QEMU user networking, so
+  their guest-only RDP listener has no host-routable address.
 - `qdistro-forward` installed on the VM (built via
   `qdistro/daemons/forward/` — present in the baseweed bake).
 - `qdwin-bystander` v ≥ 2026-05-14 installed on the VM (its
@@ -26,7 +27,7 @@ This scenario REQUIRES:
   pipewire output, qdwin emits `denied "no free pipewire output"`
   and the rest of the scenario short-circuits.
 
-Fail loudly if any of the *infrastructure* prereqs above (host `xfreerdp`,
+Fail loudly if any of the *infrastructure* prereqs above (VM `xfreerdp`,
 VM `qdistro-forward`, `qdwin-bystander`, a free pipewire output) is missing;
 do not skip those. The *subject* app `foot`, however, is part of the opt-in
 `QDWIN_APP_DEPS` matrix: on a lean GUI golden (no `QDWIN_APP_DEPS=1`) it is
@@ -40,9 +41,10 @@ source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
 qdwin_session_healthy || { echo "FAIL: qdwin session not up"; exit 1; }
 
-# Host: confirm xfreerdp exists.
-command -v xfreerdp >/dev/null 2>&1 || command -v xfreerdp3 >/dev/null 2>&1 \
-    || { echo "FAIL: install freerdp3 on host"; exit 1; }
+# VM: confirm xfreerdp exists. The RDP listener is guest-local under QEMU user
+# networking, so the real client must run in this same disposable VM.
+"$QDWIN_VM_EXEC" "$VMNAME" 'command -v xfreerdp >/dev/null 2>&1 || command -v xfreerdp3 >/dev/null 2>&1' \
+    || { echo "FAIL: install freerdp3 in the VM"; exit 1; }
 
 # VM: confirm qdistro-forward.
 "$QDWIN_VM_EXEC" "$VMNAME" 'test -x /usr/bin/qdistro-forward' \
@@ -126,53 +128,35 @@ prereq failure, fail loud.)
 **Assert (2.1):** prints `TCP_OPEN` (qdistro-forward is listening
 on the announced port and the kernel accepts a connection).
 
-### Step 3 — host xfreerdp handshake
+### Step 3 — guest-local full xfreerdp session
 
 ```bash
-VM_IP=$(virsh -c qemu:///session domifaddr "$VMNAME" \
-        | awk '/ipv4/{print $4}' | sed 's|/.*||')
-[ -n "$VM_IP" ] || { echo "FAIL: no VM IP"; exit 1; }
-
-# +auth-only: TLS + auth + capability exchange only, NO video render.
-# /cert:ignore: skip server-cert pinning (TOFU is a separate test).
-timeout 15 xfreerdp /v:$VM_IP:$RDP_PORT \
-    /cert:ignore \
-    /u:test /p:$RDP_PASSWORD \
-    +auth-only 2>&1 | tee /tmp/15-xfreerdp.log
+RDP_CLIENT_B64=$(base64 -w0 <<EOF
+set -o pipefail
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 \\
+  timeout 8 xfreerdp /v:127.0.0.1:$RDP_PORT /cert:ignore \\
+  /u:test /p:$RDP_PASSWORD /size:640x480 +decorations -encryption \\
+  > /tmp/15-xfreerdp.log 2>&1
+rc=\$?
+# A full client remains connected until the deliberate timeout. Any earlier
+# exit is a handshake/auth/framebuffer failure and must stay red.
+[ "\$rc" -eq 124 ] || { cat /tmp/15-xfreerdp.log; exit "\$rc"; }
+EOF
+)
+"$QDWIN_VM_EXEC" "$VMNAME" "echo $RDP_CLIENT_B64 | base64 -d | bash"
 ```
 
-**Assert (3.1):** xfreerdp's last log line is
-`Authentication only, exit status` (or a successful disconnect)
-and exit code is 0. Failure modes that should fail this assert:
+**Assert (3.1):** qdistro-forward's log shows `auth OK for user=test` and
+xfreerdp's guest log shows both local and remote framebuffer initialization.
+The client must remain connected until the deliberate timeout. This exercises
+the shadow server's post-connect authentication path; `+auth-only` exits before
+that path in FreeRDP 3.30 and is not a valid authentication test.
 
-- Exit code != 0 → handshake failed.
+Failure modes that should fail this assert:
+
+- Exit before the deliberate timeout → handshake, auth, or framebuffer setup failed.
 - "TLS connection failed" → cert/port mismatch.
 - "Failed to authenticate" → password mismatch (rotation race?).
-
-### Step 4 — frame capture path (visual)
-
-For a full frame-level test, run xfreerdp WITHOUT `+auth-only`:
-
-```bash
-DISPLAY=:0 xfreerdp /v:$VM_IP:$RDP_PORT \
-    /cert:ignore /u:test /p:$RDP_PASSWORD \
-    /size:640x480 +decorations -encryption \
-    /timeout:8000 &
-XFREERDP_PID=$!
-sleep 4
-# Screenshot the xfreerdp output window
-import -window xfreerdp /tmp/15-rdp-client.png 2>/dev/null \
-  || gnome-screenshot -w -f /tmp/15-rdp-client.png 2>/dev/null \
-  || true
-kill $XFREERDP_PID 2>/dev/null; wait 2>/dev/null
-ls -la /tmp/15-rdp-client.png
-```
-
-**Assert (4.1):** `/tmp/15-rdp-client.png` exists and is non-zero
-size; visual inspection shows the foot terminal contents (the
-remote view of the subject toplevel). This step requires a host
-display server — skip if $DISPLAY isn't set and report
-"requires X" rather than passing falsely.
 
 ### Step 5 — disconnect cleanup
 
@@ -196,9 +180,7 @@ pid=$FORWARD_PID` shortly after.
 
 ## Pass criteria
 
-Asserts 1.1, 1.2, 2.1, 3.1 pass at minimum (the
-handshake-completing-end-to-end path). 4.1 + 5.1 pass when a host
-display is available. The original `s3c-e2e` test in
+Asserts 1.1, 1.2, 2.1, 3.1, and 5.1 pass. The original `s3c-e2e` test in
 `compositor-shell.bats` proves the qdistro-forward → port-accepts
 + frames-flow path; THIS scenario adds the missing real-RDP-client
 half (xfreerdp completing the TLS handshake and decoding frames).
@@ -219,11 +201,9 @@ half (xfreerdp completing the TLS handshake and decoding frames).
 - 3.1 auth failure: password from subscribe doesn't match.
   Rotation race — qdistro-forward may have generated a new
   password between subscribe and xfreerdp launch. Re-subscribe.
-- 4.1 black screen: frames flowing in qdistro-forward (s3c-e2e
-  PASSes) but xfreerdp displays black. Pixel format mismatch
-  between PipeWire output (default BGRA) and RDP wire format
-  (typically RGB/16). Inspect the FreeRDP debug output with
-  `wlog.level=debug`.
+- 3.1 framebuffer failure: frames flow in qdistro-forward (s3c-e2e
+  PASSes) but xfreerdp cannot initialize its framebuffers. Inspect the
+  guest `/tmp/15-xfreerdp.log` with `wlog.level=debug`.
 
 ## History
 
