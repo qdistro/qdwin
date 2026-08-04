@@ -322,10 +322,51 @@ qdwin_apps_type() {
 qdwin_apps_log_grep() {
     qdwin_apps_require_vm || return 1
     local pattern="$1"
-    local b64
+    local b64 pattern_b64
+    pattern_b64=$(printf '%s' "$pattern" | base64 -w0)
     b64=$(base64 -w0 <<EOGREP
-grep -E '$pattern' /home/admin/.local/share/qdwin.log /tmp/bystander.log 2>/dev/null
+pattern=\$(printf '%s' '$pattern_b64' | base64 -d)
+{
+    runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+        journalctl --user -b -u qdwin-compositor.service --no-pager -o cat 2>/dev/null
+    cat "$QDWIN_BYSTANDER_LOG" 2>/dev/null || true
+} | grep -E "\$pattern"
 EOGREP
+)
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+}
+
+# Return a cursor at the current end of qdwin-compositor.service's user journal.
+# Scenarios capture this before an action and query only the resulting delta, so
+# a stale line from compositor startup cannot satisfy an action assertion.
+qdwin_apps_journal_cursor() {
+    qdwin_apps_require_vm || return 1
+    local b64
+    b64=$(base64 -w0 <<'EOCURSOR'
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    journalctl --user -b -u qdwin-compositor.service -n0 --show-cursor \
+    2>/dev/null | sed -n 's/^-- cursor: //p'
+EOCURSOR
+)
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+}
+
+# qdwin_apps_log_since_cursor <cursor> <extended-regexp>
+# Print matching qdwin compositor lines emitted strictly after <cursor>.
+qdwin_apps_log_since_cursor() {
+    qdwin_apps_require_vm || return 1
+    local cursor=$1 pattern=$2 b64 cursor_b64 pattern_b64
+    [ -n "$cursor" ] || { echo "qdwin-apps: journal cursor is empty" >&2; return 2; }
+    cursor_b64=$(printf '%s' "$cursor" | base64 -w0)
+    pattern_b64=$(printf '%s' "$pattern" | base64 -w0)
+    b64=$(base64 -w0 <<EOJOURNAL
+cursor=\$(printf '%s' '$cursor_b64' | base64 -d)
+pattern=\$(printf '%s' '$pattern_b64' | base64 -d)
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    journalctl --user -b -u qdwin-compositor.service \
+    --after-cursor "\$cursor" --no-pager -o cat 2>/dev/null \
+    | grep -E "\$pattern"
+EOJOURNAL
 )
     "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
 }

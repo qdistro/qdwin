@@ -73,8 +73,10 @@ The helper provides:
   use QMP `input-send-event`; do not substitute `virsh send-key` for a chord.
 - `qdwin_apps_kill_all` — `pkill -u admin -9` everything we might have
   started; for Cleanup blocks.
-- `qdwin_apps_log_grep <pattern>` — pull and grep
-  `/home/admin/.local/share/qdwin.log` from the VM.
+- `qdwin_apps_log_grep <pattern>` — grep the current boot's
+  `qdwin-compositor.service` user journal plus `/tmp/bystander.log`.
+- `qdwin_apps_journal_cursor` / `qdwin_apps_log_since_cursor <cursor> <pattern>`
+  — capture a pre-action qdwin journal boundary and inspect only its delta.
 
 ## As the runner subagent
 
