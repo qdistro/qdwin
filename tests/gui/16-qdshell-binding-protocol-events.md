@@ -48,6 +48,27 @@ qdwin_session_healthy || { echo "FAIL: session not up"; exit 1; }
     || { echo "ERROR: qdistro-test-window not installed on VM (cannot exercise protocol events)"; exit 1; }
 
 "$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -f "[q]distro-test-window" 2>/dev/null; sleep 1' >/dev/null
+
+# PRECONDITION (infra): bar text needs real fontconfig faces. Goldens baked
+# with QDWIN_APP_DEPS=0 used to ship without dejavu/liberation, which left
+# FontService at "Loaded 1 fonts, 1 monospace" and blanked every bar label
+# (Clock, ActiveWindow title, workspace numbers) even when the binding was
+# fine. Install the baseline faces if the guest has essentially none, then
+# leave qdshell to pick them up on the Step 1 restart.
+"$QDWIN_VM_EXEC" "$VMNAME" '
+  n=$(fc-list : family 2>/dev/null | sed "/^$/d" | wc -l)
+  echo "font-families-before=$n"
+  if [ "${n:-0}" -lt 2 ]; then
+    zypper -n install --no-recommends dejavu-fonts liberation-fonts >/dev/null 2>&1 || true
+    fc-cache -f >/dev/null 2>&1 || true
+  fi
+  n2=$(fc-list : family 2>/dev/null | sed "/^$/d" | wc -l)
+  echo "font-families-after=$n2"
+  [ "${n2:-0}" -ge 1 ] || {
+    echo "ERROR: no fontconfig families available (bar text cannot render; cannot exercise ActiveWindow title)"
+    exit 1
+  }
+'
 ```
 
 ## Steps
@@ -125,15 +146,20 @@ sleep 1
 qdwin_screenshot /tmp/16-step3-window-focused.png
 ```
 
-**Assert (3.1):** the screenshot's top-bar region (y in [0, 31])
-contains the substring "qd16-step2" (the spawned window's title) —
-visible because the
-`ActiveWindow` widget pulls from `Qdwin.windows`'s focused row.
-Use `tesseract` OCR or a `convert -crop` + grep on the rendered
-text. Failure here is informative: the QML side received
-toplevel_added (asserted in Step 2) but did not surface it,
-suggesting the ListModel-append path in `Services/Qdwin/Qdwin.qml`
-onToplevelAdded is broken.
+**Assert (3.1) — SOFT / NON-BLOCKING:** the screenshot's top-bar
+region (y in [0, 31]) contains the substring "qd16-step2" (the
+spawned window's title) — visible because the `ActiveWindow` widget
+pulls from `Qdwin.windows`'s focused row. Use `tesseract` OCR or a
+`convert -crop` + visual read of the rendered text.
+
+**Runner rule for 3.1:** if 3.1 is the only failing assert, the
+scenario overall result is still **PASS**. Record 3.1 as
+`SOFT-FAIL` (diagnostic) in the report and write `status.txt` =
+`PASS`. Do **not** fail the scenario on OCR flake, missing host
+tesseract, or blank antialiased glyphs alone. A 3.1-only miss is
+informative (fonts missing, ListModel title empty, or OCR noise) and
+belongs in the report body — not as a hard FAIL. Hard FAIL only when
+a required assert (1.x / 2.x / 4.x / 5.x) fails.
 
 ### Step 4 — toplevel_removed reaches QML and clears focus
 
@@ -239,13 +265,22 @@ called `set_keyboard_focus` and qdwin honored it. Before the
 
 ## Pass criteria
 
-Asserts 1.1, 1.2, 2.1, 2.2, 4.1, 4.2, 5.1, 5.2 pass. 3.1 is a
-soft assertion — useful diagnostic but not blocking (OCR can flake
-on antialiasing). If 3.1 fails alone, the binding is fine but the
-QML-side UI consumption has a separate issue worth filing.
+**Required (hard):** asserts 1.1, 1.2, 2.1, 2.2, 4.1, 4.2, 5.1, 5.2.
+All must pass for overall PASS.
+
+**Soft (non-blocking):** assert 3.1. OCR / visual bar-title check.
+If 3.1 fails alone → overall **PASS**, status.txt = `PASS`, report
+the 3.1 miss as `SOFT-FAIL` with a one-line diagnostic. Never map a
+3.1-only miss to overall FAIL (Luna agents historically over-failed
+here when host tesseract was missing).
 
 ## Known-broken-if
 
+- 3.1 soft-fails with blank bar text while 2.x/4.x/5.x pass:
+  guest fontconfig has no real faces (FontService logs
+  `Loaded 1 fonts, 1 monospace`). Setup's font precondition should
+  install dejavu/liberation; if zypper is offline that install is
+  skipped and 3.1 stays soft. Not a binding regression.
 - 1.1 silent: qdwin saw a registry global_bind but no
   bind_as_shell follow-up. Plugin loaded, called registry_bind
   but raced/segfaulted before bind_as_shell. Check qs stderr for
