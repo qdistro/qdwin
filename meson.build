@@ -1126,6 +1126,7 @@ test('view-stream-lifecycle',
   args: [
     files('qdwin/test_view_stream_lifecycle.py'),
     files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-shell-v1.xml'),
   ],
 )
 

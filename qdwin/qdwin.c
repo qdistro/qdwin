@@ -659,6 +659,9 @@ struct qdwin_view_stream {
 	struct qdwin *qdwin;
 	struct qdwin_toplevel *tl;
 	uint32_t toplevel_handle;         /* stable after tl is destroyed */
+	int listed;                       /* link is in qdwin::view_streams */
+	int server_state_released;        /* server-owned state revoked exactly once */
+	int torn_down_sent;               /* server-side terminal event sent */
 	struct weston_output *pw_output;  /* pipewire output currently pinned */
 	struct weston_output *prev_output; /* restore target on teardown */
 	struct weston_coord_global prev_pos;
@@ -5179,15 +5182,57 @@ qdwin_view_stream_disarm_pidfd(struct qdwin_view_stream *s)
 		close(fd);
 }
 
+/* Revoke everything that makes a stream live, exactly once, independently of
+ * the client-owned qdwin_view_stream_v1 resource. A client may ignore the
+ * terminal event indefinitely; it must not retain a PipeWire output, input
+ * capability, seat, child process, or a discoverable access token while its
+ * lightweight protocol tombstone waits for destroy/disconnect. */
+static void
+qdwin_view_stream_release_server_state(struct qdwin_view_stream *s)
+{
+	if (s->server_state_released)
+		return;
+	s->server_state_released = 1;
+
+	if (s->input_handle) {
+		struct wl_resource *h = s->input_handle;
+		s->input_handle = NULL;
+		s->input_claimed = 0;
+		wl_resource_set_user_data(h, NULL);
+		wl_resource_destroy(h);
+	}
+	qdwin_view_stream_reap_forward(s);
+	qdwin_view_stream_unpin(s);
+	qdwin_stream_seat_release(s);
+	if (s->listed) {
+		wl_list_remove(&s->link);
+		wl_list_init(&s->link);
+		s->listed = 0;
+	}
+
+	/* No released stream remains token-addressable (it is already off the
+	 * active list), and erase the credentials retained by its tombstone. */
+	memset(s->access_token, 0, sizeof s->access_token);
+	memset(s->rdp_password, 0, sizeof s->rdp_password);
+	s->input_claimed = 0;
+	s->allow_input = 0;
+	s->tl = NULL;
+	s->pw_output = NULL;
+	s->prev_output = NULL;
+	s->rdp_port = 0;
+	weston_log("qdwin: view_stream_server_state_released handle=%u\n",
+		   s->toplevel_handle);
+}
+
 /* item 5: the forward child exited on its own (crash, exec failure, or a future
  * fatal PipeWire error). weston's signalfd handler waitpid(-1)-reaps it; we just
  * learn of the death via pidfd readiness and run the ONE teardown path: tell the
- * subscriber (torn_down "forward exited"). The stream resource is client-owned:
- * its torn_down handler sends the protocol destructor request, which then runs
- * qdwin_stream_resource_destroyed for unpin / seat release / input-handle
- * destroy / list removal / free. Destroying it here would race that request and
- * disconnect the subscriber with "invalid object". We do NOT waitpid (weston
- * owns reaping). */
+ * subscriber (torn_down "forward exited"), immediately revoke all server-owned
+ * state, and retain only the inert client-owned protocol resource. Its
+ * torn_down handler normally sends the destructor request; an ignoring client
+ * retains no output/input/token/list capability. Destroying the resource here
+ * would race a compliant client's destructor and disconnect it with "invalid
+ * object". We do NOT waitpid (weston owns reaping). */
 static int
 qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 {
@@ -5202,7 +5247,8 @@ qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 	s->forward_pid = 0;
 	weston_log("qdwin: qdistro-forward pid=%d exited; tearing down view_stream "
 		   "rdp_port=%u (forward exited)\n", (int)dead, s->rdp_port);
-	if (s->resource) {
+	if (s->resource && !s->torn_down_sent) {
+		s->torn_down_sent = 1;
 		/* The protocol event is asynchronous, so also leave a stable journal
 		 * record that identifies the stream even if its toplevel has already
 		 * been destroyed. This is the observable completion boundary used by
@@ -5212,6 +5258,7 @@ qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 			   s->toplevel_handle, (int)dead);
 		qdwin_view_stream_v1_send_torn_down(s->resource, "forward exited");
 	}
+	qdwin_view_stream_release_server_state(s);
 	return 0;
 }
 
@@ -5385,22 +5432,7 @@ qdwin_stream_resource_destroyed(struct wl_resource *resource)
 	struct qdwin_view_stream *s = wl_resource_get_user_data(resource);
 	if (!s)
 		return;
-	/* If qdistro-forward was holding an input handle, post-destroy it
-	 * via wl_resource_destroy — this also fires the handle's
-	 * resource_destroyed which clears s->input_handle. We do this
-	 * BEFORE freeing s so the handle's destroyed callback can still
-	 * read its user_data. */
-	if (s->input_handle) {
-		struct wl_resource *h = s->input_handle;
-		s->input_handle = NULL;
-		s->input_claimed = 0;
-		wl_resource_set_user_data(h, NULL);
-		wl_resource_destroy(h);
-	}
-	qdwin_view_stream_reap_forward(s);
-	qdwin_view_stream_unpin(s);
-	qdwin_stream_seat_release(s);
-	wl_list_remove(&s->link);
+	qdwin_view_stream_release_server_state(s);
 	free(s);
 }
 
@@ -5409,9 +5441,9 @@ qdwin_stream_handle_destroy(struct wl_client *client,
 			    struct wl_resource *resource)
 {
 	(void)client;
-	struct qdwin_view_stream *s = wl_resource_get_user_data(resource);
-	if (s)
-		qdwin_view_stream_v1_send_torn_down(resource, "client destroy");
+	/* destroy is itself the client's terminal acknowledgement/cancellation.
+	 * torn_down is server-originated only; replying here would either duplicate
+	 * an earlier terminal event or target a proxy the client just destroyed. */
 	wl_resource_destroy(resource);
 }
 
@@ -5501,6 +5533,7 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 	 * read-only export cannot be driven by the remote subscriber's forward. */
 	s->allow_input = allow_input ? 1 : 0;
 	wl_list_insert(&qdwin->view_streams, &s->link);
+	s->listed = 1;
 
 	wl_resource_set_implementation(stream_resource, &qdwin_stream_impl,
 				       s, qdwin_stream_resource_destroyed);

@@ -2044,9 +2044,10 @@
       <description summary="cancel forwarding and tear down">
         Releases the pipewire output, reaps the qdistro-forward child,
         and restores the view to its normal output. Clients connected
-        to the RDP endpoint see the connection drop. qdwin emits
-        `torn_down` immediately before cleaning up so the shell sees
-        the reason string for its own UI.
+        to the RDP endpoint see the connection drop. This request is the
+        client's terminal acknowledgement/cancellation, so qdwin does not
+        reply with `torn_down`; that event is reserved for server-originated
+        termination.
       </description>
     </request>
 
@@ -2092,7 +2093,11 @@
         Emitted when the stream ends from the server side — the
         subscribed RDP client disconnected, the source toplevel was
         closed, admin revoked the approval, or the compositor
-        entered locked state. The shell should destroy this object.
+        entered locked state. Before returning to its event loop, qdwin
+        revokes all server-owned stream state and makes the PipeWire output
+        reusable even if the shell ignores this event. The protocol object
+        remains as an inert tombstone until the shell destroys it or
+        disconnects; the shell should destroy it promptly.
       </description>
       <arg name="reason" type="string"/>
     </event>

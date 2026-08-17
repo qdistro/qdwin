@@ -93,7 +93,7 @@ connection open so the stream stays live:
 "$QDWIN_VM_EXEC" "$VMNAME" \
     "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
      WAYLAND_DISPLAY=wayland-1 nohup /usr/bin/qdwin-bystander \
-       --subscribe $HANDLE \
+       --ignore-torn-down --subscribe $HANDLE \
        > /tmp/15-creds.env 2>/tmp/15-bystander.err & echo \$!'" \
     > /tmp/15-bystander.pid
 sleep 1
@@ -168,7 +168,29 @@ Failure modes that should fail this assert:
 
 **Assert (5.1):** qdistro-forward exits cleanly when killed.
 qdwin should emit `qdwin: view_stream_torn_down handle=$HANDLE
-pid=$FORWARD_PID` shortly after.
+pid=$FORWARD_PID` and exactly one
+`qdwin: view_stream_server_state_released handle=$HANDLE` shortly after.
+The deliberately non-cooperative bystander remains connected and reports
+`retaining inert view_stream`; it must not report `invalid object`.
+
+### Step 6 — ignored client cannot retain the output
+
+The first protocol object is deliberately still alive. Subscribe to the same
+handle again through the bystander's FIFO:
+
+```bash
+"$QDWIN_VM_EXEC" "$VMNAME" \
+  "printf 'subscribe %s\\n' '$HANDLE' > /run/user/1000/qdwin-cmd.fifo"
+sleep 2
+```
+
+**Assert (6.1):** a second `view_stream approved` journal event names the same
+PipeWire output as Step 1 and a new forwarder PID. This proves forwarder death
+removed the old stream from the active list and made its output immediately
+reusable even though the client retained the old protocol tombstone. Kill the
+second forwarder and assert it too produces exactly one
+`view_stream_server_state_released` line. The bystander remains alive with no
+`invalid object`; disconnecting it in Cleanup frees both inert tombstones.
 
 ## Cleanup
 
@@ -176,11 +198,13 @@ pid=$FORWARD_PID` shortly after.
 "$QDWIN_VM_EXEC" "$VMNAME" \
     'kill $(pgrep -f qdistro-forward) 2>/dev/null; \
      pkill -u admin -x foot 2>/dev/null; true' >/dev/null
+"$QDWIN_VM_EXEC" "$VMNAME" \
+    'pkill -u admin -x qdwin-bystander 2>/dev/null; true' >/dev/null
 ```
 
 ## Pass criteria
 
-Asserts 1.1, 1.2, 2.1, 3.1, and 5.1 pass. The original `s3c-e2e` test in
+Asserts 1.1, 1.2, 2.1, 3.1, 5.1, and 6.1 pass. The original `s3c-e2e` test in
 `compositor-shell.bats` proves the qdistro-forward → port-accepts
 + frames-flow path; THIS scenario adds the missing real-RDP-client
 half (xfreerdp completing the TLS handshake and decoding frames).

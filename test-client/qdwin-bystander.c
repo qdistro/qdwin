@@ -177,6 +177,10 @@ struct app {
 	 * (codex impl-10/13): allow_input=1 lets the forward inject into the per-stream
 	 * seat; allow_input=0 must yield zero injected presses. */
 	int allow_input;
+	/* Test-only lifecycle probe: retain the inert protocol tombstone after a
+	 * server-side torn_down event. This proves qdwin releases server-owned
+	 * stream state without relying on a cooperative destructor request. */
+	int ignore_torn_down;
 	/* Transient per-subscribe allow_input override (-1 = use `allow_input`).
 	 * Set by the `subscribe`/`subscribelast` FIFO commands when they carry an
 	 * explicit 0/1, consumed by do_subscribe, then reset to -1. */
@@ -531,6 +535,12 @@ on_stream_torn_down(void *d, struct qdwin_view_stream_v1 *stream,
 	fprintf(stderr,
 		"qdwin-bystander: view_stream torn_down handle=%u reason=\"%s\"\n",
 		si->handle, reason ? reason : "");
+	if (si->app->ignore_torn_down) {
+		fprintf(stderr,
+			"qdwin-bystander: retaining inert view_stream handle=%u "
+			"(--ignore-torn-down)\n", si->handle);
+		return;
+	}
 	qdwin_view_stream_v1_destroy(stream);
 	si->stream = NULL;
 }
@@ -946,7 +956,8 @@ usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s [--subscribe <handle>|last] [--peer-label <s>]\n"
-		"          [--allow-input] [--inner-display <wayland-socket>]\n"
+		"          [--allow-input] [--ignore-torn-down]\n"
+		"          [--inner-display <wayland-socket>]\n"
 		"          [--forward-session] [--connect <wayland-socket>]\n"
 		"          [--forward-all-toplevels]\n",
 		argv0);
@@ -972,6 +983,8 @@ int main(int argc, char **argv)
 				 "%s", argv[++i]);
 		} else if (strcmp(argv[i], "--allow-input") == 0) {
 			g_app.allow_input = 1;          /* input-confinement gate */
+		} else if (strcmp(argv[i], "--ignore-torn-down") == 0) {
+			g_app.ignore_torn_down = 1;     /* lifecycle tombstone probe */
 		} else if ((strcmp(argv[i], "--inner-display") == 0
 			    || strcmp(argv[i], "--connect") == 0)
 			   && i + 1 < argc) {
