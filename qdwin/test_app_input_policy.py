@@ -122,12 +122,23 @@ def main() -> int:
         "grep -q '^RDP_PASSWORD='",
         "credentials did not arrive within 6 seconds",
         'eval "$CREDS"',
+        "RDP_AUTH_CURSOR=$(qdwin_apps_journal_cursor)",
+        'qdwin_apps_log_since_cursor "$RDP_AUTH_CURSOR"',
+        'pid=$FORWARD_PID reason=\\"forward exited\\"',
+        'pid=$SECOND_FORWARD_PID reason=\\"forward exited\\"',
+        "ALL_TORN_COUNT",
+        "SECOND_ALL_TORN_COUNT",
+        "FAIL: qdshell restoration did not reach compositor-bound state",
     )
     missing = [token for token in credential_tokens if token not in rdp]
     if missing:
         return fail(f"RDP scenario lacks bounded credential poll: {missing}")
     if "Step 5 — disconnect cleanup" in rdp:
         return fail("RDP scenario still overclaims subscriber-disconnect coverage")
+    restore_call = rdp.rfind("qdwin_apps_restore_shell ||")
+    trap_clear = rdp.rfind("trap - EXIT")
+    if restore_call < 0 or trap_clear < 0 or restore_call > trap_clear:
+        return fail("RDP cleanup disarms EXIT trap before checked shell restore")
 
     print("PASS: GUI input uses real chords; shell takeover/restoration and "
           "RDP credential collection use bounded observable transitions")

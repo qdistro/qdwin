@@ -193,6 +193,9 @@ on the announced port and the kernel accepts a connection).
 ### Step 3 — guest-local full xfreerdp session
 
 ```bash
+RDP_AUTH_CURSOR=$(qdwin_apps_journal_cursor) || {
+  echo "FAIL: could not capture pre-xfreerdp journal cursor"; exit 1;
+}
 RDP_CLIENT_B64=$(base64 -w0 <<EOF
 set -o pipefail
 runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=$ACTIVE_SOCKET DISPLAY=:0 \\
@@ -208,10 +211,12 @@ EOF
 "$QDWIN_VM_EXEC" "$VMNAME" "echo $RDP_CLIENT_B64 | base64 -d | bash" || {
   echo "FAIL: xfreerdp session driver failed"; exit 1;
 }
+AUTH_LOG=$(qdwin_apps_log_since_cursor "$RDP_AUTH_CURSOR" \
+  "auth OK for user=test")
 "$QDWIN_VM_EXEC" "$VMNAME" \
   "grep -q 'Local framebuffer format' /tmp/15-xfreerdp.log && \
-   grep -q 'Remote framebuffer format' /tmp/15-xfreerdp.log && \
-   journalctl _UID=1000 --no-pager | grep -q 'auth OK for user=test'" || {
+   grep -q 'Remote framebuffer format' /tmp/15-xfreerdp.log" \
+  && printf '%s\n' "$AUTH_LOG" | grep -q 'auth OK for user=test' || {
   echo "FAIL: connected session lacks auth/framebuffer evidence"; exit 1;
 }
 ```
@@ -241,10 +246,12 @@ TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor) || {
 }
 TEARDOWN_LOG=$(qdwin_apps_log_since_cursor "$TEARDOWN_CURSOR" \
   "view_stream_(torn_down|server_state_released) handle=$HANDLE")
-TORN_COUNT=$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_torn_down' || true)
+TORN_COUNT=$(printf '%s\n' "$TEARDOWN_LOG" | \
+  grep -cF "view_stream_torn_down handle=$HANDLE pid=$FORWARD_PID reason=\"forward exited\"" || true)
+ALL_TORN_COUNT=$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_torn_down' || true)
 RELEASE_COUNT=$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_server_state_released' || true)
-[ "$TORN_COUNT" -eq 1 ] && [ "$RELEASE_COUNT" -eq 1 ] || {
-  echo "FAIL: first teardown counts torn=$TORN_COUNT released=$RELEASE_COUNT"; exit 1;
+[ "$TORN_COUNT" -eq 1 ] && [ "$ALL_TORN_COUNT" -eq 1 ] && [ "$RELEASE_COUNT" -eq 1 ] || {
+  echo "FAIL: first teardown pid/reason count=$TORN_COUNT all_torn=$ALL_TORN_COUNT released=$RELEASE_COUNT"; exit 1;
 }
 "$QDWIN_VM_EXEC" "$VMNAME" \
   "pgrep -u admin -x qdwin-bystander >/dev/null && \
@@ -296,10 +303,12 @@ SECOND_TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor) || {
 sleep 1
 SECOND_TEARDOWN_LOG=$(qdwin_apps_log_since_cursor "$SECOND_TEARDOWN_CURSOR" \
   "view_stream_(torn_down|server_state_released) handle=$HANDLE")
-SECOND_TORN_COUNT=$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_torn_down' || true)
+SECOND_TORN_COUNT=$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | \
+  grep -cF "view_stream_torn_down handle=$HANDLE pid=$SECOND_FORWARD_PID reason=\"forward exited\"" || true)
+SECOND_ALL_TORN_COUNT=$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_torn_down' || true)
 SECOND_RELEASE_COUNT=$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_server_state_released' || true)
-[ "$SECOND_TORN_COUNT" -eq 1 ] && [ "$SECOND_RELEASE_COUNT" -eq 1 ] || {
-  echo "FAIL: second teardown counts torn=$SECOND_TORN_COUNT released=$SECOND_RELEASE_COUNT"; exit 1;
+[ "$SECOND_TORN_COUNT" -eq 1 ] && [ "$SECOND_ALL_TORN_COUNT" -eq 1 ] && [ "$SECOND_RELEASE_COUNT" -eq 1 ] || {
+  echo "FAIL: second teardown pid/reason count=$SECOND_TORN_COUNT all_torn=$SECOND_ALL_TORN_COUNT released=$SECOND_RELEASE_COUNT"; exit 1;
 }
 "$QDWIN_VM_EXEC" "$VMNAME" \
   "pgrep -u admin -x qdwin-bystander >/dev/null && \
@@ -324,7 +333,9 @@ second forwarder and assert it too produces exactly one
      pkill -u admin -x foot 2>/dev/null; true' >/dev/null
 # restore_shell owns the probe-client exit so it can observe qdwin's exact
 # shell-unbound boundary before starting qdshell.
-qdwin_apps_restore_shell
+qdwin_apps_restore_shell || {
+  echo "FAIL: qdshell restoration did not reach compositor-bound state"; exit 1;
+}
 trap - EXIT
 ```
 

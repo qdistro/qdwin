@@ -143,18 +143,43 @@ def main():
     reap = function_body(source, "qdwin_view_stream_reap_forward")
     if reap is None:
         return fail("forwarder reap helper is missing or malformed")
-    rc = require_order(
-        reap,
-        (
-            "qdwin_view_stream_disarm_pidfd(s)",
-            "if (s->forward_pid <= 0)",
-            "kill(s->forward_pid, SIGTERM)",
-            "s->forward_pid = 0",
-        ),
-        "client/disconnect forwarder reap",
-    )
-    if rc:
-        return rc
+    for marker in (
+        "pid_t pid = s->forward_pid",
+        "if (s->forward_pidfd >= 0)",
+        "qdwin_pidfd_send_signal(s->forward_pidfd, SIGTERM)",
+        "qdwin_view_stream_disarm_pidfd(s)",
+        "s->forward_pid = 0",
+    ):
+        if marker not in reap:
+            return fail(f"pidfd-owned reap lacks {marker!r}")
+    signal_pos = reap.index("qdwin_pidfd_send_signal(s->forward_pidfd, SIGTERM)")
+    # The pid<=0 idempotent branch may disarm early. For a live owned child,
+    # the signal must precede the final disarm and ownership clear.
+    if not (signal_pos < reap.rindex("qdwin_view_stream_disarm_pidfd(s)") <
+            reap.index("s->forward_pid = 0")):
+        return fail("live pidfd reap disarms or clears ownership before signaling")
+    if "kill(" in reap:
+        return fail("live-stream reap contains an unsafe numeric-PID signal")
+
+    spawn = function_body(source, "qdwin_view_stream_spawn_forward")
+    if spawn is None:
+        return fail("forward spawn helper is missing or malformed")
+    if "pidfd_open(qdistro-forward" not in spawn:
+        return fail("spawn lacks explicit pidfd-open failure boundary")
+    if "pre-arm SIGTERM" not in spawn or "kill(pid, SIGTERM)" not in spawn:
+        return fail("spawn lacks bounded synchronous pre-arm cleanup")
+    if "pre-arm pidfd SIGTERM" not in spawn or \
+       "qdwin_pidfd_send_signal(pidfd, SIGTERM)" not in spawn:
+        return fail("event-source arm failure does not use its local pidfd")
+    if "qdwin_pidfd_send_signal(pidfd, 0)" not in spawn:
+        return fail("spawn does not probe pidfd_send_signal before publication")
+    if spawn.rfind("kill(pid, SIGTERM)") > spawn.index("wl_event_loop_add_fd"):
+        return fail("numeric PID fallback escapes the synchronous pre-arm window")
+
+    pidfd_signal = function_body(source, "qdwin_pidfd_send_signal")
+    if pidfd_signal is None or "SYS_pidfd_send_signal" not in pidfd_signal or \
+       "__NR_pidfd_send_signal" not in pidfd_signal or "errno = ENOSYS" not in pidfd_signal:
+        return fail("pidfd_send_signal syscall wrapper lacks portable feature guards")
 
     destroyed = function_body(source, "qdwin_stream_resource_destroyed")
     if destroyed is None:

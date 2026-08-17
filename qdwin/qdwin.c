@@ -5155,6 +5155,24 @@ qdwin_pidfd_open(pid_t pid)
 #endif
 }
 
+/* Signal the process identified by an open pidfd, never by a potentially
+ * recycled numeric PID. Keep the raw syscall fallback local so this builds on
+ * libc versions that do not yet declare pidfd_send_signal(2). */
+static int
+qdwin_pidfd_send_signal(int pidfd, int sig)
+{
+#if defined(SYS_pidfd_send_signal)
+	return (int)syscall(SYS_pidfd_send_signal, pidfd, sig, NULL, 0u);
+#elif defined(__NR_pidfd_send_signal)
+	return (int)syscall(__NR_pidfd_send_signal, pidfd, sig, NULL, 0u);
+#else
+	(void)pidfd;
+	(void)sig;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
 /* item 5: DISARM the forward death-watch — idempotent. Removes the event source
  * and closes the pidfd, resetting both fields so a later call (or the death
  * callback itself) is a no-op. MUST run before the stream struct is freed and
@@ -5377,10 +5395,29 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 	if (pidfd < 0) {
 		weston_log("qdwin: pidfd_open(qdistro-forward pid=%d) failed: %m; "
 			   "killing forward + failing stream\n", (int)pid);
-		/* codex impl-27 MED: keep forward_pid set and route through the SINGLE
-		 * ownership path (disarm-noop + SIGTERM + best-effort reap + clear) so a
-		 * child that outlives the WNOHANG isn't hidden from later cleanup. */
-		qdwin_view_stream_reap_forward(s);
+		/* Still synchronous in the fork/arm window: the event loop has not
+		 * resumed and cannot reap/reuse this child PID. This is the ONLY
+		 * permitted numeric-PID signal fallback. */
+		if (kill(pid, SIGTERM) != 0 && errno != ESRCH)
+			weston_log("qdwin: pre-arm SIGTERM pid=%d failed: %m\n",
+				   (int)pid);
+		waitpid(pid, NULL, WNOHANG);
+		s->forward_pid = 0;
+		return -1;
+	}
+	/* Prove pidfd_send_signal is available before publishing this child to the
+	 * event loop. Signal 0 is non-mutating. On old kernels/libc-header mixes,
+	 * fail the spawn inside the same synchronous no-reuse window instead of
+	 * creating a live stream that could only be stopped by numeric PID later. */
+	if (qdwin_pidfd_send_signal(pidfd, 0) != 0) {
+		weston_log("qdwin: pidfd_send_signal probe failed for "
+			   "qdistro-forward pid=%d: %m; failing stream\n", (int)pid);
+		if (kill(pid, SIGTERM) != 0 && errno != ESRCH)
+			weston_log("qdwin: pre-arm SIGTERM pid=%d failed: %m\n",
+				   (int)pid);
+		close(pidfd);
+		waitpid(pid, NULL, WNOHANG);
+		s->forward_pid = 0;
 		return -1;
 	}
 	struct wl_event_source *src = wl_event_loop_add_fd(
@@ -5390,10 +5427,14 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 		weston_log("qdwin: wl_event_loop_add_fd(pidfd) failed for "
 			   "qdistro-forward pid=%d; killing forward + failing stream\n",
 			   (int)pid);
-		/* pidfd is local-only here (never stored on s, so disarm won't see it);
-		 * close it, then reap the forward via the single ownership path. */
+		/* The local pidfd still identifies the exact child. Signal through it
+		 * before close; do not fall back to the numeric PID. */
+		if (qdwin_pidfd_send_signal(pidfd, SIGTERM) != 0 && errno != ESRCH)
+			weston_log("qdwin: pre-arm pidfd SIGTERM pid=%d failed: %m\n",
+				   (int)pid);
 		close(pidfd);
-		qdwin_view_stream_reap_forward(s);
+		waitpid(pid, NULL, WNOHANG);
+		s->forward_pid = 0;
 		return -1;
 	}
 	s->forward_pidfd = pidfd;
@@ -5407,27 +5448,35 @@ qdwin_view_stream_spawn_forward(struct qdwin_view_stream *s,
 static void
 qdwin_view_stream_reap_forward(struct qdwin_view_stream *s)
 {
-	/* item 5 (codex impl-26): disarm the pidfd death-watch FIRST — before we
-	 * SIGTERM/reap or free anything — so the event loop can never dispatch
-	 * qdwin_forward_pidfd_ready against a stream we're tearing down (it would
-	 * re-enter teardown on a freed struct). Idempotent: a no-op if the death
-	 * callback already disarmed (qdwin-initiated path) or if never armed. */
-	qdwin_view_stream_disarm_pidfd(s);
-	if (s->forward_pid <= 0)
+	pid_t pid = s->forward_pid;
+	if (pid <= 0) {
+		qdwin_view_stream_disarm_pidfd(s);
 		return;
-	if (kill(s->forward_pid, SIGTERM) != 0 && errno != ESRCH)
-		weston_log("qdwin: SIGTERM qdistro-forward pid=%d failed: %m\n",
-			   (int)s->forward_pid);
+	}
+
+	/* The pidfd remains open until after signaling, so PID reuse cannot retarget
+	 * teardown. A live stream must always have an armed pidfd; if an invariant
+	 * violation leaves none, fail closed by refusing an unsafe numeric kill. */
+	if (s->forward_pidfd >= 0) {
+		if (qdwin_pidfd_send_signal(s->forward_pidfd, SIGTERM) != 0 &&
+		    errno != ESRCH)
+			weston_log("qdwin: pidfd SIGTERM qdistro-forward pid=%d "
+				   "failed: %m\n", (int)pid);
+	} else {
+		weston_log("qdwin: refusing numeric SIGTERM without pidfd for "
+			   "qdistro-forward pid=%d\n", (int)pid);
+	}
+	qdwin_view_stream_disarm_pidfd(s);
 	/* Non-blocking reap; let weston's SIGCHLD-or-idle loop catch it.
 	 * If we block here we stall the wayland dispatch. ECHILD is EXPECTED:
 	 * weston's signalfd handler waitpid(-1)-reaps EVERY child, so it may have
 	 * already reaped this forward — the result is best-effort only and is never
 	 * used to decide teardown (the pidfd death-watch alone emits torn_down). */
 	int status;
-	pid_t got = waitpid(s->forward_pid, &status, WNOHANG);
-	if (got == s->forward_pid) {
+	pid_t got = waitpid(pid, &status, WNOHANG);
+	if (got == pid) {
 		weston_log("qdwin: qdistro-forward pid=%d reaped status=%d\n",
-			   (int)s->forward_pid, status);
+			   (int)pid, status);
 	}
 	s->forward_pid = 0;
 }
