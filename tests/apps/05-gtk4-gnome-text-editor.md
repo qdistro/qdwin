@@ -41,6 +41,10 @@ qdwin_apps_screenshot /tmp/05-step2-typed.png
 **Assert (2.1):** screenshot shows `qdwin` rendered in the editing
 area (cursor blinking after the `n`). The titlebar updates to show
 `qdwin` (the auto-derived document title) with a small `Draft` label.
+The black pixels surrounding the rounded white window are the expected bare
+desktop background, not a black canvas. Report a rendering failure only when
+the window's own document area or header is black/absent; visible `qdwin` in
+the white document area plus the `qdwin`/`Draft` title satisfies this assert.
 
 ### Step 3 — maximise
 

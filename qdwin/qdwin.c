@@ -658,6 +658,7 @@ struct qdwin_view_stream {
 	struct wl_resource *resource;     /* qdwin_view_stream_v1 */
 	struct qdwin *qdwin;
 	struct qdwin_toplevel *tl;
+	uint32_t toplevel_handle;         /* stable after tl is destroyed */
 	struct weston_output *pw_output;  /* pipewire output currently pinned */
 	struct weston_output *prev_output; /* restore target on teardown */
 	struct weston_coord_global prev_pos;
@@ -5181,10 +5182,12 @@ qdwin_view_stream_disarm_pidfd(struct qdwin_view_stream *s)
 /* item 5: the forward child exited on its own (crash, exec failure, or a future
  * fatal PipeWire error). weston's signalfd handler waitpid(-1)-reaps it; we just
  * learn of the death via pidfd readiness and run the ONE teardown path: tell the
- * subscriber (torn_down "forward exited"), then destroy the stream resource so
- * qdwin_stream_resource_destroyed performs the existing unpin / seat release /
- * input-handle destroy / list removal / free. We do NOT waitpid (weston owns
- * reaping) and do NOT use s after wl_resource_destroy returns. */
+ * subscriber (torn_down "forward exited"). The stream resource is client-owned:
+ * its torn_down handler sends the protocol destructor request, which then runs
+ * qdwin_stream_resource_destroyed for unpin / seat release / input-handle
+ * destroy / list removal / free. Destroying it here would race that request and
+ * disconnect the subscriber with "invalid object". We do NOT waitpid (weston
+ * owns reaping). */
 static int
 qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 {
@@ -5200,11 +5203,14 @@ qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 	weston_log("qdwin: qdistro-forward pid=%d exited; tearing down view_stream "
 		   "rdp_port=%u (forward exited)\n", (int)dead, s->rdp_port);
 	if (s->resource) {
+		/* The protocol event is asynchronous, so also leave a stable journal
+		 * record that identifies the stream even if its toplevel has already
+		 * been destroyed. This is the observable completion boundary used by
+		 * lifecycle monitors and the end-to-end RDP scenario. */
+		weston_log("qdwin: view_stream_torn_down handle=%u pid=%d "
+			   "reason=\"forward exited\"\n",
+			   s->toplevel_handle, (int)dead);
 		qdwin_view_stream_v1_send_torn_down(s->resource, "forward exited");
-		/* Single teardown path: resource-destroyed runs reap_forward (a now
-		 * no-op disarm + early return on forward_pid==0), unpin, seat release,
-		 * list removal, free. */
-		wl_resource_destroy(s->resource);
 	}
 	return 0;
 }
@@ -5483,6 +5489,7 @@ qdwin_handle_subscribe_view_stream(struct wl_client *client,
 	s->resource = stream_resource;
 	s->qdwin = qdwin;
 	s->tl = tl;
+	s->toplevel_handle = handle;
 	s->pw_output = pw;
 	/* item 5: calloc zeroed forward_pidfd to 0 (a valid fd); reset to -1 so the
 	 * disarm helper never closes stdin if the watch was never armed. */

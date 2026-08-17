@@ -1120,6 +1120,15 @@ test('nested-identity-policy',
   ],
 )
 
+test('view-stream-lifecycle',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_view_stream_lifecycle.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # XWayland windows may expose WM_CLASS before libweston copies app_id, and
 # their wl_surface buffer can include CSD/shadow extents that set_size() must
 # not consume.  Pin both sides of that compatibility boundary.
