@@ -1152,6 +1152,7 @@ test('app-input-policy',
     files('qdwin/test_app_input_policy.py'),
     files('tests/apps/qdwin-apps-helpers.sh'),
     files('tests/apps/09-wxwidgets-audacity.md'),
+    files('tests/apps/13-rdp-subscribe-frame.md'),
   ],
 )
 

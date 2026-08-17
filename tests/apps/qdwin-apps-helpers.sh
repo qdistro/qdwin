@@ -222,19 +222,61 @@ EOSCRIPT
     fi
 }
 
-# Undo qdwin_apps_become_shell: stop the bystander and restart qdshell so the
-# normal desktop session reclaims the shell role after the app matrix finishes.
-# Best-effort. (No unmask needed — become_shell only stops, never masks.)
+# Undo qdwin_apps_become_shell: stop the bystander, wait for qdwin to release
+# the singleton role, then restart qdshell and prove its compositor-visible
+# bind. (No unmask needed — become_shell only stops, never masks.)
 qdwin_apps_restore_shell() {
     qdwin_apps_require_vm || return 1
     local b64; b64=$(base64 -w0 <<'EOSCRIPT'
+set -u
+cursor=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+  journalctl --user -b -u qdwin-compositor.service -n 0 --show-cursor \
+  --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p' | tail -1)
+[ -n "$cursor" ] || { echo "restore: could not capture journal cursor" >&2; exit 1; }
+had_bystander=0
+pgrep -u admin -x qdwin-bystander >/dev/null 2>&1 && had_bystander=1
 pkill -u admin -x qdwin-bystander 2>/dev/null || true
+if [ "$had_bystander" = 1 ]; then
+  unbound=0
+  for _i in $(seq 1 40); do
+    if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+         journalctl --user -b -u qdwin-compositor.service \
+         --after-cursor "$cursor" --no-pager -o cat 2>/dev/null \
+         | grep -qE '^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?qdwin: shell unbound$'; then
+      unbound=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$unbound" = 1 ] || {
+    echo "restore: compositor did not release probe shell role" >&2; exit 1;
+  }
+fi
 runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
-    systemctl --user start qdshell.service 2>/dev/null || true
-true
+    systemctl --user reset-failed qdshell.service 2>/dev/null || true
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user start qdshell.service 2>/dev/null || {
+  echo "restore: could not start qdshell.service" >&2; exit 1;
+}
+bound=0
+for _i in $(seq 1 60); do
+  if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+       systemctl --user is-active --quiet qdshell.service \
+     && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+       journalctl --user -b -u qdwin-compositor.service \
+       --after-cursor "$cursor" --no-pager -o cat 2>/dev/null \
+       | grep -qE '^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?qdwin: shell bound \(uid=1000 pid=[0-9]+\); replaying [0-9]+ toplevels$'; then
+    bound=1
+    break
+  fi
+  sleep 0.1
+done
+[ "$bound" = 1 ] || {
+  echo "restore: qdshell did not acquire compositor shell role" >&2; exit 1;
+}
 EOSCRIPT
 )
-    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash" >/dev/null 2>&1 || true
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
 }
 
 # Launch <name> as admin against the active wayland socket. Logs go to

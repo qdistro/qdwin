@@ -133,7 +133,19 @@ qdwin_apps_ctl "subscribe $HANDLE" || {
   echo "FAIL: bounded first subscribe FIFO write failed"; exit 1;
 }
 sleep 1
-. <(printf '\n'; "$QDWIN_VM_EXEC" "$VMNAME" 'cat /tmp/15-creds.env')
+CREDS=
+for _i in $(seq 1 30); do
+  CREDS=$("$QDWIN_VM_EXEC" "$VMNAME" \
+    'cat /tmp/15-creds.env 2>/dev/null' || true)
+  printf '%s\n' "$CREDS" | grep -q '^RDP_PASSWORD=' && break
+  sleep 0.2
+done
+printf '%s\n' "$CREDS" | grep -q '^RDP_PASSWORD=' || {
+  echo "FAIL: approved credentials did not arrive within 6 seconds"; exit 1;
+}
+# qdwin-bystander emits only fixed KEY=value protocol fields. Import the
+# complete snapshot after the bounded poll so password/port/node stay paired.
+eval "$CREDS"
 
 APPROVAL=$(qdwin_apps_log_since_cursor "$SUBSCRIBE_CURSOR" \
   "view_stream approved handle=$HANDLE" | tail -1)
@@ -216,7 +228,7 @@ Failure modes that should fail this assert:
 - "TLS connection failed" → cert/port mismatch.
 - "Failed to authenticate" → password mismatch (rotation race?).
 
-### Step 5 — disconnect cleanup
+### Step 5 — forwarder-death cleanup
 
 ```bash
 TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor) || {
@@ -310,8 +322,8 @@ second forwarder and assert it too produces exactly one
 "$QDWIN_VM_EXEC" "$VMNAME" \
     'pkill -u admin -x qdistro-forward 2>/dev/null; \
      pkill -u admin -x foot 2>/dev/null; true' >/dev/null
-"$QDWIN_VM_EXEC" "$VMNAME" \
-    'pkill -u admin -x qdwin-bystander 2>/dev/null; true' >/dev/null
+# restore_shell owns the probe-client exit so it can observe qdwin's exact
+# shell-unbound boundary before starting qdshell.
 qdwin_apps_restore_shell
 trap - EXIT
 ```
@@ -343,12 +355,14 @@ half (xfreerdp completing the TLS handshake and decoding frames).
   PASSes) but xfreerdp cannot initialize its framebuffers. Inspect the
   guest `/tmp/15-xfreerdp.log` with `wlog.level=debug`.
 
-## Separate lifecycle coverage gap
+## Lifecycle coverage boundary
 
 This scenario proves the forwarder-death terminal path, including ignored
-clients and output reuse. The protocol also names source-close, lock, and
-admin-revoke as server-originated termination reasons; those pre-existing
-paths are not exercised here and need separate end-to-end lifecycle coverage.
+clients and output reuse. Source-close and lock entry share the compositor's
+single terminal transition and are covered by the lifecycle regression test;
+they are not separately driven by this RDP scenario. Client `destroy` is a
+cancellation (and sends no `torn_down` reply), not a simulated remote-subscriber
+disconnect. There is currently no separate admin-revoke protocol request.
 
 ## History
 

@@ -297,6 +297,8 @@ static void qdwin_nested_proxy_send_close(struct qdwin_toplevel *tl);
 static void qdwin_popup_teardown(struct qdwin_popup *p);
 static void qdwin_view_stream_unpin(struct qdwin_view_stream *s);
 static void qdwin_view_stream_reap_forward(struct qdwin_view_stream *s);
+static void qdwin_view_stream_terminate(struct qdwin_view_stream *s,
+					const char *reason);
 static void qdwin_stream_seat_init(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_release(struct qdwin_view_stream *s);
 static void qdwin_stream_confine_grab_end(struct qdwin_view_stream *s);
@@ -1970,24 +1972,14 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 	}
 	qdwin_move_grab_end_for(qdwin, tl->handle);
 
-	/* IMPL-19/rung-1 crash fix: a view_stream may be confining its per-stream
-	 * pointer focus to THIS toplevel's view via an active weston_pointer_grab.
-	 * We are about to weston_view_destroy(tl->view) and free(tl); destroying the
-	 * focused view makes libweston re-pick focus, which dispatches the confine
-	 * grab's focus() callback — and freeing tl would leave s->tl dangling for any
-	 * later pointer event. Either path crashes (observed: SIGSEGV in
-	 * qdwin_stream_confine_focus → weston_pointer_set_focus during multi-stream
-	 * teardown). End the grab and detach the stream from the dying toplevel NOW;
-	 * the stream itself is torn down later when its forward exits (until then it
-	 * has no target and drops input — qdwin_stream_confine_target handles NULL). */
+	/* A source cannot outlive its export. Terminate before destroying the view:
+	 * unpin and ending the per-stream grab both still need a valid tl/view. The
+	 * termination removes each stream from view_streams, hence SAFE iteration. */
 	{
-		struct qdwin_view_stream *vs;
-		wl_list_for_each(vs, &qdwin->view_streams, link) {
-			if (vs->tl == tl) {
-				qdwin_stream_confine_grab_end(vs);
-				vs->tl = NULL;
-			}
-		}
+		struct qdwin_view_stream *vs, *next;
+		wl_list_for_each_safe(vs, next, &qdwin->view_streams, link)
+			if (vs->tl == tl)
+				qdwin_view_stream_terminate(vs, "source toplevel closed");
 	}
 
 	for (int s = 0; s < QDWIN_SIDES; s++)
@@ -5224,6 +5216,26 @@ qdwin_view_stream_release_server_state(struct qdwin_view_stream *s)
 		   s->toplevel_handle);
 }
 
+/* The sole server-originated terminal transition. It is deliberately
+ * idempotent: competing boundaries (source close, lock entry, forward death)
+ * may be observed in one event-loop turn, but the client gets exactly one
+ * event and server-owned state is revoked exactly once. The wl_resource stays
+ * alive as an inert client-owned tombstone until destroy/disconnect. */
+static void
+qdwin_view_stream_terminate(struct qdwin_view_stream *s, const char *reason)
+{
+	if (!s)
+		return;
+	if (s->resource && !s->torn_down_sent) {
+		s->torn_down_sent = 1;
+		weston_log("qdwin: view_stream_torn_down handle=%u pid=%d "
+			   "reason=\"%s\"\n", s->toplevel_handle,
+			   (int)s->forward_pid, reason);
+		qdwin_view_stream_v1_send_torn_down(s->resource, reason);
+	}
+	qdwin_view_stream_release_server_state(s);
+}
+
 /* item 5: the forward child exited on its own (crash, exec failure, or a future
  * fatal PipeWire error). weston's signalfd handler waitpid(-1)-reaps it; we just
  * learn of the death via pidfd readiness and run the ONE teardown path: tell the
@@ -5243,22 +5255,11 @@ qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 	/* Disarm FIRST: stop this (level-triggered) source from re-firing and stop
 	 * the upcoming resource-destroyed reap from touching the source/fd again. */
 	qdwin_view_stream_disarm_pidfd(s);
-	/* Drop our ownership of the pid WITHOUT waiting — weston already reaps. */
-	s->forward_pid = 0;
+	/* Keep the pid value through the terminal transition for the stable audit
+	 * log. release_server_state's non-blocking reap clears it. */
 	weston_log("qdwin: qdistro-forward pid=%d exited; tearing down view_stream "
 		   "rdp_port=%u (forward exited)\n", (int)dead, s->rdp_port);
-	if (s->resource && !s->torn_down_sent) {
-		s->torn_down_sent = 1;
-		/* The protocol event is asynchronous, so also leave a stable journal
-		 * record that identifies the stream even if its toplevel has already
-		 * been destroyed. This is the observable completion boundary used by
-		 * lifecycle monitors and the end-to-end RDP scenario. */
-		weston_log("qdwin: view_stream_torn_down handle=%u pid=%d "
-			   "reason=\"forward exited\"\n",
-			   s->toplevel_handle, (int)dead);
-		qdwin_view_stream_v1_send_torn_down(s->resource, "forward exited");
-	}
-	qdwin_view_stream_release_server_state(s);
+	qdwin_view_stream_terminate(s, "forward exited");
 	return 0;
 }
 
@@ -5886,7 +5887,8 @@ qdwin_stream_input_inject_pointer_motion(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited ||
+	if (!s || !s->qdwin || s->qdwin->locked ||
+	    !s->allow_input || !s->seat_inited ||
 	    !s->tl || !s->tl->view || !s->tl->view->surface)
 		return;                  /* allow_input=0 => read-only: drop the event */
 
@@ -5924,7 +5926,8 @@ qdwin_stream_input_inject_pointer_button(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited ||
+	if (!s || !s->qdwin || s->qdwin->locked ||
+	    !s->allow_input || !s->seat_inited ||
 	    !s->tl || !s->tl->view || !s->tl->view->surface)
 		return;                  /* allow_input=0 or detached target (toplevel
 					  * torn down, stream awaiting forward exit):
@@ -5947,7 +5950,8 @@ qdwin_stream_input_inject_pointer_axis(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited ||
+	if (!s || !s->qdwin || s->qdwin->locked ||
+	    !s->allow_input || !s->seat_inited ||
 	    !s->tl || !s->tl->view || !s->tl->view->surface)
 		return;                  /* allow_input=0 or detached target (toplevel
 					  * torn down, stream awaiting forward exit):
@@ -5971,7 +5975,8 @@ qdwin_stream_input_inject_key(
 {
 	(void)c;
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input || !s->seat_inited ||
+	if (!s || !s->qdwin || s->qdwin->locked ||
+	    !s->allow_input || !s->seat_inited ||
 	    !s->tl || !s->tl->view || !s->tl->view->surface)
 		return;                  /* allow_input=0 or detached target (toplevel
 					  * torn down, stream awaiting forward exit):
@@ -6006,7 +6011,7 @@ qdwin_stream_input_inject_modifiers(
 	 * future claimant needs explicit modifier overrides, the right
 	 * route is to add a new request that takes evdev codes, not masks. */
 	struct qdwin_view_stream *s = wl_resource_get_user_data(r);
-	if (!s || !s->allow_input)
+	if (!s || !s->qdwin || s->qdwin->locked || !s->allow_input)
 		return;                  /* allow_input=0 => read-only: drop (completeness) */
 	weston_log("qdwin: inject modifiers (advisory) stream=%u "
 		   "dep=0x%x lat=0x%x lock=0x%x grp=%u\n",
@@ -7616,6 +7621,9 @@ qdwin_handle_set_locked(struct wl_client *client,
 	}
 	qdwin->locked = want;
 	if (want) {
+		struct qdwin_view_stream *stream, *next;
+		wl_list_for_each_safe(stream, next, &qdwin->view_streams, link)
+			qdwin_view_stream_terminate(stream, "compositor locked");
 		if (wl_resource_get_version(resource) >= 17)
 			qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 		qdwin_install_lock_curtain(qdwin);
@@ -9586,6 +9594,9 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 	if (qdwin->locked == want) return;
 	qdwin->locked = want;
 	if (want) {
+		struct qdwin_view_stream *stream, *next;
+		wl_list_for_each_safe(stream, next, &qdwin->view_streams, link)
+			qdwin_view_stream_terminate(stream, "compositor locked");
 		/* Install the curtain first so the toplevels promoted below
 		 * (which insert at the head of lock_layer) naturally land above
 		 * it; qdwin_maybe_promote_lock_toplevel re-bottoms the curtain

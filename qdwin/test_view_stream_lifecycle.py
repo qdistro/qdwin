@@ -103,6 +103,25 @@ def main():
         if marker not in release:
             return fail(f"server-state release does not revoke {marker!r}")
 
+    terminate = function_body(source, "qdwin_view_stream_terminate")
+    if terminate is None:
+        return fail("server-originated termination routine is missing")
+    rc = require_order(
+        terminate,
+        (
+            "if (s->resource && !s->torn_down_sent)",
+            "s->torn_down_sent = 1",
+            "view_stream_torn_down handle=%u pid=%d",
+            "qdwin_view_stream_v1_send_torn_down",
+            "qdwin_view_stream_release_server_state(s)",
+        ),
+        "single server-originated termination routine",
+    )
+    if rc:
+        return rc
+    if "wl_resource_destroy" in terminate:
+        return fail("server termination destroys the client-owned tombstone")
+
     death = function_body(source, "qdwin_forward_pidfd_ready")
     if death is None:
         return fail("forwarder-death callback is missing or malformed")
@@ -110,27 +129,15 @@ def main():
         death,
         (
             "qdwin_view_stream_disarm_pidfd(s)",
-            "s->forward_pid = 0",
-            "s->torn_down_sent = 1",
+            'qdwin_view_stream_terminate(s, "forward exited")',
         ),
         "forwarder-death pidfd ownership",
     )
     if rc:
         return rc
-    rc = require_order(
-        death,
-        (
-            "s->torn_down_sent = 1",
-            "view_stream_torn_down handle=%u pid=%d",
-            "qdwin_view_stream_v1_send_torn_down",
-            "qdwin_view_stream_release_server_state(s)",
-        ),
-        "forwarder-death callback",
-    )
-    if rc:
-        return rc
-    if "wl_resource_destroy" in death:
-        return fail("forwarder death destroys the client-owned tombstone")
+    if "qdwin_view_stream_v1_send_torn_down" in death or \
+       "qdwin_view_stream_release_server_state(s);" in death:
+        return fail("forwarder death bypasses the single termination routine")
 
     reap = function_body(source, "qdwin_view_stream_reap_forward")
     if reap is None:
@@ -167,14 +174,43 @@ def main():
     if "wl_resource_destroy(resource)" not in client_destroy:
         return fail("client destroy does not release its protocol tombstone")
 
+    # Source removal and both privileged lock-entry paths mutate the active
+    # list, so they must use safe iteration and the same terminal transition.
+    for name, reason in (
+        ("qdwin_surface_removed", "source toplevel closed"),
+        ("qdwin_handle_set_locked", "compositor locked"),
+        ("qdwin_handle_locker_set_locked", "compositor locked"),
+    ):
+        body = function_body(source, name)
+        if body is None:
+            return fail(f"{name} is missing or malformed")
+        if "wl_list_for_each_safe" not in body:
+            return fail(f"{name} does not safely iterate terminating streams")
+        if f'qdwin_view_stream_terminate(stream, "{reason}")' not in body and \
+           f'qdwin_view_stream_terminate(vs, "{reason}")' not in body:
+            return fail(f"{name} does not route through termination routine")
+
+    # Revocation on lock is primary; locked gates at every injection boundary
+    # are defense in depth against a queued request in the same dispatch turn.
+    for name in (
+        "qdwin_stream_input_inject_pointer_motion",
+        "qdwin_stream_input_inject_pointer_button",
+        "qdwin_stream_input_inject_pointer_axis",
+        "qdwin_stream_input_inject_key",
+        "qdwin_stream_input_inject_modifiers",
+    ):
+        body = function_body(source, name)
+        if body is None or "s->qdwin->locked" not in body:
+            return fail(f"{name} lacks a locked-state injection gate")
+
     if "server-originated\n        termination" not in protocol:
         return fail("protocol does not reserve torn_down for server termination")
     if "inert tombstone" not in protocol or "ignores this event" not in protocol:
         return fail("protocol does not specify ignored-client cleanup semantics")
 
     print(
-        "PASS: server death releases active state exactly once; compliant, "
-        "ignoring, and disconnected clients retain only a valid tombstone"
+        "PASS: forward death, source close, and both lock paths terminate "
+        "exactly once; ignored clients retain only an inert tombstone"
     )
     return 0
 

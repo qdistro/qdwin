@@ -2028,8 +2028,8 @@
         time password. These are typically shown to the admin as a
         "share this" URL / QR code.
       - Observe teardown (`torn_down`) so the shell can update its UI
-        when the stream ends (subscriber disconnected, admin revoked,
-        toplevel closed, compositor locked).
+        when the forwarding process exits, the source toplevel closes,
+        or the compositor locks.
       - Cancel the forwarding by calling `destroy`.
 
       Input injection from the remote RDP subscriber is NOT handled on
@@ -2091,9 +2091,10 @@
     <event name="torn_down">
       <description summary="stream ended">
         Emitted when the stream ends from the server side — the
-        subscribed RDP client disconnected, the source toplevel was
-        closed, admin revoked the approval, or the compositor
-        entered locked state. Before returning to its event loop, qdwin
+        qdistro-forward process exited, the source toplevel was closed,
+        or the compositor entered locked state. (There is currently no
+        separate admin-revoke request; the shell cancels its own approval
+        with `destroy`.) Before returning to its event loop, qdwin
         revokes all server-owned stream state and makes the PipeWire output
         reusable even if the shell ignores this event. The protocol object
         remains as an inert tombstone until the shell destroys it or
