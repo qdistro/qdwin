@@ -96,6 +96,16 @@ qdwin_apps_screenshot /tmp/10-step1-tk.png
 # Pull it to the host so a failure (e.g. a Tk font error) is diagnosable
 # instead of a silent black screenshot.
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/tk.log" 2>&1 | tee /tmp/10-step1-tk.log
+
+# Exercise the round-trip promised by this scenario's acceptance criterion.
+qdwin_apps_ctl maxlast
+sleep 2
+qdwin_apps_screenshot /tmp/10-step1-tk-max.png
+qdwin_apps_ctl restorelast
+sleep 2
+qdwin_apps_screenshot /tmp/10-step1-tk-restore.png
+"$QDWIN_VM_EXEC" "$VMNAME" "tail -20 /tmp/bystander.log" \
+    2>&1 | tee /tmp/10-step1-bystander.log
 qdwin_apps_kill_all
 
 # ENV PREREQUISITE (not a qdwin bug): if the app log shows
@@ -114,7 +124,18 @@ fi
 a "Click me" button. Standard Tk theme (grey background, default
 ttk widgets).
 
-**Assert (1.2):** if instead `/tmp/10-step1-tk.log` contains
+**Assert (1.2):** the max screenshot shows the same widgets in a window filling
+the output, and the bystander evidence contains `cmd max handle=<N>`, state
+`0x1`, and 1280x800 geometry for that handle.
+
+**Assert (1.3):** the restore screenshot shows the complete Tk window back at
+its floating size, surrounded by black compositor background, and the
+bystander evidence contains `cmd restore handle=<N>`, state `0x0`, and the
+pre-max geometry for the same handle. The black area outside the small,
+centred window is expected when qdshell is not running; do not mistake that
+background for a black or missing application window.
+
+**Assert (1.4):** if instead `/tmp/10-step1-tk.log` contains
 `failed to allocate font`, this step is an `INFRA:` env prerequisite
 (missing VM font package), not a qdwin FAIL — see Setup/Known failure
 modes.
@@ -136,6 +157,15 @@ qdwin_apps_launch fltk "/tmp/fltk-demo" 2>&1 | tee /tmp/10-step2-launch.log
 sleep 4
 qdwin_apps_screenshot /tmp/10-step2-fltk.png
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/fltk.log" 2>&1 | tee /tmp/10-step2-fltk.log
+
+qdwin_apps_ctl maxlast
+sleep 2
+qdwin_apps_screenshot /tmp/10-step2-fltk-max.png
+qdwin_apps_ctl restorelast
+sleep 2
+qdwin_apps_screenshot /tmp/10-step2-fltk-restore.png
+"$QDWIN_VM_EXEC" "$VMNAME" "tail -20 /tmp/bystander.log" \
+    2>&1 | tee /tmp/10-step2-bystander.log
 qdwin_apps_kill_all
 fi
 ```
@@ -144,6 +174,12 @@ fi
 qdwin", File / Edit menu bar, "FLTK demo" centred header, "Text:"
 label with entry "type here", "Click me" button. Distinctive flat
 FLTK widgets.
+
+**Assert (2.2):** max fills the output and restore returns the complete FLTK
+window to its floating size. The bystander evidence must show max state
+`0x1`, restore state `0x0`, and the restored pre-max geometry for one handle.
+Black surrounding the centred restored window is the expected bare-compositor
+background, not a rendering failure.
 
 ### Step 3 — Java Swing
 
@@ -159,6 +195,15 @@ qdwin_apps_launch swing "cd /tmp && java SwingDemo" 2>&1 | tee /tmp/10-step3-lau
 sleep 10
 qdwin_apps_screenshot /tmp/10-step3-swing.png
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/swing.log" 2>&1 | tee /tmp/10-step3-swing.log
+
+qdwin_apps_ctl maxlast
+sleep 2
+qdwin_apps_screenshot /tmp/10-step3-swing-max.png
+qdwin_apps_ctl restorelast
+sleep 2
+qdwin_apps_screenshot /tmp/10-step3-swing-restore.png
+"$QDWIN_VM_EXEC" "$VMNAME" "tail -20 /tmp/bystander.log" \
+    2>&1 | tee /tmp/10-step3-bystander.log
 qdwin_apps_kill_all
 fi
 ```
@@ -166,6 +211,12 @@ fi
 **Assert (3.1):** if `HAVE_SWING=1`, screenshot shows the Swing window: title "Swing on
 qdwin", File / Edit menu bar, "Swing demo" header, "type here" text
 field, "Click me" button. Metal (Java default) look-and-feel.
+
+**Assert (3.2):** max fills the output and restore returns the complete Swing
+window to its floating size. The bystander evidence must show max state
+`0x1`, restore state `0x0`, and the restored pre-max geometry for one handle.
+Black surrounding the centred restored window is the expected bare-compositor
+background, not a rendering failure.
 
 ## Cleanup
 
@@ -179,7 +230,9 @@ qdwin_apps_kill_all
 ## Pass criteria
 
 - Each INSTALLED toolkit (`HAVE_*=1`) renders a window with the named
-  widgets, and the bystander log shows `xwayland=1` for its toplevel.
+  widgets, the bystander log shows `xwayland=1` for its toplevel, max state
+  `0x1` fills the output, and restore state `0x0` returns the same complete
+  window to its pre-max floating geometry.
 - A toolkit whose dep is absent is a **clean SKIP**, never a FAIL/ERROR:
   Tk/FLTK/Swing are opt-in `QDWIN_APP_DEPS` packages, so on a lean golden
   the whole scenario short-circuits to `SKIP` in Setup, and on a partial
