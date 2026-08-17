@@ -202,7 +202,7 @@ for _i in \$(seq 1 40); do
     if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
          journalctl --user -b -u qdwin-compositor.service \
          --after-cursor "\$cursor" --no-pager -o cat 2>/dev/null \
-         | grep -qFx 'qdwin: shell unbound'; then
+         | grep -qE '(^|\] )qdwin: shell unbound$'; then
         handoff_seen=1
         break
     fi
