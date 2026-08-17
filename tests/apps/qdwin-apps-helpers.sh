@@ -131,7 +131,8 @@ runuser -u admin -- bash -c '
     setsid qdwin-bystander >"$QDWIN_BYSTANDER_LOG" 2>&1 &
 '
 # The bystander creates the FIFO before its wayland connect, so a short poll
-# is enough; fail loudly if it never appears.
+# catches filesystem readiness. Then wait separately for compositor-visible
+# shell ownership; FIFO creation alone happens before the Wayland hello.
 for _i in \$(seq 1 40); do
     [ -p "$QDWIN_BYSTANDER_FIFO" ] && break
     sleep 0.1
@@ -141,6 +142,16 @@ done
     tail -5 "$QDWIN_BYSTANDER_LOG" 2>/dev/null >&2
     exit 1
 }
+for _i in \$(seq 1 40); do
+    grep -q 'hello uid=' "$QDWIN_BYSTANDER_LOG" 2>/dev/null && break
+    sleep 0.1
+done
+if grep -q 'shell role already claimed' "$QDWIN_BYSTANDER_LOG" 2>/dev/null \
+   || ! grep -q 'hello uid=' "$QDWIN_BYSTANDER_LOG" 2>/dev/null; then
+    echo "bystander did not acquire singleton shell role" >&2
+    tail -10 "$QDWIN_BYSTANDER_LOG" 2>/dev/null >&2
+    exit 1
+fi
 echo "become-shell ok sock=$sock fifo=$QDWIN_BYSTANDER_FIFO"
 EOSCRIPT
 )
@@ -153,8 +164,23 @@ EOSCRIPT
 # exactly one replacement and verify its hello. This avoids racing two clients
 # for qdwin's singleton shell role while still permitting probe-only flags.
 qdwin_apps_prepare_shell_probe() {
-    qdwin_apps_become_shell || return 1
-    local b64; b64=$(base64 -w0 <<EOSCRIPT
+    if ! qdwin_apps_become_shell; then
+        qdwin_apps_restore_shell
+        return 1
+    fi
+    local cursor cursor_b64 b64
+    cursor=$(qdwin_apps_journal_cursor) || {
+        qdwin_apps_restore_shell
+        return 1
+    }
+    [ -n "$cursor" ] || {
+        echo "cannot observe shell ownership handoff: empty journal cursor" >&2
+        qdwin_apps_restore_shell
+        return 1
+    }
+    cursor_b64=$(printf '%s' "$cursor" | base64 -w0)
+    b64=$(base64 -w0 <<EOSCRIPT
+cursor=\$(printf '%s' '$cursor_b64' | base64 -d)
 pkill -u admin -x qdwin-bystander 2>/dev/null || true
 for _i in \$(seq 1 40); do
     pgrep -u admin -x qdwin-bystander >/dev/null 2>&1 || break
@@ -169,11 +195,31 @@ if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
     echo "qdshell still owns/contends for the singleton shell role" >&2
     exit 1
 fi
+# Process exit is insufficient: wait until qdwin's resource-destroy callback
+# has cleared shell_bound/shell_resource and logged the ownership boundary.
+handoff_seen=0
+for _i in \$(seq 1 40); do
+    if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+         journalctl --user -b -u qdwin-compositor.service \
+         --after-cursor "\$cursor" --no-pager -o cat 2>/dev/null \
+         | grep -qFx 'qdwin: shell unbound'; then
+        handoff_seen=1
+        break
+    fi
+    sleep 0.1
+done
+[ "\$handoff_seen" = 1 ] || {
+    echo "compositor did not report shell unbound after suite bystander exit" >&2
+    exit 1
+}
 rm -f "$QDWIN_BYSTANDER_FIFO"
-echo "shell-probe slot ready fifo=$QDWIN_BYSTANDER_FIFO"
+echo "shell-probe slot ready after compositor handoff fifo=$QDWIN_BYSTANDER_FIFO"
 EOSCRIPT
 )
-    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+    if ! "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"; then
+        qdwin_apps_restore_shell
+        return 1
+    fi
 }
 
 # Undo qdwin_apps_become_shell: stop the bystander and restart qdshell so the

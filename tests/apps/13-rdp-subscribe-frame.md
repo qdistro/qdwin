@@ -64,10 +64,13 @@ if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v foot >/dev/null 2>&1'; then
     exit 0
 fi
 
+# Arm restoration before the first helper that can stop qdshell or replace the
+# singleton shell client. The helper also self-restores on failure; the trap
+# covers every later early exit from Setup/Steps.
+trap 'qdwin_apps_restore_shell' EXIT
 qdwin_apps_prepare_shell_probe || {
     echo "FAIL: could not reserve singleton shell role for RDP probe"; exit 1;
 }
-trap 'qdwin_apps_restore_shell' EXIT
 # Re-detect after takeover; never hard-code wayland-1 across compositor restarts.
 ACTIVE_SOCKET=$(qdwin_apps_active_socket)
 [ -n "$ACTIVE_SOCKET" ] || { echo "FAIL: qdwin stopped during shell takeover"; exit 1; }
@@ -94,7 +97,9 @@ ACTIVE_SOCKET=$(qdwin_apps_active_socket)
 }
 
 # Spawn a foot terminal to share.
-qdwin_apps_launch foot "foot sleep 600"
+qdwin_apps_launch foot "foot sleep 600" || {
+    echo "FAIL: could not launch foot subject"; exit 1;
+}
 sleep 2
 
 HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
@@ -121,8 +126,12 @@ lines on stdout when `approved` fires and keeps the wayland
 connection open so the stream stays live:
 
 ```bash
-SUBSCRIBE_CURSOR=$(qdwin_apps_journal_cursor)
-qdwin_apps_ctl "subscribe $HANDLE"
+SUBSCRIBE_CURSOR=$(qdwin_apps_journal_cursor) || {
+  echo "FAIL: could not capture first subscribe journal cursor"; exit 1;
+}
+qdwin_apps_ctl "subscribe $HANDLE" || {
+  echo "FAIL: bounded first subscribe FIFO write failed"; exit 1;
+}
 sleep 1
 . <(printf '\n'; "$QDWIN_VM_EXEC" "$VMNAME" 'cat /tmp/15-creds.env')
 
@@ -140,6 +149,9 @@ FIRST_PW_OUTPUT=$(printf '%s\n' "$APPROVAL" | \
 # RDP_CERT_PATH, RDP_PASSWORD. FORWARD_PID is not exposed via the
 # protocol — derive from journal if needed.
 echo "rdp_port=$RDP_PORT node=$PIPEWIRE_NODE_NAME"
+[ "$RDP_PORT" -ge 1024 ] 2>/dev/null && [ "$RDP_PORT" -le 65535 ] || {
+  echo "FAIL: approved event returned invalid RDP port: $RDP_PORT"; exit 1;
+}
 ```
 
 If qdwin-bystander is absent on the VM (older bake), fail with
@@ -159,7 +171,8 @@ prereq failure, fail loud.)
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/$RDP_PORT' && echo TCP_OPEN"
+    "timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/$RDP_PORT' && echo TCP_OPEN" \
+    || { echo "FAIL: RDP port $RDP_PORT did not accept TCP"; exit 1; }
 ```
 
 **Assert (2.1):** prints `TCP_OPEN` (qdistro-forward is listening
@@ -170,7 +183,7 @@ on the announced port and the kernel accepts a connection).
 ```bash
 RDP_CLIENT_B64=$(base64 -w0 <<EOF
 set -o pipefail
-runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 \\
+runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=$ACTIVE_SOCKET DISPLAY=:0 \\
   timeout 8 xfreerdp /v:127.0.0.1:$RDP_PORT /cert:ignore \\
   /u:test /p:$RDP_PASSWORD /size:640x480 +decorations -encryption \\
   > /tmp/15-xfreerdp.log 2>&1
@@ -180,7 +193,15 @@ rc=\$?
 [ "\$rc" -eq 124 ] || { cat /tmp/15-xfreerdp.log; exit "\$rc"; }
 EOF
 )
-"$QDWIN_VM_EXEC" "$VMNAME" "echo $RDP_CLIENT_B64 | base64 -d | bash"
+"$QDWIN_VM_EXEC" "$VMNAME" "echo $RDP_CLIENT_B64 | base64 -d | bash" || {
+  echo "FAIL: xfreerdp session driver failed"; exit 1;
+}
+"$QDWIN_VM_EXEC" "$VMNAME" \
+  "grep -q 'Local framebuffer format' /tmp/15-xfreerdp.log && \
+   grep -q 'Remote framebuffer format' /tmp/15-xfreerdp.log && \
+   journalctl _UID=1000 --no-pager | grep -q 'auth OK for user=test'" || {
+  echo "FAIL: connected session lacks auth/framebuffer evidence"; exit 1;
+}
 ```
 
 **Assert (3.1):** qdistro-forward's log shows `auth OK for user=test` and
@@ -198,18 +219,27 @@ Failure modes that should fail this assert:
 ### Step 5 — disconnect cleanup
 
 ```bash
-TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor)
+TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor) || {
+  echo "FAIL: could not capture first teardown journal cursor"; exit 1;
+}
 "$QDWIN_VM_EXEC" "$VMNAME" \
     "kill $FORWARD_PID 2>/dev/null; sleep 1; \
-     ps -p $FORWARD_PID 2>&1 | tail -1"
+     ! ps -p $FORWARD_PID >/dev/null 2>&1" || {
+  echo "FAIL: forwarder $FORWARD_PID did not exit"; exit 1;
+}
 TEARDOWN_LOG=$(qdwin_apps_log_since_cursor "$TEARDOWN_CURSOR" \
   "view_stream_(torn_down|server_state_released) handle=$HANDLE")
-[ "$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_torn_down')" -eq 1 ]
-[ "$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_server_state_released')" -eq 1 ]
+TORN_COUNT=$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_torn_down' || true)
+RELEASE_COUNT=$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_server_state_released' || true)
+[ "$TORN_COUNT" -eq 1 ] && [ "$RELEASE_COUNT" -eq 1 ] || {
+  echo "FAIL: first teardown counts torn=$TORN_COUNT released=$RELEASE_COUNT"; exit 1;
+}
 "$QDWIN_VM_EXEC" "$VMNAME" \
   "pgrep -u admin -x qdwin-bystander >/dev/null && \
    grep -q 'retaining inert view_stream handle=$HANDLE' /tmp/15-bystander.err && \
-   ! grep -q 'invalid object' /tmp/15-bystander.err"
+   ! grep -q 'invalid object' /tmp/15-bystander.err" || {
+  echo "FAIL: ignoring bystander died, missed tombstone, or hit protocol error"; exit 1;
+}
 ```
 
 **Assert (5.1):** qdistro-forward exits cleanly when killed.
@@ -225,8 +255,12 @@ The first protocol object is deliberately still alive. Subscribe to the same
 handle again through the bystander's FIFO:
 
 ```bash
-REUSE_CURSOR=$(qdwin_apps_journal_cursor)
-qdwin_apps_ctl "subscribe $HANDLE"
+REUSE_CURSOR=$(qdwin_apps_journal_cursor) || {
+  echo "FAIL: could not capture output-reuse journal cursor"; exit 1;
+}
+qdwin_apps_ctl "subscribe $HANDLE" || {
+  echo "FAIL: bounded reuse subscribe FIFO write failed"; exit 1;
+}
 sleep 2
 SECOND_APPROVAL=$(qdwin_apps_log_since_cursor "$REUSE_CURSOR" \
   "view_stream approved handle=$HANDLE" | tail -1)
@@ -234,19 +268,32 @@ SECOND_FORWARD_PID=$(printf '%s\n' "$SECOND_APPROVAL" | \
   sed -nE 's/.*forward_pid=([0-9]+).*/\1/p')
 SECOND_PW_OUTPUT=$(printf '%s\n' "$SECOND_APPROVAL" | \
   sed -nE 's/.* pw=([^ ]+).*/\1/p')
-[ -n "$SECOND_FORWARD_PID" ] && [ "$SECOND_FORWARD_PID" != "$FORWARD_PID" ]
-[ "$SECOND_PW_OUTPUT" = "$FIRST_PW_OUTPUT" ]
+[ -n "$SECOND_FORWARD_PID" ] && [ "$SECOND_FORWARD_PID" != "$FORWARD_PID" ] || {
+  echo "FAIL: reuse approval missing a new forward PID: $SECOND_APPROVAL"; exit 1;
+}
+[ "$SECOND_PW_OUTPUT" = "$FIRST_PW_OUTPUT" ] || {
+  echo "FAIL: output not reused: first=$FIRST_PW_OUTPUT second=$SECOND_PW_OUTPUT"; exit 1;
+}
 
-SECOND_TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor)
-"$QDWIN_VM_EXEC" "$VMNAME" "kill $SECOND_FORWARD_PID"
+SECOND_TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor) || {
+  echo "FAIL: could not capture second teardown journal cursor"; exit 1;
+}
+"$QDWIN_VM_EXEC" "$VMNAME" "kill $SECOND_FORWARD_PID" || {
+  echo "FAIL: could not kill second forwarder $SECOND_FORWARD_PID"; exit 1;
+}
 sleep 1
 SECOND_TEARDOWN_LOG=$(qdwin_apps_log_since_cursor "$SECOND_TEARDOWN_CURSOR" \
   "view_stream_(torn_down|server_state_released) handle=$HANDLE")
-[ "$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_torn_down')" -eq 1 ]
-[ "$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_server_state_released')" -eq 1 ]
+SECOND_TORN_COUNT=$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_torn_down' || true)
+SECOND_RELEASE_COUNT=$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_server_state_released' || true)
+[ "$SECOND_TORN_COUNT" -eq 1 ] && [ "$SECOND_RELEASE_COUNT" -eq 1 ] || {
+  echo "FAIL: second teardown counts torn=$SECOND_TORN_COUNT released=$SECOND_RELEASE_COUNT"; exit 1;
+}
 "$QDWIN_VM_EXEC" "$VMNAME" \
   "pgrep -u admin -x qdwin-bystander >/dev/null && \
-   ! grep -q 'invalid object' /tmp/15-bystander.err"
+   ! grep -q 'invalid object' /tmp/15-bystander.err" || {
+  echo "FAIL: bystander died or hit protocol error after output reuse"; exit 1;
+}
 ```
 
 **Assert (6.1):** a second `view_stream approved` journal event names the same
