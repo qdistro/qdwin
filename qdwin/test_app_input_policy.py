@@ -35,15 +35,37 @@ def main() -> int:
     # weston_log() embeds its own timestamp in MESSAGE, even with journalctl
     # -o cat. The shell handoff poll must accept that real prefix while keeping
     # the terminal event anchored so an adjacent diagnostic cannot satisfy it.
-    handoff_pattern = r"(^|\] )qdwin: shell unbound$"
-    if "grep -qE '(^|\\] )qdwin: shell unbound$'" not in helper:
+    handoff_pattern = (
+        r"^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?"
+        r"qdwin: shell unbound$"
+    )
+    shell_filter = (
+        "grep -qE '^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?"
+        "qdwin: shell unbound$'"
+    )
+    if shell_filter not in helper:
         return fail("shell handoff poll does not use the anchored, weston-"
                     "timestamp-tolerant filter")
-    actual_message = "[18:27:17.713] qdwin: shell unbound"
-    if re.search(handoff_pattern, actual_message) is None:
-        return fail("shell handoff filter rejects an actual weston journal message")
-    if re.search(handoff_pattern, actual_message + " late") is not None:
-        return fail("shell handoff filter is not end-anchored")
+    positives = (
+        "qdwin: shell unbound",
+        "[18:27:17.713] qdwin: shell unbound",
+    )
+    negatives = (
+        "noise] qdwin: shell unbound",
+        "prefix [foo] qdwin: shell unbound",
+        "[8:27:17.713] qdwin: shell unbound",
+        "[18:27:17.71] qdwin: shell unbound",
+        "[18:27:17x713] qdwin: shell unbound",
+        "[18:27:17.713] qdwin: shell unbound late",
+    )
+    rejected = [message for message in positives
+                if re.fullmatch(handoff_pattern, message) is None]
+    accepted = [message for message in negatives
+                if re.fullmatch(handoff_pattern, message) is not None]
+    if rejected:
+        return fail(f"shell handoff filter rejects valid message(s): {rejected}")
+    if accepted:
+        return fail(f"shell handoff filter accepts invalid message(s): {accepted}")
 
     print("PASS: app GUI input uses real chords and shell handoff accepts "
           "weston-prefixed journal messages")
