@@ -129,9 +129,10 @@ def main():
         death,
         (
             "qdwin_view_stream_disarm_pidfd(s)",
-            'qdwin_view_stream_terminate(s, "forward exited")',
+            "s->forward_pid = 0",
+            'qdwin_view_stream_terminate(s, "forward exited", dead)',
         ),
-        "forwarder-death pidfd ownership",
+        "forwarder-death PID ownership",
     )
     if rc:
         return rc
@@ -186,8 +187,7 @@ def main():
             return fail(f"{name} is missing or malformed")
         if "wl_list_for_each_safe" not in body:
             return fail(f"{name} does not safely iterate terminating streams")
-        if f'qdwin_view_stream_terminate(stream, "{reason}")' not in body and \
-           f'qdwin_view_stream_terminate(vs, "{reason}")' not in body:
+        if "qdwin_view_stream_terminate" not in body or reason not in body:
             return fail(f"{name} does not route through termination routine")
 
     # Revocation on lock is primary; locked gates at every injection boundary

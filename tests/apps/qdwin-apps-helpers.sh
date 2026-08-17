@@ -229,6 +229,29 @@ qdwin_apps_restore_shell() {
     qdwin_apps_require_vm || return 1
     local b64; b64=$(base64 -w0 <<'EOSCRIPT'
 set -u
+# Idempotent terminal state: prepare_shell_probe self-restores on failure and
+# the caller's EXIT trap may restore again. Prove the currently active service
+# owns the compositor role (latest lifecycle record names its MainPID) and
+# succeed without waiting for an impossible new post-cursor bind.
+if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+     systemctl --user is-active --quiet qdshell.service; then
+  qpid=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user show qdshell.service -p MainPID --value 2>/dev/null || true)
+  latest_shell=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    journalctl --user -b -u qdwin-compositor.service --no-pager -o cat \
+    2>/dev/null | grep -E '^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?qdwin: shell (unbound|bound \(uid=1000 pid=[0-9]+\); replaying [0-9]+ toplevels)$' \
+    | tail -1 || true)
+  if [ -n "$qpid" ] && [ "$qpid" -gt 0 ] 2>/dev/null \
+     && printf '%s\n' "$latest_shell" \
+        | grep -qE "^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?qdwin: shell bound \\(uid=1000 pid=$qpid\\); replaying [0-9]+ toplevels$"; then
+    echo "restore: qdshell already owns compositor shell role pid=$qpid"
+    exit 0
+  fi
+  # Active without proven ownership cannot acquire the singleton role through
+  # another `start` no-op. Stop this unhealthy/contending instance first.
+  runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user stop qdshell.service 2>/dev/null || true
+fi
 cursor=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
   journalctl --user -b -u qdwin-compositor.service -n 0 --show-cursor \
   --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p' | tail -1)
@@ -260,12 +283,15 @@ runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
 }
 bound=0
 for _i in $(seq 1 60); do
-  if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+  qpid=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user show qdshell.service -p MainPID --value 2>/dev/null || true)
+  if [ -n "$qpid" ] && [ "$qpid" -gt 0 ] 2>/dev/null \
+     && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
        systemctl --user is-active --quiet qdshell.service \
      && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
        journalctl --user -b -u qdwin-compositor.service \
        --after-cursor "$cursor" --no-pager -o cat 2>/dev/null \
-       | grep -qE '^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?qdwin: shell bound \(uid=1000 pid=[0-9]+\); replaying [0-9]+ toplevels$'; then
+       | grep -qE "^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?qdwin: shell bound \\(uid=1000 pid=$qpid\\); replaying [0-9]+ toplevels$"; then
     bound=1
     break
   fi

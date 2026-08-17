@@ -70,18 +70,52 @@ def main() -> int:
 
     restore = helper[helper.find("\nqdwin_apps_restore_shell() {") :]
     for token in (
+        "restore: qdshell already owns compositor shell role pid=$qpid",
+        "systemctl --user show qdshell.service -p MainPID --value",
+        'pid=$qpid\\\\); replaying [0-9]+ toplevels$',
         "had_bystander=0",
         'grep -qE \'^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?qdwin: shell unbound$\'',
         "systemctl --user start qdshell.service",
-        "qdwin: shell bound \\(uid=1000 pid=[0-9]+\\); replaying [0-9]+ toplevels$",
         'systemctl --user is-active --quiet qdshell.service',
     ):
         if token not in restore:
             return fail(f"shell restoration lacks compositor handoff token {token!r}")
-    if not (restore.index("shell unbound$") <
-            restore.index("systemctl --user start qdshell.service") <
-            restore.index("qdwin: shell bound")):
+    had_pos = restore.index("had_bystander=0")
+    unbound_pos = restore.index("shell unbound$", had_pos)
+    start_pos = restore.index("systemctl --user start qdshell.service")
+    bound_pos = restore.index("qdwin: shell bound", start_pos)
+    if not (unbound_pos < start_pos < bound_pos):
         return fail("shell restoration does not release-before-start-before-bind")
+
+    # Behavioral truth table for the already-restored fast path. Active alone
+    # is insufficient: the latest compositor lifecycle record must be a bound
+    # record naming the service's live MainPID. This makes a second EXIT-trap
+    # restore harmless without accepting stale/mismatched ownership.
+    def already_bound(active, main_pid, latest):
+        if not active or not main_pid or main_pid <= 0:
+            return False
+        pattern = (
+            r"^(?:\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?"
+            rf"qdwin: shell bound \(uid=1000 pid={main_pid}\); "
+            r"replaying [0-9]+ toplevels$"
+        )
+        return re.fullmatch(pattern, latest) is not None
+
+    positives = (
+        (True, 2299, "qdwin: shell bound (uid=1000 pid=2299); replaying 0 toplevels"),
+        (True, 2299, "[19:00:13.073] qdwin: shell bound (uid=1000 pid=2299); replaying 4 toplevels"),
+    )
+    negatives = (
+        (False, 2299, positives[0][2]),
+        (True, 0, positives[0][2]),
+        (True, 2300, positives[0][2]),
+        (True, 2299, "qdwin: shell unbound"),
+        (True, 2299, "prefix qdwin: shell bound (uid=1000 pid=2299); replaying 0 toplevels"),
+    )
+    if not all(already_bound(*case) for case in positives):
+        return fail("already-bound restore model rejects a valid terminal state")
+    if any(already_bound(*case) for case in negatives):
+        return fail("already-bound restore model accepts inactive/stale ownership")
 
     credential_tokens = (
         "for _i in $(seq 1 30)",

@@ -298,7 +298,7 @@ static void qdwin_popup_teardown(struct qdwin_popup *p);
 static void qdwin_view_stream_unpin(struct qdwin_view_stream *s);
 static void qdwin_view_stream_reap_forward(struct qdwin_view_stream *s);
 static void qdwin_view_stream_terminate(struct qdwin_view_stream *s,
-					const char *reason);
+					const char *reason, pid_t audit_pid);
 static void qdwin_stream_seat_init(struct qdwin_view_stream *s);
 static void qdwin_stream_seat_release(struct qdwin_view_stream *s);
 static void qdwin_stream_confine_grab_end(struct qdwin_view_stream *s);
@@ -1979,7 +1979,8 @@ qdwin_surface_removed(struct weston_desktop_surface *dsurf, void *data)
 		struct qdwin_view_stream *vs, *next;
 		wl_list_for_each_safe(vs, next, &qdwin->view_streams, link)
 			if (vs->tl == tl)
-				qdwin_view_stream_terminate(vs, "source toplevel closed");
+				qdwin_view_stream_terminate(vs, "source toplevel closed",
+							    vs->forward_pid);
 	}
 
 	for (int s = 0; s < QDWIN_SIDES; s++)
@@ -5222,7 +5223,8 @@ qdwin_view_stream_release_server_state(struct qdwin_view_stream *s)
  * event and server-owned state is revoked exactly once. The wl_resource stays
  * alive as an inert client-owned tombstone until destroy/disconnect. */
 static void
-qdwin_view_stream_terminate(struct qdwin_view_stream *s, const char *reason)
+qdwin_view_stream_terminate(struct qdwin_view_stream *s, const char *reason,
+			    pid_t audit_pid)
 {
 	if (!s)
 		return;
@@ -5230,7 +5232,7 @@ qdwin_view_stream_terminate(struct qdwin_view_stream *s, const char *reason)
 		s->torn_down_sent = 1;
 		weston_log("qdwin: view_stream_torn_down handle=%u pid=%d "
 			   "reason=\"%s\"\n", s->toplevel_handle,
-			   (int)s->forward_pid, reason);
+			   (int)audit_pid, reason);
 		qdwin_view_stream_v1_send_torn_down(s->resource, reason);
 	}
 	qdwin_view_stream_release_server_state(s);
@@ -5255,11 +5257,14 @@ qdwin_forward_pidfd_ready(int fd, uint32_t mask, void *data)
 	/* Disarm FIRST: stop this (level-triggered) source from re-firing and stop
 	 * the upcoming resource-destroyed reap from touching the source/fd again. */
 	qdwin_view_stream_disarm_pidfd(s);
-	/* Keep the pid value through the terminal transition for the stable audit
-	 * log. release_server_state's non-blocking reap clears it. */
+	/* A readable pidfd identifies the exited child, but the numeric PID may be
+	 * reused as soon as weston reaps it. Relinquish ownership BEFORE generic
+	 * cleanup so reap_forward can never SIGTERM an unrelated reused PID. Keep
+	 * the saved value only as audit data for the terminal journal record. */
+	s->forward_pid = 0;
 	weston_log("qdwin: qdistro-forward pid=%d exited; tearing down view_stream "
 		   "rdp_port=%u (forward exited)\n", (int)dead, s->rdp_port);
-	qdwin_view_stream_terminate(s, "forward exited");
+	qdwin_view_stream_terminate(s, "forward exited", dead);
 	return 0;
 }
 
@@ -7623,7 +7628,8 @@ qdwin_handle_set_locked(struct wl_client *client,
 	if (want) {
 		struct qdwin_view_stream *stream, *next;
 		wl_list_for_each_safe(stream, next, &qdwin->view_streams, link)
-			qdwin_view_stream_terminate(stream, "compositor locked");
+			qdwin_view_stream_terminate(stream, "compositor locked",
+						    stream->forward_pid);
 		if (wl_resource_get_version(resource) >= 17)
 			qdwin_overlay_grab_start(qdwin, /* role=locker */ 2);
 		qdwin_install_lock_curtain(qdwin);
@@ -9596,7 +9602,8 @@ qdwin_handle_locker_set_locked(struct wl_client *client,
 	if (want) {
 		struct qdwin_view_stream *stream, *next;
 		wl_list_for_each_safe(stream, next, &qdwin->view_streams, link)
-			qdwin_view_stream_terminate(stream, "compositor locked");
+			qdwin_view_stream_terminate(stream, "compositor locked",
+						    stream->forward_pid);
 		/* Install the curtain first so the toplevels promoted below
 		 * (which insert at the head of lock_layer) naturally land above
 		 * it; qdwin_maybe_promote_lock_toplevel re-bottoms the curtain
