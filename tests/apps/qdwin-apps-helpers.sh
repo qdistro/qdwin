@@ -311,14 +311,26 @@ qdwin_apps_screenshot() {
     $QDWIN_VIRSH screenshot "$VMNAME" "$out" 2>&1 | tail -1
 }
 
-# Assert a shell-driven maximise/restore round-trip for the most recently
-# added toplevel. The caller supplies a unique host artifact prefix; this
-# writes <prefix>-{max,restore}.png and <prefix>-roundtrip.log.
+# Return the current bystander log line count. Capture this immediately before
+# launching an app, then pass it to qdwin_apps_assert_max_restore_last so a
+# stale historical toplevel can never satisfy a new app assertion.
+qdwin_apps_bystander_log_boundary() {
+    qdwin_apps_require_vm || return 1
+    "$QDWIN_VM_EXEC" "$VMNAME" "wc -l < '$QDWIN_BYSTANDER_LOG'" 2>/dev/null
+}
+
+# Assert a shell-driven maximise/restore round-trip for the expected toplevel
+# added after a caller-captured boundary. Arguments are artifact prefix,
+# pre-launch log line count, exact app_id, and exact title. This writes
+# <prefix>-{max,restore}.png and <prefix>-roundtrip.log.
 # A FIFO write alone is not success: state and geometry must appear after a
 # fresh log boundary, and restore must reproduce the committed baseline.
 qdwin_apps_assert_max_restore_last() {
     qdwin_apps_require_vm || return 1
     local prefix="$1"
+    local launch_boundary="$2"
+    local expected_app_id="$3"
+    local expected_title="$4"
     local baseline handle bx by bw bh max_start restore_start
     local max_evidence restore_evidence max_geometry restore_geometry
     local mx my mw mh rx ry rw rh
@@ -327,17 +339,44 @@ qdwin_apps_assert_max_restore_last() {
         echo "FAIL: max/restore assertion requires a host artifact prefix" >&2
         return 1
     }
+    [[ "$launch_boundary" =~ ^[0-9]+$ ]] || {
+        echo "FAIL: expected numeric pre-launch log boundary; observed '$launch_boundary' (artifact_prefix=$prefix)" >&2
+        return 1
+    }
+    [ -n "$expected_app_id" ] && [ -n "$expected_title" ] || {
+        echo "FAIL: expected exact app_id and title for round-trip assertion (artifact_prefix=$prefix)" >&2
+        return 1
+    }
     mkdir -p "$(dirname "$prefix")" || return 1
 
+    local app_b64 title_b64
+    app_b64=$(printf '%s' "$expected_app_id" | base64 -w0)
+    title_b64=$(printf '%s' "$expected_title" | base64 -w0)
     baseline=$("$QDWIN_VM_EXEC" "$VMNAME" "
 log='$QDWIN_BYSTANDER_LOG'
-handle=\$(sed -n 's/.*toplevel_added handle=\\([0-9][0-9]*\\).*/\\1/p' \"\$log\" | tail -1)
-[ -n \"\$handle\" ] || { echo 'no toplevel_added in bystander log' >&2; exit 1; }
-sed -n \"s/.*toplevel_geometry handle=\$handle x=\\(-*[0-9][0-9]*\\) y=\\(-*[0-9][0-9]*\\) w=\\([0-9][0-9]*\\) h=\\([0-9][0-9]*\\).*/\$handle \\1 \\2 \\3 \\4/p\" \"\$log\" | tail -1
+start=$launch_boundary
+expected_app=\$(printf '%s' '$app_b64' | base64 -d)
+expected_title=\$(printf '%s' '$title_b64' | base64 -d)
+delta=\$(tail -n +\$((start + 1)) \"\$log\")
+added=\$(printf '%s\\n' \"\$delta\" | grep -F 'qdwin-bystander: toplevel_added handle=' \
+    | grep -F \" app_id=\\\"\$expected_app\\\" title=\\\"\$expected_title\\\" xwayland=1\" | tail -1)
+handle=\$(printf '%s\\n' \"\$added\" | sed -n 's/.*toplevel_added handle=\\([0-9][0-9]*\\).*/\\1/p')
+[ -n \"\$handle\" ] || {
+    echo \"expected post-boundary app_id=\\\"\$expected_app\\\" title=\\\"\$expected_title\\\" xwayland=1; observed:\" >&2
+    printf '%s\\n' \"\$delta\" >&2
+    exit 1
+}
+geometry=\$(printf '%s\\n' \"\$delta\" | sed -n \"s/.*toplevel_geometry handle=\$handle x=\\(-*[0-9][0-9]*\\) y=\\(-*[0-9][0-9]*\\) w=\\([0-9][0-9]*\\) h=\\([0-9][0-9]*\\).*/\$handle \\1 \\2 \\3 \\4/p\" | tail -1)
+[ -n \"\$geometry\" ] || {
+    echo \"expected post-boundary geometry for handle=\$handle; observed:\" >&2
+    printf '%s\\n' \"\$delta\" >&2
+    exit 1
+}
+printf '%s\\n' \"\$geometry\"
 " 2>/dev/null) || true
     read -r handle bx by bw bh <<<"$baseline"
     if ! [[ "$handle $bx $by $bw $bh" =~ ^[0-9]+\ -?[0-9]+\ -?[0-9]+\ [1-9][0-9]*\ [1-9][0-9]*$ ]]; then
-        echo "FAIL: expected positive pre-max geometry; observed '${baseline:-<none>}' (log=$QDWIN_BYSTANDER_LOG)" >&2
+        echo "FAIL: expected post-boundary $expected_app_id/$expected_title xwayland=1 with positive geometry; observed '${baseline:-<none>}' (log=$QDWIN_BYSTANDER_LOG artifact_prefix=$prefix)" >&2
         return 1
     fi
 
@@ -406,7 +445,9 @@ exit 1
     qdwin_apps_screenshot "${prefix}-restore.png" || return 1
 
     {
-        printf 'PASS: handle=%s baseline=%s %s %s %s\n' "$handle" "$bx" "$by" "$bw" "$bh"
+        printf 'PASS: handle=%s app_id="%s" title="%s" xwayland=1 launch_boundary=%s baseline=%s %s %s %s\n' \
+            "$handle" "$expected_app_id" "$expected_title" "$launch_boundary" \
+            "$bx" "$by" "$bw" "$bh"
         printf '%s\n' "$max_evidence"
         printf '%s\n' "$restore_evidence"
     } | tee "${prefix}-roundtrip.log"
