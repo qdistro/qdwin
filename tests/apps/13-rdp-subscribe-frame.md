@@ -308,7 +308,7 @@ second forwarder and assert it too produces exactly one
 
 ```bash
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    'kill $(pgrep -f qdistro-forward) 2>/dev/null; \
+    'pkill -u admin -x qdistro-forward 2>/dev/null; \
      pkill -u admin -x foot 2>/dev/null; true' >/dev/null
 "$QDWIN_VM_EXEC" "$VMNAME" \
     'pkill -u admin -x qdwin-bystander 2>/dev/null; true' >/dev/null
