@@ -38,8 +38,9 @@ ERROR (see the Setup guard below).
 
 ```bash
 source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
-qdwin_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
-qdwin_session_healthy || { echo "FAIL: qdwin session not up"; exit 1; }
+qdwin_apps_set_vm "${VMNAME:-$(virsh -c qemu:///session list --name --state-running | head -1)}"
+ACTIVE_SOCKET=$(qdwin_apps_active_socket)
+[ -n "$ACTIVE_SOCKET" ] || { echo "FAIL: qdwin session not up"; exit 1; }
 
 # VM: confirm xfreerdp exists. The RDP listener is guest-local under QEMU user
 # networking, so the real client must run in this same disposable VM.
@@ -50,6 +51,11 @@ qdwin_session_healthy || { echo "FAIL: qdwin session not up"; exit 1; }
 "$QDWIN_VM_EXEC" "$VMNAME" 'test -x /usr/bin/qdistro-forward' \
     || { echo "FAIL: qdistro-forward not installed on VM"; exit 1; }
 
+# VM: confirm the lifecycle-probe option is baked into qdwin-bystander.
+"$QDWIN_VM_EXEC" "$VMNAME" \
+    '/usr/bin/qdwin-bystander --help 2>&1 | grep -q -- --ignore-torn-down' \
+    || { echo "FAIL: deploy qdwin-bystander with --ignore-torn-down"; exit 1; }
+
 # Subject app: foot is the toplevel shared over RDP and is part of the opt-in
 # qdwin app-deps matrix. On a lean GUI golden (no QDWIN_APP_DEPS=1) it is
 # legitimately absent — SKIP cleanly rather than ERROR, matching apps/05/07/08.
@@ -58,12 +64,37 @@ if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v foot >/dev/null 2>&1'; then
     exit 0
 fi
 
+qdwin_apps_prepare_shell_probe || {
+    echo "FAIL: could not reserve singleton shell role for RDP probe"; exit 1;
+}
+trap 'qdwin_apps_restore_shell' EXIT
+# Re-detect after takeover; never hard-code wayland-1 across compositor restarts.
+ACTIVE_SOCKET=$(qdwin_apps_active_socket)
+[ -n "$ACTIVE_SOCKET" ] || { echo "FAIL: qdwin stopped during shell takeover"; exit 1; }
+
 "$QDWIN_VM_EXEC" "$VMNAME" 'pkill -u admin -x foot 2>/dev/null; sleep 1' >/dev/null
 
-# Spawn a foot terminal to share.
+# Launch exactly one scenario bystander into the role reserved above. Pin its
+# FIFO explicitly: a stale FIFO or a second shell client is a hard setup error.
 "$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     WAYLAND_DISPLAY=wayland-1 foot sleep 600 >/dev/null 2>&1 &' " >/dev/null
+    "rm -f /run/user/1000/qdwin-cmd.fifo /tmp/15-creds.env /tmp/15-bystander.err; \
+     runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+       WAYLAND_DISPLAY=$ACTIVE_SOCKET \
+       QDWIN_BYSTANDER_FIFO=/run/user/1000/qdwin-cmd.fifo \
+       setsid -f /usr/bin/qdwin-bystander --ignore-torn-down \
+       >/tmp/15-creds.env 2>/tmp/15-bystander.err; \
+     for i in \$(seq 1 40); do \
+       grep -q 'hello uid=' /tmp/15-bystander.err 2>/dev/null && break; sleep 0.1; \
+     done; \
+     ! grep -q 'shell role already claimed' /tmp/15-bystander.err; \
+     test -p /run/user/1000/qdwin-cmd.fifo; \
+     pgrep -u admin -x qdwin-bystander >/dev/null; \
+     grep -q 'hello uid=' /tmp/15-bystander.err" || {
+    echo "FAIL: RDP probe did not acquire singleton shell role"; exit 1;
+}
+
+# Spawn a foot terminal to share.
+qdwin_apps_launch foot "foot sleep 600"
 sleep 2
 
 HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
@@ -85,19 +116,25 @@ qdwin_shell_v1_subscribe_view_stream(shell, HANDLE, "...", 0, 0, 0);
 
 emits the `approved` event with `(pipewire_node_name, rdp_port,
 rdp_cert_path, rdp_password)`. Drive this from the VM via
-`qdwin-bystander --subscribe`, which prints sh-sourceable KEY=value
+the probe bystander's canonical FIFO, which prints sh-sourceable KEY=value
 lines on stdout when `approved` fires and keeps the wayland
 connection open so the stream stays live:
 
 ```bash
-"$QDWIN_VM_EXEC" "$VMNAME" \
-    "runuser -l admin -c 'XDG_RUNTIME_DIR=/run/user/1000 \
-     WAYLAND_DISPLAY=wayland-1 nohup /usr/bin/qdwin-bystander \
-       --ignore-torn-down --subscribe $HANDLE \
-       > /tmp/15-creds.env 2>/tmp/15-bystander.err & echo \$!'" \
-    > /tmp/15-bystander.pid
+SUBSCRIBE_CURSOR=$(qdwin_apps_journal_cursor)
+qdwin_apps_ctl "subscribe $HANDLE"
 sleep 1
 . <(printf '\n'; "$QDWIN_VM_EXEC" "$VMNAME" 'cat /tmp/15-creds.env')
+
+APPROVAL=$(qdwin_apps_log_since_cursor "$SUBSCRIBE_CURSOR" \
+  "view_stream approved handle=$HANDLE" | tail -1)
+FORWARD_PID=$(printf '%s\n' "$APPROVAL" | \
+  sed -nE 's/.*forward_pid=([0-9]+).*/\1/p')
+FIRST_PW_OUTPUT=$(printf '%s\n' "$APPROVAL" | \
+  sed -nE 's/.* pw=([^ ]+).*/\1/p')
+[ -n "$FORWARD_PID" ] && [ -n "$FIRST_PW_OUTPUT" ] || {
+  echo "FAIL: approved event lacks forward PID/PipeWire output: $APPROVAL"; exit 1;
+}
 
 # Variables now in scope: HANDLE, PIPEWIRE_NODE_NAME, RDP_PORT,
 # RDP_CERT_PATH, RDP_PASSWORD. FORWARD_PID is not exposed via the
@@ -161,9 +198,18 @@ Failure modes that should fail this assert:
 ### Step 5 — disconnect cleanup
 
 ```bash
+TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor)
 "$QDWIN_VM_EXEC" "$VMNAME" \
     "kill $FORWARD_PID 2>/dev/null; sleep 1; \
      ps -p $FORWARD_PID 2>&1 | tail -1"
+TEARDOWN_LOG=$(qdwin_apps_log_since_cursor "$TEARDOWN_CURSOR" \
+  "view_stream_(torn_down|server_state_released) handle=$HANDLE")
+[ "$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_torn_down')" -eq 1 ]
+[ "$(printf '%s\n' "$TEARDOWN_LOG" | grep -c 'view_stream_server_state_released')" -eq 1 ]
+"$QDWIN_VM_EXEC" "$VMNAME" \
+  "pgrep -u admin -x qdwin-bystander >/dev/null && \
+   grep -q 'retaining inert view_stream handle=$HANDLE' /tmp/15-bystander.err && \
+   ! grep -q 'invalid object' /tmp/15-bystander.err"
 ```
 
 **Assert (5.1):** qdistro-forward exits cleanly when killed.
@@ -179,9 +225,28 @@ The first protocol object is deliberately still alive. Subscribe to the same
 handle again through the bystander's FIFO:
 
 ```bash
-"$QDWIN_VM_EXEC" "$VMNAME" \
-  "printf 'subscribe %s\\n' '$HANDLE' > /run/user/1000/qdwin-cmd.fifo"
+REUSE_CURSOR=$(qdwin_apps_journal_cursor)
+qdwin_apps_ctl "subscribe $HANDLE"
 sleep 2
+SECOND_APPROVAL=$(qdwin_apps_log_since_cursor "$REUSE_CURSOR" \
+  "view_stream approved handle=$HANDLE" | tail -1)
+SECOND_FORWARD_PID=$(printf '%s\n' "$SECOND_APPROVAL" | \
+  sed -nE 's/.*forward_pid=([0-9]+).*/\1/p')
+SECOND_PW_OUTPUT=$(printf '%s\n' "$SECOND_APPROVAL" | \
+  sed -nE 's/.* pw=([^ ]+).*/\1/p')
+[ -n "$SECOND_FORWARD_PID" ] && [ "$SECOND_FORWARD_PID" != "$FORWARD_PID" ]
+[ "$SECOND_PW_OUTPUT" = "$FIRST_PW_OUTPUT" ]
+
+SECOND_TEARDOWN_CURSOR=$(qdwin_apps_journal_cursor)
+"$QDWIN_VM_EXEC" "$VMNAME" "kill $SECOND_FORWARD_PID"
+sleep 1
+SECOND_TEARDOWN_LOG=$(qdwin_apps_log_since_cursor "$SECOND_TEARDOWN_CURSOR" \
+  "view_stream_(torn_down|server_state_released) handle=$HANDLE")
+[ "$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_torn_down')" -eq 1 ]
+[ "$(printf '%s\n' "$SECOND_TEARDOWN_LOG" | grep -c 'view_stream_server_state_released')" -eq 1 ]
+"$QDWIN_VM_EXEC" "$VMNAME" \
+  "pgrep -u admin -x qdwin-bystander >/dev/null && \
+   ! grep -q 'invalid object' /tmp/15-bystander.err"
 ```
 
 **Assert (6.1):** a second `view_stream approved` journal event names the same
@@ -200,6 +265,8 @@ second forwarder and assert it too produces exactly one
      pkill -u admin -x foot 2>/dev/null; true' >/dev/null
 "$QDWIN_VM_EXEC" "$VMNAME" \
     'pkill -u admin -x qdwin-bystander 2>/dev/null; true' >/dev/null
+qdwin_apps_restore_shell
+trap - EXIT
 ```
 
 ## Pass criteria
@@ -228,6 +295,13 @@ half (xfreerdp completing the TLS handshake and decoding frames).
 - 3.1 framebuffer failure: frames flow in qdistro-forward (s3c-e2e
   PASSes) but xfreerdp cannot initialize its framebuffers. Inspect the
   guest `/tmp/15-xfreerdp.log` with `wlog.level=debug`.
+
+## Separate lifecycle coverage gap
+
+This scenario proves the forwarder-death terminal path, including ignored
+clients and output reuse. The protocol also names source-close, lock, and
+admin-revoke as server-originated termination reasons; those pre-existing
+paths are not exercised here and need separate end-to-end lifecycle coverage.
 
 ## History
 

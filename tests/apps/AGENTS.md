@@ -61,6 +61,10 @@ The helper provides:
   needed; call it directly only if you want the takeover without the check.
 - `qdwin_apps_restore_shell` — undo the above: stop the bystander, restart
   `qdshell.service`. Best-effort; safe to call in Cleanup.
+- `qdwin_apps_prepare_shell_probe` — reserve the singleton shell role for a
+  scenario-specific bystander: run the normal takeover, then stop its suite
+  bystander, remove the canonical FIFO, and fail if qdshell/bystander still
+  owns the role. Launch and verify exactly one replacement immediately.
 - `qdwin_apps_launch <name> <cmd>` — start an app as `admin` against the
   active wayland socket with the standard env (`MOZ_ENABLE_WAYLAND=1`,
   `QT_QPA_PLATFORM=wayland`, `GDK_BACKEND=wayland`, `DISPLAY=:0`).

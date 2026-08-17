@@ -147,6 +147,35 @@ EOSCRIPT
     "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
 }
 
+# Prepare for a scenario-specific shell-role probe. First use the normal,
+# validated takeover path to stop qdshell and prove qdwin is reachable; then
+# remove that suite bystander and its FIFO. The caller must immediately launch
+# exactly one replacement and verify its hello. This avoids racing two clients
+# for qdwin's singleton shell role while still permitting probe-only flags.
+qdwin_apps_prepare_shell_probe() {
+    qdwin_apps_become_shell || return 1
+    local b64; b64=$(base64 -w0 <<EOSCRIPT
+pkill -u admin -x qdwin-bystander 2>/dev/null || true
+for _i in \$(seq 1 40); do
+    pgrep -u admin -x qdwin-bystander >/dev/null 2>&1 || break
+    sleep 0.1
+done
+if pgrep -u admin -x qdwin-bystander >/dev/null 2>&1; then
+    echo "suite bystander still owns the singleton shell role" >&2
+    exit 1
+fi
+if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+       systemctl --user is-active --quiet qdshell.service; then
+    echo "qdshell still owns/contends for the singleton shell role" >&2
+    exit 1
+fi
+rm -f "$QDWIN_BYSTANDER_FIFO"
+echo "shell-probe slot ready fifo=$QDWIN_BYSTANDER_FIFO"
+EOSCRIPT
+)
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+}
+
 # Undo qdwin_apps_become_shell: stop the bystander and restart qdshell so the
 # normal desktop session reclaims the shell role after the app matrix finishes.
 # Best-effort. (No unmask needed — become_shell only stops, never masks.)
@@ -212,9 +241,19 @@ qdwin_apps_ctl() {
         maxlast) cmd=max ;;
         restorelast) cmd=restore ;;
     esac
-    local b64
+    local b64 cmd_b64
+    cmd_b64=$(printf '%s' "$cmd" | base64 -w0)
     b64=$(base64 -w0 <<EOCTL
-echo '$cmd' > $QDWIN_BYSTANDER_FIFO
+set -eu
+[ -p "$QDWIN_BYSTANDER_FIFO" ] || {
+    echo "missing bystander FIFO: $QDWIN_BYSTANDER_FIFO" >&2; exit 1;
+}
+pgrep -u admin -x qdwin-bystander >/dev/null || {
+    echo "no bystander reader for FIFO: $QDWIN_BYSTANDER_FIFO" >&2; exit 1;
+}
+cmd=\$(printf '%s' '$cmd_b64' | base64 -d)
+QDWIN_FIFO_CMD="\$cmd" QDWIN_FIFO_PATH="$QDWIN_BYSTANDER_FIFO" \
+    timeout 3 bash -c 'printf "%s\n" "\$QDWIN_FIFO_CMD" > "\$QDWIN_FIFO_PATH"'
 EOCTL
 )
     "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"

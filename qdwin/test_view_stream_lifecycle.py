@@ -69,6 +69,29 @@ def main():
     )
     if rc:
         return rc
+    rc = require_order(
+        release,
+        (
+            "s->input_handle = NULL",
+            "wl_resource_set_user_data(h, NULL)",
+            "wl_resource_destroy(h)",
+        ),
+        "input-handle revocation",
+    )
+    if rc:
+        return rc
+    rc = require_order(
+        release,
+        (
+            "if (s->listed)",
+            "wl_list_remove(&s->link)",
+            "wl_list_init(&s->link)",
+            "s->listed = 0",
+        ),
+        "active-list revocation",
+    )
+    if rc:
+        return rc
     for marker in (
         "wl_resource_destroy(h)",
         "s->input_claimed = 0",
@@ -86,6 +109,17 @@ def main():
     rc = require_order(
         death,
         (
+            "qdwin_view_stream_disarm_pidfd(s)",
+            "s->forward_pid = 0",
+            "s->torn_down_sent = 1",
+        ),
+        "forwarder-death pidfd ownership",
+    )
+    if rc:
+        return rc
+    rc = require_order(
+        death,
+        (
             "s->torn_down_sent = 1",
             "view_stream_torn_down handle=%u pid=%d",
             "qdwin_view_stream_v1_send_torn_down",
@@ -97,6 +131,22 @@ def main():
         return rc
     if "wl_resource_destroy" in death:
         return fail("forwarder death destroys the client-owned tombstone")
+
+    reap = function_body(source, "qdwin_view_stream_reap_forward")
+    if reap is None:
+        return fail("forwarder reap helper is missing or malformed")
+    rc = require_order(
+        reap,
+        (
+            "qdwin_view_stream_disarm_pidfd(s)",
+            "if (s->forward_pid <= 0)",
+            "kill(s->forward_pid, SIGTERM)",
+            "s->forward_pid = 0",
+        ),
+        "client/disconnect forwarder reap",
+    )
+    if rc:
+        return rc
 
     destroyed = function_body(source, "qdwin_stream_resource_destroyed")
     if destroyed is None:
