@@ -14,7 +14,6 @@ source).
 ```bash
 source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
-qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 
 # qci supplies a durable per-run directory. Standalone runs get a unique
 # fallback which is printed for retrieval; no host or guest path is shared
@@ -23,6 +22,39 @@ CASE_ARTIFACT_DIR=${QCI_GUI_ARTIFACT_DIR:-$(mktemp -d /tmp/qdwin-apps-10.XXXXXX)
 mkdir -p "$CASE_ARTIFACT_DIR"/{logs,screenshots}
 CASE_TOKEN=$(basename "$CASE_ARTIFACT_DIR" | tr -cd 'A-Za-z0-9_.-')
 CASE_GUEST_DIR=/tmp/qdwin-apps-10-$CASE_TOKEN
+DEMOS_HTTP_PID=""
+DEMOS_PORT_FILE=""
+
+# Arm cleanup before creating guest staging or launching any process. Preserve
+# the scenario's original status, but always remove transient state and return
+# the VM to its normal qdshell session. The artifact directory is evidence and
+# intentionally survives cleanup.
+qdwin_apps_10_kill_case() {
+    [ -n "${CASE_GUEST_DIR:-}" ] || return 0
+    "$QDWIN_VM_EXEC" "$VMNAME" "
+pkill -u admin -9 -f '$CASE_GUEST_DIR/tk-demo.py' 2>/dev/null || true
+pkill -u admin -9 -f '$CASE_GUEST_DIR/fltk-demo' 2>/dev/null || true
+pkill -u admin -9 -f 'java SwingDemo' 2>/dev/null || true
+true
+" >/dev/null 2>&1 || true
+}
+
+qdwin_apps_10_cleanup() {
+    local status="${1:-0}"
+    qdwin_apps_10_kill_case
+    [ -n "${CASE_GUEST_DIR:-}" ] && \
+        "$QDWIN_VM_EXEC" "$VMNAME" "rm -rf '$CASE_GUEST_DIR'" 2>/dev/null || true
+    qdwin_apps_restore_shell || true
+    [ -n "${DEMOS_PORT_FILE:-}" ] && rm -f "$DEMOS_PORT_FILE" || true
+    [ -n "${DEMOS_HTTP_PID:-}" ] && kill "$DEMOS_HTTP_PID" 2>/dev/null || true
+    DEMOS_HTTP_PID=""
+    DEMOS_PORT_FILE=""
+    trap - EXIT
+    return "$status"
+}
+trap 'qdwin_apps_10_status=$?; qdwin_apps_10_cleanup "$qdwin_apps_10_status"; exit "$qdwin_apps_10_status"' EXIT
+
+qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 "$QDWIN_VM_EXEC" "$VMNAME" "install -d -o admin -g admin -m 700 '$CASE_GUEST_DIR'"
 echo "scenario artifacts: $CASE_ARTIFACT_DIR"
 
@@ -107,10 +139,6 @@ qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step1-tk.png"
 # instead of a silent black screenshot.
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/tk.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step1-tk.log"
 
-# Exercise the round-trip promised by this scenario's acceptance criterion.
-qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step1-tk" || exit 1
-qdwin_apps_kill_all
-
 # ENV PREREQUISITE (not a qdwin bug): if the app log shows
 # `failed to allocate font`, the VM template lacks a usable X11 bitmap
 # font, so Tk cannot allocate its default font and renders a black/empty
@@ -118,6 +146,13 @@ qdwin_apps_kill_all
 # prerequisite (INFRA), per tests/apps/AGENTS.md — NOT a compositor FAIL.
 if grep -q 'failed to allocate font' "$CASE_ARTIFACT_DIR/logs/step1-tk.log" 2>/dev/null; then
     echo "INFRA: Tk font allocation failed in VM template (install xorg-x11-fonts / xorg-x11-fonts-core); Tk sub-case is an env prerequisite, not a qdwin bug"
+    qdwin_apps_10_kill_case
+else
+    # A runnable Tk client must complete the protocol round-trip. This gate
+    # comes after the exact prerequisite classification so missing fonts do
+    # not get mislabeled as a compositor failure.
+    qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step1-tk" || exit 1
+    qdwin_apps_10_kill_case
 fi
 fi
 ```
@@ -162,7 +197,7 @@ qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step2-fltk.png"
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/fltk.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-fltk.log"
 
 qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step2-fltk" || exit 1
-qdwin_apps_kill_all
+qdwin_apps_10_kill_case
 fi
 ```
 
@@ -193,7 +228,7 @@ qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step3-swing.png"
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/swing.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-swing.log"
 
 qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step3-swing" || exit 1
-qdwin_apps_kill_all
+qdwin_apps_10_kill_case
 fi
 ```
 
@@ -210,11 +245,9 @@ background, not a rendering failure.
 ## Cleanup
 
 ```bash
-qdwin_apps_kill_all
-# Stop the private demo HTTP server started in Setup.
-[ -n "${DEMOS_HTTP_PID:-}" ] && kill "$DEMOS_HTTP_PID" 2>/dev/null || true
-[ -n "${DEMOS_PORT_FILE:-}" ] && rm -f "$DEMOS_PORT_FILE" || true
-"$QDWIN_VM_EXEC" "$VMNAME" "rm -rf '$CASE_GUEST_DIR'" 2>/dev/null || true
+# Explicit success cleanup also disarms the EXIT trap. Any earlier exit takes
+# the same cleanup path automatically while preserving its nonzero status.
+qdwin_apps_10_cleanup 0
 ```
 
 ## Pass criteria
