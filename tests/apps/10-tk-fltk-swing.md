@@ -16,6 +16,16 @@ source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 
+# qci supplies a durable per-run directory. Standalone runs get a unique
+# fallback which is printed for retrieval; no host or guest path is shared
+# with a concurrent invocation.
+CASE_ARTIFACT_DIR=${QCI_GUI_ARTIFACT_DIR:-$(mktemp -d /tmp/qdwin-apps-10.XXXXXX)}
+mkdir -p "$CASE_ARTIFACT_DIR"/{logs,screenshots}
+CASE_TOKEN=$(basename "$CASE_ARTIFACT_DIR" | tr -cd 'A-Za-z0-9_.-')
+CASE_GUEST_DIR=/tmp/qdwin-apps-10-$CASE_TOKEN
+"$QDWIN_VM_EXEC" "$VMNAME" "install -d -o admin -g admin -m 700 '$CASE_GUEST_DIR'"
+echo "scenario artifacts: $CASE_ARTIFACT_DIR"
+
 # App-deps gate (opt-in): Tk/FLTK/Swing are heavy toolkit deps that are only
 # baked into the QDWIN_APP_DEPS golden, not the lean GUI golden. Detect each
 # toolkit's build/run prerequisite IN THE VM up front:
@@ -56,14 +66,14 @@ done
 # and we serve from that exact live socket, printing the bound port on
 # stdout, so there is no bind-probe-then-close race window. Bind 0.0.0.0
 # so the guest reaches us at 10.0.2.2 over SLIRP NAT.
-DEMOS_PORT_FILE=$(mktemp)
+DEMOS_PORT_FILE=$(mktemp "$CASE_ARTIFACT_DIR/demos-port.XXXXXX")
 ( cd "$DEMOS_DIR" && exec python3 -c '
 import http.server, socketserver, sys
 socketserver.TCPServer.allow_reuse_address = False
 httpd = socketserver.TCPServer(("0.0.0.0", 0), http.server.SimpleHTTPRequestHandler)
 sys.stdout.write(str(httpd.server_address[1]) + "\n"); sys.stdout.flush()
 httpd.serve_forever()
-' > "$DEMOS_PORT_FILE" 2>/tmp/10-demos-http.log ) &
+' > "$DEMOS_PORT_FILE" 2>"$CASE_ARTIFACT_DIR/logs/demos-http.log" ) &
 DEMOS_HTTP_PID=$!
 DEMOS_PORT=""
 for _ in $(seq 1 50); do
@@ -72,7 +82,7 @@ for _ in $(seq 1 50); do
     kill -0 "$DEMOS_HTTP_PID" 2>/dev/null || break   # server died before binding
     sleep 0.2
 done
-[ -n "$DEMOS_PORT" ] || { echo "FAIL: demo HTTP server failed to bind (see /tmp/10-demos-http.log)"; exit 1; }
+[ -n "$DEMOS_PORT" ] || { echo "FAIL: demo HTTP server failed to bind (see $CASE_ARTIFACT_DIR/logs/demos-http.log)"; exit 1; }
 DEMOS=http://10.0.2.2:$DEMOS_PORT
 echo "serving $DEMOS_DIR at $DEMOS (pid $DEMOS_HTTP_PID)"
 ```
@@ -87,25 +97,18 @@ echo "serving $DEMOS_DIR at $DEMOS (pid $DEMOS_HTTP_PID)"
 if ! "$QDWIN_VM_EXEC" "$VMNAME" "python3 -c 'import tkinter' 2>/dev/null"; then
     echo "SKIP step 1 (Tk): python313-tk not installed; qdwin app deps are opt-in"
 else
-qdwin_apps_launch tk "wget -qO /tmp/tk-demo.py $DEMOS/tk-demo.py && python3 /tmp/tk-demo.py" \
-    2>&1 | tee /tmp/10-step1-launch.log
+qdwin_apps_launch tk "wget -qO '$CASE_GUEST_DIR/tk-demo.py' $DEMOS/tk-demo.py && python3 '$CASE_GUEST_DIR/tk-demo.py'" \
+    2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step1-launch.log"
 sleep 6
-qdwin_apps_screenshot /tmp/10-step1-tk.png
+qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step1-tk.png"
 # Preserve the demo's own stdout/stderr: the launch helper only returns
 # the vm-exec exit, but the app writes to /tmp/tk.log INSIDE the VM.
 # Pull it to the host so a failure (e.g. a Tk font error) is diagnosable
 # instead of a silent black screenshot.
-"$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/tk.log" 2>&1 | tee /tmp/10-step1-tk.log
+"$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/tk.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step1-tk.log"
 
 # Exercise the round-trip promised by this scenario's acceptance criterion.
-qdwin_apps_ctl maxlast
-sleep 2
-qdwin_apps_screenshot /tmp/10-step1-tk-max.png
-qdwin_apps_ctl restorelast
-sleep 2
-qdwin_apps_screenshot /tmp/10-step1-tk-restore.png
-"$QDWIN_VM_EXEC" "$VMNAME" "tail -20 /tmp/bystander.log" \
-    2>&1 | tee /tmp/10-step1-bystander.log
+qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step1-tk" || exit 1
 qdwin_apps_kill_all
 
 # ENV PREREQUISITE (not a qdwin bug): if the app log shows
@@ -113,7 +116,7 @@ qdwin_apps_kill_all
 # font, so Tk cannot allocate its default font and renders a black/empty
 # toplevel with no `toplevel_added`. Report this sub-case as an env
 # prerequisite (INFRA), per tests/apps/AGENTS.md — NOT a compositor FAIL.
-if grep -q 'failed to allocate font' /tmp/10-step1-tk.log 2>/dev/null; then
+if grep -q 'failed to allocate font' "$CASE_ARTIFACT_DIR/logs/step1-tk.log" 2>/dev/null; then
     echo "INFRA: Tk font allocation failed in VM template (install xorg-x11-fonts / xorg-x11-fonts-core); Tk sub-case is an env prerequisite, not a qdwin bug"
 fi
 fi
@@ -135,7 +138,7 @@ pre-max geometry for the same handle. The black area outside the small,
 centred window is expected when qdshell is not running; do not mistake that
 background for a black or missing application window.
 
-**Assert (1.4):** if instead `/tmp/10-step1-tk.log` contains
+**Assert (1.4):** if instead `$CASE_ARTIFACT_DIR/logs/step1-tk.log` contains
 `failed to allocate font`, this step is an `INFRA:` env prerequisite
 (missing VM font package), not a qdwin FAIL — see Setup/Known failure
 modes.
@@ -149,23 +152,16 @@ idempotent.
 if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v g++ >/dev/null 2>&1 && test -e /usr/include/FL/Fl.H'; then
     echo "SKIP step 2 (FLTK): fltk-devel/g++ not installed; qdwin app deps are opt-in"
 else
-"$QDWIN_VM_EXEC" "$VMNAME" "wget -qO /tmp/fltk-demo.cxx $DEMOS/fltk-demo.cxx && \
-    g++ -o /tmp/fltk-demo /tmp/fltk-demo.cxx -lfltk" \
-    2>&1 | tee /tmp/10-step2-build.log | tail -3
+"$QDWIN_VM_EXEC" "$VMNAME" "wget -qO '$CASE_GUEST_DIR/fltk-demo.cxx' $DEMOS/fltk-demo.cxx && \
+    g++ -o '$CASE_GUEST_DIR/fltk-demo' '$CASE_GUEST_DIR/fltk-demo.cxx' -lfltk" \
+    2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-build.log" | tail -3
 
-qdwin_apps_launch fltk "/tmp/fltk-demo" 2>&1 | tee /tmp/10-step2-launch.log
+qdwin_apps_launch fltk "'$CASE_GUEST_DIR/fltk-demo'" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-launch.log"
 sleep 4
-qdwin_apps_screenshot /tmp/10-step2-fltk.png
-"$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/fltk.log" 2>&1 | tee /tmp/10-step2-fltk.log
+qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step2-fltk.png"
+"$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/fltk.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-fltk.log"
 
-qdwin_apps_ctl maxlast
-sleep 2
-qdwin_apps_screenshot /tmp/10-step2-fltk-max.png
-qdwin_apps_ctl restorelast
-sleep 2
-qdwin_apps_screenshot /tmp/10-step2-fltk-restore.png
-"$QDWIN_VM_EXEC" "$VMNAME" "tail -20 /tmp/bystander.log" \
-    2>&1 | tee /tmp/10-step2-bystander.log
+qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step2-fltk" || exit 1
 qdwin_apps_kill_all
 fi
 ```
@@ -187,23 +183,16 @@ background, not a rendering failure.
 if ! "$QDWIN_VM_EXEC" "$VMNAME" 'command -v javac >/dev/null 2>&1'; then
     echo "SKIP step 3 (Swing): javac (java-25-openjdk-devel) not installed; qdwin app deps are opt-in"
 else
-"$QDWIN_VM_EXEC" "$VMNAME" "wget -qO /tmp/SwingDemo.java $DEMOS/SwingDemo.java && \
-    cd /tmp && javac SwingDemo.java" \
-    2>&1 | tee /tmp/10-step3-build.log | tail -3
+"$QDWIN_VM_EXEC" "$VMNAME" "wget -qO '$CASE_GUEST_DIR/SwingDemo.java' $DEMOS/SwingDemo.java && \
+    cd '$CASE_GUEST_DIR' && javac SwingDemo.java" \
+    2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-build.log" | tail -3
 
-qdwin_apps_launch swing "cd /tmp && java SwingDemo" 2>&1 | tee /tmp/10-step3-launch.log
+qdwin_apps_launch swing "cd '$CASE_GUEST_DIR' && java SwingDemo" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-launch.log"
 sleep 10
-qdwin_apps_screenshot /tmp/10-step3-swing.png
-"$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/swing.log" 2>&1 | tee /tmp/10-step3-swing.log
+qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step3-swing.png"
+"$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/swing.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-swing.log"
 
-qdwin_apps_ctl maxlast
-sleep 2
-qdwin_apps_screenshot /tmp/10-step3-swing-max.png
-qdwin_apps_ctl restorelast
-sleep 2
-qdwin_apps_screenshot /tmp/10-step3-swing-restore.png
-"$QDWIN_VM_EXEC" "$VMNAME" "tail -20 /tmp/bystander.log" \
-    2>&1 | tee /tmp/10-step3-bystander.log
+qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step3-swing" || exit 1
 qdwin_apps_kill_all
 fi
 ```
@@ -225,6 +214,7 @@ qdwin_apps_kill_all
 # Stop the private demo HTTP server started in Setup.
 [ -n "${DEMOS_HTTP_PID:-}" ] && kill "$DEMOS_HTTP_PID" 2>/dev/null || true
 [ -n "${DEMOS_PORT_FILE:-}" ] && rm -f "$DEMOS_PORT_FILE" || true
+"$QDWIN_VM_EXEC" "$VMNAME" "rm -rf '$CASE_GUEST_DIR'" 2>/dev/null || true
 ```
 
 ## Pass criteria
