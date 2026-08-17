@@ -311,6 +311,107 @@ qdwin_apps_screenshot() {
     $QDWIN_VIRSH screenshot "$VMNAME" "$out" 2>&1 | tail -1
 }
 
+# Assert a shell-driven maximise/restore round-trip for the most recently
+# added toplevel. The caller supplies a unique host artifact prefix; this
+# writes <prefix>-{max,restore}.png and <prefix>-roundtrip.log.
+# A FIFO write alone is not success: state and geometry must appear after a
+# fresh log boundary, and restore must reproduce the committed baseline.
+qdwin_apps_assert_max_restore_last() {
+    qdwin_apps_require_vm || return 1
+    local prefix="$1"
+    local baseline handle bx by bw bh max_start restore_start
+    local max_evidence restore_evidence max_geometry restore_geometry
+    local mx my mw mh rx ry rw rh
+
+    [ -n "$prefix" ] || {
+        echo "FAIL: max/restore assertion requires a host artifact prefix" >&2
+        return 1
+    }
+    mkdir -p "$(dirname "$prefix")" || return 1
+
+    baseline=$("$QDWIN_VM_EXEC" "$VMNAME" "
+log='$QDWIN_BYSTANDER_LOG'
+handle=\$(sed -n 's/.*toplevel_added handle=\\([0-9][0-9]*\\).*/\\1/p' \"\$log\" | tail -1)
+[ -n \"\$handle\" ] || { echo 'no toplevel_added in bystander log' >&2; exit 1; }
+sed -n \"s/.*toplevel_geometry handle=\$handle x=\\(-*[0-9][0-9]*\\) y=\\(-*[0-9][0-9]*\\) w=\\([0-9][0-9]*\\) h=\\([0-9][0-9]*\\).*/\$handle \\1 \\2 \\3 \\4/p\" \"\$log\" | tail -1
+" 2>/dev/null) || true
+    read -r handle bx by bw bh <<<"$baseline"
+    if ! [[ "$handle $bx $by $bw $bh" =~ ^[0-9]+\ -?[0-9]+\ -?[0-9]+\ [1-9][0-9]*\ [1-9][0-9]*$ ]]; then
+        echo "FAIL: expected positive pre-max geometry; observed '${baseline:-<none>}' (log=$QDWIN_BYSTANDER_LOG)" >&2
+        return 1
+    fi
+
+    max_start=$("$QDWIN_VM_EXEC" "$VMNAME" "wc -l < '$QDWIN_BYSTANDER_LOG'" 2>/dev/null) || return 1
+    qdwin_apps_ctl maxlast || {
+        echo "FAIL: max command failed for handle=$handle (artifact_prefix=$prefix)" >&2
+        return 1
+    }
+    max_evidence=$("$QDWIN_VM_EXEC" "$VMNAME" "
+log='$QDWIN_BYSTANDER_LOG'; start=$max_start; handle=$handle
+for _i in \$(seq 1 40); do
+    delta=\$(tail -n +\$((start + 1)) \"\$log\")
+    if printf '%s\\n' \"\$delta\" | grep -qFx \"qdwin-bystander: toplevel_state handle=\$handle state=0x1\" \
+       && printf '%s\\n' \"\$delta\" | grep -q \"toplevel_geometry handle=\$handle \"; then
+        printf '%s\\n' \"\$delta\"; exit 0
+    fi
+    sleep 0.1
+done
+echo \"expected post-command max state=0x1 and geometry for handle=\$handle; observed:\" >&2
+tail -n +\$((start + 1)) \"\$log\" >&2
+exit 1
+" 2>&1) || {
+        printf 'FAIL: %s (artifact_prefix=%s)\n' "$max_evidence" "$prefix" >&2
+        return 1
+    }
+    max_geometry=$(printf '%s\n' "$max_evidence" \
+        | sed -n "s/.*toplevel_geometry handle=$handle x=\\(-*[0-9][0-9]*\\) y=\\(-*[0-9][0-9]*\\) w=\\([0-9][0-9]*\\) h=\\([0-9][0-9]*\\).*/\\1 \\2 \\3 \\4/p" \
+        | tail -1)
+    read -r mx my mw mh <<<"$max_geometry"
+    if [ "$mx $my $mw $mh" != "0 0 1280 800" ]; then
+        echo "FAIL: expected maximized geometry 0 0 1280 800 for handle=$handle; observed '${max_geometry:-<none>}' (artifact_prefix=$prefix)" >&2
+        return 1
+    fi
+    qdwin_apps_screenshot "${prefix}-max.png" || return 1
+
+    restore_start=$("$QDWIN_VM_EXEC" "$VMNAME" "wc -l < '$QDWIN_BYSTANDER_LOG'" 2>/dev/null) || return 1
+    qdwin_apps_ctl restorelast || {
+        echo "FAIL: restore command failed for handle=$handle (artifact_prefix=$prefix)" >&2
+        return 1
+    }
+    restore_evidence=$("$QDWIN_VM_EXEC" "$VMNAME" "
+log='$QDWIN_BYSTANDER_LOG'; start=$restore_start; handle=$handle
+for _i in \$(seq 1 40); do
+    delta=\$(tail -n +\$((start + 1)) \"\$log\")
+    if printf '%s\\n' \"\$delta\" | grep -qFx \"qdwin-bystander: toplevel_state handle=\$handle state=0x0\" \
+       && printf '%s\\n' \"\$delta\" | grep -q \"toplevel_geometry handle=\$handle \"; then
+        printf '%s\\n' \"\$delta\"; exit 0
+    fi
+    sleep 0.1
+done
+echo \"expected post-command restore state=0x0 and geometry for handle=\$handle; observed:\" >&2
+tail -n +\$((start + 1)) \"\$log\" >&2
+exit 1
+" 2>&1) || {
+        printf 'FAIL: %s (artifact_prefix=%s)\n' "$restore_evidence" "$prefix" >&2
+        return 1
+    }
+    restore_geometry=$(printf '%s\n' "$restore_evidence" \
+        | sed -n "s/.*toplevel_geometry handle=$handle x=\\(-*[0-9][0-9]*\\) y=\\(-*[0-9][0-9]*\\) w=\\([0-9][0-9]*\\) h=\\([0-9][0-9]*\\).*/\\1 \\2 \\3 \\4/p" \
+        | tail -1)
+    read -r rx ry rw rh <<<"$restore_geometry"
+    if [ "$rx $ry $rw $rh" != "$bx $by $bw $bh" ]; then
+        echo "FAIL: expected restored geometry $bx $by $bw $bh for handle=$handle; observed '${restore_geometry:-<none>}' (artifact_prefix=$prefix)" >&2
+        return 1
+    fi
+    qdwin_apps_screenshot "${prefix}-restore.png" || return 1
+
+    {
+        printf 'PASS: handle=%s baseline=%s %s %s %s\n' "$handle" "$bx" "$by" "$bw" "$bh"
+        printf '%s\n' "$max_evidence"
+        printf '%s\n' "$restore_evidence"
+    } | tee "${prefix}-roundtrip.log"
+}
+
 qdwin_apps_send_key() {
     qdwin_apps_require_vm || return 1
     local key qcode
