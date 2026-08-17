@@ -24,6 +24,7 @@ CASE_TOKEN=$(basename "$CASE_ARTIFACT_DIR" | tr -cd 'A-Za-z0-9_.-')
 CASE_GUEST_DIR=/tmp/qdwin-apps-10-$CASE_TOKEN
 DEMOS_HTTP_PID=""
 DEMOS_PORT_FILE=""
+CASE_INFRA=0
 
 # Arm cleanup before creating guest staging or launching any process. Preserve
 # the scenario's original status, but always remove transient state and return
@@ -32,11 +33,28 @@ DEMOS_PORT_FILE=""
 qdwin_apps_10_kill_case() {
     [ -n "${CASE_GUEST_DIR:-}" ] || return 0
     "$QDWIN_VM_EXEC" "$VMNAME" "
-pkill -u admin -9 -f '$CASE_GUEST_DIR/tk-demo.py' 2>/dev/null || true
-pkill -u admin -9 -f '$CASE_GUEST_DIR/fltk-demo' 2>/dev/null || true
-pkill -u admin -9 -f 'java SwingDemo' 2>/dev/null || true
+kill_tracked() {
+    pidfile=\$1; expected=\$2
+    [ -r \"\$pidfile\" ] || return 0
+    pid=\$(cat \"\$pidfile\")
+    case \"\$pid\" in ''|*[!0-9]*) return 0;; esac
+    [ -r \"/proc/\$pid/status\" ] || return 0
+    uid=\$(awk '/^Uid:/{print \$2}' \"/proc/\$pid/status\")
+    cmdline=\$(tr '\\0' ' ' < \"/proc/\$pid/cmdline\")
+    [ \"\$uid\" = 1000 ] || { echo \"kept pid=\$pid: uid=\$uid expected=1000\"; return 0; }
+    case \"\$cmdline\" in
+        *\"\$expected\"*)
+            kill -9 \"\$pid\" 2>/dev/null || true
+            echo \"killed tracked pid=\$pid expected=\$expected cmdline=\$cmdline\"
+            ;;
+        *) echo \"kept tracked pid=\$pid: expected=\$expected cmdline=\$cmdline\";;
+    esac
+}
+kill_tracked '$CASE_GUEST_DIR/tk.pid' '$CASE_GUEST_DIR/tk-demo.py'
+kill_tracked '$CASE_GUEST_DIR/fltk.pid' '$CASE_GUEST_DIR/fltk-demo'
+kill_tracked '$CASE_GUEST_DIR/swing.pid' 'java SwingDemo'
 true
-" >/dev/null 2>&1 || true
+" >>"$CASE_ARTIFACT_DIR/logs/tracked-cleanup.log" 2>&1 || true
 }
 
 qdwin_apps_10_cleanup() {
@@ -57,6 +75,20 @@ trap 'qdwin_apps_10_status=$?; qdwin_apps_10_cleanup "$qdwin_apps_10_status"; ex
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
 "$QDWIN_VM_EXEC" "$VMNAME" "install -d -o admin -g admin -m 700 '$CASE_GUEST_DIR'"
 echo "scenario artifacts: $CASE_ARTIFACT_DIR"
+
+# This GUI lane is defined for the baked 1280x800 mode. Gate that assumption
+# explicitly rather than hard-coding geometry in a later assertion without
+# proving the precondition.
+qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/output-precondition.png"
+if ! command -v identify >/dev/null 2>&1; then
+    echo "INFRA: ImageMagick identify is required to verify the 1280x800 GUI CI output"
+    exit 1
+fi
+CASE_OUTPUT_GEOMETRY=$(identify -format '%wx%h' "$CASE_ARTIFACT_DIR/screenshots/output-precondition.png" 2>/dev/null || true)
+if [ "$CASE_OUTPUT_GEOMETRY" != 1280x800 ]; then
+    echo "INFRA: scenario 10 requires GUI CI output 1280x800; observed ${CASE_OUTPUT_GEOMETRY:-unreadable}"
+    exit 1
+fi
 
 # App-deps gate (opt-in): Tk/FLTK/Swing are heavy toolkit deps that are only
 # baked into the QDWIN_APP_DEPS golden, not the lean GUI golden. Detect each
@@ -129,7 +161,8 @@ echo "serving $DEMOS_DIR at $DEMOS (pid $DEMOS_HTTP_PID)"
 if ! "$QDWIN_VM_EXEC" "$VMNAME" "python3 -c 'import tkinter' 2>/dev/null"; then
     echo "SKIP step 1 (Tk): python313-tk not installed; qdwin app deps are opt-in"
 else
-qdwin_apps_launch tk "wget -qO '$CASE_GUEST_DIR/tk-demo.py' $DEMOS/tk-demo.py && python3 '$CASE_GUEST_DIR/tk-demo.py'" \
+TK_LOG_BOUNDARY=$(qdwin_apps_bystander_log_boundary) || exit 1
+qdwin_apps_launch tk "wget -qO '$CASE_GUEST_DIR/tk-demo.py' $DEMOS/tk-demo.py && printf '%s\\n' \$\$ > '$CASE_GUEST_DIR/tk.pid' && exec python3 '$CASE_GUEST_DIR/tk-demo.py'" \
     2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step1-launch.log"
 sleep 6
 qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step1-tk.png"
@@ -146,12 +179,14 @@ qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step1-tk.png"
 # prerequisite (INFRA), per tests/apps/AGENTS.md — NOT a compositor FAIL.
 if grep -q 'failed to allocate font' "$CASE_ARTIFACT_DIR/logs/step1-tk.log" 2>/dev/null; then
     echo "INFRA: Tk font allocation failed in VM template (install xorg-x11-fonts / xorg-x11-fonts-core); Tk sub-case is an env prerequisite, not a qdwin bug"
+    CASE_INFRA=1
     qdwin_apps_10_kill_case
 else
     # A runnable Tk client must complete the protocol round-trip. This gate
     # comes after the exact prerequisite classification so missing fonts do
     # not get mislabeled as a compositor failure.
-    qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step1-tk" || exit 1
+    qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step1-tk" \
+        "$TK_LOG_BOUNDARY" tk "Tk on qdwin" || exit 1
     qdwin_apps_10_kill_case
 fi
 fi
@@ -174,9 +209,9 @@ centred window is expected when qdshell is not running; do not mistake that
 background for a black or missing application window.
 
 **Assert (1.4):** if instead `$CASE_ARTIFACT_DIR/logs/step1-tk.log` contains
-`failed to allocate font`, this step is an `INFRA:` env prerequisite
-(missing VM font package), not a qdwin FAIL — see Setup/Known failure
-modes.
+`failed to allocate font`, classify the cause as `INFRA:` (missing VM font
+package), continue collecting other toolkit evidence, then return a nonzero
+overall scenario status after cleanup — see Setup/Known failure modes.
 
 ### Step 2 — FLTK
 
@@ -191,12 +226,14 @@ else
     g++ -o '$CASE_GUEST_DIR/fltk-demo' '$CASE_GUEST_DIR/fltk-demo.cxx' -lfltk" \
     2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-build.log" | tail -3
 
-qdwin_apps_launch fltk "'$CASE_GUEST_DIR/fltk-demo'" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-launch.log"
+FLTK_LOG_BOUNDARY=$(qdwin_apps_bystander_log_boundary) || exit 1
+qdwin_apps_launch fltk "printf '%s\\n' \$\$ > '$CASE_GUEST_DIR/fltk.pid' && exec '$CASE_GUEST_DIR/fltk-demo'" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-launch.log"
 sleep 4
 qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step2-fltk.png"
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/fltk.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step2-fltk.log"
 
-qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step2-fltk" || exit 1
+qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step2-fltk" \
+    "$FLTK_LOG_BOUNDARY" FLTK "FLTK on qdwin" || exit 1
 qdwin_apps_10_kill_case
 fi
 ```
@@ -222,12 +259,14 @@ else
     cd '$CASE_GUEST_DIR' && javac SwingDemo.java" \
     2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-build.log" | tail -3
 
-qdwin_apps_launch swing "cd '$CASE_GUEST_DIR' && java SwingDemo" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-launch.log"
+SWING_LOG_BOUNDARY=$(qdwin_apps_bystander_log_boundary) || exit 1
+qdwin_apps_launch swing "cd '$CASE_GUEST_DIR' && printf '%s\\n' \$\$ > '$CASE_GUEST_DIR/swing.pid' && exec java SwingDemo" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-launch.log"
 sleep 10
 qdwin_apps_screenshot "$CASE_ARTIFACT_DIR/screenshots/step3-swing.png"
 "$QDWIN_VM_EXEC" "$VMNAME" "cat /tmp/swing.log" 2>&1 | tee "$CASE_ARTIFACT_DIR/logs/step3-swing.log"
 
-qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step3-swing" || exit 1
+qdwin_apps_assert_max_restore_last "$CASE_ARTIFACT_DIR/screenshots/step3-swing" \
+    "$SWING_LOG_BOUNDARY" SwingDemo "Swing on qdwin" || exit 1
 qdwin_apps_10_kill_case
 fi
 ```
@@ -247,7 +286,13 @@ background, not a rendering failure.
 ```bash
 # Explicit success cleanup also disarms the EXIT trap. Any earlier exit takes
 # the same cleanup path automatically while preserving its nonzero status.
-qdwin_apps_10_cleanup 0
+qdwin_apps_10_status=0
+if [ "${CASE_INFRA:-0}" != 0 ]; then
+    echo "FAIL: scenario 10 had installed-toolkit infrastructure failures"
+    qdwin_apps_10_status=1
+fi
+qdwin_apps_10_cleanup "$qdwin_apps_10_status"
+exit "$qdwin_apps_10_status"
 ```
 
 ## Pass criteria
@@ -275,7 +320,9 @@ qdwin_apps_10_cleanup 0
   env/template prerequisite, not a qdwin compositor bug. Ensure
   `xorg-x11-fonts` (and `xorg-x11-fonts-core`) are installed in the
   template; if absent, report the Tk sub-case as
-  `INFRA: Tk font allocation failed` per AGENTS.md rather than FAIL.
+  `INFRA: Tk font allocation failed` per AGENTS.md. The cause remains
+  infrastructure, but an installed toolkit that did not run makes the overall
+  scenario nonzero after cleanup.
 - **`g++` / FLTK headers not found** — VM missing `gcc-c++` / `fltk-devel`.
   The Setup gate records `HAVE_FLTK=0` and Step 2 reports `SKIP step 2 (FLTK)`
   — an opt-in app dep, not a FAIL. `fltk-devel` drags in `gcc-c++`.
