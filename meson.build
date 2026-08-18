@@ -1153,6 +1153,7 @@ test('app-input-policy',
     files('tests/apps/qdwin-apps-helpers.sh'),
     files('tests/apps/09-wxwidgets-audacity.md'),
     files('tests/apps/13-rdp-subscribe-frame.md'),
+    files('tests/apps/02-xterm-xwayland-launch.md'),
   ],
 )
 

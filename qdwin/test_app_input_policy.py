@@ -12,11 +12,12 @@ def fail(message: str) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
-        return fail("usage: test_app_input_policy.py helper.sh audacity.md rdp.md")
+    if len(sys.argv) != 5:
+        return fail("usage: test_app_input_policy.py helper.sh audacity.md rdp.md xterm.md")
     helper = Path(sys.argv[1]).read_text(encoding="utf-8")
     audacity = Path(sys.argv[2]).read_text(encoding="utf-8")
     rdp = Path(sys.argv[3]).read_text(encoding="utf-8")
+    xterm = Path(sys.argv[4]).read_text(encoding="utf-8")
 
     required = (
         "qdwin_apps_qmp_key()",
@@ -32,6 +33,39 @@ def main() -> int:
         return fail("app helper regressed to simultaneous virsh send-key injection")
     if "qdwin_apps_chord alt -- f" not in audacity:
         return fail("Audacity File-menu assertion does not use a modifier-held chord")
+
+    # App cleanup must never tear down shared XWayland/compositor state or
+    # generic-runtime services.  The old unbounded pkill -f list killed both,
+    # invalidating scenario 02's weston-liveness assertion before xterm ran.
+    kill_start = helper.find("\nqdwin_apps_kill() {")
+    kill_all_start = helper.find("\nqdwin_apps_kill_all() {")
+    if kill_start < 0 or kill_all_start < 0 or kill_start > kill_all_start:
+        return fail("app helper lacks targeted cleanup before kill-all wrapper")
+    cleanup = helper[kill_start:]
+    for forbidden in ("Xwayland", " python3", " java", " SwingDemo"):
+        if forbidden in cleanup:
+            return fail(f"app cleanup can target shared/runtime process {forbidden!r}")
+    for token in (
+        "refusing unapproved cleanup target",
+        'pgrep -u admin -f "^(/[^[:space:]]*/)?\\${pattern}([[:space:]]|\\$)"',
+        "kill -TERM --",
+        "kill -KILL --",
+    ):
+        if token not in cleanup:
+            return fail(f"app cleanup lacks scoped lifecycle token {token!r}")
+    if "qdwin_apps_kill xterm" not in xterm:
+        return fail("xterm crash scenario does not use xterm-scoped cleanup")
+    if "qdwin_apps_kill_all" in xterm:
+        return fail("xterm crash scenario still invokes global app cleanup")
+    for token in (
+        "pgrep -u admin -x weston | head -1",
+        "expected numeric weston PID before xterm",
+        "targeted setup cleanup restarted weston",
+        "weston restarted (pid $WESTON_PID_BEFORE",
+        "exit 1",
+    ):
+        if token not in xterm:
+            return fail(f"xterm crash scenario lacks fail-closed PID token {token!r}")
 
     # weston_log() embeds its own timestamp in MESSAGE, even with journalctl
     # -o cat. The shell handoff poll must accept that real prefix while keeping

@@ -666,20 +666,67 @@ EOJOURNAL
     "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
 }
 
-qdwin_apps_kill_all() {
+# Stop only named test applications.  Matching is anchored at argv[0]'s
+# basename instead of using an unbounded `pkill -f` substring: the latter made
+# `Xwayland`, `python3`, and `java` entries kill the compositor and unrelated
+# user services during scenario setup.  The allowlist also prevents a scenario
+# variable from turning this helper into an arbitrary process killer.
+qdwin_apps_kill() {
     qdwin_apps_require_vm || return 1
-    local b64; b64=$(base64 -w0 <<'EOKILL'
-for app in firefox thunderbird vlc kate krita gimp obsidian Obsidian \
-           xterm xeyes thunar libreoffice soffice inkscape mpv \
-           foot gnome-text-editor gedit gnome-system-monitor \
-           gnome-calculator chromium audacity gpick feh qbittorrent \
-           qpdfview eog ristretto evince python3 java SwingDemo \
-           fltk-demo Xwayland; do
-    pkill -u admin -9 -f "$app" 2>/dev/null
+    [ "$#" -gt 0 ] || { echo "qdwin-apps: kill requires an application name" >&2; return 2; }
+    local app names=""
+    for app in "$@"; do
+        case "$app" in
+            firefox|thunderbird|vlc|kate|krita|gimp|obsidian|Obsidian|\
+            xterm|xeyes|thunar|libreoffice|soffice|soffice.bin|inkscape|mpv|\
+            foot|gnome-text-editor|gedit|gnome-system-monitor|\
+            gnome-calculator|chromium|audacity|gpick|feh|qbittorrent|\
+            qpdfview|eog|ristretto|evince|fltk-demo)
+                names+=" $app"
+                ;;
+            *)
+                echo "qdwin-apps: refusing unapproved cleanup target '$app'" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    local b64 names_b64
+    names_b64=$(printf '%s' "${names# }" | base64 -w0)
+    b64=$(base64 -w0 <<EOKILL
+set -u
+names=\$(printf '%s' '$names_b64' | base64 -d)
+match_app() {
+    local app=\$1
+    local pattern=\$app
+    [ "\$app" = soffice.bin ] && pattern='soffice\.bin'
+    pgrep -u admin -f "^(/[^[:space:]]*/)?\${pattern}([[:space:]]|\$)"
+}
+for app in \$names; do
+    match_app "\$app" | xargs -r kill -TERM -- 2>/dev/null || true
 done
-sleep 1
+for _i in \$(seq 1 20); do
+    alive=0
+    for app in \$names; do
+        match_app "\$app" >/dev/null 2>&1 && alive=1
+    done
+    [ "\$alive" = 0 ] && exit 0
+    sleep 0.1
+done
+for app in \$names; do
+    match_app "\$app" | xargs -r kill -KILL -- 2>/dev/null || true
+done
 true
 EOKILL
 )
-    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash" >/dev/null 2>&1 || true
+    "$QDWIN_VM_EXEC" "$VMNAME" "echo $b64 | base64 -d | bash"
+}
+
+qdwin_apps_kill_all() {
+    qdwin_apps_kill \
+        firefox thunderbird vlc kate krita gimp obsidian Obsidian \
+        xterm xeyes thunar libreoffice soffice soffice.bin inkscape mpv \
+        foot gnome-text-editor gedit gnome-system-monitor \
+        gnome-calculator chromium audacity gpick feh qbittorrent \
+        qpdfview eog ristretto evince fltk-demo
 }

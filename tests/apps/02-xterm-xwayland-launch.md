@@ -11,16 +11,28 @@ dereferenced inside `qdwin_client_uid`).
 source ${QDWIN_REPO}/tests/apps/qdwin-apps-helpers.sh
 qdwin_apps_set_vm "${VMNAME}"
 qdwin_apps_session_up || { echo "FAIL: bystander/weston not healthy"; exit 1; }
-qdwin_apps_kill_all
 
-# Snapshot weston pid before so we can detect a restart.
-WESTON_PID_BEFORE=$(virsh qemu-agent-command "$VMNAME" \
-    '{"execute":"guest-exec","arguments":{"path":"/bin/sh","arg":["-c","pgrep -u admin weston | head -1"],"capture-output":true}}' \
-    2>/dev/null | head -1 || true)
-# fallback via vm-exec
-WESTON_PID_BEFORE=$(qdwin_apps_log_grep 'WESTON_PID' 2>/dev/null || \
-    "$QDWIN_VM_EXEC" "$VMNAME" 'pgrep -u admin weston | head -1' 2>/dev/null)
+# Snapshot the actual guest weston PID directly.  A qemu guest-exec response
+# contains the transient command PID, not its captured stdout, and a historical
+# journal grep can return stale/non-numeric text; neither is valid evidence.
+WESTON_PID_BEFORE=$("$QDWIN_VM_EXEC" "$VMNAME" \
+    'pgrep -u admin -x weston | head -1' 2>/dev/null)
+case "$WESTON_PID_BEFORE" in
+    ''|*[!0-9]*) echo "FAIL: expected numeric weston PID before xterm, observed '$WESTON_PID_BEFORE'" >&2; exit 1 ;;
+esac
 echo "weston pid before: $WESTON_PID_BEFORE"
+
+# This scenario owns only xterm. Never stop Xwayland itself: doing so destroys
+# the very compositor/session continuity that the weston-PID assertion tests.
+# Check the setup cleanup immediately so it cannot invalidate the baseline
+# before the actual launch regression begins.
+qdwin_apps_kill xterm
+WESTON_PID_AFTER_SETUP=$("$QDWIN_VM_EXEC" "$VMNAME" \
+    'pgrep -u admin -x weston | head -1' 2>/dev/null)
+[ "$WESTON_PID_BEFORE" = "$WESTON_PID_AFTER_SETUP" ] || {
+    echo "FAIL: targeted setup cleanup restarted weston (pid $WESTON_PID_BEFORE → $WESTON_PID_AFTER_SETUP)" >&2
+    exit 1
+}
 ```
 
 ## Steps
@@ -56,9 +68,11 @@ qdwin_apps_log_grep "toplevel_added .*owner_uid=${ADMIN_UID} .*title=\"xterm\"" 
 proving qdwin didn't crash. Use:
 
 ```bash
-WESTON_PID_AFTER=$("$QDWIN_VM_EXEC" "$VMNAME" 'pgrep -u admin weston | head -1')
-[ "$WESTON_PID_BEFORE" = "$WESTON_PID_AFTER" ] || \
-    echo "FAIL: weston restarted (pid $WESTON_PID_BEFORE → $WESTON_PID_AFTER)"
+WESTON_PID_AFTER=$("$QDWIN_VM_EXEC" "$VMNAME" 'pgrep -u admin -x weston | head -1')
+[ "$WESTON_PID_BEFORE" = "$WESTON_PID_AFTER" ] || {
+    echo "FAIL: weston restarted (pid $WESTON_PID_BEFORE → $WESTON_PID_AFTER)" >&2
+    exit 1
+}
 ```
 
 ### Step 2 — type into xterm
@@ -77,7 +91,10 @@ works after the NULL-client fix (the SIGSEGV used to fire during
 ## Cleanup
 
 ```bash
-qdwin_apps_ctl "close" || qdwin_apps_kill_all
+qdwin_apps_ctl "close" || true
+# The FIFO write only proves command delivery. Ensure this scenario's xterm is
+# gone even if the compositor could not service the close request.
+qdwin_apps_kill xterm
 ```
 
 ## Pass criteria

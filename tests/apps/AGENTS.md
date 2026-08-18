@@ -77,8 +77,12 @@ The helper provides:
 - `qdwin_apps_send_key KEY_*` / `qdwin_apps_type "string"` for discrete
   keys, and `qdwin_apps_chord alt -- f` for real modifier-held chords. These
   use QMP `input-send-event`; do not substitute `virsh send-key` for a chord.
-- `qdwin_apps_kill_all` — `pkill -u admin -9` everything we might have
-  started; for Cleanup blocks.
+- `qdwin_apps_kill <name>...` — stop only the named, allowlisted test apps
+  using an argv[0]-anchored match. Prefer this in Cleanup when the scenario
+  knows what it launched.
+- `qdwin_apps_kill_all` — stop all allowlisted test apps, but never shared
+  session infrastructure (`weston`, `Xwayland`, generic `python3`/`java`
+  services). Use only as the Setup/Cleanup safety net.
 - `qdwin_apps_log_grep <pattern>` — grep the current boot's
   `qdwin-compositor.service` user journal plus `/tmp/bystander.log`.
 - `qdwin_apps_journal_cursor` / `qdwin_apps_log_since_cursor <cursor> <pattern>`
