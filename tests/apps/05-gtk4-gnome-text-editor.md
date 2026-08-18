@@ -35,7 +35,22 @@ menu at the top-right, and an empty editing area.
 ```bash
 qdwin_apps_type "qdwin"
 sleep 1
-qdwin_apps_screenshot /tmp/05-step2-typed.png
+GTK_STEP2_IMAGE=${QCI_GUI_ARTIFACT_DIR:-/tmp}/step2-typed.png
+qdwin_apps_screenshot "$GTK_STEP2_IMAGE"
+# Independent rendering evidence for the document canvas. This centered crop is
+# wholly inside the editor at its launch geometry. A real black/absent GTK
+# canvas has a near-zero grayscale mean; the normal white document is >0.9.
+# Keep the threshold conservative so themes/antialiasing cannot manufacture a
+# pass, while making a visual agent's black-background confusion impossible.
+GTK_DOCUMENT_MEAN=$(magick "$GTK_STEP2_IMAGE" \
+  -crop 320x240+480+280 +repage -colorspace Gray \
+  -format '%[fx:mean]' info:)
+printf 'gtk_document_center_mean=%s\n' "$GTK_DOCUMENT_MEAN" | \
+  tee "${QCI_GUI_ARTIFACT_DIR:-/tmp}/step2-render-metric.txt"
+awk -v mean="$GTK_DOCUMENT_MEAN" 'BEGIN { exit !(mean >= 0.70) }' || {
+  echo "FAIL: GTK document center is black/absent (mean=$GTK_DOCUMENT_MEAN)"
+  exit 1
+}
 ```
 
 **Assert (2.1):** screenshot shows `qdwin` rendered in the editing
@@ -45,6 +60,9 @@ The black pixels surrounding the rounded white window are the expected bare
 desktop background, not a black canvas. Report a rendering failure only when
 the window's own document area or header is black/absent; visible `qdwin` in
 the white document area plus the `qdwin`/`Draft` title satisfies this assert.
+The required `gtk_document_center_mean >= 0.70` metric above independently
+proves that the in-window document area is not black; when it passes, do not
+reinterpret the surrounding desktop pixels as an absent document canvas.
 
 ### Step 3 — maximise
 
