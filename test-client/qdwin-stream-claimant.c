@@ -28,6 +28,12 @@
  *                ALREADY_CLAIMED protocol error (one-shot consumption).
  *   - invalid_token   : a 3rd connection claims a bogus 32-hex token → must get the
  *                INVALID_TOKEN protocol error (public global is harmless w/o secret).
+ *   - reclaim_invalid_token (opt-in, QDWIN_CLAIMANT_RECLAIM=1): after the inject,
+ *                the live handle is destroyed and its connection closed (= the
+ *                forward releasing its claim), then a NEW connection (same pid,
+ *                so the pid gate still passes) claims the SAME real token → must
+ *                get INVALID_TOKEN. Pins the one-shot contract: release must
+ *                invalidate the token, not make it claimable again (iso2 10 E4).
  * (The `not_claimed` error is unreachable by construction: an inject handle only
  * exists after a successful claim, and a failed claim is a fatal protocol error —
  * so there is no live unclaimed handle to inject on. qdwin's inject handlers also
@@ -177,6 +183,8 @@ struct status {
 	int go_seen;           /* GO signal observed */
 	int inject_sent;       /* motion+button injected on the live handle */
 	int inject_x, inject_y;
+	int reclaim_checked;   /* QDWIN_CLAIMANT_RECLAIM=1: the re-claim ran */
+	int reclaim_invalid_token; /* re-claim of the released token got INVALID_TOKEN */
 };
 
 static void write_status(const struct status *s)
@@ -189,10 +197,12 @@ static void write_status(const struct status *s)
 	fprintf(f, "{\"pid\":%d,\"bound\":%d,\"claim_real\":%d,"
 		   "\"already_claimed\":%d,\"invalid_token\":%d,"
 		   "\"go_seen\":%d,\"inject_sent\":%d,"
-		   "\"inject_x\":%d,\"inject_y\":%d}\n",
+		   "\"inject_x\":%d,\"inject_y\":%d,"
+		   "\"reclaim_checked\":%d,\"reclaim_invalid_token\":%d}\n",
 		s->pid, s->bound, s->claim_real, s->already_claimed,
 		s->invalid_token, s->go_seen, s->inject_sent,
-		s->inject_x, s->inject_y);
+		s->inject_x, s->inject_y,
+		s->reclaim_checked, s->reclaim_invalid_token);
 	fflush(f);
 	int fd = fileno(f);
 	if (fd >= 0) fsync(fd);
@@ -323,11 +333,34 @@ int main(int argc, char **argv)
 	}
 
 	qdwin_stream_input_handle_v1_destroy(handle);
+	wl_display_flush(pos.dpy);
+	(void)wl_display_roundtrip(pos.dpy);   /* server processes the destroy */
 	si_close(&pos);
+
+	/* (4) opt-in one-shot check: the claim above is now RELEASED (handle
+	 * destroyed + connection closed). Re-claim the SAME token from a fresh
+	 * connection of this same pid: the token must have been invalidated on
+	 * release, so the only acceptable outcome is INVALID_TOKEN. A successful
+	 * re-claim here means release made the token claimable again (the
+	 * pre-fix behaviour) → the check fails (fail closed). */
+	const char *reclaim = getenv("QDWIN_CLAIMANT_RECLAIM");
+	if (reclaim && !strcmp(reclaim, "1")) {
+		struct si_conn re;
+		st.reclaim_checked = 1;
+		if (si_connect(&re, wl_display) == 0) {
+			(void)qdwin_stream_input_v1_claim(re.si, token);
+			wl_display_flush(re.dpy);
+			st.reclaim_invalid_token = expect_claim_error(
+				&re, QDWIN_STREAM_INPUT_V1_ERROR_INVALID_TOKEN);
+		}
+		si_close(&re);
+		write_status(&st);
+	}
 	free(token);
 
 	/* Exit success only if every required outcome held. */
 	int ok = st.claim_real && st.already_claimed && st.invalid_token &&
-		 st.inject_sent;
+		 st.inject_sent &&
+		 (!st.reclaim_checked || st.reclaim_invalid_token);
 	return ok ? 0 : 6;
 }
