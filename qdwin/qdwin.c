@@ -5037,6 +5037,30 @@ qdwin_view_stream_unpin(struct qdwin_view_stream *s)
 		weston_output_schedule_repaint(target);
 }
 
+/* Fill buf with n bytes from the kernel CSPRNG. getrandom(2) may return
+ * short or -1/EINTR (blocking flag 0, interrupted before the entropy pool is
+ * ready); loop over those. Any other failure (ENOSYS, EFAULT) is hard: return
+ * -1 and let the caller refuse to mint a token rather than fabricate one from
+ * a clock (iso2 `11` E4). */
+static int
+qdwin_getrandom_full(unsigned char *buf, size_t n)
+{
+	size_t off = 0;
+	int tries = 0;
+	while (off < n) {
+		ssize_t got = getrandom(buf + off, n - off, 0);
+		if (got < 0) {
+			if (errno == EINTR && ++tries < 64)
+				continue;
+			return -1;
+		}
+		if (got == 0 && ++tries >= 64)
+			return -1;
+		off += (size_t)got;
+	}
+	return 0;
+}
+
 /* Hex-encode n random bytes into out (out_len must be 2*n+1). */
 static int
 qdwin_hex_token(char *out, size_t out_len, size_t n_bytes)
@@ -5044,8 +5068,7 @@ qdwin_hex_token(char *out, size_t out_len, size_t n_bytes)
 	unsigned char buf[32];
 	if (n_bytes > sizeof buf)
 		n_bytes = sizeof buf;
-	ssize_t got = getrandom(buf, n_bytes, 0);
-	if (got != (ssize_t)n_bytes) {
+	if (qdwin_getrandom_full(buf, n_bytes) < 0) {
 		out[0] = '\0';
 		return -1;
 	}
@@ -5899,11 +5922,12 @@ qdwin_ts_from_msec(uint32_t time_msec)
 static struct qdwin_view_stream *
 qdwin_view_stream_by_token(struct qdwin *qdwin, const char *token)
 {
-	if (!token)
+	if (!token || !token[0])
 		return NULL;
 	struct qdwin_view_stream *s;
 	wl_list_for_each(s, &qdwin->view_streams, link) {
-		if (strncmp(s->access_token, token,
+		if (s->access_token[0] &&
+		    strncmp(s->access_token, token,
 			    sizeof s->access_token) == 0)
 			return s;
 	}
@@ -5921,6 +5945,10 @@ qdwin_stream_input_handle_resource_destroyed(struct wl_resource *resource)
 	if (s->input_handle == resource) {
 		s->input_handle = NULL;
 		s->input_claimed = 0;
+		/* The protocol calls the token one-shot: once a claim has been
+		 * released it must not be claimable again with the same token
+		 * (iso2 `10` E4). Erase it; by_token rejects empty tokens. */
+		memset(s->access_token, 0, sizeof s->access_token);
 		qdwin_stream_confine_grab_end(s);   /* IMPL-19: drop the focus lock */
 		weston_log("qdwin: stream_input handle released "
 			   "(rdp_port=%u)\n", s->rdp_port);
@@ -19663,24 +19691,25 @@ qdwin_activation_token_find(struct qdwin *qdwin, const char *token)
 	return NULL;
 }
 
-static void
+static int
 qdwin_generate_token(char out[33])
 {
 	unsigned char raw[16];
 	static const char hex[] = "0123456789abcdef";
-	ssize_t n = getrandom(raw, sizeof raw, 0);
-	if (n != (ssize_t)sizeof raw) {
-		/* Fallback: coarse clock xor. Good enough for a non-secret
-		 * correlation id; the token's threat model is replay within
-		 * a single session. */
-		for (size_t i = 0; i < sizeof raw; i++)
-			raw[i] = (unsigned char)(i * 37u + (unsigned)time(NULL));
+	/* EINTR/short reads are retried inside qdwin_getrandom_full. On a
+	 * hard failure there is NO fallback: a time-seeded token is
+	 * guessable and the token gates focus stealing. Return -1 and let
+	 * the caller deny the activation (iso2 `11` E4). */
+	if (qdwin_getrandom_full(raw, sizeof raw) < 0) {
+		out[0] = '\0';
+		return -1;
 	}
 	for (int i = 0; i < 16; i++) {
 		out[i * 2]     = hex[(raw[i] >> 4) & 0xf];
 		out[i * 2 + 1] = hex[raw[i]        & 0xf];
 	}
 	out[32] = '\0';
+	return 0;
 }
 
 static void
@@ -19764,9 +19793,13 @@ qdwin_activation_token_commit(struct wl_client *client,
 	(void)client;
 	if (!t || t->committed)
 		return;
-	qdwin_generate_token(token_buf);
 	free(t->token);
-	t->token = strdup(token_buf);
+	if (qdwin_generate_token(token_buf) < 0) {
+		weston_log("qdwin: xdg-activation getrandom failed → deny\n");
+		t->token = NULL;
+	} else {
+		t->token = strdup(token_buf);
+	}
 	if (!t->token) {
 		/* Alloc failure: deny rather than issue an empty/unfindable
 		 * token that silently breaks activation.  Send done("") so the

@@ -828,6 +828,62 @@ def check_stream_input_helper_bound(source):
     return 0
 
 
+def check_stream_input_token_one_shot(source):
+    """iso2 `10` E4: the protocol calls the stream access_token one-shot.
+    Releasing the claimed handle must ERASE the token (not just clear
+    input_claimed), and the token lookup must never match an erased token,
+    so a second claim with the same token after release fails closed."""
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_stream_input_handle_resource_destroyed\s*\(",
+        "qdwin_stream_input_handle_resource_destroyed",
+    )
+    if err:
+        return fail(err)
+    if "memset(s->access_token, 0, sizeof s->access_token)" not in body:
+        return fail("stream_input handle release no longer erases the "
+                    "access_token (token would be re-claimable)")
+    if "s->input_claimed = 0" not in body:
+        return fail("stream_input handle release no longer clears "
+                    "input_claimed")
+    lookup, err = _function_body(
+        source,
+        r"static struct qdwin_view_stream \*\s*qdwin_view_stream_by_token\s*\(",
+        "qdwin_view_stream_by_token",
+    )
+    if err:
+        return fail(err)
+    if "!token[0]" not in lookup or "s->access_token[0] &&" not in lookup:
+        return fail("qdwin_view_stream_by_token can match an erased "
+                    "(empty) access_token")
+    # iso2 `11` E4: no clock-derived token fallback when getrandom fails.
+    gen, err = _function_body(
+        source,
+        r"static int\s+qdwin_generate_token\s*\(",
+        "qdwin_generate_token",
+    )
+    if err:
+        return fail(err)
+    if "time(NULL)" in gen:
+        return fail("qdwin_generate_token fabricates tokens from time(NULL)")
+    if "qdwin_getrandom_full" not in gen:
+        return fail("qdwin_generate_token does not use the EINTR/short-read "
+                    "safe getrandom wrapper")
+    rnd, err = _function_body(
+        source,
+        r"static int\s+qdwin_getrandom_full\s*\(",
+        "qdwin_getrandom_full",
+    )
+    if err:
+        return fail(err)
+    if "EINTR" not in rnd:
+        return fail("qdwin_getrandom_full does not retry on EINTR")
+    if "qdwin_generate_token(token_buf) < 0" not in source:
+        return fail("xdg-activation commit does not check "
+                    "qdwin_generate_token failure")
+    return 0
+
+
 def check_nested_proxy_forwards_secctx(source):
     """J12 Fix B: a nested tier-2 proxy has no backing app wl_client
     (desktop_surface == NULL), so qdwin_send_toplevel_security_context cannot
@@ -954,6 +1010,7 @@ def main():
         check_pixel_destroy_preserves_position,
         check_generic_raise_paths_preserve_pending_gate,
         check_stream_input_helper_bound,
+        check_stream_input_token_one_shot,
         check_nested_proxy_forwards_secctx,
     )
     for check in checks:

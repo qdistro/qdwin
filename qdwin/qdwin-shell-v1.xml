@@ -2120,10 +2120,14 @@
       through that seat. The seat's focus is locked to the source
       view — injection cannot leak to other views.
 
-      Tokens are one-shot and single-use. Reconnecting
-      qdistro-forward (e.g. after a crash) requires the compositor
-      to mint a fresh token, which currently means destroying and
-      re-subscribing the `qdwin_view_stream_v1` on the shell side.
+      Tokens are one-shot and single-use: a successful `claim` consumes
+      the token, and destroying the returned handle (or the claimant
+      disconnecting) invalidates it rather than making it claimable
+      again — a second `claim` with the same token after release fails
+      with `invalid_token`. Reconnecting qdistro-forward (e.g. after a
+      crash) therefore requires the compositor to mint a fresh token,
+      which currently means destroying and re-subscribing the
+      `qdwin_view_stream_v1` on the shell side.
     </description>
 
     <enum name="error">
