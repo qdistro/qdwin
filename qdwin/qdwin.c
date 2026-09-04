@@ -2967,6 +2967,7 @@ qdwin_chrome_attach_side(struct qdwin_toplevel *tl, int side,
 	c->view = weston_view_create(ws);
 	if (!c->view) {
 		wl_list_remove(&c->surface_destroy.link);
+		wl_list_remove(&c->surface_commit.link);
 		c->surface = NULL;
 		return -1;
 	}
@@ -10685,6 +10686,8 @@ qdwin_handle_data_offer_receive_decision(struct wl_client *client,
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 	struct qdwin_data_offer_pending *p =
 		qdwin_data_offer_pending_find(qdwin, handle);
 	if (!p) {
@@ -15964,6 +15967,8 @@ qdwin_handle_set_cursor_sprite(struct wl_client *client,
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 
 	if (shape < 1 ||
 	    shape > WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE) {
@@ -20113,6 +20118,8 @@ qdwin_handle_activation_decision(struct wl_client *client,
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
 	struct qdwin_activation_pending *ap =
 		qdwin_activation_pending_find(qdwin, handle);
 	if (!ap) {
