@@ -9372,16 +9372,18 @@ bind_qdwin_shell(struct wl_client *client, void *data,
 		return;
 	}
 
-	/* The nested pixel consumer is a separate, root-installed executable.
-	 * It needs a protocol resource solely to issue bind_proxy_pixels, whose
-	 * handler independently proves that the caller owns the advertised
-	 * proxy. Keep the normal single-shell rule for every other peer. */
+	/* Helpers that need a protocol resource without the shell role:
+	 * the nested pixel consumer (bind_proxy_pixels) and the
+	 * cursor-sprites supplier (set_cursor_sprite). Each is pinned to
+	 * an exact root-installed exe. Keep the single-shell rule for
+	 * every other peer. */
 	if (qdwin->shell_bound && !qdwin_client_is_bound_shell(qdwin, client)) {
 		char *peer_exe = qdwin_proc_exe(pid);
-		bool pixelfeed =
-			qdwin_nested_pixelfeed_peer_allowed(peer_exe);
+		bool helper =
+			qdwin_nested_pixelfeed_peer_allowed(peer_exe) ||
+			qdwin_cursor_sprite_peer_allowed(peer_exe);
 		free(peer_exe);
-		if (!pixelfeed) {
+		if (!helper) {
 			wl_client_post_implementation_error(
 				client,
 				"qdwin_shell_v1: shell role already claimed");
@@ -15966,16 +15968,24 @@ qdwin_handle_set_cursor_sprite(struct wl_client *client,
 			       int32_t hotspot_y)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
-	(void)client;
-	/* Deliberately NOT gated by qdwin_shell_require_bound (iso2 `10`
-	 * E1 applied it, and s6.8-cursor-sprites-v10 caught it): the
-	 * protocol says set_cursor_sprite is "issued by the shell (or a
-	 * helper it spawned)", and the production issuer is the
-	 * qdistro-cursor-sprites user service — a separate wl_client at
-	 * allowed_uid that never calls bind_as_shell. The resource is
-	 * already uid-filtered and secctx-rejected in bind_qdwin_shell;
-	 * a per-request helper capability is the follow-up, not this
-	 * gate. */
+	pid_t pid;
+	uid_t uid;
+	gid_t gid;
+	char *peer_exe;
+	bool allowed;
+
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	peer_exe = qdwin_proc_exe(pid);
+	allowed = qdwin_client_is_bound_shell(qdwin, client) ||
+		  qdwin_cursor_sprite_peer_allowed(peer_exe);
+	free(peer_exe);
+	if (!allowed) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_NOT_BOUND,
+				       "set_cursor_sprite: not the bound shell "
+				       "or cursor-sprites helper");
+		return;
+	}
 
 	if (shape < 1 ||
 	    shape > WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE) {
@@ -18031,6 +18041,7 @@ struct qdwin_primary_seat {
 	struct qdwin *qdwin;
 	struct weston_seat *seat;
 	struct qdwin_primary_source *current_source;
+	uint32_t selection_serial;
 	struct wl_list devices;  /* qdwin_primary_device::link */
 	struct wl_listener seat_destroy_listener;
 	struct wl_list link;  /* qdwin::primary_seats::link */
@@ -18338,8 +18349,13 @@ qdwin_primary_device_set_selection(struct wl_client *client,
 	struct qdwin_primary_seat *pseat = device ? device->pseat : NULL;
 	struct qdwin_primary_device *d;
 	(void)client;
-	(void)serial;
 	if (!pseat)
+		return;
+	/* Same stale-serial guard as weston_seat_set_selection
+	 * (libweston data-device.c): silently ignore an older serial
+	 * when a source is already set. First set is never stale. */
+	if (qdwin_selection_serial_is_stale(pseat->selection_serial, serial,
+					    pseat->current_source != NULL))
 		return;
 	if (source && source->pseat && source->pseat != pseat) {
 		/* Source already bound elsewhere — reject per spec intent. */
@@ -18350,6 +18366,7 @@ qdwin_primary_device_set_selection(struct wl_client *client,
 		qdwin_primary_seat_clear_selection(pseat, 1);
 	else if (!source)
 		qdwin_primary_seat_clear_selection(pseat, 1);
+	pseat->selection_serial = serial;
 	if (!source)
 		return;
 	source->pseat = pseat;

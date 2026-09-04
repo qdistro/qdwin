@@ -327,6 +327,22 @@ qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe)
 }
 
 bool
+qdwin_cursor_sprite_peer_allowed(const char *peer_exe)
+{
+	return peer_exe &&
+	       strcmp(peer_exe, "/usr/bin/qdistro-cursor-sprites") == 0;
+}
+
+bool
+qdwin_selection_serial_is_stale(uint32_t current, uint32_t incoming,
+				bool has_current)
+{
+	if (!has_current)
+		return false;
+	return (current - incoming) < (UINT32_MAX / 2u);
+}
+
+bool
 qdwin_om_mutation_allowed(bool client_is_bound_shell,
 			  bool shell_bound,
 			  pid_t client_pid, uid_t client_uid,

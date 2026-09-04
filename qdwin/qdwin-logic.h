@@ -215,6 +215,17 @@ bool qdwin_nested_secctx_publisher_allowed(const char *sandbox_engine,
  * resource for bind_proxy_pixels without acquiring the shell role. */
 bool qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe);
 
+/* Exact root-installed helper allowed to issue set_cursor_sprite without
+ * acquiring the shell role. Production issuer is
+ * /usr/bin/qdistro-cursor-sprites (qdistro-cursor-sprites.service). */
+bool qdwin_cursor_sprite_peer_allowed(const char *peer_exe);
+
+/* Weston wl_data_device set_selection stale-serial test: with a current
+ * source, reject incoming serials that are not newer than current
+ * (unsigned wrap-safe). First set (no current source) is never stale. */
+bool qdwin_selection_serial_is_stale(uint32_t current, uint32_t incoming,
+				     bool has_current);
+
 /* ------------------------------------------------------------------
  * Deliberate fail-open / broad-trust pins (02/S13).
  *

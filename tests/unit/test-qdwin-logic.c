@@ -526,6 +526,44 @@ static void test_nested_pixelfeed_peer_identity(void)
 	      "lookalike pixelfeed path is rejected");
 }
 
+static void test_cursor_sprite_peer_identity(void)
+{
+	CHECK(qdwin_cursor_sprite_peer_allowed(
+		      "/usr/bin/qdistro-cursor-sprites"),
+	      "root-installed cursor-sprites helper is recognized");
+	CHECK(!qdwin_cursor_sprite_peer_allowed(NULL),
+	      "missing cursor-sprites executable is rejected");
+	CHECK(!qdwin_cursor_sprite_peer_allowed(""),
+	      "empty cursor-sprites executable is rejected");
+	CHECK(!qdwin_cursor_sprite_peer_allowed(
+		       "qdistro-cursor-sprites"),
+	      "basename-only cursor-sprites identity is rejected");
+	CHECK(!qdwin_cursor_sprite_peer_allowed(
+		       "/tmp/qdistro-cursor-sprites"),
+	      "lookalike cursor-sprites path is rejected");
+	CHECK(!qdwin_cursor_sprite_peer_allowed(
+		       "/usr/bin/qdistro-nested-pixelfeed"),
+	      "pixelfeed helper is not a cursor-sprites helper");
+}
+
+static void test_selection_serial_stale(void)
+{
+	CHECK(!qdwin_selection_serial_is_stale(0, 0, false),
+	      "first set is never stale, even at serial 0");
+	CHECK(!qdwin_selection_serial_is_stale(5, 0, false),
+	      "first set ignores the stored serial");
+	CHECK(qdwin_selection_serial_is_stale(5, 0, true),
+	      "serial 0 is stale after a newer selection");
+	CHECK(qdwin_selection_serial_is_stale(10, 9, true),
+	      "older serial is stale");
+	CHECK(qdwin_selection_serial_is_stale(10, 10, true),
+	      "equal serial is stale (weston: current - incoming == 0)");
+	CHECK(!qdwin_selection_serial_is_stale(10, 11, true),
+	      "newer serial is accepted");
+	CHECK(!qdwin_selection_serial_is_stale(0, 1, true),
+	      "serial 1 is newer than 0");
+}
+
 /* ---- deliberate fail-open / broad-trust pins (02/S13) ----
  *
  * These tests pin explicit risk-register entries rather than asserting ideal
@@ -713,6 +751,8 @@ int main(void)
 	test_global_visibility();
 	test_nested_secctx_publisher_identity();
 	test_nested_pixelfeed_peer_identity();
+	test_cursor_sprite_peer_identity();
+	test_selection_serial_stale();
 	test_s13_fail_open_pins();
 	test_popup_constrain();
 
