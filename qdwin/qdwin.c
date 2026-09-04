@@ -15967,8 +15967,15 @@ qdwin_handle_set_cursor_sprite(struct wl_client *client,
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	(void)client;
-	if (!qdwin_shell_require_bound(qdwin, resource))
-		return;
+	/* Deliberately NOT gated by qdwin_shell_require_bound (iso2 `10`
+	 * E1 applied it, and s6.8-cursor-sprites-v10 caught it): the
+	 * protocol says set_cursor_sprite is "issued by the shell (or a
+	 * helper it spawned)", and the production issuer is the
+	 * qdistro-cursor-sprites user service — a separate wl_client at
+	 * allowed_uid that never calls bind_as_shell. The resource is
+	 * already uid-filtered and secctx-rejected in bind_qdwin_shell;
+	 * a per-request helper capability is the follow-up, not this
+	 * gate. */
 
 	if (shape < 1 ||
 	    shape > WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE) {
