@@ -871,6 +871,8 @@ static void
 rdp_peer_release_input(RdpPeerContext *peer_context)
 {
 	struct weston_keyboard *keyboard;
+	struct weston_pointer_button_event button_event;
+	struct weston_key_event key_event;
 	struct timespec time;
 	uint32_t *keys;
 	bool pointer_frame = false;
@@ -884,8 +886,11 @@ rdp_peer_release_input(RdpPeerContext *peer_context)
 	for (i = 0; i < ARRAY_LENGTH(peer_context->button_state); i++) {
 		if (!peer_context->button_state[i])
 			continue;
-		notify_button(peer_context->item.seat, &time, BTN_LEFT + i,
-			      WL_POINTER_BUTTON_STATE_RELEASED);
+		weston_pointer_button_event_init(&button_event, &time,
+						 peer_context->item.seat,
+						 BTN_LEFT + i,
+						 WL_POINTER_BUTTON_STATE_RELEASED);
+		notify_button(&button_event);
 		peer_context->button_state[i] = false;
 		pointer_frame = true;
 	}
@@ -896,10 +901,12 @@ rdp_peer_release_input(RdpPeerContext *peer_context)
 	while (keyboard && keyboard->keys.size >= sizeof(uint32_t)) {
 		keys = keyboard->keys.data;
 		/* notify_key removes the released key from this same array. */
-		notify_key(peer_context->item.seat, &time,
-			   keys[keyboard->keys.size / sizeof(uint32_t) - 1],
-			   WL_KEYBOARD_KEY_STATE_RELEASED,
-			   STATE_UPDATE_AUTOMATIC);
+		weston_key_event_init(&key_event, &time,
+				      peer_context->item.seat,
+				      keys[keyboard->keys.size / sizeof(uint32_t) - 1],
+				      WL_KEYBOARD_KEY_STATE_RELEASED,
+				      STATE_UPDATE_AUTOMATIC);
+		notify_key(&key_event);
 	}
 }
 
