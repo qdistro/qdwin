@@ -514,6 +514,9 @@ static void test_nested_pixelfeed_peer_identity(void)
 	CHECK(qdwin_nested_pixelfeed_peer_allowed(
 		      "/usr/bin/qdistro-nested-pixelfeed"),
 	      "root-installed nested pixelfeed helper is recognized");
+	CHECK(qdwin_nested_pixelfeed_peer_allowed(
+		      "/usr/bin/qdistro-mm-remote-pixelfeed"),
+	      "root-installed remote pixelfeed helper is recognized");
 	CHECK(!qdwin_nested_pixelfeed_peer_allowed(NULL),
 	      "missing pixelfeed executable is rejected");
 	CHECK(!qdwin_nested_pixelfeed_peer_allowed(""),
@@ -524,6 +527,40 @@ static void test_nested_pixelfeed_peer_identity(void)
 	CHECK(!qdwin_nested_pixelfeed_peer_allowed(
 		       "/tmp/qdistro-nested-pixelfeed"),
 	      "lookalike pixelfeed path is rejected");
+	CHECK(!qdwin_nested_pixelfeed_peer_allowed(
+		       "/tmp/qdistro-mm-remote-pixelfeed"),
+	      "lookalike remote pixelfeed path is rejected");
+}
+
+static void test_remote_nested_publisher_identity(void)
+{
+	CHECK(qdwin_remote_nested_publisher_allowed(
+		      "/usr/bin/qdistro-mm-remote-viewer-helper"),
+	      "root-installed remote viewer helper is recognized");
+	CHECK(!qdwin_remote_nested_publisher_allowed(NULL),
+	      "missing remote publisher executable is rejected");
+	CHECK(!qdwin_remote_nested_publisher_allowed(
+		       "qdistro-mm-remote-viewer-helper"),
+	      "basename-only remote publisher is rejected");
+	CHECK(!qdwin_remote_nested_publisher_allowed(
+		       "/tmp/qdistro-mm-remote-viewer-helper"),
+	      "remote publisher path lookalike is rejected");
+	CHECK(!qdwin_remote_nested_publisher_allowed("/usr/bin/weston"),
+	      "ordinary nested publisher cannot attach remote identity");
+}
+
+/* Ensures: a delayed HUP/readable callback for a replaced nested input peer
+ * cannot close or inject through the currently-owned peer connection. */
+static void test_nested_input_peer_event_identity(void)
+{
+	CHECK(qdwin_nested_input_peer_event_current(42, 42),
+	      "current nested input peer event is accepted");
+	CHECK(!qdwin_nested_input_peer_event_current(41, 42),
+	      "replaced nested input peer event is rejected");
+	CHECK(!qdwin_nested_input_peer_event_current(-1, 42),
+	      "invalid nested input event fd is rejected");
+	CHECK(!qdwin_nested_input_peer_event_current(42, -1),
+	      "nested input event is rejected after current peer teardown");
 }
 
 static void test_cursor_sprite_peer_identity(void)
@@ -753,6 +790,8 @@ int main(void)
 	test_nested_pixelfeed_peer_identity();
 	test_cursor_sprite_peer_identity();
 	test_selection_serial_stale();
+	test_remote_nested_publisher_identity();
+	test_nested_input_peer_event_identity();
 	test_s13_fail_open_pins();
 	test_popup_constrain();
 

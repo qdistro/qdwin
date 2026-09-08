@@ -44,7 +44,7 @@
     "experimental" convention: version 1 is the first unstable draft.
   </description>
 
-  <interface name="qdwin_shell_v1" version="33">
+  <interface name="qdwin_shell_v1" version="34">
     <description summary="the qdwin shell attach point">
       The shell binds this global once and holds it for the lifetime of
       its process. qdwin rejects a second bind from the same client; a
@@ -1863,6 +1863,68 @@
            summary="milliseconds since the retained frame was composited"/>
       <arg name="msc" type="uint"
            summary="low 32 bits of the output frame counter at retention"/>
+    </event>
+
+    <event name="nested_proxy_remote_identity" since="34">
+      <description summary="authority-bound identity for a remote nested proxy">
+        Emitted only after qdwin verifies that the exact root-installed remote
+        viewer helper attached an immutable identity obtained from its local
+        authenticated controller. This is a protected sidecar to
+        toplevel_added; app_id and title remain untrusted presentation text.
+      </description>
+      <arg name="handle" type="uint"/>
+      <arg name="source_machine" type="string"/>
+      <arg name="trust_domain_id" type="string"/>
+      <arg name="stream_id" type="string"/>
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+    </event>
+
+    <request name="set_remote_output_input" since="34">
+      <description summary="gate console-equivalent input from one RDP output">
+        Enables or disables RDP peer input at the compositor backend for the
+        named pre-created rdp-N output. Disabling deterministically releases
+        every held key and pointer button before returning. The backend starts
+        disabled, and qdwin disables it again if the bound shell disappears.
+
+        This is a safety boundary, not ordinary settings IPC. Only the
+        exclusively bound shell may invoke it; the shell in turn accepts the
+        exact generation/slot transition only from the authenticated display
+        controller transaction.
+      </description>
+      <arg name="output_name" type="string" summary="exact rdp-N slot name"/>
+      <arg name="enabled" type="uint" summary="0 disabled, 1 enabled"/>
+    </request>
+
+    <event name="remote_output_input_result" since="34">
+      <description summary="authoritative result of an RDP input gate request">
+        Correlates the exact output name and requested state. `applied` is 1
+        only after the RDP backend accepted the transition and, for disable,
+        released its held input state.
+      </description>
+      <arg name="output_name" type="string"/>
+      <arg name="enabled" type="uint"/>
+      <arg name="applied" type="uint"/>
+    </event>
+
+    <request name="drain_remote_output_state" since="34">
+      <description summary="drain session input and transfer state before detach">
+        Runs qdwin's fail-safe output-boundary cancellation without removing
+        the named output: cancel active grabs, DND, IME composition and pointer
+        constraints; clear keyboard/pointer/touch focus; and clear clipboard
+        plus primary selection. The controller invokes this only after RDP
+        input is disabled and before closing the authenticated carrier.
+      </description>
+      <arg name="output_name" type="string" summary="exact rdp-N slot name"/>
+    </request>
+
+    <event name="remote_output_drain_result" since="34">
+      <description summary="authoritative result of remote-output state drain">
+        `applied` is 1 only after the named output was found and the complete
+        cancellation boundary returned.
+      </description>
+      <arg name="output_name" type="string"/>
+      <arg name="applied" type="uint"/>
     </event>
   </interface>
 

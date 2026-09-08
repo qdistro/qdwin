@@ -984,6 +984,69 @@ def check_nested_proxy_forwards_secctx(source):
     return 0
 
 
+def check_nested_input_peer_replacement(source):
+    """A replacement peer must retire its old event source before the sink
+    helper closes the old fd, and a stale callback must not touch the new fd."""
+    listen, err = _function_body(
+        source,
+        r"static int\s+qdwin_nested_input_sink_listen_cb\s*\(",
+        "qdwin_nested_input_sink_listen_cb",
+    )
+    if err:
+        return fail(err)
+    remove_at = listen.find("wl_event_source_remove(")
+    accept_at = listen.find("qdwin_nested_input_sink_accept(")
+    if remove_at < 0 or accept_at < 0 or remove_at > accept_at:
+        return fail("nested input replacement does not remove the old event "
+                    "source before accept closes/replaces its peer fd")
+    if "old_peer_fd" not in listen or "peer_fd == old_peer_fd" not in listen:
+        return fail("nested input replacement does not restore the old watch "
+                    "when accept loses a readiness race")
+
+    peer, err = _function_body(
+        source,
+        r"static int\s+qdwin_nested_input_sink_peer_cb\s*\(",
+        "qdwin_nested_input_sink_peer_cb",
+    )
+    if err:
+        return fail(err)
+    current_at = peer.find("qdwin_nested_input_peer_event_current(")
+    hangup_at = peer.find("WL_EVENT_HANGUP")
+    if current_at < 0 or hangup_at < 0 or current_at > hangup_at:
+        return fail("nested input peer callback can process HUP before proving "
+                    "the event fd is still current")
+    if "ignoring stale input-sink peer event" not in peer:
+        return fail("stale nested input peer rejection is not observable")
+    return 0
+
+
+def check_remote_identity_is_protected_and_immutable(source):
+    body, err = _function_body(
+        source,
+        r"static void\s+qdwin_nested_toplevel_set_remote_identity\s*\(",
+        "qdwin_nested_toplevel_set_remote_identity",
+    )
+    if err:
+        return fail(err)
+    required = (
+        "wl_client_get_credentials",
+        "qdwin_proc_exe(pid)",
+        "qdwin_remote_nested_publisher_allowed(peer_exe)",
+        "QDWIN_NESTED_TOPLEVEL_V1_ERROR_UNAUTHORIZED_REMOTE_IDENTITY",
+        "QDWIN_NESTED_TOPLEVEL_V1_ERROR_INVALID_REMOTE_IDENTITY",
+        "QDWIN_NESTED_TOPLEVEL_V1_ERROR_REMOTE_IDENTITY_IMMUTABLE",
+        "qdwin_emit_nested_proxy_remote_identity",
+    )
+    for token in required:
+        if token not in body:
+            return fail("remote identity setter lacks protected step: " + token)
+    identity_at = body.find("qdwin_remote_nested_publisher_allowed")
+    assign_at = body.find("tl->proxy_remote_source_machine = source_copy")
+    if identity_at < 0 or assign_at < 0 or identity_at > assign_at:
+        return fail("remote publisher identity must be verified before storing")
+    return 0
+
+
 def main():
     if len(sys.argv) != 2:
         return fail("usage: test_nested_identity_policy.py <qdwin.c>")
@@ -1012,6 +1075,8 @@ def main():
         check_stream_input_helper_bound,
         check_stream_input_token_one_shot,
         check_nested_proxy_forwards_secctx,
+        check_nested_input_peer_replacement,
+        check_remote_identity_is_protected_and_immutable,
     )
     for check in checks:
         rc = check(source)

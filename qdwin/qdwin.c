@@ -44,6 +44,7 @@
 
 #include <libweston/libweston.h>
 #include <libweston/desktop.h>
+#include <libweston/plugin-registry.h>
 #include <libweston/shell-utils.h>
 #include <libweston/xwayland-api.h>
 #include <wayland-server-core.h>
@@ -54,6 +55,28 @@
  * header, but resolvable at dlopen time against the executable's
  * symbol table (same trick kiosk-shell uses). */
 int screenshooter_create(struct weston_compositor *ec);
+
+/* qdwin builds against the distribution's stable libweston headers while the
+ * in-tree RDP backend carries an additive tail to the v2 API. Keep a private
+ * ABI view of that registered vtable: the first three entries are the stock v2
+ * layout and the final entry is the input gate. Function-pointer
+ * representation is the ABI contract; qdwin calls only the final typed
+ * member. */
+#define QDWIN_RDP_OUTPUT_API_NAME "weston_rdp_output_api_v2"
+struct qdwin_rdp_output_api_extended_v2 {
+	void (*head_get_monitor)(void);
+	void (*output_set_mode)(void);
+	void (*disable_output_resize)(void);
+	bool (*output_set_input_enabled)(struct weston_output *output,
+					 bool enabled);
+};
+
+static const struct qdwin_rdp_output_api_extended_v2 *
+qdwin_rdp_output_get_api(struct weston_compositor *compositor)
+{
+	return weston_plugin_api_get(compositor, QDWIN_RDP_OUTPUT_API_NAME,
+				     sizeof(struct qdwin_rdp_output_api_extended_v2));
+}
 
 #include "qdwin-shell-v1-server-protocol.h"
 #include "qdwin-locker-v1-server-protocol.h"
@@ -275,6 +298,8 @@ static void qdwin_om_resync_all(struct qdwin *qdwin);
  * objects whose complete types are declared below. */
 static void qdwin_output_boundary_transition(struct qdwin *qdwin,
 					      struct weston_output *removed);
+static void qdwin_output_boundary_cancel_state(struct qdwin *qdwin,
+					       struct weston_output *removed);
 /* §6.8 cursor-sprite full theme forward decl (impl table at L3577 needs
  * the symbol; definition lives near the rest of the cursor-shape code). */
 static void qdwin_handle_set_cursor_sprite(struct wl_client *client,
@@ -552,6 +577,13 @@ struct qdwin_toplevel {
 	char *proxy_secctx_app_id;
 	char *proxy_secctx_instance;
 	bool proxy_secctx_set;
+	/* v31: authority-bound remote identity. These fields are populated only
+	 * by qdwin_nested_toplevel_v1.set_remote_identity after exact publisher
+	 * executable verification; app_id/title never participate in attribution. */
+	char *proxy_remote_source_machine;
+	char *proxy_remote_trust_domain_id;
+	char *proxy_remote_stream_id;
+	uint64_t proxy_remote_generation;
 	/* §6.8 S2b: when the admin shell calls bind_proxy_pixels, the
 	 * compositor swaps the placeholder curtain view for a view of the
 	 * bound surface. proxy_pixel_view is the active view (== tl->view),
@@ -1700,6 +1732,24 @@ qdwin_emit_toplevel_app_id(struct qdwin *qdwin,
 }
 
 static void
+qdwin_emit_nested_proxy_remote_identity(struct qdwin *qdwin,
+					struct qdwin_toplevel *tl)
+{
+	if (!qdwin || !tl || !tl->is_nested_proxy ||
+	    !tl->proxy_remote_source_machine ||
+	    !qdwin->shell_bound || !qdwin->shell_resource ||
+	    wl_resource_get_version(qdwin->shell_resource) < 34)
+		return;
+	qdwin_shell_v1_send_nested_proxy_remote_identity(
+		qdwin->shell_resource, tl->handle,
+		tl->proxy_remote_source_machine,
+		tl->proxy_remote_trust_domain_id,
+		tl->proxy_remote_stream_id,
+		(uint32_t)(tl->proxy_remote_generation >> 32),
+		(uint32_t)tl->proxy_remote_generation);
+}
+
+static void
 qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 {
 	const char *app_id;
@@ -1732,6 +1782,7 @@ qdwin_send_toplevel_added(struct qdwin *qdwin, struct qdwin_toplevel *tl)
 					   title  ? title  : "",
 					   (uint32_t)qdwin_toplevel_is_xwayland(qdwin, tl));
 	qdwin_send_toplevel_security_context(qdwin, tl);
+	qdwin_emit_nested_proxy_remote_identity(qdwin, tl);
 	/* v24 sidecar: tell the shell which workspace this window opened on.
 	 * Mirrors the secctx event ordering — immediately after
 	 * toplevel_added so the shell has the row before it fills fields. */
@@ -3714,6 +3765,127 @@ qdwin_handle_prepare_output_capture(struct wl_client *client,
 			   output->name);
 		return;
 	}
+}
+
+static bool
+qdwin_remote_output_name_valid(const char *name)
+{
+	const char *p;
+	if (!name || strncmp(name, "rdp-", 4) != 0 || !name[4])
+		return false;
+	for (p = name + 4; *p; p++)
+		if (*p < '0' || *p > '9')
+			return false;
+	return p - (name + 4) <= 3;
+}
+
+static bool
+qdwin_set_remote_output_input(struct qdwin *qdwin, const char *output_name,
+			      bool enabled)
+{
+	const struct qdwin_rdp_output_api_extended_v2 *api;
+	struct weston_output *output;
+	struct wl_list *lists[2] = {
+		&qdwin->compositor->output_list,
+		&qdwin->compositor->pending_output_list,
+	};
+
+	if (!qdwin_remote_output_name_valid(output_name))
+		return false;
+	api = qdwin_rdp_output_get_api(qdwin->compositor);
+	if (!api || !api->output_set_input_enabled)
+		return false;
+	/* A disabled pre-created RDP slot lives on pending_output_list. Safety-off
+	 * must remain idempotent there during cold-start and crash recovery; only
+	 * searching active outputs made the daemon reject an already-safe disable. */
+	for (int i = 0; i < 2; i++) {
+		wl_list_for_each(output, lists[i], link) {
+			if (output->name && strcmp(output->name, output_name) == 0)
+				return api->output_set_input_enabled(output, enabled);
+		}
+	}
+	return false;
+}
+
+/* v32: the authenticated display controller reaches this only through the
+ * exclusively bound qdshell transaction. RDP starts fail-closed; disabling
+ * also releases backend-held keys/buttons. */
+static void
+qdwin_handle_set_remote_output_input(struct wl_client *client,
+				     struct wl_resource *resource,
+				     const char *output_name,
+				     uint32_t enabled)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	bool applied;
+	(void)client;
+
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (wl_resource_get_version(resource) < 34) {
+		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_METHOD,
+				       "remote output requests require qdwin shell v34");
+		return;
+	}
+	if (enabled > 1 || !qdwin_remote_output_name_valid(output_name)) {
+		weston_log("qdwin: remote input gate rejected invalid request\n");
+		return;
+	}
+	/* Safety-off remains available while locked; safety-on does not. */
+	if (enabled && qdwin->locked) {
+		wl_resource_post_error(resource,
+				       QDWIN_SHELL_V1_ERROR_LOCKED, "locked");
+		return;
+	}
+	applied = qdwin_set_remote_output_input(
+		qdwin, output_name, enabled != 0);
+	weston_log("qdwin: remote input gate output=%s enabled=%u result=%s\n",
+		   output_name, enabled, applied ? "applied" : "rejected");
+	qdwin_shell_v1_send_remote_output_input_result(
+		resource, output_name, enabled, applied ? 1u : 0u);
+}
+
+/* v33: run the R8 cancellation half before carrier close. This is deliberately
+ * separate from output removal so transfer state is gone while the peer is
+ * still connected and the controller can wait for an authoritative result. */
+static void
+qdwin_handle_drain_remote_output_state(struct wl_client *client,
+				       struct wl_resource *resource,
+				       const char *output_name)
+{
+	struct qdwin *qdwin = wl_resource_get_user_data(resource);
+	struct weston_output *output;
+	struct wl_list *lists[2] = {
+		&qdwin->compositor->output_list,
+		&qdwin->compositor->pending_output_list,
+	};
+	bool applied = false;
+	(void)client;
+
+	if (!qdwin_shell_require_bound(qdwin, resource))
+		return;
+	if (wl_resource_get_version(resource) < 34) {
+		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_METHOD,
+				       "remote output requests require qdwin shell v34");
+		return;
+	}
+	if (!qdwin_remote_output_name_valid(output_name)) {
+		weston_log("qdwin: remote output drain rejected invalid request\n");
+		return;
+	}
+	for (int i = 0; i < 2 && !applied; i++) {
+		wl_list_for_each(output, lists[i], link) {
+			if (!output->name || strcmp(output->name, output_name) != 0)
+				continue;
+			qdwin_output_boundary_cancel_state(qdwin, output);
+			applied = true;
+			break;
+		}
+	}
+	weston_log("qdwin: remote output drain output=%s result=%s\n",
+		   output_name, applied ? "applied" : "rejected");
+	qdwin_shell_v1_send_remote_output_drain_result(
+		resource, output_name, applied ? 1u : 0u);
 }
 
 /* ------------------------------------------------------------------
@@ -9300,6 +9472,8 @@ static const struct qdwin_shell_v1_interface qdwin_shell_impl = {
 	.set_key_repeat = qdwin_handle_set_key_repeat,
 	.request_set_position = qdwin_handle_request_set_position,
 	.prepare_output_capture = qdwin_handle_prepare_output_capture,
+	.set_remote_output_input = qdwin_handle_set_remote_output_input,
+	.drain_remote_output_state = qdwin_handle_drain_remote_output_state,
 };
 
 static void
@@ -9307,6 +9481,14 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 {
 	struct qdwin *qdwin = wl_resource_get_user_data(resource);
 	if (qdwin->shell_resource == resource) {
+		struct weston_output *output;
+		/* v32: shell loss is authority loss. Revoke every live RDP seat
+		 * before clearing the binding; the backend releases held input. */
+		wl_list_for_each(output, &qdwin->compositor->output_list, link) {
+			if (qdwin_remote_output_name_valid(output->name))
+				qdwin_set_remote_output_input(
+					qdwin, output->name, false);
+		}
 		qdwin_hotkeys_purge(qdwin);
 		if (qdwin->move_grab_active) {
 			qdwin->move_grab_active = 0;
@@ -19018,12 +19200,103 @@ qdwin_nested_toplevel_set_geometry(struct wl_client *client,
 		qdwin_nested_proxy_set_geometry(t->proxy_tl, w, h);
 }
 
+static int
+qdwin_remote_identity_text_valid(const char *text, int stream)
+{
+	if (!text)
+		return 0;
+	size_t length = strlen(text);
+	if (!length || length > 128 || (stream && length < 16))
+		return 0;
+	for (size_t i = 0; i < length; i++) {
+		unsigned char c = (unsigned char)text[i];
+		int alpha_num = (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+		if (!alpha_num && !(i > 0 && (c == '_' || c == '-' ||
+		    (!stream && (c == '.' || c == ':')))))
+			return 0;
+	}
+	return 1;
+}
+
+static void
+qdwin_nested_toplevel_set_remote_identity(struct wl_client *client,
+					   struct wl_resource *resource,
+					   const char *source_machine,
+					   const char *trust_domain_id,
+					   const char *stream_id,
+					   uint32_t generation_hi,
+					   uint32_t generation_lo)
+{
+	struct qdwin_nested_toplevel *t = wl_resource_get_user_data(resource);
+	if (!t || !t->proxy_tl)
+		return;
+	pid_t pid = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
+	wl_client_get_credentials(client, &pid, &uid, &gid);
+	(void)uid;
+	(void)gid;
+	char *peer_exe = qdwin_proc_exe(pid);
+	int publisher_allowed =
+		qdwin_remote_nested_publisher_allowed(peer_exe);
+	free(peer_exe);
+	if (!publisher_allowed) {
+		wl_resource_post_error(resource,
+			QDWIN_NESTED_TOPLEVEL_V1_ERROR_UNAUTHORIZED_REMOTE_IDENTITY,
+			"remote identity publisher is not authorized");
+		return;
+	}
+	uint64_t generation = ((uint64_t)generation_hi << 32) | generation_lo;
+	if (!generation ||
+	    !qdwin_remote_identity_text_valid(source_machine, 0) ||
+	    !qdwin_remote_identity_text_valid(trust_domain_id, 0) ||
+	    !qdwin_remote_identity_text_valid(stream_id, 1)) {
+		wl_resource_post_error(resource,
+			QDWIN_NESTED_TOPLEVEL_V1_ERROR_INVALID_REMOTE_IDENTITY,
+			"remote identity fields are invalid");
+		return;
+	}
+	struct qdwin_toplevel *tl = t->proxy_tl;
+	if (tl->proxy_remote_source_machine) {
+		if (tl->proxy_remote_generation == generation &&
+		    strcmp(tl->proxy_remote_source_machine, source_machine) == 0 &&
+		    strcmp(tl->proxy_remote_trust_domain_id, trust_domain_id) == 0 &&
+		    strcmp(tl->proxy_remote_stream_id, stream_id) == 0)
+			return;
+		wl_resource_post_error(resource,
+			QDWIN_NESTED_TOPLEVEL_V1_ERROR_REMOTE_IDENTITY_IMMUTABLE,
+			"remote identity cannot change");
+		return;
+	}
+	char *source_copy = qdwin_xstrdup_or_null(source_machine);
+	char *trust_copy = qdwin_xstrdup_or_null(trust_domain_id);
+	char *stream_copy = qdwin_xstrdup_or_null(stream_id);
+	if (!source_copy || !trust_copy || !stream_copy) {
+		free(source_copy);
+		free(trust_copy);
+		free(stream_copy);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	tl->proxy_remote_source_machine = source_copy;
+	tl->proxy_remote_trust_domain_id = trust_copy;
+	tl->proxy_remote_stream_id = stream_copy;
+	tl->proxy_remote_generation = generation;
+	weston_log("qdwin/nested-proxy: verified remote identity handle=%u "
+		   "source=%s trust_domain=%s stream=%s generation=%llu\n",
+		   tl->handle, source_copy, trust_copy, stream_copy,
+		   (unsigned long long)generation);
+	qdwin_emit_nested_proxy_remote_identity(tl->qdwin, tl);
+}
+
 static const struct qdwin_nested_toplevel_v1_interface
 qdwin_nested_toplevel_impl = {
 	.destroy      = qdwin_nested_toplevel_destroy_req,
 	.set_title    = qdwin_nested_toplevel_set_title,
 	.set_app_id   = qdwin_nested_toplevel_set_app_id,
 	.set_geometry = qdwin_nested_toplevel_set_geometry,
+	.set_remote_identity = qdwin_nested_toplevel_set_remote_identity,
 };
 
 static void
@@ -20603,7 +20876,14 @@ static int
 qdwin_nested_input_sink_peer_cb(int fd, uint32_t mask, void *data)
 {
 	struct qdwin_toplevel *tl = data;
-	(void)fd;
+	int current_fd = tl->nested_input_sink
+		? tl->nested_input_sink->peer_fd : -1;
+	if (!qdwin_nested_input_peer_event_current(fd, current_fd)) {
+		weston_log("qdwin/nested: ignoring stale input-sink peer event "
+			   "handle=%u event_fd=%d current_fd=%d\n",
+			   tl->handle, fd, current_fd);
+		return 0;
+	}
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		weston_log("qdwin/nested: input-sink peer closed handle=%u\n",
 			   tl->handle);
@@ -20700,8 +20980,35 @@ qdwin_nested_input_sink_listen_cb(int fd, uint32_t mask, void *data)
 	(void)fd;
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR))
 		return 0;
-	if (qdwin_nested_input_sink_accept(tl->nested_input_sink) < 0)
+
+	/* The sink helper closes the old peer only after accept4 succeeds.  Its
+	 * wl_event_source must be removed first: otherwise a delayed HUP for the
+	 * closed fd can run after peer_fd has been replaced and close the new
+	 * peer.  If accept4 loses a readiness race, restore the old watch. */
+	int old_peer_fd = tl->nested_input_sink
+		? tl->nested_input_sink->peer_fd : -1;
+	if (tl->nested_input_peer_source) {
+		wl_event_source_remove(tl->nested_input_peer_source);
+		tl->nested_input_peer_source = NULL;
+	}
+	if (qdwin_nested_input_sink_accept(tl->nested_input_sink) < 0) {
+		if (old_peer_fd >= 0 && tl->nested_input_sink &&
+		    tl->nested_input_sink->peer_fd == old_peer_fd) {
+			struct wl_event_loop *loop = wl_display_get_event_loop(
+				qdwin->compositor->wl_display);
+			tl->nested_input_peer_source = wl_event_loop_add_fd(
+				loop, old_peer_fd, WL_EVENT_READABLE,
+				qdwin_nested_input_sink_peer_cb, tl);
+			if (!tl->nested_input_peer_source) {
+				close(old_peer_fd);
+				tl->nested_input_sink->peer_fd = -1;
+				weston_log("qdwin/nested: failed to restore "
+					   "input-sink peer watch handle=%u\n",
+					   tl->handle);
+			}
+		}
 		return 0;
+	}
 	weston_log("qdwin/nested: input-sink connected handle=%u\n",
 		   tl->handle);
 	struct wl_event_loop *loop = wl_display_get_event_loop(
@@ -20709,6 +21016,13 @@ qdwin_nested_input_sink_listen_cb(int fd, uint32_t mask, void *data)
 	tl->nested_input_peer_source = wl_event_loop_add_fd(
 		loop, tl->nested_input_sink->peer_fd, WL_EVENT_READABLE,
 		qdwin_nested_input_sink_peer_cb, tl);
+	if (!tl->nested_input_peer_source) {
+		close(tl->nested_input_sink->peer_fd);
+		tl->nested_input_sink->peer_fd = -1;
+		weston_log("qdwin/nested: failed to watch input-sink peer "
+			   "handle=%u\n", tl->handle);
+		return 0;
+	}
 	return 1;
 }
 
@@ -21553,6 +21867,9 @@ qdwin_nested_proxy_destroy(struct qdwin_toplevel *tl)
 	free(tl->proxy_secctx_engine);
 	free(tl->proxy_secctx_app_id);
 	free(tl->proxy_secctx_instance);
+	free(tl->proxy_remote_source_machine);
+	free(tl->proxy_remote_trust_domain_id);
+	free(tl->proxy_remote_stream_id);
 	free(tl);
 }
 
@@ -23196,10 +23513,10 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	}
 
 	/* Advertise the full interface version so the shell can bind every
-	 * request/event through v33 (retained-frame capture_served_stale). */
+	 * request/event through v34 (remote identity/input/drain). */
 	qdwin->shell_global = wl_global_create(ec->wl_display,
 					       &qdwin_shell_v1_interface,
-					       33, qdwin, bind_qdwin_shell);
+					       34, qdwin, bind_qdwin_shell);
 	if (!qdwin->shell_global) {
 		weston_log("qdwin: wl_global_create failed\n");
 		goto fail;
@@ -23409,7 +23726,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 	wl_display_set_global_filter(ec->wl_display,
 				     qdwin_secctx_global_filter, qdwin);
 
-	/* §6.8 S1: qdwin_nested_v1 manager global at v2 (string node IDs).
+	/* §6.8 S1: qdwin_nested_v1 manager global at v3 (remote identity).
 	 * Peer-uid-filtered.
 	 *
 	 * §P10: compiled out in role=guest builds. The in-VM compositor
@@ -23422,7 +23739,7 @@ wet_shell_init(struct weston_compositor *ec, int *argc, char *argv[])
 #ifndef QDWIN_ROLE_GUEST
 	qdwin->nested_manager_global = wl_global_create(
 		ec->wl_display, &qdwin_nested_manager_v1_interface,
-		2, qdwin, bind_qdwin_nested_manager);
+		3, qdwin, bind_qdwin_nested_manager);
 	if (!qdwin->nested_manager_global) {
 		weston_log("qdwin: nested-manager wl_global_create failed\n");
 		goto fail;

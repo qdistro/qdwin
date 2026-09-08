@@ -323,7 +323,22 @@ bool
 qdwin_nested_pixelfeed_peer_allowed(const char *peer_exe)
 {
 	return peer_exe &&
-	       strcmp(peer_exe, "/usr/bin/qdistro-nested-pixelfeed") == 0;
+	       (strcmp(peer_exe, "/usr/bin/qdistro-nested-pixelfeed") == 0 ||
+	        strcmp(peer_exe, "/usr/bin/qdistro-mm-remote-pixelfeed") == 0);
+}
+
+bool
+qdwin_remote_nested_publisher_allowed(const char *peer_exe)
+{
+	return peer_exe &&
+	       strcmp(peer_exe, "/usr/bin/qdistro-mm-remote-viewer-helper") == 0;
+}
+
+bool
+qdwin_nested_input_peer_event_current(int event_fd, int current_peer_fd)
+{
+	return event_fd >= 0 && current_peer_fd >= 0 &&
+	       event_fd == current_peer_fd;
 }
 
 bool

@@ -28,6 +28,7 @@
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -346,6 +347,37 @@ rdp_output_disable_resize(struct weston_output *base)
 }
 
 static void
+rdp_output_apply_initial_mode(struct weston_output *base,
+			      struct weston_mode *mode)
+{
+	const char *requested;
+	int width, height;
+	char trailing;
+
+	/* The stock multi-backend frontend consumes --width/--height while
+	 * loading the first backend, leaving an RDP slot at 640x480.  A trusted
+	 * launcher can seed the pre-created slot's leaseable mode explicitly.
+	 * This is initial-state only: negotiated peer resize and later output
+	 * management continue through the ordinary backend path. */
+	if (base->current_mode)
+		return;
+	requested = getenv("QDWIN_RDP_INITIAL_MODE");
+	if (!requested || !*requested)
+		return;
+	if (sscanf(requested, "%dx%d%c", &width, &height, &trailing) != 2 ||
+	    width < 64 || width > 16384 || height < 64 || height > 16384 ||
+	    (int64_t)width * height > 67108864) {
+		weston_log("Ignoring invalid QDWIN_RDP_INITIAL_MODE='%s'\n",
+			   requested);
+		return;
+	}
+	mode->width = width;
+	mode->height = height;
+	weston_log("RDP initial output mode seeded by trusted launcher: %dx%d\n",
+		   width, height);
+}
+
+static void
 rdp_output_set_mode(struct weston_output *base, struct weston_mode *mode)
 {
 	struct rdp_output *rdpOutput = container_of(base, struct rdp_output, base);
@@ -354,6 +386,7 @@ rdp_output_set_mode(struct weston_output *base, struct weston_mode *mode)
 	struct rdp_peers_item *rdpPeer;
 	rdpSettings *settings;
 
+	rdp_output_apply_initial_mode(base, mode);
 	mode->refresh = b->rdp_monitor_refresh_rate;
 	weston_output_set_single_mode(base, mode);
 
@@ -824,6 +857,76 @@ out_error_stream:
 out_error_nsc:
 	rfx_context_free(context->rfx_context);
 	return FALSE;
+}
+
+static bool
+rdp_peer_input_allowed(RdpPeerContext *peer_context)
+{
+	return peer_context->rdpBackend->input_enabled &&
+		(peer_context->item.flags & RDP_PEER_ACTIVATED) &&
+		peer_context->item.seat;
+}
+
+static void
+rdp_peer_release_input(RdpPeerContext *peer_context)
+{
+	struct weston_keyboard *keyboard;
+	struct timespec time;
+	uint32_t *keys;
+	bool pointer_frame = false;
+	unsigned int i;
+
+	if (!(peer_context->item.flags & RDP_PEER_ACTIVATED) ||
+	    !peer_context->item.seat)
+		return;
+
+	weston_compositor_get_time(&time);
+	for (i = 0; i < ARRAY_LENGTH(peer_context->button_state); i++) {
+		if (!peer_context->button_state[i])
+			continue;
+		notify_button(peer_context->item.seat, &time, BTN_LEFT + i,
+			      WL_POINTER_BUTTON_STATE_RELEASED);
+		peer_context->button_state[i] = false;
+		pointer_frame = true;
+	}
+	if (pointer_frame)
+		notify_pointer_frame(peer_context->item.seat);
+
+	keyboard = weston_seat_get_keyboard(peer_context->item.seat);
+	while (keyboard && keyboard->keys.size >= sizeof(uint32_t)) {
+		keys = keyboard->keys.data;
+		/* notify_key removes the released key from this same array. */
+		notify_key(peer_context->item.seat, &time,
+			   keys[keyboard->keys.size / sizeof(uint32_t) - 1],
+			   WL_KEYBOARD_KEY_STATE_RELEASED,
+			   STATE_UPDATE_AUTOMATIC);
+	}
+}
+
+static bool
+rdp_output_set_input_enabled(struct weston_output *base, bool enabled)
+{
+	struct rdp_output *output = to_rdp_output(base);
+	struct rdp_backend *backend;
+	struct rdp_peers_item *item;
+
+	if (!output)
+		return false;
+	backend = output->backend;
+	if (backend->input_enabled == enabled)
+		return true;
+
+	backend->input_enabled = enabled;
+	if (!enabled) {
+		wl_list_for_each(item, &backend->peers, link) {
+			RdpPeerContext *context =
+				(RdpPeerContext *)item->peer->context;
+			rdp_peer_release_input(context);
+		}
+	}
+	weston_log("RDP input gate output=%s enabled=%d\n",
+		   base->name ? base->name : "(unnamed)", enabled);
+	return true;
 }
 
 static void
@@ -1436,6 +1539,8 @@ xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
 	bool need_frame = false;
 	struct timespec time;
 
+	if (!rdp_peer_input_allowed(peerContext))
+		return TRUE;
 	dump_mouseinput(peerContext, flags, x, y, false);
 
 	/* Per RDP spec, the x,y position is valid on all input mouse messages,
@@ -1503,6 +1608,8 @@ xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
 	struct timespec time;
 	struct weston_coord_global pos;
 
+	if (!rdp_peer_input_allowed(peerContext))
+		return TRUE;
 	dump_mouseinput(peerContext, flags, x, y, true);
 
 	if (flags & PTR_XFLAGS_BUTTON1)
@@ -1559,7 +1666,9 @@ xf_input_synchronize_event(rdpInput *input, UINT32 flags)
 	struct rdp_output *output = rdp_get_first_output(b);
 	struct weston_keyboard *keyboard;
 
-        rdp_debug_verbose(b, "RDP backend: %s ScrLk:%d, NumLk:%d, CapsLk:%d, KanaLk:%d\n",
+	if (!rdp_peer_input_allowed(peerCtx))
+		return TRUE;
+	rdp_debug_verbose(b, "RDP backend: %s ScrLk:%d, NumLk:%d, CapsLk:%d, KanaLk:%d\n",
 			  __func__,
 			  flags & KBD_SYNC_SCROLL_LOCK ? 1 : 0,
 			  flags & KBD_SYNC_NUM_LOCK ? 1 : 0,
@@ -1600,7 +1709,7 @@ xf_input_keyboard_event(rdpInput *input, UINT16 flags, XF_KEV_CODE_TYPE code)
         rdp_debug_verbose(peerContext->rdpBackend, "RDP backend: %s flags:0x%x, code:0x%x\n",
 			  __func__, flags, code);
 
-	if (!(peerContext->item.flags & RDP_PEER_ACTIVATED)) {
+	if (!rdp_peer_input_allowed(peerContext)) {
 		rdp_debug_verbose(peerContext->rdpBackend, " -> NOT ACTIVATED\n");
 		return TRUE;
 	}
@@ -2017,6 +2126,7 @@ static const struct weston_rdp_output_api api = {
 	rdp_head_get_monitor,
 	rdp_output_set_mode,
 	rdp_output_disable_resize,
+	rdp_output_set_input_enabled,
 };
 
 static const uint32_t rdp_formats[] = {
@@ -2064,6 +2174,9 @@ rdp_backend_create(struct weston_compositor *compositor,
 	/* After here, rdp_debug() is ready to be used */
 
 	b->rdp_monitor_refresh_rate = config->refresh_rate * 1000;
+	/* Fail closed until the exclusively bound shell admits this peer after
+	 * authenticated carrier establishment. */
+	b->input_enabled = false;
 	rdp_debug(b, "RDP backend: WESTON_RDP_MONITOR_REFRESH_RATE: %d\n", b->rdp_monitor_refresh_rate);
 
 	b->clipboard_debug = weston_log_ctx_add_log_scope(b->compositor->weston_log_ctx,
@@ -2084,28 +2197,37 @@ rdp_backend_create(struct weston_compositor *compositor,
 			goto err_free_strings;
 	}
 
-	/* if we are listening for client connections on an external listener
-	 * fd, we don't need to enforce TLS or RDP security, since FreeRDP
-	 * will consider it to be a local connection */
+	/* An external listener controls *who may connect* but does not make the
+	 * byte stream cryptographically authenticated.  Historically this path
+	 * unconditionally disabled TLS because it was intended for an already-
+	 * trusted local transport (for example a Hyper-V socket).  Qdistro passes
+	 * a mode-0600 AF_UNIX listener reached only through its paired mTLS relay,
+	 * and still requires an independently pinned inner RDP certificate.  Honor
+	 * an explicitly supplied cert/key for external listeners too.  Keep the
+	 * old no-certificate local-transport behavior for existing callers. */
 	fd = config->external_listener_fd;
-	if (fd < 0 && !b->vmconnect) {
-		if (!b->rdp_key && (!b->server_cert || !b->server_key)) {
+	if (fd < 0) {
+		if (!b->vmconnect && !b->rdp_key &&
+		    (!b->server_cert || !b->server_key)) {
 			weston_log("the RDP compositor requires keys and an optional certificate for RDP or TLS security ("
 				   "--rdp4-key or --rdp-tls-cert/--rdp-tls-key)\n");
 			goto err_free_strings;
 		}
-		if (b->server_cert && b->server_key) {
-			b->tls_enabled = 1;
+	}
+	if (b->server_cert && b->server_key) {
+		b->tls_enabled = 1;
+		if (fd >= 0)
+			weston_log("RDP TLS support activated on external listener\n");
+		else
 			rdp_debug(b, "TLS support activated\n");
-		}
-		if(b->tls_enabled && b->nla_ntlm_db) {
-			if (access(b->nla_ntlm_db, F_OK) == 0) {
-				b->nla_enabled = 1;
-				rdp_debug(b, "NLA support activated\n");
-			} else {
-				b->nla_enabled = 0;
-				rdp_debug(b, "NLA credential file ('%s') not found, fall back to TLS Security.\n", b->nla_ntlm_db);
-			}
+	}
+	if (b->tls_enabled && b->nla_ntlm_db) {
+		if (access(b->nla_ntlm_db, F_OK) == 0) {
+			b->nla_enabled = 1;
+			rdp_debug(b, "NLA support activated\n");
+		} else {
+			b->nla_enabled = 0;
+			rdp_debug(b, "NLA credential file ('%s') not found, fall back to TLS Security.\n", b->nla_ntlm_db);
 		}
 	}
 

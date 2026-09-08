@@ -1169,6 +1169,15 @@ test('output-boundary-policy',
   ],
 )
 
+test('cross-output-position-policy',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_cross_output_position_policy.py'),
+    files('qdwin/qdwin.c'),
+  ],
+)
+
 # RDP-headless focus-listener rebind invariants. Driven by
 # tests/host/20-rdp-focus-rebind.md (live VM half is PENDING residue).
 test('rdp-focus-rebind',
@@ -1177,6 +1186,41 @@ test('rdp-focus-rebind',
   args: [
     files('qdwin/test_rdp_focus_rebind.py'),
     files('qdwin/qdwin.c'),
+  ],
+)
+
+# R9 authenticated display carrier: the vendored Weston RDP backend must keep
+# inner certificate-based TLS when its listener is a broker-owned inherited fd.
+test('rdp-external-listener-tls',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_rdp_external_listener_tls.py'),
+    files('libweston-vendored/src/libweston/backend-rdp/rdp.c'),
+  ],
+)
+
+# A multi-backend Weston frontend consumes the shared --width/--height before
+# it loads RDP. Let the trusted launcher seed one bounded, initial-only slot
+# mode so the authenticated display lease can name an actually advertised mode.
+test('rdp-initial-mode',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_rdp_initial_mode.py'),
+    files('libweston-vendored/src/libweston/backend-rdp/rdp.c'),
+  ],
+)
+
+test('rdp-input-gate',
+  python3,
+  suite: 'source_invariant',
+  args: [
+    files('qdwin/test_rdp_input_gate.py'),
+    files('libweston-vendored/src/libweston/backend-rdp/rdp.c'),
+    files('libweston-vendored/src/include/libweston/backend-rdp.h'),
+    files('qdwin/qdwin.c'),
+    files('qdwin/qdwin-shell-v1.xml'),
   ],
 )
 

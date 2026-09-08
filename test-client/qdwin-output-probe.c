@@ -23,6 +23,14 @@
  *                    `done` (with a bumped serial) follows.
  *   --bad-serial     apply a config built against serial+1; asserts
  *                    `cancelled`.
+ *   --disable=NAME   with --apply/--test, disable the named head while
+ *                    preserving every other head's enabled state.
+ *   --enable=NAME    with --apply/--test, enable the named head while
+ *                    preserving every other head's enabled state.
+ *   --position=X,Y   set the enable target's logical position (requires
+ *                    --enable=NAME).
+ *   --expect-state=NAME:0|1
+ *                    assert the enumerated head exists and has this state.
  *   --expect-denied  combine with --test/--apply: assert the compositor
  *                    REJECTS the mutation with a protocol error (an
  *                    unauthorized client must never reach succeeded/failed/
@@ -198,6 +206,10 @@ int main(int argc, char *argv[])
 {
 	int expect_heads = -1;
 	int do_test = 0, do_apply = 0, bad_serial = 0, expect_denied = 0;
+	const char *disable_name = NULL, *enable_name = NULL;
+	const char *expect_state_name = NULL;
+	int expect_state = -1;
+	int set_position = 0, position_x = 0, position_y = 0;
 	for (int i = 1; i < argc; i++) {
 		if (strncmp(argv[i], "--expect-heads=", 15) == 0)
 			expect_heads = atoi(argv[i] + 15);
@@ -209,6 +221,40 @@ int main(int argc, char *argv[])
 			bad_serial = 1;
 		else if (strcmp(argv[i], "--expect-denied") == 0)
 			expect_denied = 1;
+		else if (strncmp(argv[i], "--disable=", 10) == 0)
+			disable_name = argv[i] + 10;
+		else if (strncmp(argv[i], "--enable=", 9) == 0)
+			enable_name = argv[i] + 9;
+		else if (strncmp(argv[i], "--position=", 11) == 0) {
+			if (sscanf(argv[i] + 11, "%d,%d", &position_x,
+			           &position_y) != 2) {
+				fprintf(stderr, "qdwin-output-probe: invalid --position\n");
+				return 2;
+			}
+			set_position = 1;
+		} else if (strncmp(argv[i], "--expect-state=", 15) == 0) {
+			char *sep = strrchr(argv[i] + 15, ':');
+			if (!sep || (strcmp(sep + 1, "0") != 0 &&
+			             strcmp(sep + 1, "1") != 0)) {
+				fprintf(stderr, "qdwin-output-probe: invalid --expect-state\n");
+				return 2;
+			}
+			*sep = '\0';
+			expect_state_name = argv[i] + 15;
+			expect_state = atoi(sep + 1);
+		}
+	}
+	if (disable_name && enable_name) {
+		fprintf(stderr, "qdwin-output-probe: choose one of --disable/--enable\n");
+		return 2;
+	}
+	if (set_position && !enable_name) {
+		fprintf(stderr, "qdwin-output-probe: --position requires --enable\n");
+		return 2;
+	}
+	if ((disable_name || enable_name) && !(do_test || do_apply)) {
+		fprintf(stderr, "qdwin-output-probe: --disable/--enable requires --test or --apply\n");
+		return 2;
 	}
 
 	struct probe p = {0};
@@ -246,19 +292,63 @@ int main(int argc, char *argv[])
 			expect_heads, p.head_count);
 		return 1;
 	}
+	if (expect_state_name) {
+		int found = 0;
+		for (int i = 0; i < p.head_count; i++) {
+			if (strcmp(p.heads[i].name, expect_state_name) != 0)
+				continue;
+			found = 1;
+			if (p.heads[i].enabled != expect_state) {
+				fprintf(stderr, "qdwin-output-probe: FAIL head %s "
+					"enabled=%d, expected %d\n", expect_state_name,
+					p.heads[i].enabled, expect_state);
+				return 1;
+			}
+		}
+		if (!found) {
+			fprintf(stderr, "qdwin-output-probe: FAIL head %s not found\n",
+				expect_state_name);
+			return 1;
+		}
+	}
 
 	if ((do_test || do_apply || bad_serial) && p.head_count > 0) {
 		uint32_t use_serial = bad_serial ? p.serial + 1 : p.serial;
 		struct zwlr_output_configuration_v1 *cfg =
 			zwlr_output_manager_v1_create_configuration(p.manager, use_serial);
 		zwlr_output_configuration_v1_add_listener(cfg, &config_listener, &p);
-		/* Enable + reposition head 0; leave all others enabled untouched. */
+		/* Preserve the observed state of every head except the named target.
+		 * Whole-layout configuration is required by the protocol. */
+		int target_found = (!disable_name && !enable_name);
 		for (int i = 0; i < p.head_count; i++) {
+			int enabled = p.heads[i].enabled;
+			if (disable_name && strcmp(p.heads[i].name, disable_name) == 0) {
+				enabled = 0;
+				target_found = 1;
+			}
+			if (enable_name && strcmp(p.heads[i].name, enable_name) == 0) {
+				enabled = 1;
+				target_found = 1;
+			}
+			if (!enabled) {
+				zwlr_output_configuration_v1_disable_head(
+					cfg, p.heads[i].proxy);
+				continue;
+			}
 			struct zwlr_output_configuration_head_v1 *chh =
-				zwlr_output_configuration_v1_enable_head(cfg, p.heads[i].proxy);
-			if (i == 0)
-				zwlr_output_configuration_head_v1_set_position(chh,
-					p.heads[i].pos_x, p.heads[i].pos_y);
+				zwlr_output_configuration_v1_enable_head(
+					cfg, p.heads[i].proxy);
+			if (enable_name && set_position &&
+			    strcmp(p.heads[i].name, enable_name) == 0)
+				zwlr_output_configuration_head_v1_set_position(
+					chh, position_x, position_y);
+			else if (!disable_name && !enable_name && i == 0)
+				zwlr_output_configuration_head_v1_set_position(
+					chh, p.heads[i].pos_x, p.heads[i].pos_y);
+		}
+		if (!target_found) {
+			fprintf(stderr, "qdwin-output-probe: target head not found\n");
+			return 1;
 		}
 		if (do_apply || bad_serial)
 			zwlr_output_configuration_v1_apply(cfg);

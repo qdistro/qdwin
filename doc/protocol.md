@@ -75,6 +75,20 @@ before qdwin acts:
 Every gate is fail-safe: timing out the shell's response defaults
 to deny.
 
+### Remote display controls (since v34)
+
+Version 34 appends remote identity and display controls after the existing
+v31–v33 application-ID and capture interfaces, preserving their opcodes.
+`nested_proxy_remote_identity` carries the verified publisher's immutable
+remote-origin tuple. `set_remote_output_input` enables a named RDP slot only
+through the bound shell; input starts disabled and shell loss disables it.
+`drain_remote_output_state` cancels the slot's input and transfer state before
+the authenticated carrier is detached. Both requests return explicit result
+events and reject callers bound below version 34.
+
+The nested protocol's version 3 `set_remote_identity` request accepts an
+immutable origin only from the exact root-installed remote viewer publisher.
+
 ### Hotkey channel (since v19)
 
 `register_hotkey(modifiers, keysym, slot)` registers a global hotkey

@@ -225,6 +225,14 @@ bool qdwin_cursor_sprite_peer_allowed(const char *peer_exe);
  * (unsigned wrap-safe). First set (no current source) is never stale. */
 bool qdwin_selection_serial_is_stale(uint32_t current, uint32_t incoming,
 				     bool has_current);
+/* Only this root-installed publisher may attach authority-bound identity to a
+ * nested proxy. Ordinary weston publishers and path lookalikes fail closed. */
+bool qdwin_remote_nested_publisher_allowed(const char *peer_exe);
+
+/* A nested input peer callback may already be queued while a replacement
+ * connection is accepted.  Only the event source for the currently-owned fd
+ * may tear down or inject through the per-toplevel input sink. */
+bool qdwin_nested_input_peer_event_current(int event_fd, int current_peer_fd);
 
 /* ------------------------------------------------------------------
  * Deliberate fail-open / broad-trust pins (02/S13).
