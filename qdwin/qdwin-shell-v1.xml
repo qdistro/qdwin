@@ -1212,10 +1212,11 @@
         is opaque scoped to one pending receive.
 
         `source_handle` and `target_handle` are toplevel handles for
-        the source-owning silo and the destination-focused silo (the
-        wl_client that called .receive). Either may be UINT32_MAX
-        when no qdwin toplevel maps to the side (e.g. RDP backend
-        without delivered focus, compositor scratch surface).
+        the source-owning client and the client that called .receive.
+        Both are resolved from their actual Wayland resources, independent
+        of keyboard focus. If either client has no tracked toplevel, the
+        receive is denied without emitting this event. A connection from
+        another launch in the same silo is not an identity substitute.
 
         `mime_type` is the exact byte string the destination
         requested. The shell must NOT assume canonical formatting
@@ -1234,12 +1235,9 @@
         fd as if the shell answered "deny". This bounds the wedged-
         shell case without leaking destination fd ownership.
 
-        Pre-v15 shells: the compositor falls back to "always allow"
-        (call source->send unconditionally), preserving v14
-        semantics. The shell's bound version is what the compositor
-        consults at receive time; older shells cannot opt into the
-        gate and the v14 focus-aware-clear remains the load-bearing
-        defense for them.
+        Absent or pre-v15 shells deny receives. Enforcement remains
+        installed across shell restart; pending receives are closed when
+        the shell disconnects. Allocation or timeout setup failure denies.
       </description>
       <arg name="request_handle" type="uint"
            summary="compositor-allocated, unique per pending receive"/>

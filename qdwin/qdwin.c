@@ -9341,6 +9341,8 @@ qdwin_shell_resource_destroy(struct wl_resource *resource)
 			qdwin->kb_repeat_overridden = 0;
 			qdwin_resend_repeat_info(qdwin);
 		}
+		/* A replacement shell must never inherit outstanding approvals. */
+		qdwin_data_offer_pending_free_all(qdwin);
 		qdwin->shell_resource = NULL;
 		qdwin->shell_bound = 0;
 		qdwin->shell_pid = 0;
@@ -10418,7 +10420,7 @@ qdwin_emit_selection_set(struct qdwin *qdwin, struct weston_seat *seat,
  * destination) pair against the rules engine while leaving other
  * mime types denied.
  *
- * Mechanism (no clean upstream hook in libweston-16): when
+ * Mechanism: when
  * selection_signal fires we wrap the new data_source's `send` callback
  * with our shim. libweston later invokes `send(source, mime, fd)` on
  * every wl_data_offer.receive call from a destination. The shim
@@ -10427,9 +10429,10 @@ qdwin_emit_selection_set(struct qdwin *qdwin, struct weston_seat *seat,
  * → close(fd) (destination sees EOF → empty paste).
  *
  * The wrap is per-source (one weston_data_source = one wrap entry,
- * one libweston `destroy_signal` listener for cleanup). Pre-v15 shells
- * cause the install to be skipped → libweston's original send is
- * never overwritten → v14 semantics preserved.
+ * one libweston `destroy_signal` listener for cleanup). Enforcement is
+ * installed independently of shell presence; absent/pre-v15 shells deny.
+ * libweston accepts receive only for source->offer, whose public resource
+ * retains the authenticated receiver at this synchronous callback boundary.
  */
 
 struct qdwin_data_source_wrap {
@@ -10449,6 +10452,7 @@ struct qdwin_data_offer_pending {
 	int fd;        /* -1 once handed off / closed */
 	char *mime;
 	struct wl_event_source *timeout_source;
+	struct wl_listener target_destroy_listener;
 	struct wl_list link;  /* qdwin::data_offer_pending */
 };
 
@@ -10478,6 +10482,7 @@ qdwin_data_offer_pending_close(struct qdwin_data_offer_pending *p, int allow)
 static void
 qdwin_data_offer_pending_free(struct qdwin_data_offer_pending *p)
 {
+	wl_list_remove(&p->target_destroy_listener.link);
 	wl_list_remove(&p->link);
 	if (p->timeout_source)
 		wl_event_source_remove(p->timeout_source);
@@ -10493,14 +10498,17 @@ qdwin_data_offer_pending_free_all(struct qdwin *qdwin)
 	struct qdwin_data_offer_pending *p, *tmp;
 	wl_list_for_each_safe(p, tmp,
 			      &qdwin->data_offer_pending, link) {
-		if (p->fd >= 0)
-			close(p->fd);
-		wl_list_remove(&p->link);
-		if (p->timeout_source)
-			wl_event_source_remove(p->timeout_source);
-		free(p->mime);
-		free(p);
+		qdwin_data_offer_pending_free(p);
 	}
+}
+
+static void
+qdwin_data_offer_target_destroyed(struct wl_listener *listener, void *data)
+{
+	struct qdwin_data_offer_pending *p =
+		wl_container_of(listener, p, target_destroy_listener);
+	(void)data;
+	qdwin_data_offer_pending_free(p);
 }
 
 static int
@@ -10509,7 +10517,6 @@ qdwin_data_offer_pending_timeout_cb(void *data)
 	struct qdwin_data_offer_pending *p = data;
 	weston_log("qdwin: data_offer_receive_pending handle=%u "
 		   "timed out → deny\n", p->handle);
-	p->timeout_source = NULL;  /* one-shot; libwl frees on return */
 	qdwin_data_offer_pending_close(p, 0);
 	qdwin_data_offer_pending_free(p);
 	return 0;
@@ -10526,17 +10533,8 @@ qdwin_data_source_wrap_on_source_destroy(struct wl_listener *l, void *data)
 			      &w->qdwin->data_offer_pending, link) {
 		if (p->wrap != w)
 			continue;
-		/* Source is going away; we cannot honour an allow now.
-		 * Close fd → destination sees EOF (empty paste). */
-		if (p->fd >= 0)
-			close(p->fd);
-		p->fd = -1;
-		p->wrap = NULL;
-		wl_list_remove(&p->link);
-		if (p->timeout_source)
-			wl_event_source_remove(p->timeout_source);
-		free(p->mime);
-		free(p);
+		/* Source is going away; pending approvals become inert. */
+		qdwin_data_offer_pending_free(p);
 	}
 	wl_list_remove(&w->link);
 	wl_list_remove(&w->destroy_listener.link);
@@ -10559,7 +10557,7 @@ qdwin_data_source_wraps_free_all(struct qdwin *qdwin)
 static void qdwin_data_source_send_shim(struct weston_data_source *source,
 					 const char *mime, int32_t fd);
 
-/* Install the send-shim on src->send. Idempotent + version-gated. */
+/* Install before publishing a selection, including while the shell is down. */
 static void
 qdwin_install_data_source_wrap(struct qdwin *qdwin,
 			       struct weston_seat *seat,
@@ -10567,15 +10565,16 @@ qdwin_install_data_source_wrap(struct qdwin *qdwin,
 {
 	if (!qdwin || !src)
 		return;
-	if (!qdwin_shell_can_receive_v15(qdwin))
-		return;
-	if (qdwin_data_source_wrap_find(qdwin, src))
-		return;
+	if (src->send == qdwin_data_source_send_shim)
+		return;  /* already wrapped, or permanently denied after wrap OOM */
 	if (!src->send)
 		return;  /* nothing to wrap */
 	struct qdwin_data_source_wrap *w = calloc(1, sizeof(*w));
-	if (!w)
+	if (!w) {
+		/* No wrap means the shim denies. Never leave original_send live. */
+		src->send = qdwin_data_source_send_shim;
 		return;
+	}
 	w->qdwin = qdwin;
 	w->source = src;
 	w->seat = seat;
@@ -10599,13 +10598,7 @@ qdwin_data_source_send_shim(struct weston_data_source *source,
 	struct qdwin_data_source_wrap *w = qdwin ?
 		qdwin_data_source_wrap_find(qdwin, source) : NULL;
 	if (!w || !qdwin || !qdwin_shell_can_receive_v15(qdwin)) {
-		/* Wrap missing or shell version dropped — pass through if
-		 * we still know the original; otherwise close fd to avoid
-		 * leak. */
-		if (w && w->original_send)
-			w->original_send(source, mime, fd);
-		else
-			close(fd);
+		close(fd);
 		return;
 	}
 
@@ -10616,6 +10609,21 @@ qdwin_data_source_send_shim(struct weston_data_source *source,
 	if (mime && strnlen(mime, QDWIN_MIME_TYPE_MAX + 1u) > QDWIN_MIME_TYPE_MAX) {
 		weston_log("qdwin: data_offer.receive dropped — mime too long "
 			   "(cap %u)\n", QDWIN_MIME_TYPE_MAX);
+		close(fd);
+		return;
+	}
+
+	/* data_offer_receive checks offer == source->offer immediately before
+	 * invoking us. Read that resource, never keyboard focus or a different
+	 * connection sharing an app_id. Internal sends without an offer and
+	 * proxy endpoints without their own tracked toplevel fail closed. */
+	struct wl_client *src_client = source->resource ?
+		wl_resource_get_client(source->resource) : NULL;
+	struct wl_client *dst_client = source->offer && source->offer->resource ?
+		wl_resource_get_client(source->offer->resource) : NULL;
+	struct qdwin_toplevel *src_tl = qdwin_toplevel_for_client(qdwin, src_client);
+	struct qdwin_toplevel *dst_tl = qdwin_toplevel_for_client(qdwin, dst_client);
+	if (!src_tl || !dst_tl) {
 		close(fd);
 		return;
 	}
@@ -10638,21 +10646,23 @@ qdwin_data_source_send_shim(struct weston_data_source *source,
 	if (p->handle == 0)
 		p->handle = ++qdwin->data_offer_receive_next_handle;
 	wl_list_insert(&qdwin->data_offer_pending, &p->link);
+	p->target_destroy_listener.notify = qdwin_data_offer_target_destroyed;
+	wl_client_add_destroy_listener(dst_client, &p->target_destroy_listener);
 
-	struct wl_client *src_client = source->resource ?
-		wl_resource_get_client(source->resource) : NULL;
-	struct qdwin_toplevel *src_tl =
-		qdwin_toplevel_for_keyboard_focus(qdwin, w->seat);
-	if (!src_tl)
-		src_tl = qdwin_toplevel_for_client(qdwin, src_client);
-	if (!src_tl)
-		src_tl = qdwin_toplevel_for_secctx_app_id(qdwin, src_client);
-	struct qdwin_toplevel *dst_tl =
-		qdwin_toplevel_for_keyboard_focus(qdwin, w->seat);
-	uint32_t source_handle = src_tl ? src_tl->handle : UINT32_MAX;
-	uint32_t target_handle = dst_tl ? dst_tl->handle : UINT32_MAX;
+	uint32_t source_handle = src_tl->handle;
+	uint32_t target_handle = dst_tl->handle;
 	const char *seat_name = (w->seat && w->seat->seat_name) ?
 		w->seat->seat_name : "";
+
+	struct wl_event_loop *loop =
+		wl_display_get_event_loop(qdwin->compositor->wl_display);
+	p->timeout_source = wl_event_loop_add_timer(
+		loop, qdwin_data_offer_pending_timeout_cb, p);
+	if (!p->timeout_source ||
+	    wl_event_source_timer_update(p->timeout_source, 2000) < 0) {
+		qdwin_data_offer_pending_free(p);
+		return;
+	}
 
 	qdwin_shell_v1_send_data_offer_receive_pending(
 		qdwin->shell_resource, p->handle, seat_name,
@@ -10661,13 +10671,6 @@ qdwin_data_source_send_shim(struct weston_data_source *source,
 		   "src=%u dst=%u mime='%s' fd=%d\n",
 		   p->handle, seat_name, source_handle, target_handle,
 		   p->mime, p->fd);
-
-	struct wl_event_loop *loop =
-		wl_display_get_event_loop(qdwin->compositor->wl_display);
-	p->timeout_source = wl_event_loop_add_timer(
-		loop, qdwin_data_offer_pending_timeout_cb, p);
-	if (p->timeout_source)
-		wl_event_source_timer_update(p->timeout_source, 2000);
 }
 
 static struct qdwin_data_offer_pending *
@@ -10729,7 +10732,7 @@ qdwin_on_seat_selection_changed(struct wl_listener *listener, void *data)
 	 * the shell about the selection. Once the shell starts processing
 	 * selection_set, destinations may already begin calling
 	 * wl_data_offer.receive; the shim must already be in place to
-	 * intercept. No-op when shell version <15. */
+	 * intercept. Absent/pre-v15 shells remain fail-closed. */
 	qdwin_install_data_source_wrap(tr->qdwin, seat, src);
 	/* Pass the data source's wl_client so emit_selection_set can
 	 * fall back to a toplevel owned by that client when no toplevel
@@ -12938,6 +12941,7 @@ qdwin_track_seat(struct qdwin *qdwin, struct weston_seat *seat)
 	qdwin_install_focus_listener_if_needed(tr);
 	/* B6: pointer focus listener for default-cursor restoration. */
 	qdwin_install_pointer_focus_listener_if_needed(tr);
+	qdwin_install_data_source_wrap(qdwin, seat, seat->selection_data_source);
 	return tr;
 }
 

@@ -1429,3 +1429,9 @@ test('qdwin-logic-unit',
   ),
   suite: 'logic',
 )
+
+# Exercises production receive dispatch with real Wayland resources and pipes.
+test('clipboard-receive-boundary', python3,
+  args: [files('qdwin/test_clipboard_receive.py'), files('qdwin/qdwin.c'),
+         files('libweston-vendored/src/libweston/data-device.c')],
+)

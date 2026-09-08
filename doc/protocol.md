@@ -60,8 +60,17 @@ before qdwin acts:
   admit-or-deny for an `xdg-activation` token-driven focus request.
 - `data_offer_receive_pending` / `data_offer_receive_decision` (since
   v15) — admit-or-deny each cross-client clipboard receive. The
-  decision carries the destination MIME type, the source client's
-  security-context tag, and the destination client's tag.
+  event carries the requested MIME type and toplevel handles belonging
+  to the actual source and receiving Wayland clients. libweston invokes
+  the send shim only for its active `source->offer`, whose resource
+  retains the receiving client; keyboard focus never supplies either
+  endpoint. Connections without a mapped toplevel are denied, including
+  separate proxy/helper connections that only share an app ID. The shell
+  resolves the handles to their authenticated identity sidecars.
+  Wrapping applies even without a shell; absent/pre-v15 shells deny.
+  Shell or endpoint loss cancels pending receives, and allocation or
+  timer setup failure closes the pipe. A restarted shell starts with no
+  inherited approvals; existing sources remain guarded.
 
 Every gate is fail-safe: timing out the shell's response defaults
 to deny.
