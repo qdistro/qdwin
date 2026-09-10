@@ -59,12 +59,24 @@ CURSOR=$("$QDWIN_VM_EXEC" "$VMNAME" "journalctl _UID=1000 -n 1 \
   "setsid -f runuser -u admin -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 \
    WAYLAND_DISPLAY=wayland-1 weston-terminal \
    >/tmp/qd12-weston-terminal.log 2>&1" >/dev/null
-sleep 2
-HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
-  "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
-   grep -E 'qdwin: toplevel_added handle=[0-9]+ uid=1000 pid=[0-9]+ app_id=weston-terminal' | \
-   tail -1 | sed -nE 's/.*handle=([0-9]+).*/\1/p'")
-[ -n "$HANDLE" ] || { echo "ERROR: weston-terminal never mapped (no toplevel_added)"; exit 1; }
+# weston-terminal sends xdg_toplevel.set_app_id AFTER its initial commit, so
+# its `toplevel_added` line always reads `app_id=(null)` and the real id
+# arrives on a SEPARATE `toplevel_app_id` line. That id is also the reverse-DNS
+# `org.freedesktop.weston.wayland-terminal`, not `weston-terminal`. Matching
+# `toplevel_added ... app_id=weston-terminal` therefore never succeeds.
+# (Clients like qdistro-test-window DO carry app_id at map time, which is why
+# 16/17/18/19 can key on `toplevel_added` and this scenario cannot.)
+# Poll rather than sleep: the app_id line can lag the map under host load.
+HANDLE=""
+for _i in $(seq 1 30); do
+    HANDLE=$("$QDWIN_VM_EXEC" "$VMNAME" \
+      "journalctl _UID=1000 --after-cursor='$CURSOR' --no-pager | \
+       grep -E 'qdwin: toplevel_app_id handle=[0-9]+ app_id=\"org\\.freedesktop\\.weston\\.wayland-terminal\"' | \
+       tail -1 | sed -nE 's/.*handle=([0-9]+).*/\1/p'")
+    [ -n "$HANDLE" ] && break
+    sleep 1
+done
+[ -n "$HANDLE" ] || { echo "ERROR: weston-terminal never mapped (no toplevel_app_id for org.freedesktop.weston.wayland-terminal)"; exit 1; }
 
 # Focus the window so qdshell's WindowManagerService._onHotkey acts on
 # it (the toggle-maximize hotkey no-ops when focusedHandle <= 0). Uses
