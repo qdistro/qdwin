@@ -229,21 +229,58 @@ qdwin_apps_restore_shell() {
     qdwin_apps_require_vm || return 1
     local b64; b64=$(base64 -w0 <<'EOSCRIPT'
 set -u
+SHELL_LINE_RE='^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?qdwin: shell (unbound|bound \(uid=1000 pid=[0-9]+\); replaying [0-9]+ toplevels)$'
+
+# pid named by the LATEST shell lifecycle record, or empty when that record is
+# an unbind (i.e. nobody holds the role). "$@" is passed to journalctl, so a
+# caller can scope the search with --after-cursor.
+latest_bound_pid() {
+  runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    journalctl --user -b -u qdwin-compositor.service --no-pager -o cat "$@" \
+    2>/dev/null | grep -E "$SHELL_LINE_RE" | tail -1 \
+    | sed -nE 's/.*bound \(uid=1000 pid=([0-9]+)\).*/\1/p'
+}
+
+# Does $1 belong to qdshell.service? qdwin names the WAYLAND CLIENT's pid,
+# which is NOT the unit MainPID: qdshell.service is
+# `ExecStart=dbus-run-session -- qs`, so MainPID is the dbus-run-session
+# wrapper and `qs` — the process that actually binds the shell role — is its
+# child. Comparing against MainPID alone therefore NEVER matched, and restore
+# reported "did not acquire" on sessions that had in fact recovered. Test
+# against the unit's cgroup, which covers both, and keep the MainPID check as
+# a fallback for a hypothetical unwrapped ExecStart.
+pid_is_qdshell() {
+  _p="${1:-}"
+  [ -n "$_p" ] && [ "$_p" -gt 0 ] 2>/dev/null || return 1
+  _main=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user show qdshell.service -p MainPID --value 2>/dev/null || true)
+  [ "$_p" = "$_main" ] && return 0
+  _cg=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
+    systemctl --user show qdshell.service -p ControlGroup --value 2>/dev/null || true)
+  [ -n "$_cg" ] || return 1
+  grep -qx "$_p" "/sys/fs/cgroup$_cg/cgroup.procs" 2>/dev/null
+}
+
 # Idempotent terminal state: prepare_shell_probe self-restores on failure and
 # the caller's EXIT trap may restore again. Prove the currently active service
-# owns the compositor role (latest lifecycle record names its MainPID) and
-# succeed without waiting for an impossible new post-cursor bind.
+# owns the compositor role (the latest lifecycle record names one of its pids)
+# and succeed without waiting for an impossible new post-cursor bind.
 if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
      systemctl --user is-active --quiet qdshell.service; then
-  qpid=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
-    systemctl --user show qdshell.service -p MainPID --value 2>/dev/null || true)
-  latest_shell=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
-    journalctl --user -b -u qdwin-compositor.service --no-pager -o cat \
-    2>/dev/null | grep -E '^(\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?qdwin: shell (unbound|bound \(uid=1000 pid=[0-9]+\); replaying [0-9]+ toplevels)$' \
-    | tail -1 || true)
-  if [ -n "$qpid" ] && [ "$qpid" -gt 0 ] 2>/dev/null \
-     && printf '%s\n' "$latest_shell" \
-        | grep -qE "^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?qdwin: shell bound \\(uid=1000 pid=$qpid\\); replaying [0-9]+ toplevels$"; then
+  qpid=$(latest_bound_pid)
+  if [ -z "$qpid" ]; then
+    # Latest record is an unbind: NOBODY holds the role, so qs may simply be
+    # mid-start (an EXIT-trap restore racing a just-started qdshell). Give it a
+    # bounded moment before forcing a needless stop/start. When some OTHER
+    # client holds the role (the bystander, the common case here) qpid is
+    # non-empty and we fall straight through to the stop — this costs nothing.
+    _deadline=$((SECONDS + 10))
+    while [ -z "$qpid" ] && [ "$SECONDS" -lt "$_deadline" ]; do
+      sleep 0.5
+      qpid=$(latest_bound_pid)
+    done
+  fi
+  if pid_is_qdshell "$qpid"; then
     echo "restore: qdshell already owns compositor shell role pid=$qpid"
     exit 0
   fi
@@ -261,7 +298,10 @@ pgrep -u admin -x qdwin-bystander >/dev/null 2>&1 && had_bystander=1
 pkill -u admin -x qdwin-bystander 2>/dev/null || true
 if [ "$had_bystander" = 1 ]; then
   unbound=0
-  for _i in $(seq 1 40); do
+  # Wall-clock for the same reason as the bind wait below: 40 x 0.1s bounded
+  # only the sleeps, and 4s is thin for a starved guest to reap the bystander.
+  _deadline=$((SECONDS + 30))
+  while :; do
     if runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
          journalctl --user -b -u qdwin-compositor.service \
          --after-cursor "$cursor" --no-pager -o cat 2>/dev/null \
@@ -269,7 +309,8 @@ if [ "$had_bystander" = 1 ]; then
       unbound=1
       break
     fi
-    sleep 0.1
+    [ "$SECONDS" -ge "$_deadline" ] && break
+    sleep 0.2
   done
   [ "$unbound" = 1 ] || {
     echo "restore: compositor did not release probe shell role" >&2; exit 1;
@@ -282,23 +323,27 @@ runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
   echo "restore: could not start qdshell.service" >&2; exit 1;
 }
 bound=0
-for _i in $(seq 1 60); do
-  qpid=$(runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
-    systemctl --user show qdshell.service -p MainPID --value 2>/dev/null || true)
-  if [ -n "$qpid" ] && [ "$qpid" -gt 0 ] 2>/dev/null \
+# WALL-CLOCK deadline, not an iteration count: each iteration also makes 3-4
+# runuser round trips into the guest, so `seq 1 N` bounds the sleeps but not the
+# elapsed time — under 8-way starvation that stretched to minutes, and the
+# scenario calls restore twice inside a 720s agent budget. qdshell restart + QML
+# load + bind measures ~2-2.4s idle; the old 60 x 0.1s allowed only 6s of it.
+_deadline=$((SECONDS + 60))
+while :; do
+  qpid=$(latest_bound_pid --after-cursor "$cursor")
+  if [ -n "$qpid" ] \
      && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
        systemctl --user is-active --quiet qdshell.service \
-     && runuser -u admin -- env XDG_RUNTIME_DIR=/run/user/1000 \
-       journalctl --user -b -u qdwin-compositor.service \
-       --after-cursor "$cursor" --no-pager -o cat 2>/dev/null \
-       | grep -qE "^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?qdwin: shell bound \\(uid=1000 pid=$qpid\\); replaying [0-9]+ toplevels$"; then
+     && pid_is_qdshell "$qpid"; then
     bound=1
     break
   fi
-  sleep 0.1
+  [ "$SECONDS" -ge "$_deadline" ] && break
+  sleep 0.5
 done
 [ "$bound" = 1 ] || {
-  echo "restore: qdshell did not acquire compositor shell role" >&2; exit 1;
+  echo "restore: qdshell did not acquire compositor shell role (latest post-cursor bind pid=${qpid:-none})" >&2
+  exit 1
 }
 EOSCRIPT
 )
