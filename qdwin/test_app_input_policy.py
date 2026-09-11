@@ -102,11 +102,29 @@ def main() -> int:
     if accepted:
         return fail(f"shell handoff filter accepts invalid message(s): {accepted}")
 
-    restore = helper[helper.find("\nqdwin_apps_restore_shell() {") :]
+    # Bound the slice at the function's own terminator. Slicing to EOF let a
+    # token or a deadline in ANY later helper satisfy these assertions, so a
+    # restore path that lost the construct would still pass by aliasing.
+    _restore_start = helper.find("\nqdwin_apps_restore_shell() {")
+    _restore_end = helper.find("\nEOSCRIPT\n)", _restore_start)
+    if _restore_start < 0 or _restore_end < 0:
+        return fail("cannot locate qdwin_apps_restore_shell guest script")
+    restore = helper[_restore_start:_restore_end]
     for token in (
         "restore: qdshell already owns compositor shell role pid=$qpid",
+        # Ownership is proven by UNIT MEMBERSHIP, not MainPID equality:
+        # qdshell.service runs `dbus-run-session -- qs`, so MainPID is the
+        # wrapper while qdwin logs the `qs` CLIENT pid. MainPID is kept only as
+        # a fallback for a hypothetical unwrapped ExecStart; the cgroup check is
+        # what actually decides. See qdistro/deploy/qdshell.service.
         "systemctl --user show qdshell.service -p MainPID --value",
-        'pid=$qpid\\\\); replaying [0-9]+ toplevels$',
+        "systemctl --user show qdshell.service -p ControlGroup --value",
+        'grep -qx "$_p" "/sys/fs/cgroup$_cg/cgroup.procs"',
+        "latest_bound_pid",
+        # Pin the CONJUNCTIONS, not just the call names: `pid_is_qdshell "$q" ||
+        # true` keeps every bare name token satisfied while accepting anyone.
+        'if pid_is_qdshell "$qpid"; then',
+        '&& pid_is_qdshell "$qpid"; then',
         "had_bystander=0",
         'grep -qE \'^(\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}\\] )?qdwin: shell unbound$\'',
         "systemctl --user start qdshell.service",
@@ -117,34 +135,112 @@ def main() -> int:
     had_pos = restore.index("had_bystander=0")
     unbound_pos = restore.index("shell unbound$", had_pos)
     start_pos = restore.index("systemctl --user start qdshell.service")
-    bound_pos = restore.index("qdwin: shell bound", start_pos)
-    if not (unbound_pos < start_pos < bound_pos):
+    # The post-start bind is proven by a CURSOR-SCOPED lifecycle lookup whose
+    # pid must then be shown to belong to qdshell.service. The literal
+    # "shell bound" text now lives only in the shared regex at the top of the
+    # guest script, so anchor the ordering on those two calls instead.
+    bound_pos = restore.index('latest_bound_pid --after-cursor "$cursor"',
+                              start_pos)
+    owned_pos = restore.index('pid_is_qdshell "$qpid"', bound_pos)
+    if not (unbound_pos < start_pos < bound_pos < owned_pos):
         return fail("shell restoration does not release-before-start-before-bind")
+    # `bound=1` must be reached THROUGH the ownership conjunction above.
+    if restore.index("bound=1", owned_pos) < owned_pos:
+        return fail("shell restoration sets bound=1 outside the ownership check")
+    # The bind wait must be bounded by WALL CLOCK, not an iteration count: each
+    # iteration makes several runuser round trips into the guest, so `seq 1 N`
+    # bounds the sleeps but not the elapsed time and collapsed to ~6s of real
+    # budget under 8-way starvation. Pin the SHAPE and a floor on the budget,
+    # not an exact constant, and require the deadline to actually be CONSULTED
+    # -- a revert that leaves a dead `_deadline=` assignment behind must fail.
+    bind_region = restore[start_pos:]
+    deadline = re.search(r"_deadline=\$\(\(SECONDS \+ ([0-9]+)\)\)", bind_region)
+    if deadline is None or int(deadline.group(1)) < 30:
+        return fail("shell restoration bind wait is not wall-clock bounded "
+                    "with at least a 30s budget")
+    if '[ "$SECONDS" -ge "$_deadline" ]' not in bind_region:
+        return fail("shell restoration bind wait never consults its deadline")
+    # Strip comment lines first: the helper's own rationale MENTIONS `seq 1 N`
+    # as the shape it replaced, and a naive substring test would read that
+    # explanation as the defect it warns about.
+    bind_code = "\n".join(line for line in bind_region.splitlines()
+                          if not line.lstrip().startswith("#"))
+    if "$(seq " in bind_code:
+        return fail("shell restoration bind wait is iteration-counted")
+    # The bind loop must ALSO require the unit to be active, not merely inherit
+    # the fast path's is-active check from earlier in the script.
+    if "systemctl --user is-active --quiet qdshell.service" not in bind_region:
+        return fail("shell restoration bind wait does not require an active unit")
 
     # Behavioral truth table for the already-restored fast path. Active alone
     # is insufficient: the latest compositor lifecycle record must be a bound
-    # record naming the service's live MainPID. This makes a second EXIT-trap
-    # restore harmless without accepting stale/mismatched ownership.
-    def already_bound(active, main_pid, latest):
-        if not active or not main_pid or main_pid <= 0:
-            return False
-        pattern = (
-            r"^(?:\[[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] )?"
-            rf"qdwin: shell bound \(uid=1000 pid={main_pid}\); "
-            r"replaying [0-9]+ toplevels$"
-        )
-        return re.fullmatch(pattern, latest) is not None
+    # record naming a pid that BELONGS TO qdshell.service. Membership, not
+    # MainPID equality, is the ownership test -- the unit runs
+    # `dbus-run-session -- qs`, so MainPID is the wrapper and never equals the
+    # `qs` client pid qdwin logs; comparing against it made this fast path a
+    # guaranteed false negative. This keeps a second EXIT-trap restore harmless
+    # without accepting stale, foreign, or bystander-held ownership.
+    # The lifecycle filter is the HELPER's own SHELL_LINE_RE, extracted rather
+    # than copied: a private copy would let the helper's anchors rot (dropping
+    # `^`, or loosening `uid=1000` to `uid=[0-9]+`) while this table still
+    # passed against the stale duplicate. The POSIX ERE the shell uses is valid
+    # Python `re` as written.
+    line_re = re.search(r"^SHELL_LINE_RE='(.*)'$", restore, re.M)
+    if line_re is None:
+        return fail("shell restoration has no extractable SHELL_LINE_RE")
+    shell_line_re = line_re.group(1)
+    for required in ("^(", "uid=1000 pid=[0-9]+", "replaying [0-9]+ toplevels", ")$"):
+        if required not in shell_line_re:
+            return fail(f"SHELL_LINE_RE lost its anchor/identity pin: {required!r}")
 
+    def already_bound(active, main_pid, cgroup_pids, latest):
+        if not active:
+            return False
+        # Mirrors the shell exactly: filter through SHELL_LINE_RE, then take
+        # the pid only from a BOUND record (the sed prints nothing on unbind).
+        if re.fullmatch(shell_line_re, latest) is None:
+            return False
+        match = re.search(r"bound \(uid=1000 pid=([0-9]+)\)", latest)
+        if match is None:
+            return False
+        pid = int(match.group(1))
+        if pid <= 0:
+            return False
+        # MainPID fallback first (unwrapped ExecStart), then unit membership.
+        return pid == main_pid or pid in cgroup_pids
+
+    # The realistic shape: MainPID is the dbus-run-session wrapper (3681) and
+    # the bound pid is the `qs` child (3688). Only the cgroup proves ownership.
+    WRAPPER, QS, FOREIGN = 3681, 3688, 4100
+    bound_qs = f"qdwin: shell bound (uid=1000 pid={QS}); replaying 0 toplevels"
     positives = (
-        (True, 2299, "qdwin: shell bound (uid=1000 pid=2299); replaying 0 toplevels"),
-        (True, 2299, "[19:00:13.073] qdwin: shell bound (uid=1000 pid=2299); replaying 4 toplevels"),
+        (True, WRAPPER, {WRAPPER, QS}, bound_qs),
+        (True, WRAPPER, {WRAPPER, QS},
+         f"[19:00:13.073] qdwin: shell bound (uid=1000 pid={QS}); replaying 4 toplevels"),
+        # Unwrapped ExecStart: MainPID IS the client, cgroup unreadable.
+        (True, QS, set(), bound_qs),
+        # Wrapped unit whose MainPID is momentarily unreadable: membership in
+        # the live cgroup still proves ownership, as it does in the shell.
+        (True, 0, {QS}, bound_qs),
     )
     negatives = (
-        (False, 2299, positives[0][2]),
-        (True, 0, positives[0][2]),
-        (True, 2300, positives[0][2]),
-        (True, 2299, "qdwin: shell unbound"),
-        (True, 2299, "prefix qdwin: shell bound (uid=1000 pid=2299); replaying 0 toplevels"),
+        (False, WRAPPER, {WRAPPER, QS}, bound_qs),            # unit inactive
+        # A genuine bystander: some OTHER client holds the role and its pid is
+        # absent from qdshell.service's cgroup.
+        (True, WRAPPER, {WRAPPER, QS},
+         f"qdwin: shell bound (uid=1000 pid={FOREIGN}); replaying 0 toplevels"),
+        (True, 0, set(), bound_qs),                           # no MainPID, no cgroup
+        (True, WRAPPER, {WRAPPER, QS}, "qdwin: shell unbound"),  # nobody holds the role
+        # Anchor cases: unprefixed noise and a trailing-garbage line are not
+        # lifecycle records at all, so they can never be the selected record.
+        (True, WRAPPER, {WRAPPER, QS},
+         f"prefix qdwin: shell bound (uid=1000 pid={QS}); replaying 0 toplevels"),
+        (True, WRAPPER, {WRAPPER, QS}, bound_qs + " late"),
+        # Identity: a bind by a DIFFERENT uid is not our shell, even when the
+        # pid would otherwise pass the ownership test.
+        (True, WRAPPER, {WRAPPER, QS},
+         f"qdwin: shell bound (uid=0 pid={QS}); replaying 0 toplevels"),
+        (True, WRAPPER, {WRAPPER, 0}, "qdwin: shell bound (uid=1000 pid=0); replaying 0 toplevels"),
     )
     if not all(already_bound(*case) for case in positives):
         return fail("already-bound restore model rejects a valid terminal state")
