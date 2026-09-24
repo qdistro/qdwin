@@ -1,3 +1,9 @@
+> **Moved.** This repository is frozen and archived. Development continues in
+> [qdistro/qdistro](https://github.com/qdistro/qdistro/tree/main/qdwin) under
+> `qdwin/`. Its full history up to `2838b21cc` is also preserved there on
+> branch [`legacy/multirepo/qdwin`](https://github.com/qdistro/qdistro/tree/legacy/multirepo/qdwin).
+> This repository was renamed from `qdwin` to `legacy-qdwin`.
+
 # qdwin
 
 A libweston shell plugin that hosts the qdistro desktop. Single-seat,
